@@ -1,18 +1,25 @@
 # Implementation plan
 
-## Done in this prototype
+## Completed prototype
 
 - Ruby 4.0.5 pinned with mise.
-- Gem scaffold with gemspec, executable stub, Rake, RSpec, and README.
+- Gem scaffold with gemspec, executable, Rake, RSpec, README, and docs.
 - Real Yugabyte-backed persistence via `pg`.
-- Integration tests against local Yugabyte YSQL.
-- Basic run/resume behavior.
+- Workflow DSL and synchronous engine API.
+- Runnable workflow queue and worker polling.
+- Distributed leases, heartbeats, and stale lease stealing.
+- Durable step attempts.
+- Timer waits and external event waits.
+- Side-effect idempotency fences.
+- Durable outbox with unique keys, leasing, and acknowledgement.
+- CLI commands for migration, counter workflow execution, inspection, and resume.
+- Integration tests against local Yugabyte/YSQL for the spec, guarantee matrix, and crash matrix.
 
-## Next increments
+## Remaining production hardening beyond prototype
 
-1. Add leases: `locked_by`, `locked_until`, heartbeat extension, and stale-lock stealing.
-2. Add attempt history: append-only `step_attempts` table to preserve failure history.
-3. Add a worker loop: poll runnable workflows and execute with leases.
-4. Add timers/events: persist sleeps and external wait conditions.
-5. Add CLI commands: migrate, run example workflow, inspect run, resume run.
-6. Add side-effect fencing API: idempotency keys and outbox rows.
+1. Package a long-lived worker daemon with signal handling and supervision hooks.
+2. Add workflow versioning so changed workflow definitions can safely resume old runs.
+3. Add richer attempt policies: exponential backoff, max attempts, retryable/non-retryable errors.
+4. Add observability: structured logs, metrics, tracing, and run timelines.
+5. Add advisory-lock or serializable-transaction hardening for high-concurrency production use.
+6. Add more generic CLI workflow loading instead of only the built-in counter workflow.

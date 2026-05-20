@@ -1,29 +1,36 @@
 # Durababble architecture
 
-Durababble is intentionally small: Ruby code owns workflow definition and execution, while YugabyteDB owns durable run state.
+Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitions and execution; YugabyteDB/YSQL owns all durable coordination and recovery state.
 
 ## Components
 
-- `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash and returns the next context hash.
-- `Durababble::Engine`: creates runs, resumes failed/interrupted runs, skips completed steps, and persists transitions.
-- `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It creates and updates durable tables in a configurable schema.
+- `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash and returns the next context hash or a wait request.
+- `Durababble::Engine`: creates/resumes runs, records step transitions, handles waits, and skips completed steps during recovery.
+- `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease.
+- `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions.
+- `exe/durababble`: prototype CLI for migrate/run/inspect/resume of the built-in counter workflow.
 
 ## Storage model
 
-`workflows` stores one row per run: id, name, status, input, result, error, timestamps.
+- `workflows`: one row per run; stores status, input, result, errors, and workflow lease owner/deadline.
+- `steps`: one row per workflow step position; stores latest state and result used for resume.
+- `step_attempts`: append-only attempt history for every started step.
+- `waits`: durable timer and external-event waits, including context needed to resume.
+- `fences`: idempotency fence results keyed by workflow and side-effect key.
+- `outbox`: durable outgoing messages with unique keys, processing leases, and acknowledgements.
 
-`steps` stores one row per step attempt slot: workflow_id, position, name, status, result, error, timestamps. Completed step results are reused on resume, so a completed step is not re-executed by the engine.
+## Durability semantics
 
-## Current durability semantics
+- Enqueue persists the workflow before work is claimed.
+- Claiming work atomically marks one workflow `running` and writes `locked_by`/`locked_until`.
+- A heartbeat extends an owned running lease.
+- Expired leases are returned to `pending` for recovery.
+- Before a step runs, its current step row and a new attempt row are persisted.
+- After success, the current step and attempt are marked `completed` with JSON result.
+- After failure, the current step, attempt, and workflow record the error.
+- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued.
+- Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
+- Fences persist the first side-effect result and return the persisted result for repeated keys.
+- Outbox rows are unique by key, leased for delivery, and acknowledged after external delivery.
 
-- Before a step runs, its row is upserted as `running`.
-- After success, the row is marked `completed` with JSON result.
-- After failure, the row and workflow are marked `failed` with the exception string.
-- `resume` marks the workflow `running`, rebuilds context from completed step outputs, and continues at the first non-completed step.
-
-## Future hardening
-
-- Worker leases and heartbeats for multi-process execution.
-- Attempt history instead of one row per step slot.
-- Transaction boundaries around state transitions plus external side-effect fencing.
-- Timers, sleeps, signals, external event waits, and queue polling.
+See `docs/spec.md` for the guarantee and crash matrices implemented by tests.

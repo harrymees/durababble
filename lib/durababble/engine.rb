@@ -2,18 +2,24 @@
 
 module Durababble
   class Engine
-    def initialize(store:)
+    DEFAULT_LEASE_SECONDS = 60
+
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil)
       @store = store
+      @worker_id = worker_id
+      @lease_seconds = lease_seconds
+      @crash_after = crash_after
       @store.migrate!
     end
 
     def run(workflow, input:)
-      workflow_id = @store.create_workflow(name: workflow.name, input:)
-      execute(workflow, workflow_id:)
+      workflow_id = @store.enqueue_workflow(name: workflow.name, input:)
+      resume(workflow, workflow_id:)
     end
 
     def resume(workflow, workflow_id:)
-      @store.mark_workflow_running(workflow_id)
+      @store.mark_workflow_running(workflow_id, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      crash!(:workflow_claimed)
       execute(workflow, workflow_id:)
     end
 
@@ -32,10 +38,21 @@ module Durababble
         end
 
         @store.record_step_started(workflow_id:, position:, name: step.name)
+        crash!(:step_started)
         begin
-          context = step.call(context)
+          output = step.call(context)
+          if output.is_a?(WaitRequest)
+            @store.record_wait(workflow_id:, position:, name: step.name, wait_request: output)
+            crash!(:wait_recorded)
+            return snapshot(workflow_id)
+          end
+
+          context = output
           @store.record_step_completed(workflow_id:, position:, result: context)
+          crash!(:step_completed)
         rescue StandardError => e
+          raise if e.is_a?(InjectedCrash)
+
           message = "#{e.class}: #{e.message}"
           @store.record_step_failed(workflow_id:, position:, error: message)
           @store.fail_workflow(workflow_id, error: message)
@@ -44,6 +61,7 @@ module Durababble
       end
 
       @store.complete_workflow(workflow_id, result: context)
+      crash!(:workflow_completed)
       snapshot(workflow_id)
     end
 
@@ -54,6 +72,10 @@ module Durababble
     def snapshot(workflow_id)
       row = @store.workflow(workflow_id)
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
+    end
+
+    def crash!(point)
+      raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end
   end
 end
