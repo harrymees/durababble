@@ -11,6 +11,8 @@ require_relative "durababble/worker"
 module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
+  class LeaseConflict < Error; end
+  class FenceTimeout < Error; end
 
   def self.wait_until(time, context = {})
     WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)

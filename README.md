@@ -20,14 +20,16 @@ The local Yugabyte instance used by default is `ybsqlite-vfs-yugabyte`, exposed 
 - Yugabyte-backed schema migration.
 - Durable workflow, step, wait, attempt, fence, and outbox persistence.
 - Worker polling with one-at-a-time leased claims.
-- Heartbeats and stale lease recovery.
+- Heartbeats, stale lease recovery, and lease-aware resume.
+- Transactional multi-row step and wait transitions.
 - Run and resume behavior that skips completed steps and retries incomplete work.
-- Timer waits and external event waits.
-- Side-effect idempotency fences.
-- Durable outbox with unique keys, leasing, and acknowledgement.
+- Timer waits and external event waits with concurrent signal protection.
+- Side-effect idempotency fences that acquire before the side effect executes.
+- Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement.
 - CLI commands: `migrate`, `run-counter`, `inspect`, `resume-counter`, `version`.
+- Comprehensive RSpec integration suite against real Yugabyte plus SimpleCov line/branch thresholds.
 
-See `docs/spec.md` for the implemented spec, guarantee matrix, and crash matrix.
+See `docs/spec.md` for the implemented spec, guarantee matrix, crash matrix, and coverage standard.
 
 ## CLI
 
@@ -52,4 +54,4 @@ run = Durababble::Engine.new(store:).run(workflow, input: { "count" => 2 })
 
 ## Prototype boundaries
 
-This is still a prototype, not a production Temporal replacement. It implements the guarantee and crash matrices in `docs/spec.md`, but does not yet include workflow versioning, cron scheduling, metrics, tracing, a packaged daemon supervisor, or production hardening around operational observability.
+This is still a prototype, not a production Temporal replacement. It implements the guarantee and crash matrices in `docs/spec.md`, but does not yet include workflow versioning, cron scheduling, metrics, tracing, a packaged daemon supervisor, or production operational tooling.

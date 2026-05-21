@@ -7,13 +7,15 @@
 - Real Yugabyte-backed persistence via `pg`.
 - Workflow DSL and synchronous engine API.
 - Runnable workflow queue and worker polling.
-- Distributed leases, heartbeats, and stale lease stealing.
-- Durable step attempts.
-- Timer waits and external event waits.
-- Side-effect idempotency fences.
-- Durable outbox with unique keys, leasing, and acknowledgement.
+- Distributed leases, heartbeats, stale lease stealing, and lease-aware resume.
+- Transactional multi-row step and wait transitions.
+- Durable step attempts, including waiting attempts that become completed after wake.
+- Timer waits and external event waits with concurrent signal protection.
+- Side-effect idempotency fences that acquire before side-effect execution.
+- Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement.
 - CLI commands for migration, counter workflow execution, inspection, and resume.
-- Integration tests against local Yugabyte/YSQL for the spec, guarantee matrix, and crash matrix.
+- Integration tests against local Yugabyte/YSQL for the spec, guarantee matrix, crash matrix, concurrency cases, and subprocess crash recovery.
+- SimpleCov line/branch coverage thresholds.
 
 ## Remaining production hardening beyond prototype
 
@@ -21,5 +23,5 @@
 2. Add workflow versioning so changed workflow definitions can safely resume old runs.
 3. Add richer attempt policies: exponential backoff, max attempts, retryable/non-retryable errors.
 4. Add observability: structured logs, metrics, tracing, and run timelines.
-5. Add advisory-lock or serializable-transaction hardening for high-concurrency production use.
-6. Add more generic CLI workflow loading instead of only the built-in counter workflow.
+5. Add more generic CLI workflow loading instead of only the built-in counter workflow.
+6. Add a larger soak/stress suite for long-running multi-process workloads.

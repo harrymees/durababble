@@ -18,7 +18,12 @@ module Durababble
     end
 
     def resume(workflow, workflow_id:)
-      @store.mark_workflow_running(workflow_id, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      current = @store.workflow(workflow_id)
+      return snapshot(workflow_id) if current.fetch("status") == "completed"
+
+      claimed = @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
+
       crash!(:workflow_claimed)
       execute(workflow, workflow_id:)
     end
