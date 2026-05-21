@@ -6,6 +6,8 @@ Review date: 2026-05-21
 
 Durababble is broadly faithful to the prototype spec in `docs/spec.md`: the main durable-execution features exist, the real-Yugabyte integration suite passes, and the DST suite maps every safety/crash row to deterministic scenarios. The strongest coverage is around workflow claims, lease-aware resume, waits, outbox leases, and crash/recovery paths.
 
+Follow-up correction: runtime values are intended to use Paquito, not JSON/JSONB. The JSON-specific findings below describe the earlier implementation drift that existed during this review. See `docs/paquito-storage-review.md` for the correction that moved runtime payload storage to Paquito `bytea` columns and added explicit tests for that guarantee.
+
 The main divergences found are smaller but important correctness details:
 
 1. **Implementation bug: generic row decoding parsed every text column as JSON.** Text values like workflow names, topics, keys, and error strings could be type-corrupted if they happened to look like JSON (`"123"`, `"true"`, `"null"`, `{...}`). The implementation should decode only known JSON/JSONB columns.

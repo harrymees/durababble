@@ -7,7 +7,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 - `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash and returns the next context hash or a wait request.
 - `Durababble::Engine`: creates/resumes runs, enforces workflow lease ownership, records step transitions, handles waits, and skips completed steps during recovery.
 - `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease.
-- `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions.
+- `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in `bytea` columns.
 - `exe/durababble`: prototype CLI for migrate/run/inspect/resume of the built-in counter workflow.
 
 ## Storage model
@@ -28,7 +28,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
 - Before a step runs, its current step row and a new attempt row are persisted transactionally.
 - After success/failure/wait, the related step and attempt rows are updated transactionally.
-- After success, the current step and attempt are marked `completed` with JSON result.
+- After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After failure, the current step, attempt, and workflow record the error.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.

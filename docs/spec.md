@@ -6,6 +6,7 @@ This document is the implemented prototype spec. Every item below is covered by 
 
 - Ruby 4 gem scaffold managed by mise.
 - Yugabyte-backed storage through the PostgreSQL wire protocol.
+- Runtime values (`input`, `result`, `context`, and `payload`) are serialized with Paquito into `bytea` columns, not stored as JSON/JSONB. `migrate!` can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
 - Workflow DSL with ordered named steps.
 - Durable workflow rows and durable step rows.
 - Append-only step attempt history, including waits that transition to completed attempts.
@@ -27,7 +28,7 @@ This document is the implemented prototype spec. Every item below is covered by 
 
 | Guarantee | Implementation | Explicit test |
 | --- | --- | --- |
-| Workflows are durable before execution | `Store#enqueue_workflow` inserts `pending` rows | complete spec guarantee + crash matrix |
+| Workflows are durable before execution | `Store#enqueue_workflow` inserts `pending` rows with Paquito-serialized bytea input | complete spec guarantee + crash matrix |
 | Runnable work is claimable by one worker at a time | `Store#claim_runnable_workflow` atomically updates one row and uses `FOR UPDATE SKIP LOCKED` | hardening concurrency spec |
 | Resume honors lease ownership | `Engine#resume` uses `Store#claim_workflow` and raises `LeaseConflict` for another live owner | hardening lease spec |
 | Active leases can be heartbeated | `Store#heartbeat` extends `locked_until` only for the owning worker | complete spec guarantee matrix |
@@ -43,6 +44,7 @@ This document is the implemented prototype spec. Every item below is covered by 
 | Side effects can be fenced by key | `with_fence` inserts a running fence before yield; other callers wait for result | hardening fence concurrency spec |
 | Outbox delivery is durable and leased | `outbox` rows are unique by key, claimable once, acknowledgeable, and reclaimable after lease expiry | complete + hardening outbox specs |
 | Multi-row state transitions are transactional | step start/finish/failure and wait record transitions run in DB transactions | implementation + regression suite |
+| Runtime values are not stored as JSONB | `Store` encodes values through Paquito and stores them in bytea columns | store spec Paquito storage + legacy migration specs |
 | CLI can operate the prototype | executable supports migrate/run/inspect/resume | cli spec |
 
 ## Crash matrix

@@ -109,7 +109,7 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
     expect(store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }).to eq(%w[failed completed completed])
   end
 
-  it "preserves JSON scalar step results and text columns that look like JSON" do
+  it "preserves scalar step results and text columns that look parseable" do
     store.migrate!
     workflow = Durababble::Workflow.define("123") do
       step("false") { |_ctx| false }

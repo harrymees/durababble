@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "digest"
-require "json"
 
 module Durababble
   module Deterministic
@@ -405,7 +404,7 @@ module Durababble
       end
 
       def deep(value)
-        JSON.parse(JSON.generate(value))
+        Marshal.load(Marshal.dump(value))
       end
 
       def trace(name, fields = {})

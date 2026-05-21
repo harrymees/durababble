@@ -1,13 +1,16 @@
 # frozen_string_literal: true
 
-require "json"
+require "paquito"
 require "pg"
+require "json"
 require "securerandom"
 require "time"
 
 module Durababble
   class Store
-    JSON_COLUMNS = %w[input result payload context].freeze
+    SERIALIZED_COLUMNS = %w[input result payload context].freeze
+    SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
+
 
     attr_reader :schema
 
@@ -27,8 +30,8 @@ module Durababble
           id text PRIMARY KEY,
           name text NOT NULL,
           status text NOT NULL,
-          input jsonb NOT NULL DEFAULT '{}'::jsonb,
-          result jsonb,
+          input bytea NOT NULL,
+          result bytea,
           error text,
           locked_by text,
           locked_until timestamptz,
@@ -44,7 +47,7 @@ module Durababble
           position integer NOT NULL,
           name text NOT NULL,
           status text NOT NULL,
-          result jsonb,
+          result bytea,
           error text,
           started_at timestamptz,
           completed_at timestamptz,
@@ -59,7 +62,7 @@ module Durababble
           position integer NOT NULL,
           name text NOT NULL,
           status text NOT NULL,
-          result jsonb,
+          result bytea,
           error text,
           started_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz
@@ -73,8 +76,8 @@ module Durababble
           kind text NOT NULL,
           event_key text,
           wake_at timestamptz,
-          context jsonb NOT NULL DEFAULT '{}'::jsonb,
-          payload jsonb,
+          context bytea NOT NULL,
+          payload bytea,
           status text NOT NULL,
           created_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz
@@ -85,7 +88,7 @@ module Durababble
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           key text NOT NULL,
           status text NOT NULL DEFAULT 'completed',
-          result jsonb,
+          result bytea,
           error text,
           locked_by text,
           locked_until timestamptz,
@@ -105,7 +108,7 @@ module Durababble
           id text PRIMARY KEY,
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           topic text NOT NULL,
-          payload jsonb NOT NULL,
+          payload bytea NOT NULL,
           key text NOT NULL UNIQUE,
           status text NOT NULL,
           locked_by text,
@@ -114,6 +117,7 @@ module Durababble
           processed_at timestamptz
         )
       SQL
+      migrate_serialized_columns!
       self
     end
 
@@ -128,8 +132,8 @@ module Durababble
     def enqueue_workflow(name:, input:)
       id = SecureRandom.uuid
       execute_params(
-        "INSERT INTO #{table("workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::jsonb)",
-        [id, name, dump_json(input)]
+        "INSERT INTO #{table("workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::bytea)",
+        [id, name, dump_serialized(input)]
       )
       id
     end
@@ -209,8 +213,8 @@ module Durababble
 
     def complete_workflow(workflow_id, result:)
       execute_params(
-        "UPDATE #{table("workflows")} SET status = 'completed', result = $2::jsonb, error = NULL, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1",
-        [workflow_id, dump_json(result)]
+        "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1",
+        [workflow_id, dump_serialized(result)]
       )
     end
 
@@ -246,8 +250,8 @@ module Durababble
     def record_step_completed(workflow_id:, position:, result:)
       transaction do
         execute_params(
-          "UPDATE #{table("steps")} SET status = 'completed', result = $3::jsonb, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2",
-          [workflow_id, position, dump_json(result)]
+          "UPDATE #{table("steps")} SET status = 'completed', result = $3::bytea, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2",
+          [workflow_id, position, dump_serialized(result)]
         )
         update_latest_attempt(workflow_id:, position:, status: "completed", result:, error: nil)
       end
@@ -265,16 +269,16 @@ module Durababble
 
     def record_wait(workflow_id:, position:, name:, wait_request:)
       transaction do
-        execute_params(<<~SQL, [workflow_id, position, name, dump_json(wait_request.context)])
+        execute_params(<<~SQL, [workflow_id, position, name, dump_serialized(wait_request.context)])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
-          VALUES ($1, $2, $3, 'waiting', $4::jsonb, now(), now())
+          VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
           ON CONFLICT (workflow_id, position) DO UPDATE
-            SET status = 'waiting', result = $4::jsonb, error = NULL, updated_at = now()
+            SET status = 'waiting', result = $4::bytea, error = NULL, updated_at = now()
         SQL
         wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_json(wait_request.context)])
+        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
           INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
-          VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb, 'pending')
+          VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::bytea, 'pending')
         SQL
         execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
         update_latest_attempt(workflow_id:, position:, status: "waiting", result: wait_request.context, error: nil)
@@ -305,9 +309,9 @@ module Durababble
       if inserted.cmd_tuples == 1
         begin
           result = yield
-          execute_params(<<~SQL, [workflow_id, key, token, dump_json(result)])
+          execute_params(<<~SQL, [workflow_id, key, token, dump_serialized(result)])
             UPDATE #{table("fences")}
-            SET status = 'completed', result = $4::jsonb, error = NULL, completed_at = now()
+            SET status = 'completed', result = $4::bytea, error = NULL, completed_at = now()
             WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
           SQL
           return result
@@ -342,9 +346,9 @@ module Durababble
       return existing.fetch("id") if existing
 
       id = SecureRandom.uuid
-      execute_params(<<~SQL, [id, workflow_id, topic, dump_json(payload), key])
+      execute_params(<<~SQL, [id, workflow_id, topic, dump_serialized(payload), key])
         INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, key, status)
-        VALUES ($1, $2, $3, $4::jsonb, $5, 'pending')
+        VALUES ($1, $2, $3, $4::bytea, $5, 'pending')
         ON CONFLICT (key) DO NOTHING
       SQL
       execute_params("SELECT id FROM #{table("outbox")} WHERE key = $1", [key]).first.fetch("id")
@@ -393,9 +397,9 @@ module Durababble
     private
 
     def complete_waits(where_sql, params, payload)
-      returning = execute_params(<<~SQL, params + [dump_json(payload)])
+      returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
         UPDATE #{table("waits")}
-        SET status = 'completed', payload = $#{params.length + 1}::jsonb, completed_at = now()
+        SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
         WHERE id IN (
           SELECT id FROM #{table("waits")}
           WHERE status = 'pending' AND #{where_sql}
@@ -416,7 +420,7 @@ module Durababble
       row = execute_params("SELECT id FROM #{table("step_attempts")} WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting') ORDER BY started_at DESC LIMIT 1", [workflow_id, position]).first
       return unless row
 
-      execute_params("UPDATE #{table("step_attempts")} SET status = $2, result = $3::jsonb, error = $4, completed_at = now() WHERE id = $1", [row.fetch("id"), status, dump_json(result), error])
+      execute_params("UPDATE #{table("step_attempts")} SET status = $2, result = $3::bytea, error = $4, completed_at = now() WHERE id = $1", [row.fetch("id"), status, dump_serialized(result), error])
     end
 
     def execute(sql)
@@ -439,19 +443,76 @@ module Durababble
       PG::Connection.quote_ident(schema)
     end
 
-    def dump_json(value)
-      JSON.generate(value)
+    def dump_serialized(value)
+      PG::Connection.escape_bytea(SERIALIZER.dump(value))
     end
 
-    def decode_json(value)
-      value.is_a?(String) ? JSON.parse(value) : value
+    def load_serialized(value)
+      return nil if value.nil?
+
+      SERIALIZER.load(PG::Connection.unescape_bytea(value))
     end
 
     def decode_row(row)
       row.each_with_object({}) do |(column, value), decoded|
-        decoded[column] = JSON_COLUMNS.include?(column) && value.is_a?(String) ? JSON.parse(value) : value
+        decoded[column] = SERIALIZED_COLUMNS.include?(column) ? load_serialized(value) : value
       end
     end
+
+    def migrate_serialized_columns!
+      migrate_serialized_column!("workflows", "input", not_null: true)
+      migrate_serialized_column!("workflows", "result")
+      migrate_serialized_column!("steps", "result")
+      migrate_serialized_column!("step_attempts", "result")
+      migrate_serialized_column!("waits", "context", not_null: true)
+      migrate_serialized_column!("waits", "payload")
+      migrate_serialized_column!("fences", "result")
+      migrate_serialized_column!("outbox", "payload", not_null: true)
+    end
+
+    def migrate_serialized_column!(table_name, column_name, not_null: false)
+      column = execute_params(<<~SQL, [schema, table_name, column_name]).first
+        SELECT data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+      SQL
+      return unless column
+      return if column.fetch("data_type") == "bytea"
+
+      temporary_column = "#{column_name}__paquito"
+      execute("ALTER TABLE #{table(table_name)} ADD COLUMN IF NOT EXISTS #{PG::Connection.quote_ident(temporary_column)} bytea")
+      rows = execute("SELECT * FROM #{table(table_name)}")
+      primary_keys = primary_key_columns(table_name)
+      rows.each do |row|
+        raw = row[column_name]
+        value = raw.nil? ? nil : JSON.parse(raw)
+        execute_params(<<~SQL, primary_keys.map { |key| row.fetch(key) } + [dump_serialized(value)])
+          UPDATE #{table(table_name)}
+          SET #{PG::Connection.quote_ident(temporary_column)} = $#{primary_keys.length + 1}::bytea
+          WHERE #{primary_keys.each_with_index.map { |key, index| "#{PG::Connection.quote_ident(key)} = $#{index + 1}" }.join(" AND ")}
+        SQL
+      end
+      if not_null
+        execute_params(
+          "UPDATE #{table(table_name)} SET #{PG::Connection.quote_ident(temporary_column)} = $1::bytea WHERE #{PG::Connection.quote_ident(temporary_column)} IS NULL",
+          [dump_serialized({})]
+        )
+      end
+      execute("ALTER TABLE #{table(table_name)} DROP COLUMN #{PG::Connection.quote_ident(column_name)}")
+      execute("ALTER TABLE #{table(table_name)} RENAME COLUMN #{PG::Connection.quote_ident(temporary_column)} TO #{PG::Connection.quote_ident(column_name)}")
+      execute("ALTER TABLE #{table(table_name)} ALTER COLUMN #{PG::Connection.quote_ident(column_name)} SET NOT NULL") if not_null
+    end
+
+    def primary_key_columns(table_name)
+      execute_params(<<~SQL, [schema, table_name]).map { |row| row.fetch("column_name") }
+        SELECT a.attname AS column_name
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = ($1 || '.' || $2)::regclass AND i.indisprimary
+        ORDER BY array_position(i.indkey, a.attnum)
+      SQL
+    end
+
 
     def timestamp(time)
       time.utc.iso8601(6)
