@@ -36,4 +36,12 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 
+## Benchmarking and query-shape validation
+
+- `bench/run.rb` is a macro benchmark harness for the storage and coordination operations that dominate durable execution performance.
+- The suite records environment metadata, per-operation latency percentiles, throughput, and allocation counts as JSON/CSV/Markdown.
+- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into Yugabyte before measuring queue claims and due-timer scans against large tables.
+- GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
+- Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
+
 See `docs/spec.md` for the guarantee and crash matrices implemented by tests.

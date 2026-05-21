@@ -1,0 +1,352 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "csv"
+require "fileutils"
+require "json"
+require "open3"
+require "optparse"
+require "rbconfig"
+require "socket"
+require "securerandom"
+require "time"
+
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
+require "durababble"
+
+module Durababble
+  module Benchmarks
+    DEFAULT_DATABASE_URL = ENV.fetch("DURABABBLE_DATABASE_URL", "postgresql://yugabyte@127.0.0.1:15433/yugabyte")
+
+    Operation = Struct.new(:name, :iterations, :warmup, :description, :block, keyword_init: true)
+
+    class Runner
+      def initialize(profile:, database_url:, schema:, output_dir:, fixture_size:, seed:, samples:, keep_schema:)
+        @profile = profile
+        @database_url = database_url
+        @schema = schema
+        @output_dir = output_dir
+        @fixture_size = fixture_size
+        @seed = seed
+        @samples = samples
+        @keep_schema = keep_schema
+        @rng = Random.new(seed)
+        @store = Durababble::Store.connect(database_url:, schema:)
+        @store.drop_schema!
+        @store.migrate!
+      end
+
+      def run
+        FileUtils.mkdir_p(@output_dir)
+        start = Time.now.utc
+        results = []
+        puts "durababble benchmarks profile=#{@profile} schema=#{@schema} fixture_size=#{@fixture_size} samples=#{@samples}"
+
+        operations.each do |operation|
+          puts "\n== #{operation.name}: #{operation.description}"
+          result = measure(operation)
+          cleanup_after(operation)
+          results << result
+          puts format("   median=%0.3fms p95=%0.3fms ops/s=%0.1f iterations=%d", result[:median_ms], result[:p95_ms], result[:ops_per_second], result[:iterations])
+        end
+
+        finish = Time.now.utc
+        report = {
+          suite: "durababble",
+          profile: @profile,
+          started_at: start.iso8601,
+          finished_at: finish.iso8601,
+          duration_seconds: finish - start,
+          schema: @schema,
+          fixture_size: @fixture_size,
+          seed: @seed,
+          samples: @samples,
+          environment: environment,
+          operations: results
+        }
+        stamp = start.strftime("%Y%m%dT%H%M%SZ")
+        json_path = File.join(@output_dir, "durababble-bench-#{@profile}-#{stamp}.json")
+        md_path = File.join(@output_dir, "durababble-bench-#{@profile}-#{stamp}.md")
+        csv_path = File.join(@output_dir, "durababble-bench-#{@profile}-#{stamp}.csv")
+        File.write(json_path, JSON.pretty_generate(report))
+        File.write(md_path, markdown(report))
+        File.write(csv_path, csv(report))
+        puts "\nwrote #{json_path}"
+        puts "wrote #{md_path}"
+        puts "wrote #{csv_path}"
+        report
+      ensure
+        @store&.drop_schema! unless @keep_schema
+        @store&.close
+      end
+
+      private
+
+      def operations
+        quick = @profile == "smoke"
+        [
+          Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
+          Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
+          Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
+          Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
+          Operation.new(name: "signal_events", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "signal durable event waits and wake workflows", block: method(:bench_signal_event)),
+          Operation.new(name: "outbox_claim_ack", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "claim and acknowledge outbox messages", block: method(:bench_outbox_claim_ack)),
+          Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
+          Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
+          Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
+          Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim))
+        ]
+      end
+
+      def measure(operation)
+        operation.warmup.times { |i| operation.block.call(i, warmup: true) }
+        GC.start(full_mark: true, immediate_sweep: true)
+        samples = []
+        operation.iterations.times do |i|
+          before_alloc = GC.stat.fetch(:total_allocated_objects)
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          operation.block.call(i, warmup: false)
+          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+          after_alloc = GC.stat.fetch(:total_allocated_objects)
+          samples << { seconds: elapsed, allocations: after_alloc - before_alloc }
+        end
+        summarize(operation, samples)
+      end
+
+      def cleanup_after(operation)
+        return unless operation.name == "enqueue_workflows"
+
+        connection = PG.connect(@database_url)
+        connection.exec_params("UPDATE #{PG::Connection.quote_ident(@schema)}.workflows SET status = 'completed', updated_at = now() WHERE name = $1 AND status = 'pending'", ["bench_enqueue"])
+      ensure
+        connection&.close
+      end
+
+      def summarize(operation, samples)
+        seconds = samples.map { |sample| sample.fetch(:seconds) }.sort
+        allocations = samples.map { |sample| sample.fetch(:allocations) }.sort
+        total = seconds.sum
+        {
+          name: operation.name,
+          description: operation.description,
+          iterations: operation.iterations,
+          warmup_iterations: operation.warmup,
+          total_seconds: total,
+          ops_per_second: operation.iterations / total,
+          min_ms: seconds.first * 1000.0,
+          median_ms: percentile(seconds, 0.50) * 1000.0,
+          p90_ms: percentile(seconds, 0.90) * 1000.0,
+          p95_ms: percentile(seconds, 0.95) * 1000.0,
+          p99_ms: percentile(seconds, 0.99) * 1000.0,
+          max_ms: seconds.last * 1000.0,
+          avg_allocations: allocations.sum.to_f / allocations.length,
+          p95_allocations: percentile(allocations, 0.95),
+          sample_count: samples.length
+        }
+      end
+
+      def percentile(values, quantile)
+        return values.first if values.length == 1
+
+        rank = quantile * (values.length - 1)
+        lower = values[rank.floor]
+        upper = values[rank.ceil]
+        lower + (upper - lower) * (rank - rank.floor)
+      end
+
+      def bench_enqueue(i, warmup:)
+        @store.enqueue_workflow(name: "bench_enqueue", input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+      end
+
+      def bench_claim(i, warmup:)
+        @store.enqueue_workflow(name: "bench_claim", input: { "i" => i, "warmup" => warmup })
+        claimed = @store.claim_runnable_workflow(worker_id: "claim-worker", lease_seconds: 30)
+        raise "workflow not claimed" unless claimed
+      end
+
+      def bench_heartbeat(i, warmup:)
+        id = @store.enqueue_workflow(name: "bench_heartbeat", input: { "i" => i })
+        @store.claim_workflow(workflow_id: id, worker_id: "heartbeater", lease_seconds: 30)
+        @store.heartbeat(workflow_id: id, worker_id: "heartbeater", lease_seconds: 30)
+      end
+
+      def bench_lease_conflict(i, warmup:)
+        id = @store.enqueue_workflow(name: "bench_conflict", input: { "i" => i })
+        @store.claim_workflow(workflow_id: id, worker_id: "owner", lease_seconds: 30)
+        claimed = @store.claim_workflow(workflow_id: id, worker_id: "intruder", lease_seconds: 30)
+        raise "lease conflict unexpectedly claimed" if claimed
+      end
+
+      def bench_signal_event(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_wait", input: { "i" => i })
+        @store.mark_workflow_running(workflow_id, worker_id: "waiter", lease_seconds: 30)
+        @store.record_step_started(workflow_id:, position: 0, name: "wait")
+        @store.record_wait(
+          workflow_id:,
+          position: 0,
+          name: "wait",
+          wait_request: Durababble.wait_event("bench:event:#{i}:#{warmup}", context: { "i" => i })
+        )
+        woken = @store.signal_event("bench:event:#{i}:#{warmup}", payload: { "ok" => true })
+        raise "wait not woken" unless woken == 1
+      end
+
+      def bench_outbox_claim_ack(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_outbox", input: { "i" => i })
+        outbox_id = @store.enqueue_outbox(workflow_id:, topic: "bench.topic", payload: { "i" => i, "warmup" => warmup }, key: "bench:#{warmup}:#{i}:#{SecureRandom.hex(4)}")
+        message = @store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
+        raise "outbox not claimed" unless message && message.fetch("id") == outbox_id
+        @store.ack_outbox(outbox_id, worker_id: "outbox-worker")
+      end
+
+      def bench_large_table_claim_scan(i, warmup:)
+        ensure_large_fixture!
+        @store.enqueue_workflow(name: "large_claim", input: { "i" => i, "warmup" => warmup })
+        claimed = @store.claim_runnable_workflow(worker_id: "large-claim-worker", lease_seconds: 30)
+        raise "large-table claim missed pending row" unless claimed
+      end
+
+      def bench_large_table_due_timer_scan(i, warmup:)
+        ensure_large_fixture!
+        workflow_id = @store.enqueue_workflow(name: "due_timer", input: { "i" => i })
+        @store.mark_workflow_running(workflow_id, worker_id: "timer-worker", lease_seconds: 30)
+        @store.record_step_started(workflow_id:, position: 0, name: "timer")
+        @store.record_wait(
+          workflow_id:,
+          position: 0,
+          name: "timer",
+          wait_request: Durababble.wait_until(Time.now - 1, context: { "i" => i })
+        )
+        woke = @store.wake_due_timers(now: Time.now)
+        raise "due timer not woken" unless woke >= 1
+      end
+
+      def bench_rpc_ping(i, warmup:)
+        rpc.request("ping", "i" => i, "warmup" => warmup)
+      end
+
+      def bench_rpc_enqueue_claim(i, warmup:)
+        response = rpc.request("enqueue_claim", "i" => i, "warmup" => warmup)
+        raise "rpc enqueue_claim failed" unless response.fetch("claimed")
+      end
+
+      def ensure_large_fixture!
+        return if @large_fixture_loaded
+
+        puts "   loading large fixture rows=#{@fixture_size}"
+        @store.close
+        load_large_fixture
+        @store = Durababble::Store.connect(database_url: @database_url, schema: @schema)
+        @large_fixture_loaded = true
+      end
+
+      def load_large_fixture
+        ruby = RbConfig.ruby
+        script = File.expand_path("load_fixture.rb", __dir__)
+        env = {
+          "DURABABBLE_DATABASE_URL" => @database_url,
+          "DURABABBLE_BENCH_SCHEMA" => @schema,
+          "DURABABBLE_BENCH_FIXTURE_SIZE" => @fixture_size.to_s,
+          "DURABABBLE_BENCH_SEED" => @seed.to_s
+        }
+        system(env, ruby, script, exception: true)
+      end
+
+      def rpc
+        @rpc ||= RpcClient.new(database_url: @database_url, schema: @schema)
+      end
+
+      def environment
+        {
+          ruby_description: RUBY_DESCRIPTION,
+          ruby_engine: RUBY_ENGINE,
+          ruby_version: RUBY_VERSION,
+          ruby_platform: RUBY_PLATFORM,
+          yjit_enabled: defined?(RubyVM::YJIT) ? RubyVM::YJIT.enabled? : false,
+          hostname: Socket.gethostname,
+          pid: Process.pid,
+          gc: GC.stat.slice(:heap_live_slots, :heap_free_slots, :total_allocated_objects),
+          git_sha: git("rev-parse", "HEAD"),
+          git_branch: git("branch", "--show-current")
+        }
+      end
+
+      def git(*args)
+        out, status = Open3.capture2("git", *args, chdir: File.expand_path("..", __dir__))
+        status.success? ? out.strip : nil
+      end
+
+      def markdown(report)
+        lines = []
+        lines << "# Durababble benchmark #{report.fetch(:profile)} #{report.fetch(:started_at)}"
+        lines << ""
+        lines << "- Git: `#{report.fetch(:environment).fetch(:git_sha)}`"
+        lines << "- Ruby: `#{report.fetch(:environment).fetch(:ruby_description)}`"
+        lines << "- Fixture size: `#{report.fetch(:fixture_size)}`"
+        lines << "- Schema: `#{report.fetch(:schema)}`"
+        lines << ""
+        lines << "| Operation | ops/s | median ms | p95 ms | p99 ms | avg allocs |"
+        lines << "| --- | ---: | ---: | ---: | ---: | ---: |"
+        report.fetch(:operations).each do |op|
+          lines << format("| `%s` | %.1f | %.3f | %.3f | %.3f | %.1f |", op.fetch(:name), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations))
+        end
+        lines << ""
+        lines.join("\n")
+      end
+
+      def csv(report)
+        CSV.generate do |csv|
+          csv << %w[profile started_at git_sha operation iterations ops_per_second median_ms p95_ms p99_ms avg_allocations fixture_size]
+          report.fetch(:operations).each do |op|
+            csv << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
+          end
+        end
+      end
+    end
+
+    class RpcClient
+      def initialize(database_url:, schema:)
+        @stdin, @stdout, @wait_thr = Open3.popen2e({ "DURABABBLE_DATABASE_URL" => database_url, "DURABABBLE_BENCH_SCHEMA" => schema }, RbConfig.ruby, File.expand_path("rpc_worker.rb", __dir__))
+      end
+
+      def request(command, payload = {})
+        @stdin.puts(JSON.generate({ command:, payload: }))
+        @stdin.flush
+        loop do
+          line = @stdout.gets
+          raise "rpc worker exited" unless line
+          next unless line.start_with?("{")
+
+          response = JSON.parse(line)
+          raise response.fetch("error") unless response.fetch("ok")
+          return response.fetch("result")
+        end
+      end
+    end
+  end
+end
+
+options = {
+  profile: ENV.fetch("DURABABBLE_BENCH_PROFILE", "smoke"),
+  database_url: Durababble::Benchmarks::DEFAULT_DATABASE_URL,
+  schema: ENV.fetch("DURABABBLE_BENCH_SCHEMA", "durababble_bench_#{Time.now.utc.strftime("%Y%m%d%H%M%S")}_#{Process.pid}"),
+  output_dir: ENV.fetch("DURABABBLE_BENCH_OUTPUT", File.expand_path("results", __dir__)),
+  fixture_size: Integer(ENV.fetch("DURABABBLE_BENCH_FIXTURE_SIZE", ENV.fetch("DURABABBLE_BENCH_PROFILE", "smoke") == "full" ? "100000" : "2000")),
+  seed: Integer(ENV.fetch("DURABABBLE_BENCH_SEED", "12345")),
+  samples: Integer(ENV.fetch("DURABABBLE_BENCH_SAMPLES", "1")),
+  keep_schema: ENV["DURABABBLE_BENCH_KEEP_SCHEMA"] == "1"
+}
+
+OptionParser.new do |parser|
+  parser.banner = "Usage: ruby bench/run.rb [options]"
+  parser.on("--profile PROFILE", "smoke or full") { |value| options[:profile] = value }
+  parser.on("--database-url URL", "YSQL connection URL") { |value| options[:database_url] = value }
+  parser.on("--schema SCHEMA", "YSQL schema to create/drop") { |value| options[:schema] = value }
+  parser.on("--output DIR", "result output directory") { |value| options[:output_dir] = value }
+  parser.on("--fixture-size N", Integer, "large-table fixture rows") { |value| options[:fixture_size] = value }
+  parser.on("--seed N", Integer, "fixture seed") { |value| options[:seed] = value }
+  parser.on("--keep-schema", "do not drop benchmark schema at exit") { options[:keep_schema] = true }
+end.parse!
+
+runner = Durababble::Benchmarks::Runner.new(**options)
+runner.run

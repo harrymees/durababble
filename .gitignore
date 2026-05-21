@@ -4,3 +4,4 @@
 /pkg/
 /coverage/
 /tmp/
+/bench/results/

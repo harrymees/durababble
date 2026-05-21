@@ -117,6 +117,7 @@ module Durababble
           processed_at timestamptz
         )
       SQL
+      create_performance_indexes!
       migrate_serialized_columns!
       self
     end
@@ -444,7 +445,7 @@ module Durababble
     end
 
     def dump_serialized(value)
-      PG::Connection.escape_bytea(SERIALIZER.dump(value))
+      "\\x#{SERIALIZER.dump(value).unpack1("H*")}"
     end
 
     def load_serialized(value)
@@ -468,6 +469,15 @@ module Durababble
       migrate_serialized_column!("waits", "payload")
       migrate_serialized_column!("fences", "result")
       migrate_serialized_column!("outbox", "payload", not_null: true)
+    end
+
+    def create_performance_indexes!
+      execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (locked_until) WHERE status = 'running'")
+      execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (event_key, created_at) WHERE kind = 'event' AND status = 'pending'")
+      execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (wake_at, created_at) WHERE kind = 'timer' AND status = 'pending'")
+      execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (locked_until) WHERE status = 'processing'")
     end
 
     def migrate_serialized_column!(table_name, column_name, not_null: false)

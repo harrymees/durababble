@@ -58,6 +58,28 @@ RSpec.describe Durababble::Store, :integration do
     expect(Durababble::Store::SERIALIZER.load(payload)).to eq({ "count" => 1 })
   end
 
+  it "creates queue and recovery indexes for production-sized tables" do
+    store.migrate!
+
+    indexes = PG.connect(database_url) do |connection|
+      connection.exec_params(<<~SQL, [schema]).map { |row| row.fetch("indexname") }
+        SELECT indexname
+        FROM pg_indexes
+        WHERE schemaname = $1
+        ORDER BY indexname
+      SQL
+    end
+
+    expect(indexes).to include(
+      "workflows_queue_idx",
+      "workflows_expired_lease_idx",
+      "waits_event_pending_idx",
+      "waits_timer_pending_idx",
+      "outbox_queue_idx",
+      "outbox_expired_lease_idx"
+    )
+  end
+
   it "migrates legacy JSONB runtime columns into Paquito bytea columns" do
     connection = PG.connect(database_url)
     connection.exec("CREATE SCHEMA #{PG::Connection.quote_ident(schema)}")

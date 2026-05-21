@@ -1,0 +1,102 @@
+name: benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Benchmark profile
+        type: choice
+        options: [smoke, full]
+        default: full
+      fixture_size:
+        description: Large-table fixture rows
+        required: false
+        default: "100000"
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  yugabyte-benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DURABABBLE_DATABASE_URL: postgresql://yugabyte@127.0.0.1:15433/yugabyte
+      DURABABBLE_BENCH_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || 'full' }}
+      DURABABBLE_BENCH_FIXTURE_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.fixture_size || '100000' }}
+      DURABABBLE_BENCH_OUTPUT: bench/results
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Install client tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Start YugabyteDB
+        run: |
+          docker run -d --name yugabyte \
+            -p 15433:5433 -p 7000:7000 -p 9000:9000 \
+            yugabytedb/yugabyte:latest \
+            bin/yugabyted start --daemon=false --listen=0.0.0.0
+          for i in $(seq 1 120); do
+            if psql "$DURABABBLE_DATABASE_URL" -c 'select 1' >/dev/null 2>&1; then
+              echo "Yugabyte is ready"
+              exit 0
+            fi
+            docker logs yugabyte --tail 20 || true
+            sleep 2
+          done
+          docker logs yugabyte || true
+          exit 1
+
+      - name: Install gems
+        run: mise exec -- bundle install
+
+      - name: Capture environment metadata
+        run: |
+          mkdir -p bench/results
+          {
+            echo "# Environment"
+            date -u
+            uname -a
+            mise exec -- ruby -v
+            mise exec -- bundle -v
+            psql "$DURABABBLE_DATABASE_URL" -c 'select version();'
+            docker image inspect yugabytedb/yugabyte:latest --format '{{json .RepoDigests}}' || true
+          } | tee bench/results/environment.txt
+
+      - name: Run Durababble benchmark suite
+        run: |
+          mise exec -- ruby bench/run.rb \
+            --profile "$DURABABBLE_BENCH_PROFILE" \
+            --fixture-size "$DURABABBLE_BENCH_FIXTURE_SIZE" \
+            --output "$DURABABBLE_BENCH_OUTPUT"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: durababble-benchmarks-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            bench/results/**
+          retention-days: 180
+
+      - name: Collect Yugabyte logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/yugabyte-logs
+          docker logs yugabyte > /tmp/yugabyte-logs/yugabyte.log 2>&1 || true
+          docker ps -a > /tmp/yugabyte-logs/docker-ps.txt 2>&1 || true
+
+      - name: Upload Yugabyte logs on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: yugabyte-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: /tmp/yugabyte-logs
+          if-no-files-found: ignore
