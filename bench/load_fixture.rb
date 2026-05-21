@@ -12,8 +12,10 @@ rows = Integer(ENV.fetch("DURABABBLE_BENCH_FIXTURE_SIZE"))
 seed = Integer(ENV.fetch("DURABABBLE_BENCH_SEED", "12345"))
 rng = Random.new(seed)
 store = Durababble::Store.connect(database_url:, schema:)
+store.send(:execute, "SET client_min_messages TO warning")
 store.migrate!
 connection = PG.connect(database_url)
+connection.exec("SET client_min_messages TO warning")
 q_schema = PG::Connection.quote_ident(schema)
 
 puts "loading #{rows} historical workflows/waits/outbox rows into #{schema}"

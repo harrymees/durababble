@@ -32,6 +32,7 @@ module Durababble
         @keep_schema = keep_schema
         @rng = Random.new(seed)
         @store = Durababble::Store.connect(database_url:, schema:)
+        @store.send(:execute, "SET client_min_messages TO warning")
         @store.drop_schema!
         @store.migrate!
       end
@@ -76,6 +77,7 @@ module Durababble
         puts "wrote #{csv_path}"
         report
       ensure
+        @rpc&.close
         @store&.drop_schema! unless @keep_schema
         @store&.close
       end
@@ -90,9 +92,21 @@ module Durababble
           Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
           Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
           Operation.new(name: "signal_events", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "signal durable event waits and wake workflows", block: method(:bench_signal_event)),
+          Operation.new(name: "event_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into event wait, signal it, and resume remaining workflow steps", block: method(:bench_event_wait_resume_workflow)),
+          Operation.new(name: "timer_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into due timer wait, wake it, and resume remaining workflow steps", block: method(:bench_timer_wait_resume_workflow)),
+          Operation.new(name: "worker_tick_execute_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "worker tick claim + execute a runnable workflow", block: method(:bench_worker_tick_execute_workflow)),
+          Operation.new(name: "worker_run_until_idle_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "worker drains a small batch through run_until_idle", block: method(:bench_worker_run_until_idle_batch)),
+          Operation.new(name: "resume_skips_completed_step", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "resume reconstructs context and skips already-completed steps", block: method(:bench_resume_skips_completed_step)),
+          Operation.new(name: "read_workflow_state", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "inspect workflow, steps, attempts, and waits for observability", block: method(:bench_read_workflow_state)),
+          Operation.new(name: "failed_workflow_retry", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "retry a failed workflow through the runnable queue", block: method(:bench_failed_workflow_retry)),
+          Operation.new(name: "expired_workflow_lease_recovery", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "detect and return expired workflow leases to pending", block: method(:bench_expired_workflow_lease_recovery)),
+          Operation.new(name: "fence_first_execution", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "acquire an idempotency fence, run side effect, and persist result", block: method(:bench_fence_first_execution)),
+          Operation.new(name: "fence_cached_result", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "read cached idempotency fence result without re-running side effect", block: method(:bench_fence_cached_result)),
           Operation.new(name: "outbox_claim_ack", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "claim and acknowledge outbox messages", block: method(:bench_outbox_claim_ack)),
+          Operation.new(name: "outbox_expired_reclaim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "reclaim an outbox message whose processing lease expired", block: method(:bench_outbox_expired_reclaim)),
           Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
           Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
+          Operation.new(name: "large_table_signal_miss", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "event-signal miss against a large pending wait set", block: method(:bench_large_table_signal_miss)),
           Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
           Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim))
         ]
@@ -114,10 +128,18 @@ module Durababble
       end
 
       def cleanup_after(operation)
-        return unless operation.name == "enqueue_workflows"
-
         connection = PG.connect(@database_url)
-        connection.exec_params("UPDATE #{PG::Connection.quote_ident(@schema)}.workflows SET status = 'completed', updated_at = now() WHERE name = $1 AND status = 'pending'", ["bench_enqueue"])
+        schema = PG::Connection.quote_ident(@schema)
+        connection.exec(<<~SQL)
+          UPDATE #{schema}.workflows
+          SET status = 'completed', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE name <> 'fixture' AND status <> 'completed'
+        SQL
+        connection.exec(<<~SQL)
+          UPDATE #{schema}.outbox
+          SET status = 'processed', locked_by = NULL, locked_until = NULL, processed_at = COALESCE(processed_at, now())
+          WHERE status <> 'processed'
+        SQL
       ensure
         connection&.close
       end
@@ -189,6 +211,92 @@ module Durababble
         )
         woken = @store.signal_event("bench:event:#{i}:#{warmup}", payload: { "ok" => true })
         raise "wait not woken" unless woken == 1
+        @store.complete_workflow(workflow_id, result: { "signaled" => true })
+      end
+
+      def bench_event_wait_resume_workflow(i, warmup:)
+        key = "bench:event-resume:#{warmup}:#{i}:#{SecureRandom.hex(4)}"
+        workflow = event_resume_workflow(key)
+        run = Durababble::Engine.new(store: @store, worker_id: "event-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
+        raise "workflow did not wait" unless run.status == "waiting"
+        @store.signal_event(key, payload: { "signal" => true })
+        resumed = Durababble::Engine.new(store: @store, worker_id: "event-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
+        raise "engine did not resume signaled workflow" unless resumed.status == "completed"
+      end
+
+      def bench_timer_wait_resume_workflow(i, warmup:)
+        workflow = timer_resume_workflow
+        run = Durababble::Engine.new(store: @store, worker_id: "timer-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
+        raise "workflow did not wait" unless run.status == "waiting"
+        @store.wake_due_timers(now: Time.now)
+        resumed = Durababble::Engine.new(store: @store, worker_id: "timer-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
+        raise "engine did not resume timer workflow" unless resumed.status == "completed"
+      end
+
+      def bench_worker_tick_execute_workflow(i, warmup:)
+        workflow = arithmetic_workflow("bench_worker_tick")
+        @store.enqueue_workflow(name: workflow.name, input: { "i" => i, "value" => 1 })
+        worked = worker_for("tick-worker", workflow).tick
+        raise "worker did not execute workflow" unless worked == :worked
+      end
+
+      def bench_worker_run_until_idle_batch(i, warmup:)
+        workflow = arithmetic_workflow("bench_worker_drain")
+        10.times { |n| @store.enqueue_workflow(name: workflow.name, input: { "i" => i, "n" => n, "value" => 1 }) }
+        worked = worker_for("drain-worker", workflow).run_until_idle(max_ticks: 20)
+        raise "worker did not drain batch" unless worked == 10
+      end
+
+      def bench_resume_skips_completed_step(i, warmup:)
+        workflow = arithmetic_workflow("bench_resume_skip")
+        workflow_id = @store.enqueue_workflow(name: workflow.name, input: { "i" => i, "value" => 1 })
+        @store.mark_workflow_running(workflow_id, worker_id: "resume-prep", lease_seconds: 30)
+        @store.record_step_started(workflow_id:, position: 0, name: "add_one")
+        @store.record_step_completed(workflow_id:, position: 0, result: { "i" => i, "value" => 2 })
+        run = Durababble::Engine.new(store: @store, worker_id: "resume-prep", lease_seconds: 30, migrate: false).resume(workflow, workflow_id:)
+        raise "resume did not complete" unless run.status == "completed" && run.result.fetch("value") == 4
+      end
+
+      def bench_read_workflow_state(i, warmup:)
+        workflow_id = state_read_ids[i % state_read_ids.length]
+        @store.workflow(workflow_id)
+        @store.steps_for(workflow_id)
+        @store.step_attempts_for(workflow_id)
+        @store.waits_for(workflow_id)
+      end
+
+      def bench_failed_workflow_retry(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_failed_retry", input: { "i" => i })
+        @store.mark_workflow_running(workflow_id, worker_id: "failure-owner", lease_seconds: 30)
+        @store.record_step_started(workflow_id:, position: 0, name: "flaky")
+        @store.record_step_failed(workflow_id:, position: 0, error: "synthetic failure")
+        @store.fail_workflow(workflow_id, error: "synthetic failure")
+        claimed = @store.claim_runnable_workflow(worker_id: "retry-worker", lease_seconds: 30)
+        raise "failed workflow was not retry-claimable" unless claimed
+      end
+
+      def bench_expired_workflow_lease_recovery(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_expired", input: { "i" => i })
+        @store.claim_workflow(workflow_id:, worker_id: "expired-owner", lease_seconds: 30)
+        expire_workflow_lease(workflow_id)
+        recovered = @store.steal_expired_leases!(now: Time.now)
+        raise "expired workflow lease was not recovered" unless recovered >= 1
+      end
+
+      def bench_fence_first_execution(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_fence", input: { "i" => i })
+        result = @store.with_fence(workflow_id:, key: "first:#{warmup}:#{i}:#{SecureRandom.hex(4)}", poll_interval: 0.001, timeout: 2) do
+          { "side_effect" => i, "warmup" => warmup }
+        end
+        raise "fence result mismatch" unless result.fetch("side_effect") == i
+      end
+
+      def bench_fence_cached_result(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_fence_cached", input: { "i" => i })
+        key = "cached:#{warmup}:#{i}:#{SecureRandom.hex(4)}"
+        expected = @store.with_fence(workflow_id:, key:, poll_interval: 0.001, timeout: 2) { { "cached" => i } }
+        result = @store.with_fence(workflow_id:, key:, poll_interval: 0.001, timeout: 2) { raise "side effect reran" }
+        raise "cached fence mismatch" unless result == expected
       end
 
       def bench_outbox_claim_ack(i, warmup:)
@@ -197,6 +305,16 @@ module Durababble
         message = @store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         raise "outbox not claimed" unless message && message.fetch("id") == outbox_id
         @store.ack_outbox(outbox_id, worker_id: "outbox-worker")
+      end
+
+      def bench_outbox_expired_reclaim(i, warmup:)
+        workflow_id = @store.enqueue_workflow(name: "bench_outbox_expired", input: { "i" => i })
+        outbox_id = @store.enqueue_outbox(workflow_id:, topic: "bench.topic", payload: { "i" => i, "warmup" => warmup }, key: "bench-expired:#{warmup}:#{i}:#{SecureRandom.hex(4)}")
+        first = @store.claim_outbox(worker_id: "outbox-owner", lease_seconds: 30)
+        raise "outbox not initially claimed" unless first && first.fetch("id") == outbox_id
+        expire_outbox_lease(outbox_id)
+        second = @store.claim_outbox(worker_id: "outbox-reclaimer", lease_seconds: 30)
+        raise "expired outbox was not reclaimed" unless second && second.fetch("id") == outbox_id
       end
 
       def bench_large_table_claim_scan(i, warmup:)
@@ -219,6 +337,13 @@ module Durababble
         )
         woke = @store.wake_due_timers(now: Time.now)
         raise "due timer not woken" unless woke >= 1
+        @store.complete_workflow(workflow_id, result: { "woke" => true })
+      end
+
+      def bench_large_table_signal_miss(i, warmup:)
+        ensure_large_fixture!
+        woken = @store.signal_event("bench:missing:event:#{warmup}:#{i}:#{SecureRandom.hex(4)}", payload: { "ok" => false })
+        raise "missing event unexpectedly woke waits" unless woken.zero?
       end
 
       def bench_rpc_ping(i, warmup:)
@@ -230,6 +355,85 @@ module Durababble
         raise "rpc enqueue_claim failed" unless response.fetch("claimed")
       end
 
+      def worker_for(worker_id, workflow)
+        @workers ||= {}
+        @workers[[worker_id, workflow.name]] ||= Durababble::Worker.new(
+          store: @store,
+          workflows: { workflow.name => workflow },
+          worker_id:,
+          lease_seconds: 30,
+          migrate: false
+        )
+      end
+
+      def arithmetic_workflow(name)
+        @arithmetic_workflows ||= {}
+        @arithmetic_workflows[name] ||= Durababble::Workflow.define(name) do
+          step :add_one do |ctx|
+            ctx.merge("value" => ctx.fetch("value") + 1)
+          end
+          step :double do |ctx|
+            ctx.merge("value" => ctx.fetch("value") * 2)
+          end
+        end
+      end
+
+      def event_resume_workflow(event_key)
+        Durababble::Workflow.define("bench_event_resume") do
+          step :wait_for_event do |ctx|
+            Durababble.wait_event(event_key, context: ctx)
+          end
+          step :finish_after_event do |ctx|
+            ctx.merge("finished" => true)
+          end
+        end
+      end
+
+      def timer_resume_workflow
+        @timer_resume_workflow ||= Durababble::Workflow.define("bench_timer_resume") do
+          step :wait_for_timer do |ctx|
+            Durababble.wait_until(Time.now - 1, context: ctx)
+          end
+          step :finish_after_timer do |ctx|
+            ctx.merge("finished" => true)
+          end
+        end
+      end
+
+      def state_read_ids
+        return @state_read_ids if @state_read_ids
+
+        workflow = arithmetic_workflow("bench_state_read")
+        @state_read_ids = 25.times.map do |i|
+          id = @store.enqueue_workflow(name: workflow.name, input: { "i" => i, "value" => 1 })
+          Durababble::Engine.new(store: @store, worker_id: "state-reader-prep", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: id)
+          id
+        end
+      end
+
+      def expire_workflow_lease(workflow_id)
+        with_connection do |connection|
+          connection.exec_params("UPDATE #{quoted_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [workflow_id])
+        end
+      end
+
+      def expire_outbox_lease(outbox_id)
+        with_connection do |connection|
+          connection.exec_params("UPDATE #{quoted_schema}.outbox SET locked_until = now() - interval '1 second' WHERE id = $1", [outbox_id])
+        end
+      end
+
+      def with_connection
+        connection = PG.connect(@database_url)
+        yield connection
+      ensure
+        connection&.close
+      end
+
+      def quoted_schema
+        PG::Connection.quote_ident(@schema)
+      end
+
       def ensure_large_fixture!
         return if @large_fixture_loaded
 
@@ -237,6 +441,7 @@ module Durababble
         @store.close
         load_large_fixture
         @store = Durababble::Store.connect(database_url: @database_url, schema: @schema)
+        @store.send(:execute, "SET client_min_messages TO warning")
         @large_fixture_loaded = true
       end
 
@@ -321,6 +526,18 @@ module Durababble
           raise response.fetch("error") unless response.fetch("ok")
           return response.fetch("result")
         end
+      end
+
+      def close
+        @stdin.close unless @stdin.closed?
+        return if @wait_thr.join(1)
+
+        Process.kill("TERM", @wait_thr.pid)
+        @wait_thr.join(1)
+      rescue StandardError
+        nil
+      ensure
+        @stdout.close unless @stdout.closed?
       end
     end
   end

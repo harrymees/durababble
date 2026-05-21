@@ -40,7 +40,8 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 
 - `bench/run.rb` is a macro benchmark harness for the storage and coordination operations that dominate durable execution performance.
 - The suite records environment metadata, per-operation latency percentiles, throughput, and allocation counts as JSON/CSV/Markdown.
-- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into Yugabyte before measuring queue claims and due-timer scans against large tables.
+- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into Yugabyte before measuring queue claims, due-timer scans, and event-signal misses against large tables.
+- The benchmark operation set intentionally covers the main prototype lifecycle: enqueue, claim, heartbeat, lease conflict/recovery, worker tick/drain, end-to-end event and timer waits, resume-with-completed-steps, failed-workflow retry, observability reads, idempotency fences, outbox claim/ack/reclaim, large-table query shapes, and cross-process command RPC.
 - GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
 - Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
 

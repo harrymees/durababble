@@ -4,12 +4,12 @@ module Durababble
   class Engine
     DEFAULT_LEASE_SECONDS = 60
 
-    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil)
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
-      @store.migrate!
+      @store.migrate! if migrate
     end
 
     def run(workflow, input:)
