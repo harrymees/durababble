@@ -69,3 +69,10 @@ The latest verification produced substantially higher coverage than the minimums
 ## Prototype boundaries
 
 This is still a prototype, not a production Temporal replacement. It has explicit support for the guarantees above, but does not yet include workflow versioning, cron scheduling, a long-lived daemon supervisor, metrics, tracing, or production-grade operational tooling.
+
+Additional explicit prototype boundaries found during faithfulness review:
+
+- Fence owner crash recovery is not specified or implemented. `Store#with_fence` prevents concurrent duplicate side effects while the owner completes or fails normally, but a process crash after fence acquisition and before fence completion leaves a `running` fence that waiters eventually time out on. Retrying/taking over expired fences is future work.
+- Worker registry misses are not handled gracefully. `Worker#tick` expects claimed workflow names to exist in the supplied registry; a missing workflow can raise after claiming and will rely on normal lease expiry for recovery.
+- Long-running steps do not heartbeat automatically while user code runs. Callers should treat `lease_seconds` as covering expected step duration in this prototype.
+- CLI coverage is happy-path oriented and not a complete UX/error-contract specification.

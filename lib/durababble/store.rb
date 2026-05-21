@@ -7,6 +7,8 @@ require "time"
 
 module Durababble
   class Store
+    JSON_COLUMNS = %w[input result payload context].freeze
+
     attr_reader :schema
 
     def self.connect(database_url:, schema: "durababble")
@@ -438,7 +440,7 @@ module Durababble
     end
 
     def dump_json(value)
-      JSON.generate(value || {})
+      JSON.generate(value)
     end
 
     def decode_json(value)
@@ -446,14 +448,8 @@ module Durababble
     end
 
     def decode_row(row)
-      row.transform_values do |value|
-        next value unless value.is_a?(String)
-
-        begin
-          JSON.parse(value)
-        rescue JSON::ParserError
-          value
-        end
+      row.each_with_object({}) do |(column, value), decoded|
+        decoded[column] = JSON_COLUMNS.include?(column) && value.is_a?(String) ? JSON.parse(value) : value
       end
     end
 

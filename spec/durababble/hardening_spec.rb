@@ -109,6 +109,22 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
     expect(store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }).to eq(%w[failed completed completed])
   end
 
+  it "preserves JSON scalar step results and text columns that look like JSON" do
+    store.migrate!
+    workflow = Durababble::Workflow.define("123") do
+      step("false") { |_ctx| false }
+    end
+
+    run = Durababble::Engine.new(store:).run(workflow, input: { "start" => true })
+
+    expect(run.status).to eq("completed")
+    expect(run.result).to eq(false)
+    workflow_row = store.workflow(run.id)
+    expect(workflow_row.fetch("name")).to eq("123")
+    expect(store.steps_for(run.id).first.fetch("name")).to eq("false")
+    expect(store.step_attempts_for(run.id).first.fetch("result")).to eq(false)
+  end
+
   it "runs a fenced side effect only once under concurrent callers" do
     store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
