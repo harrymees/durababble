@@ -8,7 +8,7 @@ require "time"
 
 module Durababble
   class Store
-    SERIALIZED_COLUMNS = %w[input result payload context heartbeat_cursor].freeze
+    SERIALIZED_COLUMNS = %w[input result payload context heartbeat_cursor state args kwargs].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
 
 
@@ -121,6 +121,35 @@ module Durababble
           locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           processed_at timestamptz
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
+          object_type text NOT NULL,
+          object_id text NOT NULL,
+          state bytea,
+          locked_by text,
+          locked_until timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (object_type, object_id)
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
+          id text PRIMARY KEY,
+          object_type text NOT NULL,
+          object_id text NOT NULL,
+          method_name text NOT NULL,
+          args bytea NOT NULL,
+          kwargs bytea NOT NULL,
+          status text NOT NULL,
+          result bytea,
+          error text,
+          locked_by text,
+          locked_until timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          completed_at timestamptz
         )
       SQL
       create_performance_indexes!
@@ -521,6 +550,48 @@ module Durababble
       execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = $1 ORDER BY started_at, position", [workflow_id]).map { |row| decode_row(row) }
     end
 
+    def object_state(object_type:, object_id:)
+      row = execute_params("SELECT state FROM #{table("durable_objects")} WHERE object_type = $1 AND object_id = $2", [object_type, object_id]).first
+      decode_row(row)&.fetch("state") if row
+    end
+
+    def save_object_state(object_type:, object_id:, state:)
+      execute_params(<<~SQL, [object_type, object_id, dump_serialized(state)])
+        INSERT INTO #{table("durable_objects")} (object_type, object_id, state)
+        VALUES ($1, $2, $3::bytea)
+        ON CONFLICT (object_type, object_id) DO UPDATE
+          SET state = $3::bytea, updated_at = now()
+      SQL
+      state
+    end
+
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+      id = SecureRandom.uuid
+      execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
+        INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
+        VALUES ($1, $2, $3, $4, $5::bytea, $6::bytea, 'pending')
+      SQL
+      id
+    end
+
+    def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
+      row = execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
+        UPDATE #{table("durable_object_commands")}
+        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
+        WHERE id = $1 AND status IN ('pending', 'failed')
+        RETURNING *
+      SQL
+      decode_row(row) if row
+    end
+
+    def complete_object_command(command_id:, result:)
+      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'completed', result = $2::bytea, locked_by = NULL, locked_until = NULL, completed_at = now() WHERE id = $1", [command_id, dump_serialized(result)])
+    end
+
+    def fail_object_command(command_id:, error:)
+      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1", [command_id, error])
+    end
+
     private
 
     def complete_waits(where_sql, params, payload)
@@ -649,6 +720,10 @@ module Durababble
       migrate_serialized_column!("waits", "payload")
       migrate_serialized_column!("fences", "result")
       migrate_serialized_column!("outbox", "payload", not_null: true)
+      migrate_serialized_column!("durable_objects", "state")
+      migrate_serialized_column!("durable_object_commands", "args", not_null: true)
+      migrate_serialized_column!("durable_object_commands", "kwargs", not_null: true)
+      migrate_serialized_column!("durable_object_commands", "result")
     end
 
     def create_performance_indexes!

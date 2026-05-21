@@ -9,9 +9,20 @@ store = Durababble::Store.connect(
 workflow_id = ENV.fetch("DURABABBLE_WORKFLOW_ID")
 crash_after = ENV.fetch("DURABABBLE_CRASH_AFTER").to_sym
 
-workflow = Durababble::Workflow.define("counter") do
-  step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-  step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
+class CrashRunnerCounterWorkflow < Durababble::Workflow
+  workflow_name "counter"
+
+  def execute(input)
+    double(increment(input))
+  end
+
+  step def increment(input)
+    { "count" => input.fetch("count") + 1 }
+  end
+
+  step def double(input)
+    { "count" => input.fetch("count") * 2 }
+  end
 end
 
-Durababble::Engine.new(store:, worker_id: "crasher", crash_after:).resume(workflow, workflow_id:)
+Durababble::Engine.new(store:, worker_id: "crasher", crash_after:).resume(CrashRunnerCounterWorkflow, workflow_id:)

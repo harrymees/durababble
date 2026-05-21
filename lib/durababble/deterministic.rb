@@ -527,9 +527,9 @@ module Durababble
       def waits_fences_and_outbox(seed)
         run(seed, "waits_fences_and_outbox") do |h|
           h.workflows["counter"] = counter_workflow
-          h.workflows["waiting"] = Durababble::Workflow.define("waiting") do
-            step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
-            step("finish") { |ctx| ctx.merge("finished" => true) }
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
+            test_step("finish") { |ctx| ctx.merge("finished" => true) }
           end
 
           ids = []
@@ -573,9 +573,9 @@ module Durababble
 
       def timer_and_partition(seed)
         run(seed, "timer_and_partition") do |h|
-          h.workflows["timer"] = Durababble::Workflow.define("timer") do
-            step("sleep") { |ctx| Durababble.wait_until(ctx.fetch("wake_at"), ctx) }
-            step("finish") { |ctx| ctx.merge("timer_done" => true) }
+          h.workflows["timer"] = workflow_class("timer") do
+            test_step("sleep") { |ctx| Durababble.wait_until(ctx.fetch("wake_at"), ctx) }
+            test_step("finish") { |ctx| ctx.merge("timer_done" => true) }
           end
           h.network.partition("partitioned-client", "db")
           h.network.send(source: "partitioned-client", target: "db", type: "enqueue") { h.store.enqueue_workflow(name: "timer", input: { "wake_at" => 50 }) }
@@ -775,8 +775,8 @@ module Durababble
       def step_heartbeat_cursor_recovery(seed)
         run(seed, "step_heartbeat_cursor_recovery") do |h|
           attempts = []
-          h.workflows["cursor"] = Durababble::Workflow.define("cursor") do
-            step("download") do |_ctx, heartbeat|
+          h.workflows["cursor"] = workflow_class("cursor") do
+            test_step("download") do |_ctx, heartbeat|
               attempts << heartbeat.cursor
               if attempts.length == 1
                 heartbeat.record({ "offset" => seed })
@@ -803,8 +803,8 @@ module Durababble
       def step_retry_policy_recovery(seed)
         run(seed, "step_retry_policy_recovery") do |h|
           attempts = 0
-          h.workflows["retry"] = Durababble::Workflow.define("retry") do
-            step("flaky", retry_policy: { initial_interval: 10, backoff_coefficient: 2, maximum_interval: 15, maximum_attempts: 3 }) do |ctx|
+          h.workflows["retry"] = workflow_class("retry") do
+            test_step("flaky", retry_policy: { initial_interval: 10, backoff_coefficient: 2, maximum_interval: 15, maximum_attempts: 3 }) do |ctx|
               attempts += 1
               h.scheduler.trace.event(h.scheduler.time, "worker", "step_retry_attempt", attempt: attempts)
               raise "transient #{attempts}" if attempts < 3
@@ -866,8 +866,8 @@ module Durababble
 
       def attempt_history_append_only(seed)
         run(seed, "attempt_history_append_only") do |h|
-          h.workflows["flaky"] = Durababble::Workflow.define("flaky") do
-            step("fail") { |_ctx| raise "boom" }
+          h.workflows["flaky"] = workflow_class("flaky") do
+            test_step("fail") { |_ctx| raise "boom" }
           end
           id = h.store.enqueue_workflow(name: "flaky", input: { "seed" => seed })
           3.times do |i|
@@ -880,9 +880,9 @@ module Durababble
 
       def concurrent_signal_once(seed)
         run(seed, "concurrent_signal_once") do |h|
-          h.workflows["waiting"] = Durababble::Workflow.define("waiting") do
-            step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-            step("done") { |ctx| ctx.merge("done" => true) }
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "sig" })
           h.scheduler.schedule(actor: "worker", delay: 1, name: "park") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
@@ -920,9 +920,9 @@ module Durababble
       def chaos(seed)
         run(seed, "chaos") do |h|
           h.workflows["counter"] = counter_workflow
-          h.workflows["waiting"] = Durababble::Workflow.define("waiting") do
-            step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-            step("done") { |ctx| ctx.merge("done" => true) }
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
           end
 
           12.times do |i|
@@ -939,9 +939,32 @@ module Durababble
       end
 
       def counter_workflow
-        Durababble::Workflow.define("counter") do
-          step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-          step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
+        workflow_class("counter") do
+          test_step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
+          test_step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
+        end
+      end
+
+      def workflow_class(name, &definition)
+        Class.new(Durababble::Workflow) do
+          workflow_name name
+
+          def execute(input)
+            self.class.step_order.reduce(input) { |ctx, method_name| public_send(method_name, ctx) }
+          end
+
+          def self.test_step(name, retry_policy: nil, &block)
+            define_method(name) do |ctx|
+              if block.arity >= 2
+                block.call(ctx, step_context.heartbeat)
+              else
+                block.call(ctx)
+              end
+            end
+            step name, retry: retry_policy
+          end
+
+          class_eval(&definition) if definition
         end
       end
 

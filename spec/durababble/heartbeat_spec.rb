@@ -17,8 +17,8 @@ RSpec.describe "Durababble step heartbeats", :integration do
     store.migrate!
     test_store = store
     observed = {}
-    workflow = Durababble::Workflow.define("heartbeat-extension") do
-      step("long-step") do |ctx, heartbeat|
+    workflow = durababble_test_workflow("heartbeat-extension") do
+      test_step("long-step") do |ctx, heartbeat|
         observed[:cursor_before] = heartbeat.cursor
         before = Time.parse(test_store.workflow(ctx.fetch("workflow_id")).fetch("locked_until"))
         heartbeat.record({ "offset" => 10 })
@@ -41,8 +41,8 @@ RSpec.describe "Durababble step heartbeats", :integration do
   it "passes the last heartbeat cursor into the next step invocation after lease expiry recovery" do
     store.migrate!
     attempts = []
-    workflow = Durababble::Workflow.define("heartbeat-cursor-resume") do
-      step("download") do |_ctx, heartbeat|
+    workflow = durababble_test_workflow("heartbeat-cursor-resume") do
+      test_step("download") do |_ctx, heartbeat|
         attempts << heartbeat.cursor
         if attempts.length == 1
           heartbeat.record({ "page" => 42 })
@@ -67,8 +67,8 @@ RSpec.describe "Durababble step heartbeats", :integration do
     store.migrate!
     test_store = store
     test_schema = quoted_schema
-    workflow = Durababble::Workflow.define("zombie-heartbeat") do
-      step("work") do |ctx, heartbeat|
+    workflow = durababble_test_workflow("zombie-heartbeat") do
+      test_step("work") do |ctx, heartbeat|
         test_store.send(:execute_params, "UPDATE #{test_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [ctx.fetch("workflow_id")])
         heartbeat.record({ "too_late" => true })
         { "should_not" => "complete" }

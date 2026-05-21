@@ -33,6 +33,10 @@ RSpec.describe Durababble::Worker do
       []
     end
 
+    def step_attempts_for(_workflow_id)
+      []
+    end
+
     def record_step_started(workflow_id:, position:, name:)
       @resumed << [:started, workflow_id, position, name]
     end
@@ -54,11 +58,15 @@ RSpec.describe Durababble::Worker do
     def complete_workflow(workflow_id, result:)
       @resumed << [:workflow_completed, workflow_id, result]
     end
+
+    def fail_workflow(workflow_id, error:)
+      @resumed << [:workflow_failed, workflow_id, error]
+    end
   end
 
   let(:workflow) do
-    Durababble::Workflow.define("unit") do
-      step("increment") { |ctx| ctx.merge("value" => ctx.fetch("value") + 1) }
+    durababble_test_workflow("unit") do
+      test_step("increment") { |ctx| ctx.merge("value" => ctx.fetch("value") + 1) }
     end
   end
 

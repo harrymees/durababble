@@ -13,9 +13,9 @@ RSpec.describe Durababble::Engine, :integration do
   end
 
   it "runs a workflow once and records durable step outputs" do
-    workflow = Durababble::Workflow.define("counter") do
-      step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-      step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
+    workflow = durababble_test_workflow("counter") do
+      test_step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
+      test_step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
     end
 
     engine = described_class.new(store:)
@@ -31,9 +31,9 @@ RSpec.describe Durababble::Engine, :integration do
 
   it "can resume a previously failed workflow without rerunning completed steps" do
     attempts = 0
-    workflow = Durababble::Workflow.define("flaky") do
-      step("first") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-      step("flaky") do |ctx|
+    workflow = durababble_test_workflow("flaky") do
+      test_step("first") { |ctx| { "count" => ctx.fetch("count") + 1 } }
+      test_step("flaky") do |ctx|
         attempts += 1
         raise "boom" if attempts == 1
         { "count" => ctx.fetch("count") + 10 }

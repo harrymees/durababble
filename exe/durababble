@@ -6,6 +6,22 @@ require_relative "../lib/durababble"
 
 COMMAND = ARGV.shift || "version"
 
+class DurababbleCliCounterWorkflow < Durababble::Workflow
+  workflow_name "counter"
+
+  def execute(input)
+    double(increment(input))
+  end
+
+  step def increment(input)
+    input.merge("count" => input.fetch("count") + 1)
+  end
+
+  step def double(input)
+    input.merge("count" => input.fetch("count") * 2)
+  end
+end
+
 def options
   opts = {
     schema: "durababble",
@@ -25,13 +41,6 @@ def store_from(opts)
   Durababble::Store.connect(database_url: opts.fetch(:database_url), schema: opts.fetch(:schema))
 end
 
-def counter_workflow
-  Durababble::Workflow.define("counter") do
-    step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-    step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
-  end
-end
-
 case COMMAND
 when "version", "--version", "-v"
   puts "durababble #{Durababble::VERSION}"
@@ -48,7 +57,7 @@ when "run-counter"
   opts = options
   store = store_from(opts)
   begin
-    run = Durababble::Engine.new(store:).run(counter_workflow, input: { "count" => opts.fetch(:count) })
+    run = Durababble::Engine.new(store:).run(DurababbleCliCounterWorkflow, input: { "count" => opts.fetch(:count) })
     puts "#{run.id} #{run.status} #{run.result.inspect}"
   ensure
     store.close
@@ -58,7 +67,7 @@ when "resume-counter"
   opts = options
   store = store_from(opts)
   begin
-    run = Durababble::Engine.new(store:).resume(counter_workflow, workflow_id: run_id)
+    run = Durababble::Engine.new(store:).resume(DurababbleCliCounterWorkflow, workflow_id: run_id)
     puts "#{run.id} #{run.status} #{run.result.inspect}"
   ensure
     store.close

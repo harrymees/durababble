@@ -17,12 +17,12 @@ RSpec.describe "Durababble complete durable execution support", :integration do
   end
 
   def counter_workflow(events: nil)
-    Durababble::Workflow.define("counter") do
-      step("increment") do |ctx|
+    durababble_test_workflow("counter") do
+      test_step("increment") do |ctx|
         events << "increment" if events
         { "count" => ctx.fetch("count") + 1 }
       end
-      step("double") do |ctx|
+      test_step("double") do |ctx|
         events << "double" if events
         { "count" => ctx.fetch("count") * 2 }
       end
@@ -84,14 +84,14 @@ RSpec.describe "Durababble complete durable execution support", :integration do
 
   it "implements timers, external event waits, and worker polling" do
     store.migrate!
-    workflow = Durababble::Workflow.define("waits") do
-      step("wait_for_time") do |ctx|
+    workflow = durababble_test_workflow("waits") do
+      test_step("wait_for_time") do |ctx|
         Durababble.wait_until(Time.now + 3600, ctx.merge("after_timer" => true))
       end
-      step("wait_for_event") do |ctx|
+      test_step("wait_for_event") do |ctx|
         Durababble.wait_event("approval:#{ctx.fetch("request_id")}", ctx.merge("after_event_wait" => true))
       end
-      step("finish") { |ctx| ctx.merge("finished" => true) }
+      test_step("finish") { |ctx| ctx.merge("finished" => true) }
     end
 
     worker = Durababble::Worker.new(store:, workflows: { "waits" => workflow }, worker_id: "worker-a")
@@ -145,9 +145,9 @@ RSpec.describe "Durababble complete durable execution support", :integration do
     expect(events.count("increment")).to eq(1)
 
     # Crash: while waiting -> wait row survives and signal resumes from the waiting step.
-    waiting = Durababble::Workflow.define("waiting") do
-      step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-      step("done") { |ctx| ctx.merge("done" => true) }
+    waiting = durababble_test_workflow("waiting") do
+      test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+      test_step("done") { |ctx| ctx.merge("done" => true) }
     end
     waiting_id = store.enqueue_workflow(name: "waiting", input: { "id" => "w1" })
     expect { engine(crash_after: :wait_recorded).resume(waiting, workflow_id: waiting_id) }.to raise_error(Durababble::InjectedCrash)

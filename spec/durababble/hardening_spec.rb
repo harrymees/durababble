@@ -20,12 +20,12 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
   end
 
   def counter_workflow(events: nil)
-    Durababble::Workflow.define("counter") do
-      step("increment") do |ctx|
+    durababble_test_workflow("counter") do
+      test_step("increment") do |ctx|
         events << "increment" if events
         { "count" => ctx.fetch("count") + 1 }
       end
-      step("double") do |ctx|
+      test_step("double") do |ctx|
         events << "double" if events
         { "count" => ctx.fetch("count") * 2 }
       end
@@ -111,8 +111,8 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
 
   it "preserves scalar step results and text columns that look parseable" do
     store.migrate!
-    workflow = Durababble::Workflow.define("123") do
-      step("false") { |_ctx| false }
+    workflow = durababble_test_workflow("123") do
+      test_step("false") { |_ctx| false }
     end
 
     run = Durababble::Engine.new(store:).run(workflow, input: { "start" => true })
@@ -161,9 +161,9 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
 
   it "signals a waiting event once under concurrent signalers" do
     store.migrate!
-    workflow = Durababble::Workflow.define("waiting") do
-      step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
-      step("done") { |ctx| ctx.merge("done" => true) }
+    workflow = durababble_test_workflow("waiting") do
+      test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
+      test_step("done") { |ctx| ctx.merge("done" => true) }
     end
     workflow_id = store.enqueue_workflow(name: "waiting", input: { "id" => "x" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
@@ -178,9 +178,9 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
 
   it "marks waiting step attempts completed when the wait is satisfied" do
     store.migrate!
-    workflow = Durababble::Workflow.define("waiting_attempt") do
-      step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-      step("done") { |ctx| ctx.merge("done" => true) }
+    workflow = durababble_test_workflow("waiting_attempt") do
+      test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+      test_step("done") { |ctx| ctx.merge("done" => true) }
     end
     workflow_id = store.enqueue_workflow(name: "waiting_attempt", input: { "id" => "attempt" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)

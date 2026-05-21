@@ -91,8 +91,8 @@ RSpec.describe Durababble::WorkerRuntime, :integration do
   it "starts a background worker and gracefully completes in-flight work during shutdown" do
     store.migrate!
     completed = Queue.new
-    workflow = Durababble::Workflow.define("runtime-graceful") do
-      step("finish") do |ctx|
+    workflow = durababble_test_workflow("runtime-graceful") do
+      test_step("finish") do |ctx|
         completed << true
         ctx.merge("done" => true)
       end
@@ -115,8 +115,8 @@ RSpec.describe Durababble::WorkerRuntime, :integration do
     entered = Queue.new
     release_zombie = Queue.new
     attempts = Queue.new
-    workflow = Durababble::Workflow.define("runtime-timeout") do
-      step("maybe-stuck") do |ctx|
+    workflow = durababble_test_workflow("runtime-timeout") do
+      test_step("maybe-stuck") do |ctx|
         attempt = attempts.length + 1
         attempts << attempt
         entered << attempt
@@ -149,11 +149,11 @@ RSpec.describe Durababble::WorkerRuntime, :integration do
 
   it "only claims workflow names served by this runtime's worker pool" do
     store.migrate!
-    pool_workflow = Durababble::Workflow.define("pool-a-work") do
-      step("finish") { |ctx| ctx.merge("pool" => "a") }
+    pool_workflow = durababble_test_workflow("pool-a-work") do
+      test_step("finish") { |ctx| ctx.merge("pool" => "a") }
     end
-    other_workflow = Durababble::Workflow.define("pool-b-work") do
-      step("finish") { |ctx| ctx.merge("pool" => "b") }
+    other_workflow = durababble_test_workflow("pool-b-work") do
+      test_step("finish") { |ctx| ctx.merge("pool" => "b") }
     end
     pool_workflow_id = store.enqueue_workflow(name: pool_workflow.name, input: {})
     other_workflow_id = store.enqueue_workflow(name: other_workflow.name, input: {})

@@ -4,7 +4,7 @@ module Durababble
   class Worker
     def initialize(store:, workflows:, worker_id:, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true)
       @store = store
-      @workflows = workflows
+      @workflows = normalize_workflows(workflows)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @store.migrate! if migrate
@@ -30,6 +30,17 @@ module Durababble
         end
       end
       worked
+    end
+
+    private
+
+    def normalize_workflows(workflows)
+      case workflows
+      when Hash
+        workflows.transform_keys(&:to_s)
+      else
+        Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
+      end
     end
   end
 end

@@ -1,14 +1,14 @@
 # Durababble specification
 
-This document is the implemented prototype spec. Every item below is covered by explicit integration tests against real local Yugabyte/YSQL. The hardening suite includes multi-connection concurrency tests and a subprocess crash harness. The deterministic simulation suite maps each safety/guarantee row and crash row to one or more virtual scenarios and searches many deterministic seeds.
+This document is the implemented prototype spec. Every item below is covered by explicit integration tests against real local Yugabyte/YSQL. The hardening suite includes multi-connection concurrency tests and a subprocess crash harness. The deterministic simulation suite maps each safety/guarantee row and crash row to one or more virtual scenarios and searches many deterministic seeds. The public API is class-oriented: workflows subclass `Durababble::Workflow`, durable objects subclass `Durababble::DurableObject`, and both use `expose`/`expose_command` for their public callable surface.
 
 ## Functional spec
 
 - Ruby 4 gem scaffold managed by mise.
 - Yugabyte-backed storage through the PostgreSQL wire protocol.
 - Runtime values (`input`, `result`, `context`, `payload`, and heartbeat cursors) are serialized with Paquito into `bytea` columns, not stored as JSON/JSONB. `migrate!` can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
-- Workflow DSL with ordered named steps and step-level retry policies modeled after Temporal Activity retry options, Ruby-ified as `retry_policy:` keyword arguments.
-- Durable workflow rows and durable step rows.
+- Class-oriented workflow API: workflow classes implement `#execute`; internal durable side-effect boundaries are methods declared with `step def ...` or `step retry: ...` followed by `def ...`; step-level retry policies are modeled after Temporal Activity retry options, Ruby-ified as `retry:` keyword arguments at the method declaration site.
+- Durable workflow rows and durable step rows. Step identity is assigned by deterministic execution order; method names are recorded as metadata and users do not pass step names at call sites.
 - Append-only step attempt history, including waits that transition to completed attempts.
 - Runnable workflow queue via `pending` rows.
 - Distributed workflow leases with `locked_by` and `locked_until`.
@@ -19,11 +19,78 @@ This document is the implemented prototype spec. Every item below is covered by 
 - Timer waits via `Durababble.wait_until`.
 - External event waits via `Durababble.wait_event` and `Store#signal_event`.
 - Side-effect idempotency fences via `Store#with_fence`; the fence is acquired before the block executes so concurrent callers do not duplicate the side effect.
-- Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement.
+- Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement. The public workflow/object API does not expose outbox as a first-class concept yet.
+- `expose`/`expose_command` on workflows for public query/command methods against workflow refs. `expose_command` is not a workflow step; it is the public RPC/control surface for a workflow execution.
+- Class-oriented durable object API: durable objects are identity-addressed via `DurableObject.ref(id)`, use `expose` for queries, use `expose_command` for serialized durable commands, and mutate state explicitly with `update_state`. Durable object commands are not workflow steps because the command itself is already the durable boundary.
+- Library-generated idempotency keys for workflow steps and durable object commands, exposed through `step_context.idempotency_key` and `command_context.idempotency_key` respectively. User code can read these keys but does not inject or override them.
+- RBS-style typing with no runtime type overhead. Durababble does not inspect user RBS during execution; workflow and durable object generics are for static tooling.
 - Lease-routed workflow RPC for node-to-node workflow messages: callers route through the current workflow lease holder, receivers re-check lease ownership before and after handling, stale holders reject in-flight RPCs, callers refresh/retry after lease-holder changes, no-active-owner races are handled internally by starting and awaiting a workflow lease before rerouting, and shutdown/non-running workflows are not retried.
 - High-level worker lifecycle entrypoint via `Durababble::WorkerRuntime`, intended for app boot/shutdown integration. A runtime loops `Worker#tick` for one worker pool, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and revokes its still-held workflow/outbox leases if the timeout is exceeded.
 - Prototype CLI commands: `migrate`, `run-counter`, `inspect`, `resume-counter`, and `version`.
 - SimpleCov line and branch coverage thresholds for the library.
+
+## Public API contract
+
+### Workflows
+
+A workflow class subclasses `Durababble::Workflow` and implements `#execute(input)`. `#execute` should be deterministic orchestration code. Any method that performs durable side effects must be declared as a workflow step:
+
+```ruby
+class FulfillOrder < Durababble::Workflow
+  def execute(order)
+    payment = charge_card(order)
+    ship(order, payment)
+  end
+
+  step retry: { maximum_attempts: 5, schedule: [1, 5, 30] }
+  def charge_card(order)
+    Payments.charge(order, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def ship(order, payment)
+    Shipping.buy_label(order, idempotency_key: step_context.idempotency_key)
+  end
+
+  expose_command def cancel(reason:)
+    cancel_workflow(reason:)
+  end
+
+  expose def status
+    workflow_state.status
+  end
+end
+```
+
+`Workflow.enqueue(input, store:)` creates a durable pending execution. `Engine#run(WorkflowClass, input:)` is the inline convenience path for tests and scripts. `Worker` accepts workflow classes, not old DSL workflow instances. The old `Workflow.define` block DSL is intentionally removed.
+
+`step_context` is available only while a workflow step is executing. It contains `workflow_id`, `step_index`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and are stable across retries of the same logical step.
+
+### Durable objects
+
+A durable object class subclasses `Durababble::DurableObject`. It is addressed by `Class.ref(id, store:)`. Durable object methods are not workflow steps. Public query methods are declared with `expose`; public serialized mutating commands are declared with `expose_command`:
+
+```ruby
+class Account < Durababble::DurableObject
+  def initialize_state
+    { "balance_cents" => 0 }
+  end
+
+  expose_command retry: { maximum_attempts: 5 }
+  def credit(amount_cents)
+    update_state("balance_cents" => current_state.fetch("balance_cents") + amount_cents)
+  end
+
+  expose def balance
+    current_state.fetch("balance_cents")
+  end
+end
+```
+
+`expose_command` commands are serialized through the durable object's identity, run with `command_context`, and may update state with `update_state(new_state)`. `expose` queries read latest persisted state and should not mutate state. `command_context.idempotency_key` is generated by Durababble and is stable for the durable command.
+
+### Typing
+
+Durababble's runtime does not load or validate user RBS. Types are expressed in `.rbs` files using `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
 
 ## Guarantee matrix
 
@@ -37,7 +104,7 @@ This document is the implemented prototype spec. Every item below is covered by 
 | Heartbeat cursors survive recovery | `Engine#resume` passes the previous incomplete attempt's heartbeat cursor into the next invocation of the same step | heartbeat spec + DST cursor recovery scenario |
 | Zombie workers cannot renew expired leases | `Store#heartbeat_step` updates `locked_until` and cursor only when `locked_by` still matches and `locked_until >= now()`; expired/moved leases raise `LeaseConflict` through the engine heartbeat object | heartbeat spec |
 | Zombie workers cannot complete after lease revocation | `Engine` re-checks workflow lease ownership before recording step/wait/failure/workflow terminal state, so a timed-out shutdown that revokes leases makes a late owner raise `LeaseConflict` instead of committing stale output | worker lifecycle spec |
-| Step retries are durably scheduled | A failing step with `retry_policy:` records a failed attempt, releases the workflow lease, stores `workflows.next_run_at`, and is not claimable again until the retry time is due | step retry spec + DST retry recovery scenario |
+| Step retries are durably scheduled | A failing step with `retry:` records a failed attempt, releases the workflow lease, stores `workflows.next_run_at`, and is not claimable again until the retry time is due | step retry spec + DST retry recovery scenario |
 | Retry options are Temporal-like but Ruby-shaped | Supported options are `initial_interval:`, `backoff_coefficient:`, `maximum_interval:`, `maximum_attempts:`, `schedule:`, and `non_retryable_errors:` | retry policy specs |
 | Final retry failure bubbles to the workflow | When attempts are exhausted, or the error class is non-retryable, the current step attempt is failed and the workflow row becomes `failed` with the step error | step retry spec |
 | Expired leases can be recovered | `Store#steal_expired_leases!` returns expired `running` workflows to `pending` | complete spec guarantee + crash matrix |
@@ -80,26 +147,30 @@ For application integration, prefer `Durababble::WorkerRuntime` over hand-writte
 
 ## Step retry policy details
 
-Steps are retriable at the step/activity boundary rather than by blindly rerunning whole workflows. The DSL is intentionally close to Temporal's Activity Retry Policy, but shaped as Ruby keyword arguments:
+Workflow steps are retriable at the step boundary rather than by blindly rerunning whole workflows. The DSL is intentionally close to Temporal's Activity Retry Policy, but shaped as Ruby keyword arguments at the step method definition site:
 
 ```ruby
-Durababble::Workflow.define("import") do
-  step "download",
-       retry_policy: {
-         initial_interval: 1,
-         backoff_coefficient: 2.0,
-         maximum_interval: 100,
-         maximum_attempts: 5,
-         non_retryable_errors: [ArgumentError]
-       } do |ctx, heartbeat|
-    # ...
+class ImportWorkflow < Durababble::Workflow
+  def execute(input)
+    download(input)
+  end
+
+  step retry: {
+    initial_interval: 1,
+    backoff_coefficient: 2.0,
+    maximum_interval: 100,
+    maximum_attempts: 5,
+    non_retryable_errors: [ArgumentError]
+  }
+  def download(input)
+    # use step_context.idempotency_key and step_context.heartbeat here
   end
 end
 ```
 
 `schedule: [1, 5, 30]` may be supplied for an explicit per-retry schedule; after the explicit array is exhausted, Durababble falls back to capped exponential backoff. Intervals are numeric seconds. `maximum_attempts:` counts the first execution plus retries. `non_retryable_errors:` accepts Ruby exception classes or class-name strings.
 
-On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, so retry delay survives process restarts and lease churn. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` and the error bubbles to the durable object state.
+On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, so retry delay survives process restarts and lease churn. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` and the error bubbles to the workflow state.
 
 Temporal comparison: Temporal Activities use exponential retry policies by default with `initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, and `non_retryable_errors`; Workflow Executions do not retry by default. Durababble mirrors the Activity-style option names for steps, while leaving workflow-level retry as an explicit future concern.
 

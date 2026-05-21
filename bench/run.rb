@@ -374,33 +374,55 @@ module Durababble
 
       def arithmetic_workflow(name)
         @arithmetic_workflows ||= {}
-        @arithmetic_workflows[name] ||= Durababble::Workflow.define(name) do
-          step :add_one do |ctx|
+        @arithmetic_workflows[name] ||= Class.new(Durababble::Workflow) do
+          workflow_name name
+
+          def execute(input)
+            double(add_one(input))
+          end
+
+          step def add_one(ctx)
             ctx.merge("value" => ctx.fetch("value") + 1)
           end
-          step :double do |ctx|
+
+          step def double(ctx)
             ctx.merge("value" => ctx.fetch("value") * 2)
           end
         end
       end
 
       def event_resume_workflow(event_key)
-        Durababble::Workflow.define("bench_event_resume") do
-          step :wait_for_event do |ctx|
+        Class.new(Durababble::Workflow) do
+          workflow_name "bench_event_resume"
+
+          define_method(:execute) do |input|
+            finish_after_event(wait_for_event(input))
+          end
+
+          define_method(:wait_for_event) do |ctx|
             Durababble.wait_event(event_key, context: ctx)
           end
-          step :finish_after_event do |ctx|
+          step :wait_for_event
+
+          step def finish_after_event(ctx)
             ctx.merge("finished" => true)
           end
         end
       end
 
       def timer_resume_workflow
-        @timer_resume_workflow ||= Durababble::Workflow.define("bench_timer_resume") do
-          step :wait_for_timer do |ctx|
+        @timer_resume_workflow ||= Class.new(Durababble::Workflow) do
+          workflow_name "bench_timer_resume"
+
+          def execute(input)
+            finish_after_timer(wait_for_timer(input))
+          end
+
+          step def wait_for_timer(ctx)
             Durababble.wait_until(Time.now - 1, context: ctx)
           end
-          step :finish_after_timer do |ctx|
+
+          step def finish_after_timer(ctx)
             ctx.merge("finished" => true)
           end
         end

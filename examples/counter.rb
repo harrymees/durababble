@@ -6,10 +6,21 @@ database_url = ENV.fetch("DURABABBLE_DATABASE_URL", "postgresql://yugabyte@127.0
 store = Durababble::Store.connect(database_url:, schema: "durababble_example")
 engine = Durababble::Engine.new(store:)
 
-workflow = Durababble::Workflow.define("counter") do
-  step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
-  step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
+class CounterWorkflow < Durababble::Workflow
+  workflow_name "counter"
+
+  def execute(input)
+    double(increment(input))
+  end
+
+  step def increment(input)
+    { "count" => input.fetch("count") + 1 }
+  end
+
+  step def double(input)
+    { "count" => input.fetch("count") * 2 }
+  end
 end
 
-run = engine.run(workflow, input: { "count" => 2 })
+run = engine.run(CounterWorkflow, input: { "count" => 2 })
 puts "#{run.id} #{run.status} #{run.result.inspect}"

@@ -16,8 +16,8 @@ RSpec.describe "Durababble step retry policies", :integration do
   it "retries a failed step according to a Ruby-ified Temporal exponential policy" do
     store.migrate!
     attempts = 0
-    workflow = Durababble::Workflow.define("retry-exponential") do
-      step "flaky",
+    workflow = durababble_test_workflow("retry-exponential") do
+      test_step "flaky",
            retry_policy: {
              initial_interval: 2,
              backoff_coefficient: 3,
@@ -53,8 +53,8 @@ RSpec.describe "Durababble step retry policies", :integration do
   it "persists retry schedule across lease expiry and process restart" do
     store.migrate!
     attempts = 0
-    workflow = Durababble::Workflow.define("retry-restart") do
-      step "flaky", retry_policy: { initial_interval: 5, maximum_attempts: 2 } do |ctx|
+    workflow = durababble_test_workflow("retry-restart") do
+      test_step "flaky", retry_policy: { initial_interval: 5, maximum_attempts: 2 } do |ctx|
         attempts += 1
         raise "temporary" if attempts == 1
 
@@ -84,8 +84,8 @@ RSpec.describe "Durababble step retry policies", :integration do
 
   it "bubbles the final failure to the workflow when attempts are exhausted" do
     store.migrate!
-    workflow = Durababble::Workflow.define("retry-exhausted") do
-      step "always-fails", retry_policy: { initial_interval: 1, maximum_attempts: 2 } do |_ctx|
+    workflow = durababble_test_workflow("retry-exhausted") do
+      test_step "always-fails", retry_policy: { initial_interval: 1, maximum_attempts: 2 } do |_ctx|
         raise ArgumentError, "still bad"
       end
     end
@@ -105,8 +105,8 @@ RSpec.describe "Durababble step retry policies", :integration do
 
   it "does not retry non-retryable errors" do
     store.migrate!
-    workflow = Durababble::Workflow.define("retry-nonretryable") do
-      step "bad-input", retry_policy: { maximum_attempts: 5, non_retryable_errors: [ArgumentError] } do |_ctx|
+    workflow = durababble_test_workflow("retry-nonretryable") do
+      test_step "bad-input", retry_policy: { maximum_attempts: 5, non_retryable_errors: [ArgumentError] } do |_ctx|
         raise ArgumentError, "invalid"
       end
     end
