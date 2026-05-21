@@ -15,7 +15,7 @@ module Durababble
       return :idle unless claimed
 
       workflow = @workflows.fetch(claimed.fetch("name"))
-      Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"))
+      Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
       :worked
     end
 

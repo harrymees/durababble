@@ -17,21 +17,21 @@ module Durababble
       resume(workflow, workflow_id:)
     end
 
-    def resume(workflow, workflow_id:)
-      current = @store.workflow(workflow_id)
-      return snapshot(workflow_id) if current.fetch("status") == "completed"
+    def resume(workflow, workflow_id:, claimed: nil)
+      current = claimed || @store.workflow(workflow_id)
+      return run_from_row(current) if current.fetch("status") == "completed"
 
-      claimed = @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      claimed ||= @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
       raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
 
       crash!(:workflow_claimed)
-      execute(workflow, workflow_id:)
+      execute(workflow, workflow_id:, initial_input: claimed.fetch("input"))
     end
 
     private
 
-    def execute(workflow, workflow_id:)
-      context = initial_context(workflow_id)
+    def execute(workflow, workflow_id:, initial_input: nil)
+      context = initial_input || initial_context(workflow_id)
       completed_steps = @store.steps_for(workflow_id)
                               .select { |step| step.fetch("status") == "completed" }
                               .to_h { |step| [step.fetch("position").to_i, step] }
@@ -75,7 +75,10 @@ module Durababble
     end
 
     def snapshot(workflow_id)
-      row = @store.workflow(workflow_id)
+      run_from_row(@store.workflow(workflow_id))
+    end
+
+    def run_from_row(row)
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
     end
 

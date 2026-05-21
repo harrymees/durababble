@@ -249,23 +249,11 @@ module Durababble
     end
 
     def record_step_completed(workflow_id:, position:, result:)
-      transaction do
-        execute_params(
-          "UPDATE #{table("steps")} SET status = 'completed', result = $3::bytea, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2",
-          [workflow_id, position, dump_serialized(result)]
-        )
-        update_latest_attempt(workflow_id:, position:, status: "completed", result:, error: nil)
-      end
+      record_step_completed_without_transaction(workflow_id:, position:, result:)
     end
 
     def record_step_failed(workflow_id:, position:, error:)
-      transaction do
-        execute_params(
-          "UPDATE #{table("steps")} SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2",
-          [workflow_id, position, error]
-        )
-        update_latest_attempt(workflow_id:, position:, status: "failed", result: nil, error:)
-      end
+      record_step_failed_without_transaction(workflow_id:, position:, error:)
     end
 
     def record_wait(workflow_id:, position:, name:, wait_request:)
@@ -398,30 +386,59 @@ module Durababble
     private
 
     def complete_waits(where_sql, params, payload)
-      returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
-        UPDATE #{table("waits")}
-        SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
-        WHERE id IN (
-          SELECT id FROM #{table("waits")}
-          WHERE status = 'pending' AND #{where_sql}
-          FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-      SQL
-      rows = returning.map { |row| decode_row(row) }
-      rows.each do |wait|
-        context = wait.fetch("context").merge(payload)
-        record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
-        execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [wait.fetch("workflow_id")])
+      transaction do
+        returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
+          UPDATE #{table("waits")}
+          SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
+          WHERE id IN (
+            SELECT id FROM #{table("waits")}
+            WHERE status = 'pending' AND #{where_sql}
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING *
+        SQL
+        rows = returning.map { |row| decode_row(row) }
+        rows.each do |wait|
+          context = wait.fetch("context").merge(payload)
+          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
+          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [wait.fetch("workflow_id")])
+        end
+        rows.length
       end
-      rows.length
+    end
+
+    def record_step_completed_without_transaction(workflow_id:, position:, result:)
+      serialized = dump_serialized(result)
+      execute_params(
+        "UPDATE #{table("steps")} SET status = 'completed', result = $3::bytea, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2",
+        [workflow_id, position, serialized]
+      )
+      update_latest_attempt_serialized(workflow_id:, position:, status: "completed", serialized_result: serialized, error: nil)
+    end
+
+    def record_step_failed_without_transaction(workflow_id:, position:, error:)
+      execute_params(
+        "UPDATE #{table("steps")} SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2",
+        [workflow_id, position, error]
+      )
+      update_latest_attempt_serialized(workflow_id:, position:, status: "failed", serialized_result: dump_serialized(nil), error:)
     end
 
     def update_latest_attempt(workflow_id:, position:, status:, result:, error:)
-      row = execute_params("SELECT id FROM #{table("step_attempts")} WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting') ORDER BY started_at DESC LIMIT 1", [workflow_id, position]).first
-      return unless row
+      update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result: dump_serialized(result), error:)
+    end
 
-      execute_params("UPDATE #{table("step_attempts")} SET status = $2, result = $3::bytea, error = $4, completed_at = now() WHERE id = $1", [row.fetch("id"), status, dump_serialized(result), error])
+    def update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result:, error:)
+      execute_params(<<~SQL, [workflow_id, position, status, serialized_result, error])
+        UPDATE #{table("step_attempts")}
+        SET status = $3, result = $4::bytea, error = $5, completed_at = now()
+        WHERE id = (
+          SELECT id FROM #{table("step_attempts")}
+          WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting')
+          ORDER BY started_at DESC
+          LIMIT 1
+        )
+      SQL
     end
 
     def execute(sql)

@@ -412,22 +412,11 @@ module Durababble
       end
 
       def expire_workflow_lease(workflow_id)
-        with_connection do |connection|
-          connection.exec_params("UPDATE #{quoted_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [workflow_id])
-        end
+        @store.send(:execute_params, "UPDATE #{quoted_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [workflow_id])
       end
 
       def expire_outbox_lease(outbox_id)
-        with_connection do |connection|
-          connection.exec_params("UPDATE #{quoted_schema}.outbox SET locked_until = now() - interval '1 second' WHERE id = $1", [outbox_id])
-        end
-      end
-
-      def with_connection
-        connection = PG.connect(@database_url)
-        yield connection
-      ensure
-        connection&.close
+        @store.send(:execute_params, "UPDATE #{quoted_schema}.outbox SET locked_until = now() - interval '1 second' WHERE id = $1", [outbox_id])
       end
 
       def quoted_schema
