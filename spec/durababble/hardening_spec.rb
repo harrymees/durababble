@@ -82,6 +82,33 @@ RSpec.describe "Durababble hardened durability and concurrency", :integration do
     expect(run.status).to eq("completed")
   end
 
+  it "does not rewrite an unexpired workflow lease already owned by the same worker" do
+    store.migrate!
+    workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
+    first_claim = store.claim_runnable_workflow(worker_id: "owner", lease_seconds: 60)
+
+    second_claim = store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 3_600)
+
+    expect(second_claim.fetch("id")).to eq(workflow_id)
+    expect(second_claim.fetch("locked_until")).to eq(first_claim.fetch("locked_until"))
+  end
+
+  it "does not leave a stale running attempt when retrying a step that crashed after start" do
+    store.migrate!
+    workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 2 })
+    workflow = counter_workflow
+
+    expect do
+      Durababble::Engine.new(store:, worker_id: "crasher", crash_after: :step_started).resume(workflow, workflow_id:)
+    end.to raise_error(Durababble::InjectedCrash)
+
+    store.steal_expired_leases!(now: Time.now + 61)
+    run = Durababble::Engine.new(store:, worker_id: "recover").resume(workflow, workflow_id:)
+
+    expect(run.status).to eq("completed")
+    expect(store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }).to eq(%w[failed completed completed])
+  end
+
   it "runs a fenced side effect only once under concurrent callers" do
     store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })

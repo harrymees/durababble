@@ -3,6 +3,44 @@
 require "spec_helper"
 
 RSpec.describe "Durababble deterministic simulation harness" do
+  SAFETY_MATRIX_SCENARIOS = {
+    "workflows are durable before execution" => %w[workflow_durable_before_claim],
+    "runnable work is claimable by one worker at a time" => %w[multi_worker_counter],
+    "resume honors lease ownership" => %w[lease_conflict],
+    "active leases can be heartbeated" => %w[heartbeat_extension],
+    "expired leases can be recovered" => %w[lease_expiry],
+    "completed steps are not re-executed on resume" => %w[completed_step_skip_after_crash],
+    "incomplete steps are retried" => %w[incomplete_step_retry_after_crash],
+    "step attempts are append-only" => %w[attempt_history_append_only],
+    "waiting attempts complete when signaled" => %w[concurrent_signal_once],
+    "timer waits survive process exit" => %w[timer_and_partition],
+    "event waits survive process exit" => %w[concurrent_signal_once],
+    "signaled waits resume with payload" => %w[waits_fences_and_outbox concurrent_signal_once],
+    "concurrent signalers wake a wait once" => %w[concurrent_signal_once],
+    "side effects can be fenced by key" => %w[fenced_side_effect_once waits_fences_and_outbox],
+    "outbox delivery is durable and leased" => %w[outbox_lease_expiry waits_fences_and_outbox],
+    "multi-row state transitions remain coherent under recovery" => %w[completed_step_skip_after_crash incomplete_step_retry_after_crash chaos]
+  }.freeze
+
+  CRASH_MATRIX_SCENARIOS = {
+    "after enqueue before claim" => %w[crash_after_enqueue],
+    "after lease claim before step start" => %w[crash_after_lease_claim],
+    "after step start before step completion" => %w[crash_after_step_started],
+    "after step completion before workflow completion" => %w[crash_after_step_completed],
+    "while waiting for an event" => %w[crash_while_waiting_event],
+    "after outbox insert before delivery" => %w[crash_after_outbox_insert],
+    "after outbox claim before ack" => %w[crash_after_outbox_claim]
+  }.freeze
+
+  def expect_scenarios_hold(matrix, seeds: 1..100)
+    matrix.each do |condition, scenarios|
+      scenarios.each do |scenario|
+        failures = Durababble::Deterministic.search(scenario, seeds:)
+        expect(failures).to be_empty, "#{condition.inspect} failed in scenario #{scenario.inspect}: #{failures.inspect}"
+      end
+    end
+  end
+
   it "proves full determinism by replaying the same scenario twice for the same seed" do
     first = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
     second = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
@@ -67,8 +105,16 @@ RSpec.describe "Durababble deterministic simulation harness" do
     expect(failures.first.last.join).to include("running attempt")
   end
 
+  it "proves every safety matrix condition across many deterministic seeds" do
+    expect_scenarios_hold(SAFETY_MATRIX_SCENARIOS, seeds: 1..100)
+  end
+
+  it "proves every crash matrix recovery condition across many deterministic seeds" do
+    expect_scenarios_hold(CRASH_MATRIX_SCENARIOS, seeds: 1..100)
+  end
+
   it "searches a range of deterministic chaos seeds for invariant violations" do
-    failures = Durababble::Deterministic.search("chaos", seeds: 1..40)
+    failures = Durababble::Deterministic.search("chaos", seeds: 1..100)
 
     expect(failures).to be_empty
   end

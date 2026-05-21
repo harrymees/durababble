@@ -48,6 +48,8 @@ exe/durababble resume-counter RUN_ID --schema durababble
 mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
 ```
 
+The RSpec DST matrix searches every safety/guarantee row and every crash/recovery row across seeds `1..100`. Bugs found by DST are promoted into clear non-DST regression tests; for example, retrying after a crash immediately after step start now has a hardening spec that pins stale attempt cleanup as `failed, completed, completed`.
+
 ## Example library use
 
 ```ruby

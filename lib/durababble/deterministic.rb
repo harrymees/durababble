@@ -240,6 +240,12 @@ module Durababble
       end
 
       def record_step_started(workflow_id:, position:, name:)
+        @attempts[workflow_id].each do |attempt|
+          next unless attempt.fetch("position") == position && attempt.fetch("status") == "running"
+
+          attempt["status"] = "failed"
+          attempt["error"] = "superseded by retry"
+        end
         @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil }
         @attempts[workflow_id] << { "id" => next_id("attempt"), "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil }
         trace("step_started", id: workflow_id, position:, name:)
@@ -536,6 +542,133 @@ module Durababble
         end
       end
 
+      def workflow_durable_before_claim(seed)
+        run(seed, "workflow_durable_before_claim") do |h|
+          h.workflows["counter"] = counter_workflow
+          h.scheduler.schedule(actor: "client", delay: h.scheduler.rng.int(20), name: "enqueue_then_crash") do
+            h.store.enqueue_workflow(name: "counter", input: { "count" => 5 })
+          end
+          h.add_workers(%w[worker-a worker-b], ticks: 12)
+          h.check("pending workflow eventually completed") { h.store.summary.fetch(:completed_workflows) == 1 }
+        end
+      end
+
+      def lease_conflict(seed)
+        run(seed, "lease_conflict") do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => 1 })
+          h.store.claim_workflow(workflow_id: id, worker_id: "owner", lease_seconds: 60)
+          h.scheduler.schedule(actor: "intruder", delay: h.scheduler.rng.int(20), name: "resume_without_lease") do
+            Durababble::Engine.new(store: h.store, worker_id: "intruder").resume(h.workflows.fetch("counter"), workflow_id: id)
+          rescue LeaseConflict
+            h.scheduler.trace.event(h.scheduler.time, "intruder", "lease_conflict_observed", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "owner", delay: 30 + h.scheduler.rng.int(10), name: "owner_resume") do
+            Durababble::Engine.new(store: h.store, worker_id: "owner").resume(h.workflows.fetch("counter"), workflow_id: id)
+          end
+          h.check("lease conflict observed") { h.scheduler.trace.to_s.include?("lease_conflict_observed") }
+          h.check("owner completed workflow") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def heartbeat_extension(seed)
+        run(seed, "heartbeat_extension") do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => 2 })
+          h.store.claim_workflow(workflow_id: id, worker_id: "owner", lease_seconds: 20)
+          h.scheduler.schedule(actor: "owner", delay: 15 + h.scheduler.rng.int(5), name: "heartbeat") { h.store.heartbeat(workflow_id: id, worker_id: "owner", lease_seconds: 80) }
+          h.scheduler.schedule(actor: "reaper", delay: 30, name: "steal_before_original_expiry") { h.store.steal_expired_leases! }
+          h.scheduler.schedule(actor: "owner", delay: 35, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "owner").resume(h.workflows.fetch("counter"), workflow_id: id) }
+          h.check("heartbeat prevented premature steal") { h.store.workflow(id).fetch("status") == "completed" }
+          h.check("no lease steal occurred") { !h.scheduler.trace.to_s.include?("steal_expired") }
+        end
+      end
+
+      def completed_step_skip_after_crash(seed)
+        run(seed, "completed_step_skip_after_crash") do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.scheduler.schedule(actor: "crashing-worker", delay: h.scheduler.rng.int(5), name: "crash_after_step_completed") do
+            Durababble::Engine.new(store: h.store, worker_id: "crashing-worker", crash_after: :step_completed).resume(h.workflows.fetch("counter"), workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "crashing-worker", "crashed_after_step_completed", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "reaper", delay: 70, name: "steal") { h.store.steal_expired_leases!(now: h.scheduler.time + 61) }
+          h.scheduler.schedule(actor: "recover", delay: 80, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "recover").resume(h.workflows.fetch("counter"), workflow_id: id) }
+          h.check("completed step was not re-started") { h.scheduler.trace.to_s.scan("step_started").length == 2 }
+          h.check("workflow completed after recovery") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def incomplete_step_retry_after_crash(seed)
+        run(seed, "incomplete_step_retry_after_crash") do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.scheduler.schedule(actor: "crashing-worker", delay: h.scheduler.rng.int(5), name: "crash_after_step_started") do
+            Durababble::Engine.new(store: h.store, worker_id: "crashing-worker", crash_after: :step_started).resume(h.workflows.fetch("counter"), workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "crashing-worker", "crashed_after_step_started", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "reaper", delay: 70, name: "steal") { h.store.steal_expired_leases!(now: h.scheduler.time + 61) }
+          h.scheduler.schedule(actor: "recover", delay: 80, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "recover").resume(h.workflows.fetch("counter"), workflow_id: id) }
+          h.check("incomplete step was retried") { h.store.step_attempts_for(id).map { |attempt| attempt.fetch("status") } == %w[failed completed completed] }
+          h.check("workflow completed after retry") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def attempt_history_append_only(seed)
+        run(seed, "attempt_history_append_only") do |h|
+          h.workflows["flaky"] = Durababble::Workflow.define("flaky") do
+            step("fail") { |_ctx| raise "boom" }
+          end
+          id = h.store.enqueue_workflow(name: "flaky", input: { "seed" => seed })
+          3.times do |i|
+            h.scheduler.schedule(actor: "worker-#{i}", delay: i * 20, name: "attempt") { Durababble::Engine.new(store: h.store, worker_id: "worker-#{i}").resume(h.workflows.fetch("flaky"), workflow_id: id) }
+          end
+          h.check("each retry appended an attempt") { h.store.step_attempts_for(id).length == 3 }
+          h.check("attempts are failed terminal records") { h.store.step_attempts_for(id).all? { |a| a.fetch("status") == "failed" } }
+        end
+      end
+
+      def concurrent_signal_once(seed)
+        run(seed, "concurrent_signal_once") do |h|
+          h.workflows["waiting"] = Durababble::Workflow.define("waiting") do
+            step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            step("done") { |ctx| ctx.merge("done" => true) }
+          end
+          id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "sig" })
+          h.scheduler.schedule(actor: "worker", delay: 1, name: "park") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
+          5.times do |i|
+            h.scheduler.schedule(actor: "signaler-#{i}", delay: 20 + h.scheduler.rng.int(5), name: "signal") { h.store.signal_event("event:sig", payload: { "signaler" => i }) }
+          end
+          h.scheduler.schedule(actor: "worker", delay: 40, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
+          h.check("wait completed once") { h.scheduler.trace.to_s.scan("wait_completed").length == 1 }
+          h.check("workflow completed after signal") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def fenced_side_effect_once(seed)
+        run(seed, "fenced_side_effect_once") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          5.times do |i|
+            h.scheduler.schedule(actor: "caller-#{i}", delay: h.scheduler.rng.int(5), name: "fence") do
+              h.store.with_fence(workflow_id: id, key: "charge") { { "winner" => i } }
+            rescue FenceTimeout
+              h.scheduler.trace.event(h.scheduler.time, "caller-#{i}", "fence_waited")
+            end
+          end
+          h.check("side effect ran once") { h.store.summary.fetch(:side_effects) == 1 }
+        end
+      end
+
+      def crash_after_enqueue(seed) = workflow_durable_before_claim(seed)
+      def crash_after_lease_claim(seed) = lease_expiry(seed)
+      def crash_after_step_started(seed) = incomplete_step_retry_after_crash(seed)
+      def crash_after_step_completed(seed) = completed_step_skip_after_crash(seed)
+      def crash_while_waiting_event(seed) = concurrent_signal_once(seed)
+      def crash_after_outbox_insert(seed) = outbox_lease_expiry(seed)
+      def crash_after_outbox_claim(seed) = outbox_lease_expiry(seed)
+
       def chaos(seed)
         run(seed, "chaos") do |h|
           h.workflows["counter"] = counter_workflow
@@ -591,6 +724,7 @@ module Durababble
         @store = store
         @workflows = {}
         @violations = []
+        @checks = []
       end
 
       def add_workers(ids, ticks:, crash_percent: 0)
@@ -599,7 +733,17 @@ module Durababble
         end
       end
 
+      def check(description, &block)
+        @checks << [description, block]
+      end
+
       def verify!
+        @checks.each do |description, block|
+          violations << "check failed: #{description}" unless block.call
+        rescue StandardError => e
+          violations << "check errored: #{description}: #{e.class}: #{e.message}"
+        end
+
         workflows_state = store.instance_variable_get(:@workflows)
         steps_state = store.instance_variable_get(:@steps)
         attempts_state = store.instance_variable_get(:@attempts)

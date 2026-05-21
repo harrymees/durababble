@@ -1,6 +1,6 @@
 # Durababble specification
 
-This document is the implemented prototype spec. Every item below is covered by explicit integration tests against real local Yugabyte/YSQL. The hardening suite includes multi-connection concurrency tests and a subprocess crash harness.
+This document is the implemented prototype spec. Every item below is covered by explicit integration tests against real local Yugabyte/YSQL. The hardening suite includes multi-connection concurrency tests and a subprocess crash harness. The deterministic simulation suite maps each safety/guarantee row and crash row to one or more virtual scenarios and searches many deterministic seeds.
 
 ## Functional spec
 

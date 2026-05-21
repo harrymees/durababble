@@ -221,6 +221,11 @@ module Durababble
 
     def record_step_started(workflow_id:, position:, name:)
       transaction do
+        execute_params(<<~SQL, [workflow_id, position])
+          UPDATE #{table("step_attempts")}
+          SET status = 'failed', error = 'superseded by retry', completed_at = now()
+          WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+        SQL
         execute_params(<<~SQL, [workflow_id, position, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, started_at, updated_at)
           VALUES ($1, $2, $3, 'running', now(), now())
