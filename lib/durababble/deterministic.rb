@@ -156,10 +156,11 @@ module Durababble
       def migrate! = self
       def close = nil
       def drop_schema! = nil
+      def current_time = scheduler.time
 
       def enqueue_workflow(name:, input:)
         id = next_id("wf")
-        @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil }
+        @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
         trace("enqueue_workflow", id:, name:)
         id
       end
@@ -170,8 +171,8 @@ module Durababble
         id
       end
 
-      def claim_runnable_workflow(worker_id:, lease_seconds:)
-        workflow = @workflows.values.select { |row| runnable?(row) }.min_by { |row| row.fetch("id") }
+      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+        workflow = @workflows.values.select { |row| runnable?(row) && (!workflow_names || workflow_names.include?(row.fetch("name"))) }.min_by { |row| row.fetch("id") }
         return nil unless workflow
 
         claim_row(workflow, worker_id, lease_seconds)
@@ -191,6 +192,32 @@ module Durababble
           row["locked_until"] = scheduler.time + lease_seconds
           trace("heartbeat", id: workflow_id, worker: worker_id)
         end
+      end
+
+      def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+        row = @workflows.fetch(workflow_id)
+        return nil unless row.fetch("locked_by") == worker_id && row.fetch("status") == "running" && !expired?(row)
+
+        row["locked_until"] = scheduler.time + lease_seconds
+        step = @steps[workflow_id][position]
+        return nil unless step&.fetch("status") == "running"
+
+        step["heartbeat_cursor"] = deep(cursor)
+        latest_attempt = @attempts[workflow_id].reverse.find { |attempt| attempt.fetch("position") == position && attempt.fetch("status") == "running" }
+        latest_attempt["heartbeat_cursor"] = deep(cursor) if latest_attempt
+        trace("step_heartbeat", id: workflow_id, position:, worker: worker_id, cursor:)
+        row.fetch("locked_until")
+      end
+
+      def step_heartbeat_cursor(workflow_id:, position:)
+        deep(@steps[workflow_id][position]&.fetch("heartbeat_cursor", nil))
+      end
+
+      def current_workflow_lease(workflow_id)
+        row = @workflows.fetch(workflow_id)
+        return nil unless row.fetch("status") == "running" && row.fetch("locked_by") && !expired?(row)
+
+        { "workflow_id" => workflow_id, "worker_id" => row.fetch("locked_by"), "locked_until" => row.fetch("locked_until") }
       end
 
       def steal_expired_leases!(now: nil)
@@ -215,6 +242,7 @@ module Durababble
         if worker_id
           row["locked_by"] = worker_id
           row["locked_until"] = scheduler.time + lease_seconds
+          row["next_run_at"] = nil
         end
         deep(row)
       end
@@ -226,6 +254,7 @@ module Durababble
         row["error"] = nil
         row["locked_by"] = nil
         row["locked_until"] = nil
+        row["next_run_at"] = nil
         trace("complete_workflow", id: workflow_id, result:)
       end
 
@@ -235,6 +264,7 @@ module Durababble
         row["error"] = error
         row["locked_by"] = nil
         row["locked_until"] = nil
+        row["next_run_at"] = nil
         trace("fail_workflow", id: workflow_id, error:)
       end
 
@@ -245,8 +275,9 @@ module Durababble
           attempt["status"] = "failed"
           attempt["error"] = "superseded by retry"
         end
-        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil }
-        @attempts[workflow_id] << { "id" => next_id("attempt"), "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil }
+        previous_cursor = @steps[workflow_id][position]&.fetch("heartbeat_cursor", nil)
+        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
+        @attempts[workflow_id] << { "id" => next_id("attempt"), "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
         trace("step_started", id: workflow_id, position:, name:)
       end
 
@@ -267,7 +298,7 @@ module Durababble
       end
 
       def record_wait(workflow_id:, position:, name:, wait_request:)
-        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil }
+        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][position]&.fetch("heartbeat_cursor", nil) }
         wait_id = next_id("wait")
         @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => position, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
         update_latest_attempt(workflow_id, position, "waiting", wait_request.context, nil)
@@ -344,6 +375,27 @@ module Durababble
 
       def outbox_message(outbox_id) = deep(@outbox.fetch(outbox_id))
       def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
+      def workflow_owned?(workflow_id:, worker_id:)
+        row = @workflows.fetch(workflow_id)
+        row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
+      end
+
+      def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+        row = @workflows.fetch(workflow_id)
+        return unless row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
+
+        row["status"] = "pending"
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        row["next_run_at"] = run_at
+        trace("workflow_retry_scheduled", id: workflow_id, run_at:)
+      end
+
+      def make_workflow_due!(workflow_id, now: scheduler.time)
+        row = @workflows.fetch(workflow_id)
+        row["next_run_at"] = nil
+        trace("workflow_retry_due", id: workflow_id, now:)
+      end
       def steps_for(workflow_id) = @steps[workflow_id].values.sort_by { |row| row.fetch("position") }.map { |row| deep(row) }
       def step_attempts_for(workflow_id) = @attempts[workflow_id].map { |row| deep(row) }
 
@@ -359,7 +411,8 @@ module Durababble
       private
 
       def runnable?(row)
-        row.fetch("status") == "pending" || row.fetch("status") == "failed" || (row.fetch("status") == "running" && expired?(row))
+        due = row.fetch("next_run_at", nil).nil? || row.fetch("next_run_at") <= scheduler.time
+        due && (row.fetch("status") == "pending" || row.fetch("status") == "failed" || (row.fetch("status") == "running" && expired?(row)))
       end
 
       def expired?(row)
@@ -370,6 +423,7 @@ module Durababble
         row["status"] = "running"
         row["locked_by"] = worker_id
         row["locked_until"] = scheduler.time + lease_seconds
+        row["next_run_at"] = nil
         trace("workflow_claimed", id: row.fetch("id"), worker: worker_id)
         deep(row)
       end
@@ -541,6 +595,141 @@ module Durababble
         end
       end
 
+      def rpc_fault_injection(seed)
+        run(seed, "rpc_fault_injection") do |h|
+          outcomes = %w[success timeout connection_error eof remote_error idle_disconnect_reconnect]
+          outcomes.rotate(h.scheduler.rng.int(outcomes.length)).each_with_index do |outcome, index|
+            h.scheduler.schedule(actor: "rpc-client", delay: index * 3, name: "rpc:#{outcome}") do
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.request", id: index, outcome:)
+              case outcome
+              when "success"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.success", id: index)
+              when "timeout"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.timeout", id: index)
+              when "connection_error"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.connection_error", id: index)
+              when "eof"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.eof", id: index)
+              when "remote_error"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.remote_error", id: index)
+              when "idle_disconnect_reconnect"
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.idle_disconnect", id: index)
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.reconnect", id: index)
+                h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.success", id: index)
+              end
+            end
+          end
+          h.check("success path observed") { h.scheduler.trace.to_s.include?("rpc.success") }
+          h.check("timeout fault observed") { h.scheduler.trace.to_s.include?("rpc.timeout") }
+          h.check("connection fault observed") { h.scheduler.trace.to_s.include?("rpc.connection_error") }
+          h.check("eof fault observed") { h.scheduler.trace.to_s.include?("rpc.eof") }
+          h.check("remote error observed") { h.scheduler.trace.to_s.include?("rpc.remote_error") }
+          h.check("idle disconnect recovery observed") { h.scheduler.trace.to_s.include?("rpc.reconnect") }
+        end
+      end
+
+      def workflow_rpc_lease_change(seed)
+        run(seed, "workflow_rpc_lease_change") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.claim_workflow(workflow_id: id, worker_id: "worker-a", lease_seconds: 10)
+
+          worker_a = workflow_rpc_client(h, "worker-a") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.lookup", target: "worker-a")
+            h.store.steal_expired_leases!(now: 11)
+            h.store.claim_workflow(workflow_id: id, worker_id: "worker-b", lease_seconds: 60)
+            handler = workflow_rpc_handler(h, "worker-a")
+            handler.call(payload)
+          rescue Durababble::WorkflowRpc::StaleLease
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.stale_rejected", stale: "worker-a")
+            raise
+          end
+          worker_b = workflow_rpc_client(h, "worker-b") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.retry_success", target: "worker-b")
+            workflow_rpc_handler(h, "worker-b").call(payload)
+          end
+          router = Durababble::WorkflowRpc::Router.new(store: h.store, rpc_clients: { "worker-a" => worker_a, "worker-b" => worker_b }, retry_on_stale: true)
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "workflow_rpc") do
+            router.request(workflow_id: id, command: "status", payload: { "request" => seed })
+          end
+          h.check("workflow lease moved to worker-b") { h.store.workflow(id).fetch("locked_by") == "worker-b" }
+          h.check("stale holder rejected") { h.scheduler.trace.to_s.include?("workflow_rpc.stale_rejected") }
+          h.check("retry reached new holder") { h.scheduler.trace.to_s.include?("workflow_rpc.retry_success") }
+        end
+      end
+
+      def workflow_rpc_no_active_owner_recovery(seed)
+        run(seed, "workflow_rpc_no_active_owner_recovery") do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.claim_workflow(workflow_id: id, worker_id: "worker-a", lease_seconds: 10)
+
+          worker_a = workflow_rpc_client(h, "worker-a") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.lookup", target: "worker-a")
+            h.store.steal_expired_leases!(now: 11)
+            workflow_rpc_handler(h, "worker-a").call(payload)
+          rescue Durababble::WorkflowRpc::NoActiveLease
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.no_active_holder_rejected", stale: "worker-a")
+            raise
+          end
+          worker_b = workflow_rpc_client(h, "worker-b") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.internal_start_retry_success", target: "worker-b")
+            workflow_rpc_handler(h, "worker-b").call(payload)
+          end
+          starter = Durababble::WorkflowRpc::LeaseStarter.new(store: h.store, worker_ids: ["worker-b"], lease_seconds: 60)
+          router = Durababble::WorkflowRpc::Router.new(store: h.store, rpc_clients: { "worker-a" => worker_a, "worker-b" => worker_b }, retry_on_stale: true, start_workflow: starter)
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "workflow_rpc") do
+            router.request(workflow_id: id, command: "status", payload: { "request" => seed })
+          end
+          h.check("stale no-active RPC rejected") { h.scheduler.trace.to_s.include?("workflow_rpc.no_active_holder_rejected") }
+          h.check("workflow was started internally") { h.store.workflow(id).fetch("locked_by") == "worker-b" }
+          h.check("RPC retried after internal start") { h.scheduler.trace.to_s.include?("workflow_rpc.internal_start_retry_success") }
+        end
+      end
+
+      def workflow_rpc_shutdown_midflight(seed)
+        run(seed, "workflow_rpc_shutdown_midflight") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.claim_workflow(workflow_id: id, worker_id: "worker-a", lease_seconds: 60)
+          worker_a = workflow_rpc_client(h, "worker-a") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.lookup", target: "worker-a")
+            h.store.complete_workflow(id, result: { "shutdown" => true })
+            workflow_rpc_handler(h, "worker-a") do
+              h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.unowned_handler_ran")
+              { "bad" => true }
+            end.call(payload)
+          rescue Durababble::WorkflowRpc::WorkflowNotRunning
+            h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.shutdown_rejected", stale: "worker-a")
+            raise
+          end
+          router = Durababble::WorkflowRpc::Router.new(store: h.store, rpc_clients: { "worker-a" => worker_a }, retry_on_stale: true)
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "workflow_rpc") do
+            begin
+              router.request(workflow_id: id, command: "status", payload: {})
+            rescue Durababble::WorkflowRpc::WorkflowNotRunning
+              h.scheduler.trace.event(h.scheduler.time, "workflow_rpc", "workflow_rpc.no_retry_after_shutdown")
+            end
+          end
+          h.check("shutdown stale RPC rejected") { h.scheduler.trace.to_s.include?("workflow_rpc.shutdown_rejected") }
+          h.check("unowned handler did not run") { !h.scheduler.trace.to_s.include?("workflow_rpc.unowned_handler_ran") }
+        end
+      end
+
+      def workflow_rpc_client(_h, _node_id, &block)
+        Object.new.tap do |client|
+          client.define_singleton_method(:request) do |command, payload|
+            raise Durababble::WorkflowRpc::UnknownCommand, command unless command == "workflow_rpc"
+
+            block.call(payload)
+          end
+        end
+      end
+
+      def workflow_rpc_handler(h, node_id, &handler_block)
+        Durababble::WorkflowRpc::Handler.new(store: h.store, node_id:, handlers: {
+          "status" => (handler_block || ->(payload) { { "node" => node_id, "payload" => payload } })
+        })
+      end
+
       def workflow_durable_before_claim(seed)
         run(seed, "workflow_durable_before_claim") do |h|
           h.workflows["counter"] = counter_workflow
@@ -580,6 +769,66 @@ module Durababble
           h.scheduler.schedule(actor: "owner", delay: 35, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "owner").resume(h.workflows.fetch("counter"), workflow_id: id) }
           h.check("heartbeat prevented premature steal") { h.store.workflow(id).fetch("status") == "completed" }
           h.check("no lease steal occurred") { !h.scheduler.trace.to_s.include?("steal_expired") }
+        end
+      end
+
+      def step_heartbeat_cursor_recovery(seed)
+        run(seed, "step_heartbeat_cursor_recovery") do |h|
+          attempts = []
+          h.workflows["cursor"] = Durababble::Workflow.define("cursor") do
+            step("download") do |_ctx, heartbeat|
+              attempts << heartbeat.cursor
+              if attempts.length == 1
+                heartbeat.record({ "offset" => seed })
+                raise InjectedCrash, "crash after step heartbeat"
+              end
+
+              h.scheduler.trace.event(h.scheduler.time, "worker", "step_heartbeat_resumed", cursor: heartbeat.cursor)
+              { "resumed_from" => heartbeat.cursor.fetch("offset") }
+            end
+          end
+          id = h.store.enqueue_workflow(name: "cursor", input: {})
+          h.scheduler.schedule(actor: "crashing-worker", delay: h.scheduler.rng.int(5), name: "heartbeat_then_crash") do
+            Durababble::Engine.new(store: h.store, worker_id: "crashing-worker", lease_seconds: 10).resume(h.workflows.fetch("cursor"), workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "crashing-worker", "step_heartbeat_crash", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "reaper", delay: 20, name: "steal") { h.store.steal_expired_leases! }
+          h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "recover").resume(h.workflows.fetch("cursor"), workflow_id: id) }
+          h.check("cursor was provided on retry") { attempts == [nil, { "offset" => seed }] }
+          h.check("workflow completed from cursor") { h.store.workflow(id).fetch("result") == { "resumed_from" => seed } }
+        end
+      end
+
+      def step_retry_policy_recovery(seed)
+        run(seed, "step_retry_policy_recovery") do |h|
+          attempts = 0
+          h.workflows["retry"] = Durababble::Workflow.define("retry") do
+            step("flaky", retry_policy: { initial_interval: 10, backoff_coefficient: 2, maximum_interval: 15, maximum_attempts: 3 }) do |ctx|
+              attempts += 1
+              h.scheduler.trace.event(h.scheduler.time, "worker", "step_retry_attempt", attempt: attempts)
+              raise "transient #{attempts}" if attempts < 3
+
+              ctx.merge("attempts" => attempts)
+            end
+          end
+          id = h.store.enqueue_workflow(name: "retry", input: {})
+          h.scheduler.schedule(actor: "worker-a", delay: 1 + h.scheduler.rng.int(3), name: "first_attempt") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker-a").resume(h.workflows.fetch("retry"), workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "worker-b", delay: 8, name: "restart_before_due") do
+            claimed = h.store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: Engine::DEFAULT_LEASE_SECONDS)
+            h.scheduler.trace.event(h.scheduler.time, "worker-b", "step_retry_not_due") unless claimed
+          end
+          h.scheduler.schedule(actor: "worker-b", delay: 20, name: "second_attempt_after_restart") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker-b").resume(h.workflows.fetch("retry"), workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "worker-c", delay: 36, name: "final_attempt_after_restart") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker-c").resume(h.workflows.fetch("retry"), workflow_id: id)
+          end
+          h.check("retry waited for due time") { h.scheduler.trace.to_s.include?("step_retry_not_due") }
+          h.check("workflow completed after durable retries") { h.store.workflow(id).fetch("status") == "completed" }
+          h.check("attempt history records retries") { h.store.step_attempts_for(id).map { |a| a.fetch("status") } == %w[failed failed completed] }
         end
       end
 

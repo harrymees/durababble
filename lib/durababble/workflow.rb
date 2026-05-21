@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 module Durababble
-  Step = Data.define(:name, :handler) do
-    def call(context)
-      handler.call(context)
+  Step = Data.define(:name, :handler, :retry_policy) do
+    def call(context, heartbeat = nil)
+      handler.call(context, heartbeat)
     end
   end
 
@@ -21,10 +21,10 @@ module Durababble
       @steps = []
     end
 
-    def step(name, &block)
+    def step(name, retry_policy: nil, &block)
       raise ArgumentError, "step requires a block" unless block
 
-      @steps << Step.new(name: String(name), handler: block)
+      @steps << Step.new(name: String(name), handler: block, retry_policy: RetryPolicy.from(retry_policy))
     end
   end
 end

@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "securerandom"
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 require "durababble"
 
@@ -22,6 +23,29 @@ STDIN.each_line do |line|
              id = store.enqueue_workflow(name: "rpc", input: payload)
              claimed = store.claim_workflow(workflow_id: id, worker_id: "rpc-worker", lease_seconds: 30)
              { "id" => id, "claimed" => !claimed.nil? }
+           when "enqueue_claim_batch"
+             count = Integer(payload.fetch("count"))
+             start = Integer(payload.fetch("start", 0))
+             ids = count.times.map { SecureRandom.uuid }
+             values_sql = ids.each_index.map do |index|
+               base = index * 4
+               "($#{base + 1}, $#{base + 2}, 'pending', $#{base + 3}::bytea, $#{base + 4}::timestamptz)"
+             end.join(", ")
+             insert_params = ids.each_with_index.flat_map do |id, offset|
+               [id, "rpc", store.send(:dump_serialized, payload.merge("i" => start + offset)), Time.now.utc.iso8601(6)]
+             end
+             q_schema = PG::Connection.quote_ident(schema)
+             store.send(:execute_params, <<~SQL, insert_params)
+               INSERT INTO #{q_schema}.workflows (id, name, status, input, created_at)
+               VALUES #{values_sql}
+             SQL
+             id_placeholders = ids.each_index.map { |index| "$#{index + 2}" }.join(", ")
+             updated = store.send(:execute_params, <<~SQL, ["rpc-worker"] + ids)
+               UPDATE #{q_schema}.workflows
+               SET status = 'running', locked_by = $1, locked_until = now() + interval '30 seconds', updated_at = now()
+               WHERE id IN (#{id_placeholders})
+             SQL
+             { "ids" => ids, "claimed" => updated.cmd_tuples }
            else
              raise ArgumentError, "unknown command #{command}"
            end

@@ -4,17 +4,20 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 
 ## Components
 
-- `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash and returns the next context hash or a wait request.
-- `Durababble::Engine`: creates/resumes runs, enforces workflow lease ownership, records step transitions, handles waits, and skips completed steps during recovery.
+- `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash plus an optional heartbeat object, then returns the next context hash or a wait request. Each step may define a `retry_policy:` using Ruby keyword options modeled after Temporal Activity retry policies.
+- `Durababble::RetryPolicy`: normalizes step retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays.
+- `Durababble::Engine`: creates/resumes runs, enforces workflow lease ownership, records step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
 - `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease.
+- `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
+- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running.
 - `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in `bytea` columns.
 - `exe/durababble`: prototype CLI for migrate/run/inspect/resume of the built-in counter workflow.
 
 ## Storage model
 
-- `workflows`: one row per run; stores status, input, result, errors, and workflow lease owner/deadline.
-- `steps`: one row per workflow step position; stores latest state and result used for resume.
-- `step_attempts`: append-only attempt history for every started step.
+- `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, and `next_run_at` for durably scheduled step retries.
+- `steps`: one row per workflow step position; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
+- `step_attempts`: append-only attempt history for every started step, including the latest heartbeat cursor observed for each attempt.
 - `waits`: durable timer and external-event waits, including context needed to resume.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
@@ -23,18 +26,38 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 
 - Enqueue persists the workflow before work is claimed.
 - Claiming work atomically marks one workflow `running` and writes `locked_by`/`locked_until` using locked queue selection.
-- A heartbeat extends an owned running lease.
+- A workflow heartbeat extends an owned running lease.
+- A step heartbeat (`heartbeat.record(cursor)`) compare-and-swaps against the current workflow lease owner/deadline, extends `locked_until`, and stores an opaque Paquito-serialized cursor on the current step/attempt. If the workflow lease expired or moved, the heartbeat raises `LeaseConflict` instead of reviving a zombie owner.
 - Expired leases are returned to `pending` for recovery.
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
 - Before a step runs, its current step row and a new attempt row are persisted transactionally.
 - After success/failure/wait, the related step and attempt rows are updated transactionally.
+- Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
-- After failure, the current step, attempt, and workflow record the error.
-- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued.
+- After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
+- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, the heartbeat object exposes the latest cursor from the previous incomplete invocation as `heartbeat.cursor`.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
+- Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.
+
+## Application worker lifecycle
+
+`WorkerRuntime` is the intended entrypoint for embedding Durababble in a Rails or similar long-lived app process:
+
+```ruby
+WORKER = Durababble::WorkerRuntime.start(
+  database_url: ENV.fetch("DATABASE_URL"),
+  workflows: MyApp::DurableWorkflows.for_pool("default"),
+  worker_pool: "default",
+  worker_id: "#{Socket.gethostname}-#{Process.pid}"
+)
+
+at_exit { WORKER.shutdown(timeout: 10) }
+```
+
+The runtime only claims workflow names present in its `workflows` registry, so separate pools can run different workflow families without claiming work they cannot execute. Shutdown is cooperative: the loop stops after the current tick and returns `:stopped` if the tick completes before the deadline. If user step code exceeds the deadline, `shutdown` releases this worker's workflow and outbox leases and returns `:timeout`; the still-running thread may later observe `LeaseConflict`, but it cannot commit stale step output because state updates are lease-checked.
 
 ## Benchmarking and query-shape validation
 
