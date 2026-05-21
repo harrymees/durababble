@@ -7,6 +7,7 @@ require_relative "durababble/store"
 require_relative "durababble/engine"
 require_relative "durababble/run"
 require_relative "durababble/worker"
+require_relative "durababble/deterministic"
 
 module Durababble
   class Error < StandardError; end

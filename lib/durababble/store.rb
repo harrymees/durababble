@@ -156,6 +156,12 @@ module Durababble
     end
 
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT * FROM #{table("workflows")}
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+      SQL
+      return decode_row(already_owned) if already_owned
+
       row = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
         UPDATE #{table("workflows")}
         SET status = 'running', error = NULL, locked_by = $2,

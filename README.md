@@ -28,8 +28,10 @@ The local Yugabyte instance used by default is `ybsqlite-vfs-yugabyte`, exposed 
 - Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement.
 - CLI commands: `migrate`, `run-counter`, `inspect`, `resume-counter`, `version`.
 - Comprehensive RSpec integration suite against real Yugabyte plus SimpleCov line/branch thresholds.
+- Silo/mad-turmoil-inspired deterministic simulation suite with virtual clients, worker nodes, network, and Yugabyte store.
 
 See `docs/spec.md` for the implemented spec, guarantee matrix, crash matrix, and coverage standard.
+See `docs/deterministic-testing.md` for deterministic scenario testing and seed search.
 
 ## CLI
 
@@ -38,6 +40,12 @@ exe/durababble migrate --schema durababble
 exe/durababble run-counter --schema durababble --count 2
 exe/durababble inspect RUN_ID --schema durababble
 exe/durababble resume-counter RUN_ID --schema durababble
+```
+
+## Deterministic seed search
+
+```sh
+mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
 ```
 
 ## Example library use
