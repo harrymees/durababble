@@ -19,13 +19,14 @@ Gem::Specification.new do |spec|
   spec.metadata["rubygems_mfa_required"] = "true"
 
   spec.files = Dir.chdir(__dir__) do
-    Dir["lib/**/*", "exe/*", "README.md", "LICENSE.txt"]
+    Dir["lib/**/*", "sig/**/*", "exe/*", "README.md", "LICENSE.txt"]
   end
   spec.bindir = "exe"
   spec.executables = spec.files.grep(%r{\Aexe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
 
   spec.add_dependency "pg", "~> 1.5"
+  spec.add_dependency "mysql2", "~> 0.5"
   spec.add_dependency "paquito", "~> 1.0"
   spec.add_dependency "bigdecimal", "~> 3.2"
   spec.add_development_dependency "rake", "~> 13.2"

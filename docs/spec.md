@@ -1,6 +1,6 @@
 # Durababble specification
 
-This document is the implemented prototype spec. Every item below is covered by explicit integration tests against real local Yugabyte/YSQL. The hardening suite includes multi-connection concurrency tests and a subprocess crash harness. The deterministic simulation suite maps each safety/guarantee row and crash row to one or more virtual scenarios and searches many deterministic seeds. The public API is class-oriented: workflows subclass `Durababble::Workflow`, durable objects subclass `Durababble::DurableObject`, and both use `expose`/`expose_command` for their public callable surface.
+This document specifies Durababble's intended public API and the implemented workflow-runtime guarantees. Workflow durability, crash recovery, and worker coordination rows below are covered by explicit integration tests against real local Yugabyte/YSQL plus deterministic simulation tests. Durable object APIs are implemented at the class/ref/command-row level, while the spec still names the desired actor-style serialization semantics that the durable-object worker path must harden next. The public API is class-oriented: workflows subclass `Durababble::Workflow`, durable objects subclass `Durababble::DurableObject`, and both use `expose`/`expose_command` for their public callable surface.
 
 ## Functional spec
 
@@ -20,8 +20,8 @@ This document is the implemented prototype spec. Every item below is covered by 
 - External event waits via `Durababble.wait_event` and `Store#signal_event`.
 - Side-effect idempotency fences via `Store#with_fence`; the fence is acquired before the block executes so concurrent callers do not duplicate the side effect.
 - Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement. The public workflow/object API does not expose outbox as a first-class concept yet.
-- `expose`/`expose_command` on workflows for public query/command methods against workflow refs. `expose_command` is not a workflow step; it is the public RPC/control surface for a workflow execution.
-- Class-oriented durable object API: durable objects are identity-addressed via `DurableObject.ref(id)`, use `expose` for queries, use `expose_command` for serialized durable commands, and mutate state explicitly with `update_state`. Durable object commands are not workflow steps because the command itself is already the durable boundary.
+- `expose`/`expose_command` on workflows for public query/command methods against workflow refs. `expose_command` is not a workflow step. In the current prototype, workflow ref commands persist durable command events; lease-routed command execution with return values is future work.
+- Class-oriented durable object API: durable objects are identity-addressed via `DurableObject.ref(id)`, use `expose` for queries, use `expose_command` for serialized durable commands, and mutate state explicitly with `update_state`. Durable object commands are not workflow steps because the command itself is already the durable boundary. The spec requires commands for a given object identity to execute one-at-a-time in enqueue order; the prototype currently persists command rows and executes inline while the worker/claim path is hardened.
 - Library-generated idempotency keys for workflow steps and durable object commands, exposed through `step_context.idempotency_key` and `command_context.idempotency_key` respectively. User code can read these keys but does not inject or override them.
 - RBS-style typing with no runtime type overhead. Durababble does not inspect user RBS during execution; workflow and durable object generics are for static tooling.
 - Lease-routed workflow RPC for node-to-node workflow messages: callers route through the current workflow lease holder, receivers re-check lease ownership before and after handling, stale holders reject in-flight RPCs, callers refresh/retry after lease-holder changes, no-active-owner races are handled internally by starting and awaiting a workflow lease before rerouting, and shutdown/non-running workflows are not retried.
@@ -52,18 +52,21 @@ class FulfillOrder < Durababble::Workflow
   end
 
   expose_command def cancel(reason:)
-    cancel_workflow(reason:)
+    # Workflow.ref(run_id).cancel(reason:) records a durable command event.
+    reason
   end
 
-  expose def status
-    workflow_state.status
+  expose def description
+    self.class.workflow_name
   end
 end
 ```
 
-`Workflow.enqueue(input, store:)` creates a durable pending execution. `Engine#run(WorkflowClass, input:)` is the inline convenience path for tests and scripts. `Worker` accepts workflow classes, not old DSL workflow instances. The old `Workflow.define` block DSL is intentionally removed.
+`Workflow.enqueue(input, store:)` creates a durable pending execution. `Engine#run(WorkflowClass, input:)` is the inline convenience path for tests and scripts. `Worker` accepts workflow classes, not old DSL workflow instances. The legacy block DSL is intentionally removed.
 
 `step_context` is available only while a workflow step is executing. It contains `workflow_id`, `step_index`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and are stable across retries of the same logical step.
+
+Workflow exposed commands are currently represented as durable event signals named `workflow:<workflow_id>:command:<method>`. That makes command delivery durable and replay-friendly, but does not yet execute the command method body on the workflow lease owner or return a command result to the caller.
 
 ### Durable objects
 
@@ -86,11 +89,11 @@ class Account < Durababble::DurableObject
 end
 ```
 
-`expose_command` commands are serialized through the durable object's identity, run with `command_context`, and may update state with `update_state(new_state)`. `expose` queries read latest persisted state and should not mutate state. `command_context.idempotency_key` is generated by Durababble and is stable for the durable command.
+The durable-object contract is that `expose_command` commands serialize through the durable object's identity, run with `command_context`, and may update state with `update_state(new_state)`. `expose` queries read latest persisted state and should not mutate state. `command_context.idempotency_key` is generated by Durababble and is stable for the durable command. The current inline prototype records command rows and executes the command immediately; enforcing one-at-a-time object command leasing is required before calling the durable-object runtime complete.
 
 ### Typing
 
-Durababble's runtime does not load or validate user RBS. Types are expressed in `.rbs` files using `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
+Durababble's runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
 
 ## Guarantee matrix
 
@@ -176,6 +179,17 @@ Temporal comparison: Temporal Activities use exponential retry policies by defau
 
 Cloudflare Durable Objects comparison: Durable Objects provide alarms (`setAlarm`/`getAlarm`/`alarm`) as a storage-backed wakeup mechanism. Durababble's `next_run_at` serves the same durable-wakeup role for step retries, but it is integrated into workflow queue claiming rather than exposed as a separate alarm handler.
 
+## Durable object completion criteria
+
+The durable-object API shape exists now, but the desired durable-object runtime is not complete until these semantics are implemented and tested:
+
+- commands for the same `(object_type, object_id)` are claimed and executed one-at-a-time in enqueue order;
+- command state reads and `update_state` writes are protected by the object command lease;
+- incomplete running commands can be recovered after lease expiry;
+- completed commands are idempotent by command id and are not re-executed on retry;
+- queries observe the latest committed object state and never create command rows;
+- object command retry policy uses the same retry options as workflow steps but records retry/final-failure state on `durable_object_commands`.
+
 ## Coverage standard
 
 The suite runs with SimpleCov branch coverage enabled and currently verifies at least:
@@ -195,3 +209,5 @@ Additional explicit prototype boundaries found during faithfulness review:
 - Worker registry misses are avoided for normal worker polling by claiming only workflow names present in the supplied registry. Enqueuing a workflow name with no corresponding worker pool will leave it pending until an appropriate pool is started.
 - Long-running steps do not heartbeat automatically while user code runs, but they can explicitly call the heartbeat object passed as the second step argument. Callers should either choose a `lease_seconds` covering expected step duration or call `heartbeat.record(cursor)` before the lease deadline.
 - CLI coverage is happy-path oriented and not a complete UX/error-contract specification.
+- Workflow `expose_command` currently records durable command events; a full lease-routed workflow command executor with return values is future work.
+- Durable object command rows and inline execution exist, but per-object queue serialization, lease recovery, and worker-driven object command execution are specified desired behavior rather than fully implemented runtime behavior.

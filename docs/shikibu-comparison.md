@@ -1,5 +1,7 @@
 # Durababble vs. Shikibu comparison
 
+> Historical note: this comparison was written before Durababble replaced the old `Workflow.define` context-step DSL with the class-oriented `Durababble::Workflow` / `Durababble::DurableObject` API. Treat old API examples in this document as historical context, not current public API documentation. Current API docs live in `README.md`, `docs/spec.md`, and `docs/architecture.md`.
+
 Date: 2026-05-21
 
 ## Repository snapshots inspected

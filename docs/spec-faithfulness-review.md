@@ -1,5 +1,7 @@
 # Spec faithfulness review
 
+> Historical note: this review predates the class-oriented workflow/durable-object API replacement. It is retained as an implementation archaeology note for the earlier prototype; do not treat rows that mention the old workflow DSL as current API documentation. Current spec content lives in `docs/spec.md`.
+
 Review date: 2026-05-21
 
 ## Executive summary

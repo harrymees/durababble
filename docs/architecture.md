@@ -1,17 +1,87 @@
 # Durababble architecture
 
-Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitions and execution; YugabyteDB/YSQL owns durable coordination and recovery state.
+Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durable-object definitions; YugabyteDB/YSQL owns durable coordination and recovery state.
 
 ## Components
 
-- `Durababble::Workflow`: ordered step DSL. A step receives the previous context hash plus an optional heartbeat object, then returns the next context hash or a wait request. Each step may define a `retry_policy:` using Ruby keyword options modeled after Temporal Activity retry policies.
-- `Durababble::RetryPolicy`: normalizes step retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays.
-- `Durababble::Engine`: creates/resumes runs, enforces workflow lease ownership, records step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
-- `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease.
+- `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
+- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
+- `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
+- `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
+- `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease. The worker registry contains workflow classes.
 - `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
-- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running.
+- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` currently records durable command events rather than executing through this router.
 - `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in `bytea` columns.
+- `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
 - `exe/durababble`: prototype CLI for migrate/run/inspect/resume of the built-in counter workflow.
+
+## Public API model
+
+### Workflows
+
+Workflow classes look like ordinary Ruby objects:
+
+```ruby
+class CounterWorkflow < Durababble::Workflow
+  workflow_name "counter"
+
+  def execute(input)
+    double(increment(input))
+  end
+
+  step def increment(input)
+    { "count" => input.fetch("count") + 1 }
+  end
+
+  step def double(input)
+    { "count" => input.fetch("count") * 2 }
+  end
+end
+```
+
+When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object:
+
+1. assigns the next step position;
+2. returns a persisted result immediately if that position already completed;
+3. records the step start and attempt;
+4. builds `step_context` with a generated idempotency key and heartbeat;
+5. invokes the original Ruby method body;
+6. persists success, wait, retryable failure, or final failure.
+
+This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
+
+Workflow `expose` and `expose_command` define the public ref surface:
+
+```ruby
+workflow = CounterWorkflow.ref(run_id, store:)
+workflow.description
+workflow.cancel(reason: "user request")
+```
+
+In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist command events using `Store#signal_event`. A full command executor that routes to the current lease owner, executes the method body, and returns command results is future work.
+
+### Durable objects
+
+Durable objects are identity-addressed classes with explicit state updates:
+
+```ruby
+class Account < Durababble::DurableObject
+  def initialize_state
+    { "balance_cents" => 0 }
+  end
+
+  expose_command retry: { maximum_attempts: 5 }
+  def credit(amount_cents)
+    update_state("balance_cents" => current_state.fetch("balance_cents") + amount_cents)
+  end
+
+  expose def balance
+    current_state.fetch("balance_cents")
+  end
+end
+```
+
+The desired durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in `durable_object_commands`. The current prototype has the class/ref API, command rows, inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
 
 ## Storage model
 
@@ -21,13 +91,15 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 - `waits`: durable timer and external-event waits, including context needed to resume.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
+- `durable_objects`: latest durable-object state by `(object_type, object_id)`.
+- `durable_object_commands`: persisted object command calls, arguments, result/error, status, and command lease columns.
 
 ## Durability semantics
 
 - Enqueue persists the workflow before work is claimed.
 - Claiming work atomically marks one workflow `running` and writes `locked_by`/`locked_until` using locked queue selection.
 - A workflow heartbeat extends an owned running lease.
-- A step heartbeat (`heartbeat.record(cursor)`) compare-and-swaps against the current workflow lease owner/deadline, extends `locked_until`, and stores an opaque Paquito-serialized cursor on the current step/attempt. If the workflow lease expired or moved, the heartbeat raises `LeaseConflict` instead of reviving a zombie owner.
+- A step heartbeat (`step_context.heartbeat.record(cursor)`) compare-and-swaps against the current workflow lease owner/deadline, extends `locked_until`, and stores an opaque Paquito-serialized cursor on the current step/attempt. If the workflow lease expired or moved, the heartbeat raises `LeaseConflict` instead of reviving a zombie owner.
 - Expired leases are returned to `pending` for recovery.
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
 - Before a step runs, its current step row and a new attempt row are persisted transactionally.
@@ -35,7 +107,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow definitio
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
-- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, the heartbeat object exposes the latest cursor from the previous incomplete invocation as `heartbeat.cursor`.
+- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
