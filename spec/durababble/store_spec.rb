@@ -36,7 +36,7 @@ RSpec.describe Durababble::Store, :integration do
         SELECT table_name, column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = $1
-          AND column_name IN ('input', 'result', 'context', 'payload')
+          AND column_name IN ('input', 'result', 'context', 'payload', 'heartbeat_cursor')
         ORDER BY table_name, column_name
       SQL
     end
@@ -45,6 +45,8 @@ RSpec.describe Durababble::Store, :integration do
       ["workflows", "input", "bytea"],
       ["workflows", "result", "bytea"],
       ["steps", "result", "bytea"],
+      ["steps", "heartbeat_cursor", "bytea"],
+      ["step_attempts", "heartbeat_cursor", "bytea"],
       ["waits", "context", "bytea"],
       ["outbox", "payload", "bytea"]
     )
@@ -72,12 +74,41 @@ RSpec.describe Durababble::Store, :integration do
 
     expect(indexes).to include(
       "workflows_queue_idx",
+      "workflows_runnable_due_idx",
       "workflows_expired_lease_idx",
       "waits_event_pending_idx",
       "waits_timer_pending_idx",
+      "waits_workflow_created_idx",
+      "step_attempts_workflow_started_position_idx",
+      "step_attempts_workflow_position_status_started_idx",
       "outbox_queue_idx",
       "outbox_expired_lease_idx"
     )
+  end
+
+  it "does not claim work when a worker pool has no registered workflow names" do
+    store.migrate!
+    workflow_id = store.enqueue_workflow(name: "unserved", input: {})
+
+    expect(store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 60, workflow_names: [])).to be_nil
+    expect(store.workflow(workflow_id)).to include("status" => "pending", "locked_by" => nil)
+  end
+
+  it "reports missing workflow/lease/cursor lookups as absent" do
+    store.migrate!
+
+    expect { store.workflow("missing") }.to raise_error(KeyError, /missing/)
+    expect(store.current_workflow_lease("missing")).to be_nil
+    expect(store.step_heartbeat_cursor(workflow_id: "missing", position: 0)).to be_nil
+  end
+
+  it "can mark a workflow running under a concrete worker lease" do
+    store.migrate!
+    workflow_id = store.enqueue_workflow(name: "demo", input: {})
+
+    store.mark_workflow_running(workflow_id, worker_id: "owner", lease_seconds: 60)
+
+    expect(store.current_workflow_lease(workflow_id)).to include("worker_id" => "owner")
   end
 
   it "migrates legacy JSONB runtime columns into Paquito bytea columns" do

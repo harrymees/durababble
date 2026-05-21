@@ -8,7 +8,7 @@ require "time"
 
 module Durababble
   class Store
-    SERIALIZED_COLUMNS = %w[input result payload context].freeze
+    SERIALIZED_COLUMNS = %w[input result payload context heartbeat_cursor].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
 
 
@@ -35,12 +35,14 @@ module Durababble
           error text,
           locked_by text,
           locked_until timestamptz,
+          next_run_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       SQL
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_by text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -49,12 +51,14 @@ module Durababble
           status text NOT NULL,
           result bytea,
           error text,
+          heartbeat_cursor bytea,
           started_at timestamptz,
           completed_at timestamptz,
           updated_at timestamptz NOT NULL DEFAULT now(),
           PRIMARY KEY (workflow_id, position)
         )
       SQL
+      execute("ALTER TABLE #{table("steps")} ADD COLUMN IF NOT EXISTS heartbeat_cursor bytea")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("step_attempts")} (
           id text PRIMARY KEY,
@@ -64,10 +68,12 @@ module Durababble
           status text NOT NULL,
           result bytea,
           error text,
+          heartbeat_cursor bytea,
           started_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz
         )
       SQL
+      execute("ALTER TABLE #{table("step_attempts")} ADD COLUMN IF NOT EXISTS heartbeat_cursor bytea")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("waits")} (
           id text PRIMARY KEY,
@@ -145,20 +151,51 @@ module Durababble
       id
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:)
-      row = execute_params(<<~SQL, [worker_id, lease_seconds]).first
-        UPDATE #{table("workflows")}
-        SET status = 'running', locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), updated_at = now()
-        WHERE id = (
-          SELECT id FROM #{table("workflows")}
-          WHERE status IN ('pending', 'failed')
-             OR (status = 'running' AND locked_until < now())
-          ORDER BY created_at
-          LIMIT 1
-          FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-      SQL
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+      return nil if workflow_names&.empty?
+
+      name_filter = workflow_name_filter(workflow_names)
+      row = retry_serialization_failures do
+        transaction do
+          candidates = []
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("workflows")}
+            WHERE status = 'pending'
+              AND (next_run_at IS NULL OR next_run_at <= now())
+              #{name_filter}
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("workflows")}
+            WHERE status = 'failed'
+              AND (next_run_at IS NULL OR next_run_at <= now())
+              #{name_filter}
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("workflows")}
+            WHERE status = 'running' AND locked_until < now()
+              #{name_filter}
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+
+          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          next nil unless candidate
+
+          execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
+            UPDATE #{table("workflows")}
+            SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+            WHERE id = $1
+            RETURNING *
+          SQL
+        end
+      end
       decode_row(row) if row
     end
 
@@ -172,7 +209,7 @@ module Durababble
       row = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
         UPDATE #{table("workflows")}
         SET status = 'running', error = NULL, locked_by = $2,
-            locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+            locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1
           AND (
             status IN ('pending', 'failed')
@@ -189,6 +226,90 @@ module Durababble
         SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running'
       SQL
+    end
+
+    def workflow_owned?(workflow_id:, worker_id:)
+      !!execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT 1
+        FROM #{table("workflows")}
+        WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
+      SQL
+    end
+
+    def release_worker_leases!(worker_id:)
+      transaction do
+        workflows = execute_params(<<~SQL, [worker_id]).cmd_tuples
+          UPDATE #{table("workflows")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE status = 'running' AND locked_by = $1
+        SQL
+        outbox = execute_params(<<~SQL, [worker_id]).cmd_tuples
+          UPDATE #{table("outbox")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL
+          WHERE status = 'processing' AND locked_by = $1
+        SQL
+        { "workflows" => workflows, "outbox" => outbox }
+      end
+    end
+
+    def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+      execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
+        UPDATE #{table("workflows")}
+        SET status = 'pending', locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, updated_at = now()
+        WHERE id = $1 AND status = 'running' AND locked_by = $2
+      SQL
+    end
+
+    def make_workflow_due!(workflow_id, now: Time.now)
+      execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = $2::timestamptz WHERE id = $1", [workflow_id, timestamp(now)])
+    end
+
+    def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+      renewed = transaction do
+        workflow = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
+          UPDATE #{table("workflows")}
+          SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+          WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
+          RETURNING locked_until
+        SQL
+        next nil unless workflow
+
+        serialized_cursor = dump_serialized(cursor)
+        step = execute_params(<<~SQL, [workflow_id, position, serialized_cursor]).first
+          UPDATE #{table("steps")}
+          SET heartbeat_cursor = $3::bytea, updated_at = now()
+          WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+          RETURNING heartbeat_cursor
+        SQL
+        next nil unless step
+
+        execute_params(<<~SQL, [workflow_id, position, serialized_cursor])
+          UPDATE #{table("step_attempts")}
+          SET heartbeat_cursor = $3::bytea
+          WHERE id = (
+            SELECT id FROM #{table("step_attempts")}
+            WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+            ORDER BY started_at DESC
+            LIMIT 1
+          )
+        SQL
+        workflow
+      end
+      renewed&.fetch("locked_until")
+    end
+
+    def step_heartbeat_cursor(workflow_id:, position:)
+      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = $1 AND position = $2", [workflow_id, position]).first
+      decode_row(row).fetch("heartbeat_cursor") if row
+    end
+
+    def current_workflow_lease(workflow_id)
+      row = execute_params(<<~SQL, [workflow_id]).first
+        SELECT id AS workflow_id, locked_by AS worker_id, locked_until
+        FROM #{table("workflows")}
+        WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+      SQL
+      row&.transform_values(&:itself)
     end
 
     def steal_expired_leases!(now: Time.now)
@@ -214,14 +335,14 @@ module Durababble
 
     def complete_workflow(workflow_id, result:)
       execute_params(
-        "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1",
+        "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
         [workflow_id, dump_serialized(result)]
       )
     end
 
     def fail_workflow(workflow_id, error:)
       execute_params(
-        "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1",
+        "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
         [workflow_id, error]
       )
     end
@@ -344,18 +465,35 @@ module Durababble
     end
 
     def claim_outbox(worker_id:, lease_seconds:)
-      row = execute_params(<<~SQL, [worker_id, lease_seconds]).first
-        UPDATE #{table("outbox")}
-        SET status = 'processing', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
-        WHERE id = (
-          SELECT id FROM #{table("outbox")}
-          WHERE status = 'pending' OR (status = 'processing' AND locked_until < now())
-          ORDER BY created_at
-          LIMIT 1
-          FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-      SQL
+      row = retry_serialization_failures do
+        transaction do
+          candidates = []
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("outbox")}
+            WHERE status = 'pending'
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("outbox")}
+            WHERE status = 'processing' AND locked_until < now()
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+
+          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          next nil unless candidate
+
+          execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
+            UPDATE #{table("outbox")}
+            SET status = 'processing', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
+            WHERE id = $1
+            RETURNING *
+          SQL
+        end
+      end
       decode_row(row) if row
     end
 
@@ -391,9 +529,12 @@ module Durababble
           UPDATE #{table("waits")}
           SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
           WHERE id IN (
-            SELECT id FROM #{table("waits")}
-            WHERE status = 'pending' AND #{where_sql}
-            FOR UPDATE SKIP LOCKED
+            SELECT w.id FROM #{table("waits")} AS w
+            JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
+            WHERE w.status = 'pending'
+              AND wf.status = 'waiting'
+              AND #{where_sql}
+            FOR UPDATE OF w, wf SKIP LOCKED
           )
           RETURNING *
         SQL
@@ -401,7 +542,7 @@ module Durababble
         rows.each do |wait|
           context = wait.fetch("context").merge(payload)
           record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
-          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [wait.fetch("workflow_id")])
+          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         rows.length
       end
@@ -441,6 +582,19 @@ module Durababble
       SQL
     end
 
+    def retry_serialization_failures(max_attempts: 5)
+      attempts = 0
+      begin
+        yield
+      rescue PG::TRSerializationFailure
+        attempts += 1
+        raise if attempts >= max_attempts
+
+        sleep(0.001 * attempts)
+        retry
+      end
+    end
+
     def execute(sql)
       @connection.exec(sql)
     end
@@ -451,6 +605,13 @@ module Durababble
 
     def execute_params(sql, params)
       @connection.exec_params(sql, params)
+    end
+
+    def workflow_name_filter(workflow_names)
+      return "" unless workflow_names
+
+      names = workflow_names.map { |name| @connection.escape_literal(name) }.join(", ")
+      "AND name IN (#{names})"
     end
 
     def table(name)
@@ -481,7 +642,9 @@ module Durababble
       migrate_serialized_column!("workflows", "input", not_null: true)
       migrate_serialized_column!("workflows", "result")
       migrate_serialized_column!("steps", "result")
+      migrate_serialized_column!("steps", "heartbeat_cursor")
       migrate_serialized_column!("step_attempts", "result")
+      migrate_serialized_column!("step_attempts", "heartbeat_cursor")
       migrate_serialized_column!("waits", "context", not_null: true)
       migrate_serialized_column!("waits", "payload")
       migrate_serialized_column!("fences", "result")
@@ -490,11 +653,15 @@ module Durababble
 
     def create_performance_indexes!
       execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (locked_until) WHERE status = 'running'")
-      execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (event_key, created_at) WHERE kind = 'event' AND status = 'pending'")
-      execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (wake_at, created_at) WHERE kind = 'timer' AND status = 'pending'")
+      execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
+      execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, kind, event_key, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, kind, wake_at, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
+      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
       execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (locked_until) WHERE status = 'processing'")
+      execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
     end
 
     def migrate_serialized_column!(table_name, column_name, not_null: false)

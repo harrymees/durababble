@@ -108,7 +108,8 @@ module Durababble
           Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
           Operation.new(name: "large_table_signal_miss", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "event-signal miss against a large pending wait set", block: method(:bench_large_table_signal_miss)),
           Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
-          Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim))
+          Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
+          Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch))
         ]
       end
 
@@ -355,6 +356,11 @@ module Durababble
         raise "rpc enqueue_claim failed" unless response.fetch("claimed")
       end
 
+      def bench_rpc_enqueue_claim_batch(i, warmup:)
+        response = rpc.request("enqueue_claim_batch", "start" => i * 10, "count" => 10, "warmup" => warmup)
+        raise "rpc enqueue_claim_batch failed" unless response.fetch("claimed") == 10
+      end
+
       def worker_for(worker_id, workflow)
         @workers ||= {}
         @workers[[worker_id, workflow.name]] ||= Durababble::Worker.new(
@@ -447,7 +453,11 @@ module Durababble
       end
 
       def rpc
-        @rpc ||= RpcClient.new(database_url: @database_url, schema: @schema)
+        @rpc ||= Durababble::RpcClient.spawn(
+          command: [RbConfig.ruby, File.expand_path("rpc_worker.rb", __dir__)],
+          env: { "DURABABBLE_DATABASE_URL" => @database_url, "DURABABBLE_BENCH_SCHEMA" => @schema },
+          timeout: 10
+        )
       end
 
       def environment
@@ -498,37 +508,6 @@ module Durababble
       end
     end
 
-    class RpcClient
-      def initialize(database_url:, schema:)
-        @stdin, @stdout, @wait_thr = Open3.popen2e({ "DURABABBLE_DATABASE_URL" => database_url, "DURABABBLE_BENCH_SCHEMA" => schema }, RbConfig.ruby, File.expand_path("rpc_worker.rb", __dir__))
-      end
-
-      def request(command, payload = {})
-        @stdin.puts(JSON.generate({ command:, payload: }))
-        @stdin.flush
-        loop do
-          line = @stdout.gets
-          raise "rpc worker exited" unless line
-          next unless line.start_with?("{")
-
-          response = JSON.parse(line)
-          raise response.fetch("error") unless response.fetch("ok")
-          return response.fetch("result")
-        end
-      end
-
-      def close
-        @stdin.close unless @stdin.closed?
-        return if @wait_thr.join(1)
-
-        Process.kill("TERM", @wait_thr.pid)
-        @wait_thr.join(1)
-      rescue StandardError
-        nil
-      ensure
-        @stdout.close unless @stdout.closed?
-      end
-    end
   end
 end
 

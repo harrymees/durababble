@@ -1,12 +1,14 @@
 # frozen_string_literal: true
 
 require_relative "durababble/version"
+require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/wait_request"
 require_relative "durababble/store"
 require_relative "durababble/engine"
 require_relative "durababble/run"
 require_relative "durababble/worker"
+require_relative "durababble/worker_runtime"
 require_relative "durababble/deterministic"
 
 module Durababble
@@ -23,3 +25,6 @@ module Durababble
     WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
   end
 end
+
+require_relative "durababble/rpc_client"
+require_relative "durababble/workflow_rpc"

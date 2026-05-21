@@ -13,9 +13,12 @@ The main divergences found are smaller but important correctness details:
 1. **Implementation bug: generic row decoding parsed every text column as JSON.** Text values like workflow names, topics, keys, and error strings could be type-corrupted if they happened to look like JSON (`"123"`, `"true"`, `"null"`, `{...}`). The implementation should decode only known JSON/JSONB columns.
 2. **Implementation bug: JSON serialization collapsed `false` and `nil` to `{}`.** `dump_json(value || {})` made `false` indistinguishable from `{}`. The implementation should preserve all JSON values and only default nil where the schema/DSL intentionally requires object context.
 3. **Spec gap: fence crash recovery is underspecified.** `with_fence` acquires before executing the side effect and prevents concurrent duplicate blocks, matching the current spec, but if the owner process dies mid-block, the fence remains `running` until callers time out. The table has `locked_until`, but no takeover/retry semantics. This should either become an explicit prototype boundary or be added to the guarantee matrix later.
-4. **Spec/test gap: worker behavior for unknown workflow names is unspecified.** `Worker#tick` fetches from the workflow registry and can raise after claiming a row, leaving it leased until expiry. The spec says workers poll workflows, but not how registry misses behave. For the prototype, update the spec boundary rather than inventing a policy in this pass.
+4. **Resolved worker-pool boundary: worker behavior for unknown workflow names is now avoided during normal polling.** `Worker#tick` asks the store to claim only workflow names present in the supplied registry, so a pool does not lease work it cannot execute. Workflows with no matching pool remain pending until an appropriate pool starts.
 5. **Test gap: CLI coverage is happy-path only.** It verifies migrate/run/inspect/resume, but not bad commands, missing IDs, or schema/database errors. This is acceptable for prototype scope but not comprehensive CLI behavior.
 6. **Test gap: heartbeats and acknowledgements check positive paths more than negative ownership results.** Lease ownership and outbox ownership are mostly tested through behavior, but return values/cmd tuple effects are not exposed by public API. This is acceptable, though future APIs should return booleans for owner-sensitive mutations.
+
+7. **Spec gap found after initial review: lease-routed workflow RPC was not specified.** The spec covered workflow leases, lease-aware resume, and generic process-boundary command RPC benchmarks, but it did not specify node-to-node workflow RPC routing through the current lease holder or stale in-flight behavior when leases move/shutdown occurs. This was a spec gap, not an implementation drift from an existing requirement. It is now covered by `WorkflowRpc`, `Store#current_workflow_lease`, unit tests, query-plan coverage, and DST scenarios.
+8. **Step retry policy scope is now explicit.** Durababble implements Temporal Activity-style retry options at the step boundary (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors`) and persists retry wakeups with `workflows.next_run_at`. It does not yet specify workflow-level retry policies; that remains future work, consistent with Temporal's distinction between Activity retry defaults and explicit Workflow Execution retry policy.
 
 ## Spec row-by-row assessment
 
@@ -27,7 +30,7 @@ The main divergences found are smaller but important correctness details:
 | Durable workflow and step rows | Faithful | No change. |
 | Append-only attempt history | Mostly faithful | Records are appended, terminal statuses are updated in-place. The wording is acceptable because attempts remain as records, but avoid implying immutable event sourcing. |
 | Runnable workflow queue via pending rows | Faithful | No change. |
-| Worker polling | Faithful for registered workflow names | Spec boundary should state registry misses are not yet handled gracefully. |
+| Worker polling | Faithful for registered workflow names; normal polling filters claims to the worker registry | Workflows with no matching worker pool remain pending until a suitable pool starts. |
 | Distributed workflow leases | Mostly faithful | Claims use `FOR UPDATE SKIP LOCKED`; execution itself relies on lease ownership at start and does not heartbeat automatically. Prototype boundary should keep long-running step heartbeat out of scope. |
 | Lease-aware resume | Faithful | No change. |
 | Heartbeat extension | Faithful | Test coverage adequate, but public return value could improve later. |
@@ -63,4 +66,4 @@ The main divergences found are smaller but important correctness details:
 - Add real-Yugabyte regression tests for JSON/text decoding and JSON value preservation.
 - Fix `Store#decode_row` to decode only JSON columns instead of all text columns.
 - Fix `Store#dump_json` to preserve `false` and explicit `nil` instead of coercing falsey values to `{}`.
-- Update docs to mark fence-owner crash recovery and unknown workflow registry misses as prototype boundaries.
+- Update docs to mark fence-owner crash recovery as a prototype boundary and document worker-pool claim filtering for registry misses.

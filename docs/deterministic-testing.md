@@ -32,6 +32,8 @@ Current scenarios:
 - `workflow_durable_before_claim` — enqueue survives before any worker claim.
 - `lease_conflict` — non-owning workers cannot resume a live lease.
 - `heartbeat_extension` — owner heartbeat prevents premature expired-lease stealing.
+- `step_heartbeat_cursor_recovery` — an invocation heartbeats an opaque cursor, crashes before step completion, lease expiry recovery retries the step, and the next invocation receives the prior cursor.
+- `step_retry_policy_recovery` — a flaky step fails under a configured retry policy, stores durable `next_run_at` retry delays, cannot be claimed before the due time by a restarted worker, and eventually completes under a later worker with append-only failed/failed/completed attempts.
 - `lease_expiry` — a crashed worker's workflow lease expires and another worker recovers it.
 - `completed_step_skip_after_crash` — a completed step is skipped after crash/recovery.
 - `incomplete_step_retry_after_crash` — a step that crashed after start is retried and stale attempts are closed.
@@ -42,9 +44,17 @@ Current scenarios:
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
+- `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
+- `workflow_rpc_lease_change` — a workflow RPC races with lease expiry and a new owner; stale receiver rejects and caller retries to the fresh holder.
+- `workflow_rpc_no_active_owner_recovery` — a workflow RPC races with lease expiry and no replacement owner exists yet; the router starts and awaits a new workflow lease internally, then reroutes the original RPC to the fresh holder without requiring caller-visible retry.
+- `workflow_rpc_shutdown_midflight` — a workflow RPC races with workflow completion/shutdown; stale receiver rejects and the unowned handler does not run.
 - `bug_duplicate_completion` — intentionally broken fixture used to prove invariant detection reports violations.
 
 The RSpec matrix maps each guarantee/safety condition and each crash matrix row to one or more scenarios and searches seeds `1..100` for each mapped scenario.
+
+## Spec gap found during workflow RPC review
+
+The original prototype spec covered distributed workflow leases and lease-aware `Engine#resume`, but it did not define node-to-node workflow RPC routing through the current lease holder. That was a spec gap rather than a known implementation mismatch: there was no `WorkflowRpc` component, no `current_workflow_lease` API, and no matrix row for the race where a caller looks up an owner, sends an RPC, and the lease expires or workflow shuts down in flight. The gap is now explicit in `docs/spec.md` and pinned by the `workflow_rpc_lease_change` and `workflow_rpc_shutdown_midflight` scenarios plus ordinary workflow RPC unit specs.
 
 ## Seed search
 

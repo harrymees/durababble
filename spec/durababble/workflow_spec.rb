@@ -13,4 +13,17 @@ RSpec.describe Durababble::Workflow do
     expect(workflow.steps.map(&:name)).to eq(["reserve_inventory", "charge_card"])
     expect(workflow.steps.first.call({ sku: "sku-1" })).to eq("sku-1")
   end
+
+  it "can define an empty workflow without a DSL block" do
+    workflow = described_class.define(:empty)
+
+    expect(workflow.name).to eq("empty")
+    expect(workflow.steps).to eq([])
+  end
+
+  it "rejects steps without executable handlers" do
+    workflow = described_class.new("broken")
+
+    expect { workflow.step("missing_handler") }.to raise_error(ArgumentError, /step requires a block/)
+  end
 end

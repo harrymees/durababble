@@ -11,7 +11,7 @@ module Durababble
     end
 
     def tick
-      claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds)
+      claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)
       return :idle unless claimed
 
       workflow = @workflows.fetch(claimed.fetch("name"))

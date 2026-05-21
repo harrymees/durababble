@@ -8,6 +8,8 @@ RSpec.describe "Durababble deterministic simulation harness" do
     "runnable work is claimable by one worker at a time" => %w[multi_worker_counter],
     "resume honors lease ownership" => %w[lease_conflict],
     "active leases can be heartbeated" => %w[heartbeat_extension],
+    "step heartbeats persist opaque cursors for retry" => %w[step_heartbeat_cursor_recovery],
+    "step retry policies schedule durable retries across restarts" => %w[step_retry_policy_recovery],
     "expired leases can be recovered" => %w[lease_expiry],
     "completed steps are not re-executed on resume" => %w[completed_step_skip_after_crash],
     "incomplete steps are retried" => %w[incomplete_step_retry_after_crash],
@@ -19,17 +21,22 @@ RSpec.describe "Durababble deterministic simulation harness" do
     "concurrent signalers wake a wait once" => %w[concurrent_signal_once],
     "side effects can be fenced by key" => %w[fenced_side_effect_once waits_fences_and_outbox],
     "outbox delivery is durable and leased" => %w[outbox_lease_expiry waits_fences_and_outbox],
-    "multi-row state transitions remain coherent under recovery" => %w[completed_step_skip_after_crash incomplete_step_retry_after_crash chaos]
+    "multi-row state transitions remain coherent under recovery" => %w[completed_step_skip_after_crash incomplete_step_retry_after_crash chaos],
+    "internal RPC clients surface timeout, connection, EOF, and remote failures" => %w[rpc_fault_injection],
+    "lease-routed workflow RPCs reject stale holders and recover after mid-flight lease changes" => %w[workflow_rpc_lease_change workflow_rpc_shutdown_midflight workflow_rpc_no_active_owner_recovery]
   }.freeze
 
   CRASH_MATRIX_SCENARIOS = {
     "after enqueue before claim" => %w[crash_after_enqueue],
     "after lease claim before step start" => %w[crash_after_lease_claim],
     "after step start before step completion" => %w[crash_after_step_started],
+    "after step heartbeat before step completion" => %w[step_heartbeat_cursor_recovery],
+    "after step failure before retry due time" => %w[step_retry_policy_recovery],
     "after step completion before workflow completion" => %w[crash_after_step_completed],
     "while waiting for an event" => %w[crash_while_waiting_event],
     "after outbox insert before delivery" => %w[crash_after_outbox_insert],
-    "after outbox claim before ack" => %w[crash_after_outbox_claim]
+    "after outbox claim before ack" => %w[crash_after_outbox_claim],
+    "during lease-routed workflow RPC" => %w[workflow_rpc_lease_change workflow_rpc_shutdown_midflight workflow_rpc_no_active_owner_recovery]
   }.freeze
 
   def expect_scenarios_hold(matrix, seeds: 1..100)
@@ -96,6 +103,56 @@ RSpec.describe "Durababble deterministic simulation harness" do
     expect(result.trace).to include("network.drop")
     expect(result.trace).to include("heal")
     expect(result.trace).to include("wait_completed")
+  end
+
+  it "models internal RPC timeout, connection error, EOF, and remote error faults" do
+    result = Durababble::Deterministic.prove("rpc_fault_injection", seed: 42)
+
+    expect(result.violations).to be_empty
+    expect(result.trace).to include("rpc.timeout")
+    expect(result.trace).to include("rpc.connection_error")
+    expect(result.trace).to include("rpc.eof")
+    expect(result.trace).to include("rpc.remote_error")
+    expect(result.trace).to include("rpc.reconnect")
+    expect(result.trace).to include("rpc.success")
+  end
+
+  it "models lease-routed workflow RPCs across happy, mid-flight lease change, and shutdown paths" do
+    changed = Durababble::Deterministic.prove("workflow_rpc_lease_change", seed: 42)
+    shutdown = Durababble::Deterministic.prove("workflow_rpc_shutdown_midflight", seed: 43)
+    no_active = Durababble::Deterministic.prove("workflow_rpc_no_active_owner_recovery", seed: 44)
+
+    expect(changed.violations).to be_empty
+    expect(changed.trace).to include("workflow_rpc.lookup")
+    expect(changed.trace).to include("workflow_rpc.stale_rejected")
+    expect(changed.trace).to include("workflow_rpc.retry_success")
+    expect(shutdown.violations).to be_empty
+    expect(shutdown.trace).to include("workflow_rpc.shutdown_rejected")
+    expect(shutdown.trace).not_to include("workflow_rpc.unowned_handler_ran")
+    expect(no_active.violations).to be_empty
+    expect(no_active.trace).to include("workflow_rpc.no_active_holder_rejected")
+    expect(no_active.trace).to include("workflow_rpc.internal_start_retry_success")
+    expect(no_active.summary.fetch(:completed_workflows)).to eq(0)
+  end
+
+  it "models step heartbeat cursor recovery after a crashed invocation" do
+    result = Durababble::Deterministic.prove("step_heartbeat_cursor_recovery", seed: 45)
+
+    expect(result.violations).to be_empty
+    expect(result.trace).to include("step_heartbeat")
+    expect(result.trace).to include("step_heartbeat_crash")
+    expect(result.trace).to include("step_heartbeat_resumed")
+    expect(result.summary.fetch(:completed_workflows)).to eq(1)
+  end
+
+  it "models configured step retry schedules across process restarts" do
+    result = Durababble::Deterministic.prove("step_retry_policy_recovery", seed: 46)
+
+    expect(result.violations).to be_empty
+    expect(result.trace).to include("workflow_retry_scheduled")
+    expect(result.trace).to include("step_retry_not_due")
+    expect(result.trace.scan("step_retry_attempt").length).to eq(3)
+    expect(result.summary.fetch(:completed_workflows)).to eq(1)
   end
 
   it "reports deterministic invariant violations for intentionally broken scenarios" do

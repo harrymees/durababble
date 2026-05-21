@@ -1,6 +1,14 @@
 # frozen_string_literal: true
 
 module Durababble
+  Heartbeat = Data.define(:cursor, :recorder) do
+    def record(cursor)
+      recorder.call(cursor)
+    end
+
+    alias heartbeat record
+  end
+
   class Engine
     DEFAULT_LEASE_SECONDS = 60
 
@@ -44,30 +52,64 @@ module Durababble
 
         @store.record_step_started(workflow_id:, position:, name: step.name)
         crash!(:step_started)
+        heartbeat = Heartbeat.new(
+          cursor: @store.step_heartbeat_cursor(workflow_id:, position:),
+          recorder: lambda do |cursor|
+            renewed = @store.heartbeat_step(workflow_id:, position:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
+            raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before heartbeat" unless renewed
+
+            true
+          end
+        )
         begin
-          output = step.call(context)
+          output = step.call(context, heartbeat)
           if output.is_a?(WaitRequest)
+            assert_workflow_lease!(workflow_id)
             @store.record_wait(workflow_id:, position:, name: step.name, wait_request: output)
             crash!(:wait_recorded)
             return snapshot(workflow_id)
           end
 
           context = output
+          assert_workflow_lease!(workflow_id)
           @store.record_step_completed(workflow_id:, position:, result: context)
           crash!(:step_completed)
         rescue StandardError => e
-          raise if e.is_a?(InjectedCrash)
+          raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
           message = "#{e.class}: #{e.message}"
+          assert_workflow_lease!(workflow_id)
           @store.record_step_failed(workflow_id:, position:, error: message)
-          @store.fail_workflow(workflow_id, error: message)
+          if step.retry_policy.retryable?(e, attempt_number: attempt_number(workflow_id, position))
+            delay = step.retry_policy.delay_for_attempt(attempt_number(workflow_id, position))
+            @store.schedule_workflow_retry(workflow_id:, worker_id: @worker_id, run_at: retry_run_at(delay))
+          else
+            @store.fail_workflow(workflow_id, error: message)
+          end
           return snapshot(workflow_id)
         end
       end
 
+      assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result: context)
       crash!(:workflow_completed)
       snapshot(workflow_id)
+    end
+
+    def assert_workflow_lease!(workflow_id)
+      return unless @store.respond_to?(:workflow_owned?)
+      return if @store.workflow_owned?(workflow_id:, worker_id: @worker_id)
+
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
+    end
+
+    def attempt_number(workflow_id, position)
+      @store.step_attempts_for(workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
+    end
+
+    def retry_run_at(delay)
+      base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
+      base + delay
     end
 
     def initial_context(workflow_id)
