@@ -52,7 +52,8 @@ RSpec.describe Durababble::WorkerRuntime, :integration do
   end
 
   it "is idempotent when started more than once and stopped more than once" do
-    runtime = described_class.new(store: RuntimeBranchStore.new, workflows: {}, worker_pool: "default", poll_interval: 0.01, migrate: false)
+    store = RuntimeBranchStore.new
+    runtime = described_class.new(store:, workflows: {}, worker_pool: "default", poll_interval: 0.01, migrate: false)
 
     expect(runtime.start).to equal(runtime)
     first_thread = runtime.wait(timeout: 0.05)
@@ -61,6 +62,9 @@ RSpec.describe Durababble::WorkerRuntime, :integration do
     expect(runtime.shutdown(timeout: 1)).to eq(:stopped)
     expect(runtime.shutdown(timeout: 1)).to eq(:stopped)
     expect(runtime.wait).to be_nil
+
+    runtime.close
+    expect(store.closed).to eq(false)
   end
 
   it "records lease conflicts from the polling loop without releasing leases" do

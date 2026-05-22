@@ -117,7 +117,7 @@ RSpec.describe "Durababble store backend conformance", :integration do
         expect(store.steps_for(workflow_id).first).to include("status" => "completed", "result" => { "timer" => true })
       end
 
-      it "deduplicates fenced work and replays the first completed result" do
+      it "deduplicates fenced work and replays completed or failed results" do
         store.migrate!
         workflow_id = store.create_workflow(name: "fenced", input: {})
         calls = 0
@@ -134,6 +134,18 @@ RSpec.describe "Durababble store backend conformance", :integration do
         expect(first).to eq({ "charged" => true })
         expect(second).to eq({ "charged" => true })
         expect(calls).to eq(1)
+
+        expect do
+          store.with_fence(workflow_id:, key: "charge:fails", poll_interval: 0.001, timeout: 1) do
+            raise "processor down"
+          end
+        end.to raise_error(RuntimeError, "processor down")
+
+        expect do
+          store.with_fence(workflow_id:, key: "charge:fails", poll_interval: 0.001, timeout: 1) do
+            raise "should not run"
+          end
+        end.to raise_error(Durababble::Error, /processor down/)
       end
 
       it "persists durable object state and command lifecycle payloads" do
@@ -170,6 +182,10 @@ RSpec.describe "Durababble store backend conformance", :integration do
         store.migrate!
         workflow_id = store.enqueue_workflow(name: "lifecycle", input: { "start" => true })
 
+        expect(store.claim_runnable_workflow(worker_id: "nobody", lease_seconds: 30, workflow_names: [])).to be_nil
+        expect { store.workflow("missing-workflow") }.to raise_error(KeyError, /missing-workflow/)
+        expect(store.step_heartbeat_cursor(workflow_id:, position: 99)).to be_nil
+
         expect(store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 30)).to include(
           "id" => workflow_id,
           "status" => "running",
@@ -181,6 +197,7 @@ RSpec.describe "Durababble store backend conformance", :integration do
         expect(store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).cmd_tuples).to eq(1)
 
         store.record_step_started(workflow_id:, position: 0, name: "heartbeat")
+        expect(store.heartbeat_step(workflow_id:, position: 99, worker_id: "worker-a", lease_seconds: 30, cursor: { "offset" => 99 })).to be_nil
         expect(store.heartbeat_step(workflow_id:, position: 0, worker_id: "worker-a", lease_seconds: 30, cursor: { "offset" => 10 })).not_to be_nil
         expect(store.step_heartbeat_cursor(workflow_id:, position: 0)).to eq({ "offset" => 10 })
         store.record_step_failed(workflow_id:, position: 0, error: "boom")
