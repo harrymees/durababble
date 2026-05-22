@@ -60,12 +60,11 @@ RSpec.describe "Durababble public API branch contracts" do
     expose_command retry: { maximum_attempts: 2, schedule: [0] }
     def flaky_add(amount:)
       state = current_state
-      if state.fetch("attempts", 0).zero?
-        update_state(state.merge("attempts" => 1))
+      if command_context.attempt_number == 1
         raise "try again"
       end
 
-      update_state("value" => state.fetch("value", 0) + amount, "attempts" => state.fetch("attempts"))
+      update_state("value" => state.fetch("value", 0) + amount, "attempts" => command_context.attempt_number - 1)
     end
   end
 
@@ -115,11 +114,12 @@ RSpec.describe "Durababble public API branch contracts" do
       @commands.fetch(command_id).merge(worker_id:)
     end
 
-    def complete_object_command(command_id:, result:)
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
+      save_object_state(object_type:, object_id:, state:) unless state.equal?(Durababble::Store::NO_OBJECT_STATE)
       @completed_commands << [command_id, result]
     end
 
-    def fail_object_command(command_id:, error:)
+    def fail_object_command(command_id:, error:, worker_id: nil)
       @failed_commands << [command_id, error]
     end
   end

@@ -176,6 +176,19 @@ RSpec.describe "Durababble store backend conformance", :integration do
 
         store.complete_object_command(command_id:, result: { "count" => 3 })
         expect(store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)).to be_nil
+
+        fenced_command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [],
+          kwargs: {}
+        )
+        expect(store.claim_object_command(command_id: fenced_command_id, worker_id: "object-owner", lease_seconds: 30)).to include("locked_by" => "object-owner")
+        intruder = store.complete_object_command(command_id: fenced_command_id, result: { "count" => 999 }, worker_id: "intruder")
+        expect(intruder).to be_nil.or have_attributes(cmd_tuples: 0)
+        owner = store.complete_object_command(command_id: fenced_command_id, result: { "count" => 4 }, worker_id: "object-owner")
+        expect(owner.cmd_tuples).to eq(1)
       end
 
       it "supports lease, heartbeat, retry, failure, and release lifecycle operations" do
@@ -215,6 +228,53 @@ RSpec.describe "Durababble store backend conformance", :integration do
         expect(store.workflow(workflow_id)).to include("status" => "failed", "error" => "fatal")
         expect(store.steal_expired_leases!(now: Time.now)).to eq(0)
       end
+
+      it "rejects heartbeat attempts after a workflow lease expires" do
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "expired-heartbeat", input: {})
+
+        expect(store.claim_workflow(workflow_id:, worker_id: "zombie", lease_seconds: -1)).to include("locked_by" => "zombie")
+        expect(store.workflow_owned?(workflow_id:, worker_id: "zombie")).to be(false)
+        expect(store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).cmd_tuples).to eq(0)
+        expect(store.workflow_owned?(workflow_id:, worker_id: "zombie")).to be(false)
+      end
+
+      it "reclaims expired durable object command leases" do
+        store.migrate!
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "abc", method_name: "increment", args: [], kwargs: {})
+
+        expect(store.claim_object_command(command_id:, worker_id: "crashed-object-worker", lease_seconds: -1)).to include("locked_by" => "crashed-object-worker")
+
+        reclaimed = store.claim_object_command(command_id:, worker_id: "recovery-object-worker", lease_seconds: 30)
+        expect(reclaimed).to include("id" => command_id, "status" => "running", "locked_by" => "recovery-object-worker")
+      end
+
+      it "does not leave MySQL transactions open after no-op claim paths" do
+        next unless backend.mysql?
+
+        store.migrate!
+        expect(store.claim_runnable_workflow(worker_id: "idle-worker", lease_seconds: 30)).to be_nil
+        expect(mysql_transaction_depth).to eq(0)
+
+        workflow_id = store.enqueue_workflow(name: "active", input: {})
+        expect(store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 30)).to include("locked_by" => "owner")
+        expect(store.claim_workflow(workflow_id:, worker_id: "intruder", lease_seconds: 30)).to be_nil
+        expect(mysql_transaction_depth).to eq(0)
+
+        outbox_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: {}, key: "events:active")
+        expect(store.claim_outbox(worker_id: "sender", lease_seconds: 30)).to include("id" => outbox_id)
+        expect(store.claim_outbox(worker_id: "other", lease_seconds: 30)).to be_nil
+        expect(mysql_transaction_depth).to eq(0)
+
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "abc", method_name: "increment", args: [], kwargs: {})
+        expect(store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)).to include("id" => command_id)
+        expect(store.claim_object_command(command_id:, worker_id: "other-object-worker", lease_seconds: 30)).to be_nil
+        expect(mysql_transaction_depth).to eq(0)
+      end
     end
+  end
+
+  def mysql_transaction_depth
+    store.send(:execute_params, "SELECT @@in_transaction AS in_tx", []).first.fetch("in_tx").to_i
   end
 end

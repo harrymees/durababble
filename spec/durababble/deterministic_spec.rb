@@ -8,6 +8,7 @@ RSpec.describe "Durababble deterministic simulation harness" do
     "runnable work is claimable by one worker at a time" => %w[multi_worker_counter],
     "resume honors lease ownership" => %w[lease_conflict],
     "active leases can be heartbeated" => %w[heartbeat_extension],
+    "expired workflow leases cannot be heartbeated by zombie owners" => %w[zombie_workflow_heartbeat_after_expiry],
     "step heartbeats persist opaque cursors for retry" => %w[step_heartbeat_cursor_recovery],
     "step retry policies schedule durable retries across restarts" => %w[step_retry_policy_recovery],
     "expired leases can be recovered" => %w[lease_expiry],
@@ -17,6 +18,7 @@ RSpec.describe "Durababble deterministic simulation harness" do
     "waiting attempts complete when signaled" => %w[concurrent_signal_once],
     "timer waits survive process exit" => %w[timer_and_partition],
     "event waits survive process exit" => %w[concurrent_signal_once],
+    "stale waits cannot requeue terminal workflows" => %w[stale_wait_signal_terminal_workflow],
     "signaled waits resume with payload" => %w[waits_fences_and_outbox concurrent_signal_once],
     "concurrent signalers wake a wait once" => %w[concurrent_signal_once],
     "side effects can be fenced by key" => %w[fenced_side_effect_once waits_fences_and_outbox],
@@ -179,6 +181,17 @@ RSpec.describe "Durababble deterministic simulation harness" do
     expect(result.trace).to include("network.duplicate")
     expect(result.trace.scan("wait_completed").length).to eq(1)
     expect(result.summary.fetch(:processed_outbox)).to eq(1)
+  end
+
+  it "rejects zombie heartbeats and stale wait signals in the virtual store" do
+    zombie = Durababble::Deterministic.prove("zombie_workflow_heartbeat_after_expiry", seed: 51)
+    stale_wait = Durababble::Deterministic.prove("stale_wait_signal_terminal_workflow", seed: 52)
+
+    expect(zombie.violations).to be_empty
+    expect(zombie.trace).to include("zombie_heartbeat_rejected")
+    expect(stale_wait.violations).to be_empty
+    expect(stale_wait.trace).to include("stale_wait_ignored")
+    expect(stale_wait.summary.fetch(:completed_workflows)).to eq(1)
   end
 
   it "reports deterministic invariant violations for intentionally broken scenarios" do

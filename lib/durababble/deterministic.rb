@@ -226,7 +226,7 @@ module Durababble
 
       def heartbeat(workflow_id:, worker_id:, lease_seconds:)
         row = @workflows.fetch(workflow_id)
-        if row.fetch("locked_by") == worker_id && row.fetch("status") == "running"
+        if row.fetch("locked_by") == worker_id && row.fetch("status") == "running" && !expired?(row)
           row["locked_until"] = scheduler.time + lease_seconds
           trace("heartbeat", id: workflow_id, worker: worker_id)
         end
@@ -470,18 +470,22 @@ module Durababble
       end
 
       def complete_waits(waits, payload)
+        completed = 0
         waits.each do |wait|
+          row = @workflows.fetch(wait.fetch("workflow_id"))
+          next unless row.fetch("status") == "waiting"
+
           wait["status"] = "completed"
           wait["payload"] = deep(payload)
           context = wait.fetch("context").merge(payload)
           record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position"), result: context)
-          row = @workflows.fetch(wait.fetch("workflow_id"))
           row["status"] = "pending"
           row["locked_by"] = nil
           row["locked_until"] = nil
+          completed += 1
           trace("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
         end
-        waits.length
+        completed
       end
 
       def update_latest_attempt(workflow_id, position, status, result, error)
@@ -810,6 +814,37 @@ module Durababble
           h.scheduler.schedule(actor: "owner", delay: 35, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "owner").resume(h.workflows.fetch("counter"), workflow_id: id) }
           h.check("heartbeat prevented premature steal") { h.store.workflow(id).fetch("status") == "completed" }
           h.check("no lease steal occurred") { !h.scheduler.trace.to_s.include?("steal_expired") }
+        end
+      end
+
+      def zombie_workflow_heartbeat_after_expiry(seed)
+        run(seed, "zombie_workflow_heartbeat_after_expiry") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.claim_workflow(workflow_id: id, worker_id: "zombie", lease_seconds: 10)
+          h.scheduler.schedule(actor: "zombie", delay: 20, name: "heartbeat_after_expiry") do
+            h.store.heartbeat(workflow_id: id, worker_id: "zombie", lease_seconds: 60)
+            if h.store.workflow_owned?(workflow_id: id, worker_id: "zombie")
+              h.scheduler.trace.event(h.scheduler.time, "zombie", "zombie_heartbeat_renewed", workflow_id: id)
+            else
+              h.scheduler.trace.event(h.scheduler.time, "zombie", "zombie_heartbeat_rejected", workflow_id: id)
+            end
+          end
+          h.check("expired heartbeat was rejected") { h.scheduler.trace.to_s.include?("zombie_heartbeat_rejected") }
+          h.check("zombie did not regain ownership") { !h.store.workflow_owned?(workflow_id: id, worker_id: "zombie") }
+        end
+      end
+
+      def stale_wait_signal_terminal_workflow(seed)
+        run(seed, "stale_wait_signal_terminal_workflow") do |h|
+          id = h.store.create_workflow(name: "waiting", input: { "seed" => seed })
+          h.store.record_wait(workflow_id: id, position: 0, name: "wait", wait_request: Durababble.wait_event("stale:#{seed}", { "seed" => seed }))
+          h.store.complete_workflow(id, result: { "done" => true })
+          h.scheduler.schedule(actor: "signaler", delay: h.scheduler.rng.int(5), name: "stale_signal") do
+            signaled = h.store.signal_event("stale:#{seed}", payload: { "late" => true })
+            h.scheduler.trace.event(h.scheduler.time, "signaler", signaled.zero? ? "stale_wait_ignored" : "stale_wait_completed", workflow_id: id, signaled:)
+          end
+          h.check("stale wait signal was ignored") { h.scheduler.trace.to_s.include?("stale_wait_ignored") }
+          h.check("terminal workflow remained completed") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end
 

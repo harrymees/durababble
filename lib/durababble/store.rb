@@ -13,6 +13,7 @@ module Durababble
   class Store
     SERIALIZED_COLUMNS = %w[input result payload context heartbeat_cursor state args kwargs].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
+    NO_OBJECT_STATE = Object.new.freeze
 
 
     attr_reader :schema
@@ -27,9 +28,12 @@ module Durababble
     def initialize(connection, schema:)
       @connection = connection
       @schema = schema
+      @migrated = false
     end
 
     def migrate!
+      return self if @migrated
+
       execute("CREATE SCHEMA IF NOT EXISTS #{quoted_schema}")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("workflows")} (
@@ -160,11 +164,13 @@ module Durababble
       SQL
       create_performance_indexes!
       migrate_serialized_columns!
+      @migrated = true
       self
     end
 
     def drop_schema!
       execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE")
+      @migrated = false
     end
 
     def close
@@ -259,7 +265,7 @@ module Durababble
       execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds])
         UPDATE #{table("workflows")}
         SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
-        WHERE id = $1 AND locked_by = $2 AND status = 'running'
+        WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
       SQL
     end
 
@@ -584,21 +590,43 @@ module Durababble
       row = execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
         UPDATE #{table("durable_object_commands")}
         SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
-        WHERE id = $1 AND status IN ('pending', 'failed')
+        WHERE id = $1 AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < now()))
         RETURNING *
       SQL
       decode_row(row) if row
     end
 
-    def complete_object_command(command_id:, result:)
-      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'completed', result = $2::bytea, locked_by = NULL, locked_until = NULL, completed_at = now() WHERE id = $1", [command_id, dump_serialized(result)])
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
+      transaction do
+        command = lock_object_command_for_completion(command_id:, worker_id:)
+        next nil unless command
+
+        save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now() WHERE id = $1", [command_id, dump_serialized(result)])
+      end
     end
 
-    def fail_object_command(command_id:, error:)
-      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1", [command_id, error])
+    def fail_object_command(command_id:, error:, worker_id: nil)
+      if worker_id
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()", [command_id, error, worker_id])
+      else
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1", [command_id, error])
+      end
     end
 
     private
+
+    def lock_object_command_for_completion(command_id:, worker_id:)
+      if worker_id
+        execute_params(<<~SQL, [command_id, worker_id]).first
+          SELECT 1 FROM #{table("durable_object_commands")}
+          WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+          FOR UPDATE
+        SQL
+      else
+        execute_params("SELECT 1 FROM #{table("durable_object_commands")} WHERE id = $1 FOR UPDATE", [command_id]).first
+      end
+    end
 
     def complete_waits(where_sql, params, payload)
       transaction do
@@ -831,6 +859,8 @@ module Durababble
     end
 
     def migrate!
+      return self if @migrated
+
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("workflows")} (
           id VARCHAR(191) PRIMARY KEY,
@@ -963,11 +993,13 @@ module Durababble
           INDEX #{quote_ident(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
         )
       SQL
+      @migrated = true
       self
     end
 
     def drop_schema!
       %w[durable_object_commands durable_objects waits outbox fences step_attempts steps workflows].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      @migrated = false
     end
 
     def close
@@ -1032,7 +1064,7 @@ module Durababble
           FOR UPDATE SKIP LOCKED
         SQL
         candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
-        return nil unless candidate
+        next nil unless candidate
 
         execute_params(<<~SQL, [worker_id, lease_seconds, candidate.fetch("id")])
           UPDATE #{table("workflows")}
@@ -1060,7 +1092,7 @@ module Durababble
             )
           FOR UPDATE SKIP LOCKED
         SQL
-        return nil unless row
+        next nil unless row
 
         execute_params(<<~SQL, [worker_id, lease_seconds, workflow_id])
           UPDATE #{table("workflows")}
@@ -1075,7 +1107,7 @@ module Durababble
       execute_params(<<~SQL, [lease_seconds, workflow_id, worker_id])
         UPDATE #{table("workflows")}
         SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE id = ? AND locked_by = ? AND status = 'running'
+        WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
       SQL
       MysqlResult.new([], workflow_owned?(workflow_id:, worker_id:) ? 1 : 0)
     end
@@ -1274,7 +1306,7 @@ module Durababble
           FOR UPDATE SKIP LOCKED
         SQL
         candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
-        return nil unless candidate
+        next nil unless candidate
 
         execute_params(<<~SQL, [worker_id, lease_seconds, candidate.fetch("id")])
           UPDATE #{table("outbox")}
@@ -1396,11 +1428,11 @@ module Durababble
       transaction do
         row = execute_params(<<~SQL, [command_id]).first
           SELECT id FROM #{table("durable_object_commands")}
-          WHERE id = ? AND status IN ('pending', 'failed')
+          WHERE id = ? AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < NOW(6)))
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
-        return nil unless row
+        next nil unless row
 
         execute_params(<<~SQL, [worker_id, lease_seconds, command_id])
           UPDATE #{table("durable_object_commands")}
@@ -1411,15 +1443,38 @@ module Durababble
       end
     end
 
-    def complete_object_command(command_id:, result:)
-      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'completed', result = ?, locked_by = NULL, locked_until = NULL, completed_at = NOW(6) WHERE id = ?", [dump_serialized(result), command_id])
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
+      transaction do
+        command = lock_object_command_for_completion(command_id:, worker_id:)
+        next nil unless command
+
+        save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6) WHERE id = ?", [dump_serialized(result), command_id])
+        MysqlResult.new([], 1)
+      end
     end
 
-    def fail_object_command(command_id:, error:)
-      execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL WHERE id = ?", [error, command_id])
+    def fail_object_command(command_id:, error:, worker_id: nil)
+      if worker_id
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)", [error, command_id, worker_id])
+      else
+        execute_params("UPDATE #{table("durable_object_commands")} SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL WHERE id = ?", [error, command_id])
+      end
     end
 
     private
+
+    def lock_object_command_for_completion(command_id:, worker_id:)
+      if worker_id
+        execute_params(<<~SQL, [command_id, worker_id]).first
+          SELECT 1 FROM #{table("durable_object_commands")}
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+          FOR UPDATE
+        SQL
+      else
+        execute_params("SELECT 1 FROM #{table("durable_object_commands")} WHERE id = ? FOR UPDATE", [command_id]).first
+      end
+    end
 
     def update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result:, error:)
       execute_params(<<~SQL, [status, serialized_result, error, workflow_id, position])

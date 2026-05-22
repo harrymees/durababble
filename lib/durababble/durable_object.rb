@@ -74,6 +74,7 @@ module Durababble
       @current_state = state
       @store = store
       @command_context = command_context
+      @state_dirty = false
     end
 
     def initialize_state
@@ -86,9 +87,12 @@ module Durababble
 
     def update_state(new_state)
       @current_state = new_state
-      @store&.save_object_state(object_type: self.class.object_type, object_id: durable_id, state: new_state)
+      @state_dirty = true
+      @store&.save_object_state(object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
       new_state
     end
+
+    def state_dirty? = @state_dirty
   end
 
   class DurableObjectRef
@@ -131,9 +135,12 @@ module Durababble
 
     def run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
       attempt = 0
+      worker_id = "inline-object-worker"
       begin
         attempt += 1
-        claimed = @store.claim_object_command(command_id:, worker_id: "inline-object-worker")
+        claimed = @store.claim_object_command(command_id:, worker_id:)
+        raise LeaseConflict, "could not claim durable object command #{command_id}" unless claimed
+
         state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
         context = CommandContext.new(
           object_type: @object_class.object_type,
@@ -144,10 +151,16 @@ module Durababble
         )
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, command_context: context)
         result = kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
-        @store.complete_object_command(command_id:, result:)
+        completed = if object.state_dirty?
+                      @store.complete_object_command(command_id:, result:, object_type: @object_class.object_type, object_id: @durable_id, state: object.current_state, worker_id:)
+                    else
+                      @store.complete_object_command(command_id:, result:, worker_id:)
+                    end
+        raise LeaseConflict, "lost durable object command lease #{command_id}" unless completed && (!completed.respond_to?(:cmd_tuples) || completed.cmd_tuples.to_i.positive?)
+
         result
       rescue StandardError => e
-        @store.fail_object_command(command_id:, error: "#{e.class}: #{e.message}") if claimed
+        @store.fail_object_command(command_id:, error: "#{e.class}: #{e.message}", worker_id:) if claimed
         retry if retry_policy.retryable?(e, attempt_number: attempt)
         raise
       end
