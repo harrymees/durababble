@@ -4,10 +4,6 @@ require "spec_helper"
 require "securerandom"
 
 RSpec.describe Durababble::DurableObject, :integration do
-  let(:database_url) { ENV.fetch("DURABABBLE_DATABASE_URL", "postgresql://yugabyte@127.0.0.1:15433/yugabyte") }
-  let(:schema) { "durababble_durable_object_api_#{Process.pid}_#{SecureRandom.hex(4)}" }
-  let(:store) { Durababble::Store.connect(database_url:, schema:) }
-
   AccountState = Data.define(:balance_cents) do
     def credit(amount)
       with(balance_cents: balance_cents + amount)
@@ -39,18 +35,25 @@ RSpec.describe Durababble::DurableObject, :integration do
     end
   end
 
-  after do
-    store&.drop_schema!
-    store&.close
-  end
+  durababble_store_backends.each do |backend|
+    context "with #{backend.name}" do
+      let(:schema) { "#{backend.default_schema_prefix}_durable_object_api_#{Process.pid}_#{SecureRandom.hex(4)}" }
+      let(:store) { Durababble::Store.connect(database_url: backend.database_url, schema:) }
 
-  it "exposes commands and queries without step semantics" do
-    account = ApiSpecAccount.ref("acct-1", store:)
+      after do
+        store&.drop_schema!
+        store&.close
+      end
 
-    expect(ApiSpecAccount).not_to respond_to(:step)
-    expect(account.balance).to eq(0)
-    expect(account.credit(500).balance_cents).to eq(500)
-    expect(account.debit(125).balance_cents).to eq(375)
-    expect(account.balance).to eq(375)
+      it "exposes commands and queries without step semantics" do
+        account = ApiSpecAccount.ref("acct-1", store:)
+
+        expect(ApiSpecAccount).not_to respond_to(:step)
+        expect(account.balance).to eq(0)
+        expect(account.credit(500).balance_cents).to eq(500)
+        expect(account.debit(125).balance_cents).to eq(375)
+        expect(account.balance).to eq(375)
+      end
+    end
   end
 end

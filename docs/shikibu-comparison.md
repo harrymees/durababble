@@ -79,7 +79,7 @@ Durababble's biggest weaknesses relative to Shikibu:
 5. No background application lifecycle comparable to `Shikibu::App#start/#shutdown`.
 6. No Rack/Rails/Sidekiq/ActiveJob integrations.
 7. No PostgreSQL LISTEN/NOTIFY or wakeup mechanism; waiting/resumption is poll/tick oriented.
-8. Only Yugabyte/PostgreSQL wire support; no SQLite dev mode or MySQL production option.
+8. No SQLite dev mode yet; the real SQL backends are now Yugabyte/PostgreSQL wire support and MySQL/MariaDB.
 9. CLI is a prototype counter harness, not an operational UI.
 10. Docs correctly admit missing workflow versioning, cron, metrics, tracing, daemon supervision, fence owner crash recovery, automatic long-step heartbeat, and graceful missing-registry handling.
 

@@ -32,7 +32,7 @@ module Durababble
         @keep_schema = keep_schema
         @rng = Random.new(seed)
         @store = Durababble::Store.connect(database_url:, schema:)
-        @store.send(:execute, "SET client_min_messages TO warning")
+        @store.send(:execute, "SET client_min_messages TO warning") unless @store.is_a?(Durababble::MysqlStore)
         @store.drop_schema!
         @store.migrate!
       end
@@ -129,6 +129,20 @@ module Durababble
       end
 
       def cleanup_after(operation)
+        if @store.is_a?(Durababble::MysqlStore)
+          @store.send(:execute, <<~SQL)
+            UPDATE #{@store.send(:table, "workflows")}
+            SET status = 'completed', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+            WHERE name <> 'fixture' AND status <> 'completed'
+          SQL
+          @store.send(:execute, <<~SQL)
+            UPDATE #{@store.send(:table, "outbox")}
+            SET status = 'processed', locked_by = NULL, locked_until = NULL, processed_at = COALESCE(processed_at, NOW(6))
+            WHERE status <> 'processed'
+          SQL
+          return
+        end
+
         connection = PG.connect(@database_url)
         schema = PG::Connection.quote_ident(@schema)
         connection.exec(<<~SQL)
@@ -440,11 +454,19 @@ module Durababble
       end
 
       def expire_workflow_lease(workflow_id)
-        @store.send(:execute_params, "UPDATE #{quoted_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [workflow_id])
+        if @store.is_a?(Durababble::MysqlStore)
+          @store.send(:execute_params, "UPDATE #{@store.send(:table, "workflows")} SET locked_until = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE id = ?", [workflow_id])
+        else
+          @store.send(:execute_params, "UPDATE #{quoted_schema}.workflows SET locked_until = now() - interval '1 second' WHERE id = $1", [workflow_id])
+        end
       end
 
       def expire_outbox_lease(outbox_id)
-        @store.send(:execute_params, "UPDATE #{quoted_schema}.outbox SET locked_until = now() - interval '1 second' WHERE id = $1", [outbox_id])
+        if @store.is_a?(Durababble::MysqlStore)
+          @store.send(:execute_params, "UPDATE #{@store.send(:table, "outbox")} SET locked_until = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE id = ?", [outbox_id])
+        else
+          @store.send(:execute_params, "UPDATE #{quoted_schema}.outbox SET locked_until = now() - interval '1 second' WHERE id = $1", [outbox_id])
+        end
       end
 
       def quoted_schema
@@ -458,7 +480,7 @@ module Durababble
         @store.close
         load_large_fixture
         @store = Durababble::Store.connect(database_url: @database_url, schema: @schema)
-        @store.send(:execute, "SET client_min_messages TO warning")
+        @store.send(:execute, "SET client_min_messages TO warning") unless @store.is_a?(Durababble::MysqlStore)
         @large_fixture_loaded = true
       end
 

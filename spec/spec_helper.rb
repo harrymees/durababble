@@ -10,6 +10,7 @@ SimpleCov.start do
 end
 
 require "durababble"
+require_relative "support/store_backends"
 
 RSpec.configure do |config|
   config.disable_monkey_patching!

@@ -1,6 +1,6 @@
 # Durababble
 
-Durababble is a prototype durable execution engine in Ruby 4. It stores workflow runs, workflow steps, durable-object state/commands, waits, attempts, fences, and outbox messages in YugabyteDB through the PostgreSQL-compatible YSQL endpoint.
+Durababble is a prototype durable execution engine in Ruby 4. It stores workflow runs, workflow steps, durable-object state/commands, waits, attempts, fences, and outbox messages in a SQL store. The primary tested backends are YugabyteDB through the PostgreSQL-compatible YSQL endpoint and MySQL/MariaDB through the `mysql2` adapter.
 
 Durababble's public API is intentionally Ruby-shaped:
 
@@ -21,6 +21,24 @@ mise exec -- bundle exec rake spec
 ```
 
 The local Yugabyte instance used by default is `ybsqlite-vfs-yugabyte`, exposed as `127.0.0.1:15433 -> 5433`. A second Yugabyte container, `yugalite-test-yugabyte`, is reachable at `127.0.0.1:32770`.
+
+## Store backends
+
+`Durababble::Store.connect(database_url:, schema:)` selects a backend from the URL scheme:
+
+- `postgresql://...` / `postgres://...` use the PostgreSQL/YSQL adapter backed by the `pg` gem. This is the default path used for local YugabyteDB.
+- `mysql2://...` / `mysql://...` use the MySQL/MariaDB adapter backed by the `mysql2` gem.
+
+Both adapters implement the same durable store contract for workflows, steps, attempts, waits, fences, outbox messages, durable-object state, and durable-object commands. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). The shared backend specs run representative engine, durable-object, heartbeat, retry, queue-correctness, and crash/guarantee behavior against both stores.
+
+Local MySQL/MariaDB development uses a normal database URL supplied by environment variable, for example:
+
+```sh
+export DURABABBLE_MYSQL_DATABASE_URL='mysql2://USER:[REDACTED]@127.0.0.1:3306/durababble_test'
+DURABABBLE_DATABASE_URL="$DURABABBLE_MYSQL_DATABASE_URL" mise exec -- bundle exec rspec spec/durababble/store_backend_conformance_spec.rb
+```
+
+The benchmark harness accepts either backend via `DURABABBLE_DATABASE_URL` or `--database-url`, so the same smoke/full benchmark profiles can compare YugabyteDB and MySQL/MariaDB.
 
 ## Workflow API
 
@@ -138,7 +156,7 @@ end
 
 - Class-oriented workflow API with `#execute`, `step def`, step-local retry policy, generated step idempotency keys, and class-method enqueueing.
 - Class-oriented durable object API with `ref`, `expose`, `expose_command`, generated command idempotency keys, and explicit state updates.
-- Yugabyte-backed schema migration.
+- PostgreSQL/YSQL and MySQL/MariaDB schema migration.
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
 - Worker polling with one-at-a-time leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
@@ -148,7 +166,7 @@ end
 - Side-effect idempotency fences that acquire before the side effect executes.
 - Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement. It is intentionally not modeled as a first-class public workflow API yet.
 - CLI commands: `migrate`, `run-counter`, `inspect`, `resume-counter`, `version`.
-- Comprehensive RSpec integration suite against real Yugabyte plus SimpleCov line/branch thresholds.
+- Comprehensive RSpec integration suite against real Yugabyte/PostgreSQL-compatible and MySQL/MariaDB stores plus SimpleCov line/branch thresholds.
 - Silo/mad-turmoil-inspired deterministic simulation suite with virtual clients, worker nodes, network, and Yugabyte store.
 
 See `docs/spec.md` for the implemented spec, guarantee matrix, crash matrix, and coverage standard.

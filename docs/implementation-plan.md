@@ -4,7 +4,7 @@
 
 - Ruby 4.0.5 pinned with mise.
 - Gem scaffold with gemspec, executable, Rake, RSpec, README, and docs.
-- Real Yugabyte-backed persistence via `pg`.
+- Real SQL-backed persistence via `pg` for Yugabyte/PostgreSQL-compatible URLs and `mysql2` for MySQL/MariaDB URLs.
 - Workflow DSL and synchronous engine API.
 - Runnable workflow queue and worker polling.
 - Distributed leases, heartbeats, stale lease stealing, and lease-aware resume.

@@ -1,12 +1,12 @@
 # Durababble specification
 
-This document specifies Durababble's intended public API and the implemented workflow-runtime guarantees. Workflow durability, crash recovery, and worker coordination rows below are covered by explicit integration tests against real local Yugabyte/YSQL plus deterministic simulation tests. Durable object APIs are implemented at the class/ref/command-row level, while the spec still names the desired actor-style serialization semantics that the durable-object worker path must harden next. The public API is class-oriented: workflows subclass `Durababble::Workflow`, durable objects subclass `Durababble::DurableObject`, and both use `expose`/`expose_command` for their public callable surface.
+This document specifies Durababble's intended public API and the implemented workflow-runtime guarantees. Workflow durability, crash recovery, and worker coordination rows below are covered by explicit integration tests against real local Yugabyte/YSQL plus shared backend conformance tests against MySQL/MariaDB. Durable object APIs are implemented at the class/ref/command-row level, while the spec still names the desired actor-style serialization semantics that the durable-object worker path must harden next. The public API is class-oriented: workflows subclass `Durababble::Workflow`, durable objects subclass `Durababble::DurableObject`, and both use `expose`/`expose_command` for their public callable surface.
 
 ## Functional spec
 
 - Ruby 4 gem scaffold managed by mise.
-- Yugabyte-backed storage through the PostgreSQL wire protocol.
-- Runtime values (`input`, `result`, `context`, `payload`, and heartbeat cursors) are serialized with Paquito into `bytea` columns, not stored as JSON/JSONB. `migrate!` can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
+- SQL-backed storage through either the PostgreSQL wire protocol (`postgresql://`/`postgres://`, including YugabyteDB/YSQL) or MySQL/MariaDB (`mysql2://`/`mysql://`).
+- Runtime values (`input`, `result`, `context`, `payload`, state, arguments, kwargs, and heartbeat cursors) are serialized with Paquito into binary columns, not stored as JSON/JSONB. PostgreSQL/YSQL stores these columns as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. The PostgreSQL/YSQL migration can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
 - Class-oriented workflow API: workflow classes implement `#execute`; internal durable side-effect boundaries are methods declared with `step def ...` or `step retry: ...` followed by `def ...`; step-level retry policies are modeled after Temporal Activity retry options, Ruby-ified as `retry:` keyword arguments at the method declaration site.
 - Durable workflow rows and durable step rows. Step identity is assigned by deterministic execution order; method names are recorded as metadata and users do not pass step names at call sites.
 - Append-only step attempt history, including waits that transition to completed attempts.

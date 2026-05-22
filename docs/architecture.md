@@ -1,6 +1,6 @@
 # Durababble architecture
 
-Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durable-object definitions; YugabyteDB/YSQL owns durable coordination and recovery state.
+Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durable-object definitions; a SQL store owns durable coordination and recovery state. The primary tested stores are YugabyteDB/YSQL through the PostgreSQL wire protocol and MySQL/MariaDB through `mysql2`.
 
 ## Components
 
@@ -11,7 +11,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 - `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease. The worker registry contains workflow classes.
 - `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
 - `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` currently records durable command events rather than executing through this router.
-- `Durababble::Store`: PostgreSQL/YSQL adapter using the `pg` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in `bytea` columns.
+- `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql2://`/`mysql://` URLs use the MySQL/MariaDB adapter with the `mysql2` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB).
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
 - `exe/durababble`: prototype CLI for migrate/run/inspect/resume of the built-in counter workflow.
 
@@ -135,7 +135,7 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 - `bench/run.rb` is a macro benchmark harness for the storage and coordination operations that dominate durable execution performance.
 - The suite records environment metadata, per-operation latency percentiles, throughput, and allocation counts as JSON/CSV/Markdown.
-- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into Yugabyte before measuring queue claims, due-timer scans, and event-signal misses against large tables.
+- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into the selected SQL backend before measuring queue claims, due-timer scans, and event-signal misses against large tables.
 - The benchmark operation set intentionally covers the main prototype lifecycle: enqueue, claim, heartbeat, lease conflict/recovery, worker tick/drain, end-to-end event and timer waits, resume-with-completed-steps, failed-workflow retry, observability reads, idempotency fences, outbox claim/ack/reclaim, large-table query shapes, and cross-process command RPC.
 - GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
 - Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
