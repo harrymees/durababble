@@ -89,6 +89,7 @@ RSpec.describe "Durababble complete durable execution support", :integration do
         expect(store.wake_due_timers(now: Time.now + 3601)).to eq(1)
         expect(worker.tick).to eq(:worked)
         expect(store.workflow(workflow_id).fetch("status")).to eq("waiting")
+        expect(store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }).to eq(%w[completed waiting])
         expect(store.waits_for(workflow_id).last.fetch("event_key")).to eq("approval:r1")
 
         expect(store.signal_event("approval:other", payload: {})).to eq(0)
@@ -96,6 +97,7 @@ RSpec.describe "Durababble complete durable execution support", :integration do
         expect(worker.run_until_idle).to eq(1)
         expect(store.workflow(workflow_id).fetch("status")).to eq("completed")
         expect(store.workflow(workflow_id).fetch("result")).to include("finished" => true, "approved" => true)
+        expect(store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }).to eq(%w[completed completed completed])
       end
 
       it "implements the crash matrix explicitly" do

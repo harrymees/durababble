@@ -103,11 +103,14 @@ module Durababble
     end
 
     class VirtualNetwork
+      attr_accessor :duplicate_percent
+
       def initialize(scheduler:, min_latency: 1, max_latency: 9, drop_percent: 0)
         @scheduler = scheduler
         @min_latency = min_latency
         @max_latency = max_latency
         @drop_percent = drop_percent
+        @duplicate_percent = 0
         @partitions = {}
       end
 
@@ -129,18 +132,53 @@ module Durababble
 
         delay = @min_latency + @scheduler.rng.int(@max_latency - @min_latency + 1)
         @scheduler.trace.event(@scheduler.time, "network", "network.send", source:, target:, type:, delay:)
-        @scheduler.schedule(actor: target, delay:, name: "deliver:#{type}") do
+        schedule_delivery(source:, target:, type:, payload:, delay:, duplicate: false, &handler)
+        return unless @scheduler.rng.chance(@duplicate_percent)
+
+        duplicate_delay = delay + 1 + @scheduler.rng.int(3)
+        @scheduler.trace.event(@scheduler.time, "network", "network.duplicate", source:, target:, type:, delay: duplicate_delay)
+        schedule_delivery(source:, target:, type:, payload:, delay: duplicate_delay, duplicate: true, &handler)
+      end
+
+      private
+
+      def schedule_delivery(source:, target:, type:, payload:, delay:, duplicate:, &handler)
+        @scheduler.schedule(actor: target, delay:, name: duplicate ? "deliver_duplicate:#{type}" : "deliver:#{type}") do
           @scheduler.trace.event(@scheduler.time, "network", "deliver", source:, target:, type:)
           handler.call(payload)
         end
       end
     end
 
-    class VirtualYugabyte
-      attr_reader :scheduler
-
+    class FaultPlan
       def initialize(scheduler:)
         @scheduler = scheduler
+        @after = Hash.new { |hash, key| hash[key] = [] }
+        @counts = Hash.new(0)
+      end
+
+      def fail_after(operation, once: 1, message: nil)
+        @after[operation.to_s] << { remaining: once, message: message || "injected fault after #{operation}" }
+      end
+
+      def after(operation)
+        operation = operation.to_s
+        @counts[operation] += 1
+        fault = @after[operation].find { |candidate| candidate.fetch(:remaining).positive? }
+        return unless fault
+
+        fault[:remaining] -= 1
+        @scheduler.trace.event(@scheduler.time, "fault", "fault.injected", operation:, count: @counts.fetch(operation), message: fault.fetch(:message))
+        raise InjectedCrash, fault.fetch(:message)
+      end
+    end
+
+    class VirtualYugabyte
+      attr_reader :scheduler, :fault_plan
+
+      def initialize(scheduler:, fault_plan: nil)
+        @scheduler = scheduler
+        @fault_plan = fault_plan || FaultPlan.new(scheduler:)
         @id_seq = 0
         @workflows = {}
         @steps = Hash.new { |hash, key| hash[key] = {} }
@@ -287,6 +325,7 @@ module Durababble
         step["result"] = deep(result)
         update_latest_attempt(workflow_id, position, "completed", result, nil)
         trace("step_completed", id: workflow_id, position:, result:)
+        fault_plan.after(:record_step_completed)
       end
 
       def record_step_failed(workflow_id:, position:, error:)
@@ -307,6 +346,7 @@ module Durababble
         row["locked_by"] = nil
         row["locked_until"] = nil
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
+        fault_plan.after(:record_wait)
         wait_id
       end
 
@@ -351,6 +391,7 @@ module Durababble
         @outbox[id] = { "id" => id, "workflow_id" => workflow_id, "topic" => topic, "payload" => deep(payload), "key" => key, "status" => "pending", "locked_by" => nil, "locked_until" => nil }
         @outbox_by_key[key] = id
         trace("outbox_enqueued", id:, key:, topic:)
+        fault_plan.after(:enqueue_outbox)
         id
       end
 
@@ -829,6 +870,88 @@ module Durababble
           h.check("retry waited for due time") { h.scheduler.trace.to_s.include?("step_retry_not_due") }
           h.check("workflow completed after durable retries") { h.store.workflow(id).fetch("status") == "completed" }
           h.check("attempt history records retries") { h.store.step_attempts_for(id).map { |a| a.fetch("status") } == %w[failed failed completed] }
+        end
+      end
+
+      def store_fault_after_step_completed(seed)
+        run(seed, "store_fault_after_step_completed") do |h|
+          h.workflows["counter"] = counter_workflow
+          h.store.fault_plan.fail_after(:record_step_completed, message: "lost connection after durable step write")
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.scheduler.schedule(actor: "faulty-worker", delay: h.scheduler.rng.int(5), name: "fault_after_step_completed") do
+            Durababble::Engine.new(store: h.store, worker_id: "faulty-worker", lease_seconds: 10).resume(h.workflows.fetch("counter"), workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "faulty-worker", "store_fault_observed", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "reaper", delay: 20, name: "steal") { h.store.steal_expired_leases! }
+          h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "recover").resume(h.workflows.fetch("counter"), workflow_id: id) }
+          h.check("fault was injected after step write") { h.scheduler.trace.to_s.include?("fault.injected") }
+          h.check("completed step was not marked failed after store fault") { h.store.step_attempts_for(id).map { |attempt| attempt.fetch("status") }.include?("failed") == false }
+          h.check("workflow completed after recovering from durable step write") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def store_fault_after_wait_recorded(seed)
+        run(seed, "store_fault_after_wait_recorded") do |h|
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("fault-wait:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
+          end
+          h.store.fault_plan.fail_after(:record_wait, message: "lost connection after durable wait write")
+          id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "#{seed}" })
+          h.scheduler.schedule(actor: "faulty-worker", delay: h.scheduler.rng.int(5), name: "fault_after_wait_recorded") do
+            Durababble::Engine.new(store: h.store, worker_id: "faulty-worker", lease_seconds: 10).resume(h.workflows.fetch("waiting"), workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "faulty-worker", "store_fault_observed", workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "signal", delay: 20, name: "signal") { h.store.signal_event("fault-wait:#{seed}", payload: { "ok" => true }) }
+          h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "recover").resume(h.workflows.fetch("waiting"), workflow_id: id) }
+          h.check("fault was injected after wait write") { h.scheduler.trace.to_s.include?("fault.injected") }
+          h.check("workflow completed after recovering from durable wait write") { h.store.workflow(id).fetch("status") == "completed" }
+        end
+      end
+
+      def store_fault_after_outbox_enqueue(seed)
+        run(seed, "store_fault_after_outbox_enqueue") do |h|
+          workflow_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.fault_plan.fail_after(:enqueue_outbox, message: "lost connection after durable outbox write")
+          outbox_id = nil
+          h.scheduler.schedule(actor: "producer", delay: h.scheduler.rng.int(5), name: "fault_after_outbox_enqueue") do
+            outbox_id = h.store.enqueue_outbox(workflow_id:, topic: "email", payload: { "seed" => seed }, key: "email:#{seed}")
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "producer", "store_fault_observed", workflow_id:)
+            outbox_id = h.store.enqueue_outbox(workflow_id:, topic: "email", payload: { "seed" => seed, "retry" => true }, key: "email:#{seed}")
+          end
+          h.scheduler.schedule(actor: "sender", delay: 20, name: "send") do
+            message = h.store.claim_outbox(worker_id: "sender", lease_seconds: 10)
+            h.store.ack_outbox(message.fetch("id"), worker_id: "sender") if message
+          end
+          h.check("fault was injected after outbox write") { h.scheduler.trace.to_s.include?("fault.injected") }
+          h.check("retry reused the original outbox message") { h.store.outbox_message(outbox_id).fetch("payload") == { "seed" => seed } }
+          h.check("outbox processed once after enqueue fault") { h.store.summary.fetch(:processed_outbox) == 1 }
+        end
+      end
+
+      def duplicate_delivery_signal_and_outbox(seed)
+        run(seed, "duplicate_delivery_signal_and_outbox") do |h|
+          h.network.duplicate_percent = 100
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("dup:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
+          end
+          workflow_id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "#{seed}" })
+          h.scheduler.schedule(actor: "worker", delay: 1, name: "park") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id:) }
+          h.network.send(source: "client-signal", target: "db", type: "signal", payload: {}) { h.store.signal_event("dup:#{seed}", payload: { "ok" => true }) }
+          h.network.send(source: "producer", target: "db", type: "outbox", payload: {}) { h.store.enqueue_outbox(workflow_id:, topic: "email", payload: { "seed" => seed }, key: "dup-email:#{seed}") }
+          h.scheduler.schedule(actor: "sender", delay: 25, name: "send") do
+            message = h.store.claim_outbox(worker_id: "sender", lease_seconds: 10)
+            h.store.ack_outbox(message.fetch("id"), worker_id: "sender") if message
+          end
+          h.scheduler.schedule(actor: "worker", delay: 30, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id:) }
+          h.check("duplicate network delivery occurred") { h.scheduler.trace.to_s.include?("network.duplicate") }
+          h.check("wait completed once despite duplicate signal") { h.scheduler.trace.to_s.scan("wait_completed").length == 1 }
+          h.check("outbox message was idempotent despite duplicate producer delivery") { h.store.summary.fetch(:processed_outbox) == 1 }
+          h.check("workflow completed after duplicate signal") { h.store.workflow(workflow_id).fetch("status") == "completed" }
         end
       end
 

@@ -1306,6 +1306,7 @@ module Durababble
           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         SQL
         execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+        update_latest_attempt_serialized(workflow_id:, position:, status: "waiting", serialized_result: dump_serialized(wait_request.context), error: nil)
         wait_id
       end
     end

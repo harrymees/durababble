@@ -20,7 +20,9 @@ RSpec.describe "Durababble deterministic simulation harness" do
     "signaled waits resume with payload" => %w[waits_fences_and_outbox concurrent_signal_once],
     "concurrent signalers wake a wait once" => %w[concurrent_signal_once],
     "side effects can be fenced by key" => %w[fenced_side_effect_once waits_fences_and_outbox],
-    "outbox delivery is durable and leased" => %w[outbox_lease_expiry waits_fences_and_outbox],
+    "outbox delivery is durable and leased" => %w[outbox_lease_expiry waits_fences_and_outbox store_fault_after_outbox_enqueue],
+    "store write faults leave durable state recoverable" => %w[store_fault_after_step_completed store_fault_after_wait_recorded store_fault_after_outbox_enqueue],
+    "duplicate network delivery does not duplicate durable effects" => %w[duplicate_delivery_signal_and_outbox],
     "multi-row state transitions remain coherent under recovery" => %w[completed_step_skip_after_crash incomplete_step_retry_after_crash chaos],
     "internal RPC clients surface timeout, connection, EOF, and remote failures" => %w[rpc_fault_injection],
     "lease-routed workflow RPCs reject stale holders and recover after mid-flight lease changes" => %w[workflow_rpc_lease_change workflow_rpc_shutdown_midflight workflow_rpc_no_active_owner_recovery]
@@ -153,6 +155,30 @@ RSpec.describe "Durababble deterministic simulation harness" do
     expect(result.trace).to include("step_retry_not_due")
     expect(result.trace.scan("step_retry_attempt").length).to eq(3)
     expect(result.summary.fetch(:completed_workflows)).to eq(1)
+  end
+
+  it "models durable store faults after writes and recovers from the persisted state" do
+    step = Durababble::Deterministic.prove("store_fault_after_step_completed", seed: 47)
+    wait = Durababble::Deterministic.prove("store_fault_after_wait_recorded", seed: 48)
+    outbox = Durababble::Deterministic.prove("store_fault_after_outbox_enqueue", seed: 49)
+
+    expect(step.violations).to be_empty
+    expect(step.trace).to include("fault.injected")
+    expect(step.summary.fetch(:completed_workflows)).to eq(1)
+    expect(wait.violations).to be_empty
+    expect(wait.trace).to include("wait_recorded")
+    expect(wait.summary.fetch(:completed_workflows)).to eq(1)
+    expect(outbox.violations).to be_empty
+    expect(outbox.summary.fetch(:processed_outbox)).to eq(1)
+  end
+
+  it "models duplicate network delivery without duplicate wait or outbox effects" do
+    result = Durababble::Deterministic.prove("duplicate_delivery_signal_and_outbox", seed: 50)
+
+    expect(result.violations).to be_empty
+    expect(result.trace).to include("network.duplicate")
+    expect(result.trace.scan("wait_completed").length).to eq(1)
+    expect(result.summary.fetch(:processed_outbox)).to eq(1)
   end
 
   it "reports deterministic invariant violations for intentionally broken scenarios" do
