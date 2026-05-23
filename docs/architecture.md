@@ -43,13 +43,14 @@ end
 When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object:
 
 1. assigns the next step position;
-2. returns a persisted result immediately if that position already completed;
+2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
 3. records the step start and attempt;
 4. builds `step_context` with a generated idempotency key and heartbeat;
 5. invokes the original Ruby method body;
 6. persists success, wait, retryable failure, or final failure.
 
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
+If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
 
 Async workflow code keeps that same identity rule. `async { expensive_step(input) }` reserves the next step position immediately and returns a future. `future.start`, `future.value`, and `await_all(futures)` run the reserved block in Ruby threads, but the first durable step call inside the block consumes the reserved position instead of racing on the shared step cursor. `await_all` starts all pending futures, waits for every started future to settle, then returns results in the order the caller supplied the futures. If any future failed, the first failure by supplied order is raised after siblings have settled, so replay does not depend on wall-clock completion order.
 

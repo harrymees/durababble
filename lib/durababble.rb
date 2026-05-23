@@ -13,6 +13,7 @@ module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
+  class NonDeterminismError < Error; end
   class FenceTimeout < Error; end
   class AsyncBoundaryError < Error; end
   class AsyncCanceled < Error; end

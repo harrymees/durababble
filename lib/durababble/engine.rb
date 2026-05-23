@@ -97,16 +97,17 @@ module Durababble
     #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
     def call_step(instance, method_name:, args:, kwargs:, &block)
       position = consume_position
+      step = instance.class.step_definition(method_name)
 
       known_step = @mutex.synchronize { @steps_by_position[position] }
       case known_step&.fetch("status")
       when "completed"
+        validate_completed_step_shape!(known_step, step:, position:)
         return known_step.fetch("result")
       when "canceled"
         raise AsyncCanceled, "async step at position #{position} was canceled"
       end
 
-      step = instance.class.step_definition(method_name)
       @store_mutex.synchronize do
         @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
         @mutex.synchronize do
@@ -167,7 +168,7 @@ module Durababble
       crash!(:step_completed)
       output
     rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(AsyncBoundaryError) || e.is_a?(AsyncCanceled)
+      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError) || e.is_a?(AsyncBoundaryError) || e.is_a?(AsyncCanceled)
 
       message = "#{e.class}: #{e.message}"
       attempt_number = nil
@@ -195,6 +196,21 @@ module Durababble
       raise
     ensure
       Thread.current[step_context_key] = previous_step_context
+    end
+
+    #: () -> void
+    def validate_replay_complete!
+      extra_steps = @mutex.synchronize do
+        @steps_by_position
+          .select { |position, step| position >= @position && step.fetch("status") == "completed" }
+          .sort_by { |position, _step| position }
+      end
+      return if extra_steps.empty?
+
+      rendered = extra_steps
+        .map { |position, step| "#{position}:#{step.fetch("name")}" }
+        .join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable step history: #{rendered}"
     end
 
     private
@@ -227,6 +243,16 @@ module Durababble
     #: () -> Symbol
     def async_position_key
       :"durababble_async_position_#{object_id}"
+    end
+
+    #: (untyped, step: untyped, position: untyped) -> void
+    def validate_completed_step_shape!(completed_step, step:, position:)
+      persisted_name = completed_step.fetch("name")
+      return if persisted_name == step.name
+
+      message = "workflow #{@workflow_id} replay reached step #{position} named #{step.name.inspect}, " \
+        "but durable history already completed #{persisted_name.inspect}"
+      raise NonDeterminismError, message
     end
 
     #: (untyped) -> untyped
@@ -310,6 +336,7 @@ module Durababble
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
       execution.assert_async_futures_settled!
+      execution.validate_replay_complete!
       assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result:)
       crash!(:workflow_completed)
