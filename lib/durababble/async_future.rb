@@ -10,13 +10,11 @@ module Durababble
         flattened.each(&:start)
 
         results = []
-        first_error = nil
+        first_error = nil #: untyped
         flattened.each_with_index do |future, index|
-          begin
-            results[index] = future.value
-          rescue StandardError => e
-            first_error ||= e
-          end
+          results[index] = future.value
+        rescue StandardError => e
+          first_error ||= e #: untyped
         end
 
         raise first_error if first_error

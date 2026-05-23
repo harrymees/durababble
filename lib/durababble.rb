@@ -67,7 +67,7 @@ module Durababble
 
     #: (*untyped) -> untyped
     def await_all(*futures)
-      AsyncFuture.await_all(*futures)
+      AsyncFuture.await_all(futures)
     end
 
     private

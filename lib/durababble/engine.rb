@@ -14,9 +14,6 @@ module Durababble
   end
 
   class WorkflowExecution
-    #: untyped
-    attr_reader :step_context
-
     #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, steps: untyped, ?crash_after: untyped) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, steps:, crash_after: nil)
       @store = store
@@ -46,6 +43,7 @@ module Durababble
 
     #: (Integer) { -> untyped } -> untyped
     def run_async_position(position, &block)
+      previous = nil #: untyped
       key = async_position_key
       previous = Thread.current[key]
       reservation = { position:, consumed: false }
@@ -57,7 +55,7 @@ module Durababble
 
       result
     ensure
-      Thread.current[key] = previous
+      Thread.current[async_position_key] = previous
     end
 
     #: (Integer) -> bool
@@ -171,7 +169,7 @@ module Durababble
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError) || e.is_a?(AsyncBoundaryError) || e.is_a?(AsyncCanceled)
 
       message = "#{e.class}: #{e.message}"
-      attempt_number = nil
+      attempt_number = nil #: untyped
       @store_mutex.synchronize do
         assert_workflow_lease!
         @store.record_step_failed(workflow_id: @workflow_id, position:, error: message)

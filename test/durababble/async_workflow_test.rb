@@ -354,11 +354,9 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
         error_queue = Queue.new
         thread = Thread.new do
-          begin
-            Durababble::Engine.new(store:, worker_id: "zombie", lease_seconds: 60, migrate: false).resume(workflow, workflow_id:)
-          rescue StandardError => e
-            error_queue << e
-          end
+          Durababble::Engine.new(store:, worker_id: "zombie", lease_seconds: 60, migrate: false).resume(workflow, workflow_id:)
+        rescue StandardError => e
+          error_queue << e
         end
 
         started.pop
