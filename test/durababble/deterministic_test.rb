@@ -39,6 +39,17 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "grpc_wakeup_fault_matrix",
   ].freeze
 
+  MUTATION_SCENARIOS = {
+    "bug_duplicate_completion" => /running attempt/,
+    "bug_stale_step_completion" => /running attempt/,
+    "bug_stale_lease_commit" => /stale lease commit was rejected/,
+    "bug_missed_event_wake" => /event wake completed waiting workflow/,
+    "bug_duplicated_event_wake" => /event wake completed only once/,
+    "bug_outbox_duplicate_by_key" => /duplicate outbox key|outbox key stayed unique/,
+    "bug_outbox_stuck_lease" => /outbox lease was reclaimed after expiry/,
+    "bug_attempt_history_corruption" => /attempt history stayed append-only/,
+  }.freeze
+
   def assert_scenarios_hold(scenarios, seeds:)
     scenarios.each do |scenario|
       failures = Durababble::Deterministic.search(scenario, seeds:)
@@ -227,6 +238,18 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 2, failures.length
     assert_includes failures.first.last.join, "running attempt"
+  end
+
+  test "mutation fixtures expose representative durability bug classes" do
+    MUTATION_SCENARIOS.each do |scenario, expected_violation|
+      report = Durababble::Deterministic.search_reports(scenario, seeds: 1..3).first
+
+      assert report, "expected #{scenario.inspect} to fail within seeds 1..3"
+      assert_equal scenario, report.scenario
+      assert_equal 1, report.seed
+      assert_match(/\A\h{64}\z/, report.digest)
+      assert_match expected_violation, report.violations.join("\n")
+    end
   end
 
   test "fuzzes each unique scenario target across many deterministic seeds" do

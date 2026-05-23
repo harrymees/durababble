@@ -71,6 +71,45 @@ mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.se
 
 An empty array means no invariant violation was found for that seed range.
 
+For mutation testing and handoff reports, prefer `search_reports`, which includes
+the scenario, first failing seed, deterministic trace digest, and violation text:
+
+```sh
+mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search_reports("bug_stale_lease_commit", seeds: 1..25).first'
+```
+
+Interpretation:
+
+- A non-empty report means the harness illuminated the seeded bug. Record the first
+  failing seed, digest, scenario, and violation, then keep or add a permanent
+  meta-test for that bug class.
+- An empty report over the searched range means the current scenario/invariants
+  did not expose that mutation. Tighten the scenario, trace checks, or invariant
+  coverage before treating the mutation as tested.
+- The digest is the SHA256 of the deterministic trace. It is useful for comparing
+  exact schedules while the human-readable violation names the broken guarantee.
+
+## Mutation testing
+
+Durababble keeps intentionally broken behavior out of production paths by using
+test-only mutations in the virtual Yugabyte store. Each `bug_*` scenario enables
+one controlled mutation and asserts the harness reports a violation. The permanent
+meta-test in `test/durababble/deterministic_test.rb` fails if any seeded bug stops
+being detected within seeds `1..3`.
+
+Current mutation matrix:
+
+| Mutation class | Scenario | Seed range | First failing seed | Digest | Violation signal |
+| --- | --- | --- | --- | --- | --- |
+| duplicate/stale step completion fixture | `bug_duplicate_completion` | `1..25` | `1` | `732352eae3ae7f3a02930c955a519a779c9c3611fa3521169cc2332756f7ef60` | completed workflow has running attempt |
+| stale step completion hook | `bug_stale_step_completion` | `1..25` | `1` | `35c152c73c08f10dec19dae2cdbd77c1c11100eb8aeafec6a4aad59e5ccd87bc` | completed workflow has running attempts |
+| stale lease commit | `bug_stale_lease_commit` | `1..25` | `1` | `c126d9954a6e59b7029b7e19f118cb779fa4798bc2c972135d9d348c1d3a45a7` | stale lease commit was accepted |
+| missed event wake | `bug_missed_event_wake` | `1..25` | `1` | `f70c344418dbdcc8b6600a1a5196fc88d50f2f36302ea5d72b55b90c3b501d2e` | waiting workflow did not complete after signal |
+| duplicated event wake | `bug_duplicated_event_wake` | `1..25` | `1` | `19291fa0af41f23ab4f84240ffd914bd365fef6e059309765070f8fe34c1878c` | event wake completed more than once |
+| duplicate outbox key | `bug_outbox_duplicate_by_key` | `1..25` | `1` | `050be88e8886e0a025780ee1746688557138e56c8898c94e21c97ffdd52c1ddd` | duplicate outbox key |
+| stuck outbox lease | `bug_outbox_stuck_lease` | `1..25` | `1` | `cd65a5c47e21cef55d0e7f27a3a5fda86df4701f6a3994520fb279a733854756` | expired outbox lease was not reclaimed |
+| retry/attempt-history corruption | `bug_attempt_history_corruption` | `1..25` | `1` | `f1315eb62321d0f3a226d90a7c6f3bab5b96f251aa1f851b39a08c61fa44c7ed` | attempt history was not append-only |
+
 ## Bugs found during harness work
 
 The first deterministic trace revealed that worker ticks claimed the same workflow twice: once in `Worker#tick`/`SimWorker#run_tick`, then again inside `Engine#resume`. This was not a correctness failure, but it was an unnecessary duplicate lease update and trace event. The store now treats an unexpired lease already owned by the same worker as an already-owned claim and returns it without issuing another lease update. This is pinned by a clear store regression test and a deterministic trace-count assertion.

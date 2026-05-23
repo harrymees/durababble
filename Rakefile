@@ -22,6 +22,9 @@ Rake::TestTask.new(:test) do |task|
   task.pattern = "test/**/*_test.rb"
 end
 
+desc "Alias for the full Minitest suite"
+task spec: :test
+
 namespace :test do
   desc "Run the full test suite with SimpleCov line and branch coverage gates"
   task :coverage do

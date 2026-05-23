@@ -6,6 +6,7 @@ require "digest"
 module Durababble
   module Deterministic
     Result = Data.define(:scenario, :seed, :trace, :digest, :violations, :summary)
+    MutationReport = Data.define(:scenario, :seed, :digest, :violations)
 
     class << self
       #: (untyped, seed: untyped) -> untyped
@@ -18,6 +19,16 @@ module Durababble
         seeds.filter_map do |seed|
           result = prove(scenario, seed:)
           [seed, result.violations] unless result.violations.empty?
+        end
+      end
+
+      #: (untyped, seeds: untyped) -> untyped
+      def search_reports(scenario, seeds:)
+        seeds.filter_map do |seed|
+          result = prove(scenario, seed:)
+          next if result.violations.empty?
+
+          MutationReport.new(scenario: result.scenario, seed:, digest: result.digest, violations: result.violations)
         end
       end
     end
@@ -204,10 +215,11 @@ module Durababble
       #: untyped
       attr_reader :scheduler, :fault_plan
 
-      #: (scheduler: untyped, ?fault_plan: untyped) -> void
-      def initialize(scheduler:, fault_plan: nil)
+      #: (scheduler: untyped, ?fault_plan: untyped, ?mutation: untyped) -> void
+      def initialize(scheduler:, fault_plan: nil, mutation: nil)
         @scheduler = scheduler
         @fault_plan = fault_plan || FaultPlan.new(scheduler:)
+        @mutation = mutation&.to_sym
         @id_seq = 0
         @workflows = {}
         @steps = Hash.new { |hash, key| hash[key] = {} }
@@ -353,11 +365,16 @@ module Durababble
 
       #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
       def record_step_started(workflow_id:, position:, name:)
-        @attempts[workflow_id].each do |attempt|
-          next unless attempt.fetch("position") == position && attempt.fetch("status") == "running"
+        if mutation?(:attempt_history_overwrite)
+          @attempts[workflow_id].delete_if { |attempt| attempt.fetch("position") == position }
+          trace("mutation_attempt_history_overwrite", id: workflow_id, position:)
+        else
+          @attempts[workflow_id].each do |attempt|
+            next unless attempt.fetch("position") == position && attempt.fetch("status") == "running"
 
-          attempt["status"] = "failed"
-          attempt["error"] = "superseded by retry"
+            attempt["status"] = "failed"
+            attempt["error"] = "superseded by retry"
+          end
         end
         previous_cursor = @steps[workflow_id][position]&.fetch("heartbeat_cursor", nil)
         @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
@@ -370,7 +387,9 @@ module Durababble
         step = @steps[workflow_id].fetch(position)
         step["status"] = "completed"
         step["result"] = deep(result)
-        update_latest_attempt(workflow_id, position, "completed", result, nil)
+        unless mutation?(:stale_step_completion)
+          update_latest_attempt(workflow_id, position, "completed", result, nil)
+        end
         trace("step_completed", id: workflow_id, position:, result:)
         fault_plan.after(:record_step_completed)
       end
@@ -407,7 +426,17 @@ module Durababble
 
       #: (untyped, ?payload: untyped) -> untyped
       def signal_event(event_key, payload: {})
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "event" && wait.fetch("event_key") == event_key }, payload)
+        if mutation?(:miss_event_wake)
+          trace("event_wake_missed", event_key:)
+          return 0
+        end
+
+        waits = @waits.values.select do |wait|
+          wait.fetch("kind") == "event" &&
+            wait.fetch("event_key") == event_key &&
+            (mutation?(:duplicate_event_wake) || wait.fetch("status") == "pending")
+        end
+        complete_waits(waits, payload)
       end
 
       #: (untyped) -> untyped
@@ -439,11 +468,11 @@ module Durababble
 
       #: (workflow_id: untyped, topic: untyped, payload: untyped, key: untyped) -> untyped
       def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-        return @outbox_by_key.fetch(key) if @outbox_by_key.key?(key)
+        return @outbox_by_key.fetch(key) if @outbox_by_key.key?(key) && !mutation?(:outbox_duplicate_by_key)
 
         id = next_id("outbox")
         @outbox[id] = { "id" => id, "workflow_id" => workflow_id, "topic" => topic, "payload" => deep(payload), "key" => key, "status" => "pending", "locked_by" => nil, "locked_until" => nil }
-        @outbox_by_key[key] = id
+        @outbox_by_key[key] ||= id
         trace("outbox_enqueued", id:, key:, topic:)
         fault_plan.after(:enqueue_outbox)
         id
@@ -451,7 +480,11 @@ module Durababble
 
       #: (worker_id: untyped, lease_seconds: untyped) -> untyped
       def claim_outbox(worker_id:, lease_seconds:)
-        row = @outbox.values.select { |message| message.fetch("status") == "pending" || (message.fetch("status") == "processing" && message.fetch("locked_until") < scheduler.time) }.min_by { |message| message.fetch("id") }
+        claimable = @outbox.values.select do |message|
+          message.fetch("status") == "pending" ||
+            (!mutation?(:outbox_stuck_lease) && message.fetch("status") == "processing" && message.fetch("locked_until") < scheduler.time)
+        end
+        row = claimable.min_by { |message| message.fetch("id") }
         return unless row
 
         row["status"] = "processing"
@@ -472,12 +505,16 @@ module Durababble
 
       #: (untyped) -> untyped
       def outbox_message(outbox_id) = deep(@outbox.fetch(outbox_id))
+      #: () -> untyped
+      def outbox_messages = @outbox.values.sort_by { |row| row.fetch("id") }.map { |row| deep(row) }
       #: (untyped) -> untyped
       def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
 
       #: (workflow_id: untyped, worker_id: untyped) -> untyped
       def workflow_owned?(workflow_id:, worker_id:)
         row = @workflows.fetch(workflow_id)
+        return true if mutation?(:stale_lease_commit) && row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
+
         row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
       end
 
@@ -543,7 +580,7 @@ module Durababble
         completed = 0
         waits.each do |wait|
           row = @workflows.fetch(wait.fetch("workflow_id"))
-          next unless row.fetch("status") == "waiting"
+          next unless row.fetch("status") == "waiting" || (mutation?(:duplicate_event_wake) && row.fetch("status") == "pending")
 
           wait["status"] = "completed"
           wait["payload"] = deep(payload)
@@ -577,6 +614,11 @@ module Durababble
       #: (untyped) -> untyped
       def deep(value)
         Marshal.load(Marshal.dump(value))
+      end
+
+      #: (untyped) -> untyped
+      def mutation?(name)
+        @mutation == name.to_sym
       end
 
       #: (untyped, ?untyped) -> untyped
@@ -722,6 +764,143 @@ module Durababble
           h.store.mark_workflow_running(id, worker_id: "bug", lease_seconds: 10)
           h.store.record_step_started(workflow_id: id, position: 0, name: "broken")
           h.store.complete_workflow(id, result: { "count" => seed })
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_stale_step_completion(seed)
+        run(seed, "bug_stale_step_completion", mutation: :stale_step_completion) do |h|
+          h.workflows["counter"] = counter_workflow
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.scheduler.schedule(actor: "worker", delay: h.scheduler.rng.int(5), name: "complete_with_stale_attempt") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("counter"), workflow_id: id)
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_stale_lease_commit(seed)
+        run(seed, "bug_stale_lease_commit", mutation: :stale_lease_commit) do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.claim_workflow(workflow_id: id, worker_id: "stale-worker", lease_seconds: 10)
+          h.scheduler.schedule(actor: "stale-worker", delay: 20, name: "commit_after_lease_expiry") do
+            if h.store.workflow_owned?(workflow_id: id, worker_id: "stale-worker")
+              h.store.complete_workflow(id, result: { "owner" => "stale-worker" })
+              h.scheduler.trace.event(h.scheduler.time, "stale-worker", "stale_lease_commit_accepted", workflow_id: id)
+            else
+              h.scheduler.trace.event(h.scheduler.time, "stale-worker", "stale_lease_commit_rejected", workflow_id: id)
+            end
+          end
+          h.check("stale lease commit was rejected") do
+            !h.scheduler.trace.to_s.include?("stale_lease_commit_accepted")
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_missed_event_wake(seed)
+        run(seed, "bug_missed_event_wake", mutation: :miss_event_wake) do |h|
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("miss:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
+          end
+          id = h.store.enqueue_workflow(name: "waiting", input: { "id" => seed.to_s })
+          h.scheduler.schedule(actor: "worker", delay: 1, name: "park") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "signaler", delay: 20, name: "signal") do
+            signaled = h.store.signal_event("miss:#{seed}", payload: { "ok" => true })
+            h.scheduler.trace.event(h.scheduler.time, "signaler", "signal_result", signaled:)
+          end
+          h.scheduler.schedule(actor: "worker", delay: 30, name: "resume_after_signal") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id)
+          rescue LeaseConflict
+            h.scheduler.trace.event(h.scheduler.time, "worker", "resume_blocked_waiting", workflow_id: id)
+          end
+          h.check("event wake completed waiting workflow") do
+            h.store.workflow(id).fetch("status") == "completed"
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_duplicated_event_wake(seed)
+        run(seed, "bug_duplicated_event_wake", mutation: :duplicate_event_wake) do |h|
+          h.workflows["waiting"] = workflow_class("waiting") do
+            test_step("wait") { |ctx| Durababble.wait_event("dup-wake:#{ctx.fetch("id")}", ctx) }
+            test_step("done") { |ctx| ctx.merge("done" => true) }
+          end
+          id = h.store.enqueue_workflow(name: "waiting", input: { "id" => seed.to_s })
+          h.scheduler.schedule(actor: "worker", delay: 1, name: "park") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id)
+          end
+          2.times do |i|
+            h.scheduler.schedule(actor: "signaler-#{i}", delay: 20 + i, name: "signal") do
+              h.store.signal_event("dup-wake:#{seed}", payload: { "signaler" => i })
+            end
+          end
+          h.scheduler.schedule(actor: "worker", delay: 30, name: "resume") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id)
+          end
+          h.check("event wake completed only once") do
+            h.scheduler.trace.to_s.scan("wait_completed").length == 1
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_outbox_duplicate_by_key(seed)
+        run(seed, "bug_outbox_duplicate_by_key", mutation: :outbox_duplicate_by_key) do |h|
+          workflow_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          2.times do |i|
+            h.scheduler.schedule(actor: "producer-#{i}", delay: i, name: "enqueue_outbox") do
+              h.store.enqueue_outbox(
+                workflow_id:,
+                topic: "email",
+                payload: { "producer" => i },
+                key: "email:#{seed}",
+              )
+            end
+          end
+          h.check("outbox key stayed unique") do
+            h.store.outbox_messages.count { |message| message.fetch("key") == "email:#{seed}" } == 1
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_outbox_stuck_lease(seed)
+        run(seed, "bug_outbox_stuck_lease", mutation: :outbox_stuck_lease) do |h|
+          workflow_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.enqueue_outbox(workflow_id:, topic: "email", payload: { "seed" => seed }, key: "email:#{seed}")
+          h.store.claim_outbox(worker_id: "crashed-sender", lease_seconds: 10)
+          h.scheduler.schedule(actor: "sender-b", delay: 20, name: "recover_outbox") do
+            message = h.store.claim_outbox(worker_id: "sender-b", lease_seconds: 10)
+            if message
+              h.store.ack_outbox(message.fetch("id"), worker_id: "sender-b")
+            else
+              h.scheduler.trace.event(h.scheduler.time, "sender-b", "outbox_reclaim_missed")
+            end
+          end
+          h.check("outbox lease was reclaimed after expiry") do
+            h.store.summary.fetch(:processed_outbox) == 1
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_attempt_history_corruption(seed)
+        run(seed, "bug_attempt_history_corruption", mutation: :attempt_history_overwrite) do |h|
+          h.workflows["flaky"] = workflow_class("flaky") do
+            test_step("fail") { |_ctx| raise "boom #{seed}" }
+          end
+          id = h.store.enqueue_workflow(name: "flaky", input: { "seed" => seed })
+          3.times do |i|
+            h.scheduler.schedule(actor: "worker-#{i}", delay: i * 20, name: "attempt") do
+              Durababble::Engine.new(store: h.store, worker_id: "worker-#{i}").resume(h.workflows.fetch("flaky"), workflow_id: id)
+            end
+          end
+          h.check("attempt history stayed append-only") { h.store.step_attempts_for(id).length == 3 }
         end
       end
 
@@ -1816,11 +1995,11 @@ module Durababble
       end
 
       #: (untyped, untyped) { (untyped) -> untyped } -> untyped
-      def run(seed, scenario, &block)
+      def run(seed, scenario, mutation: nil, &block)
         trace = Trace.new
         scheduler = Scheduler.new(seed:, trace:)
         network = VirtualNetwork.new(scheduler:, drop_percent: scenario == "chaos" ? 5 : 0)
-        store = VirtualYugabyte.new(scheduler:)
+        store = VirtualYugabyte.new(scheduler:, mutation:)
         harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
         trace.event(0, "dst", "begin", scenario:, seed:)
         block.call(harness)
@@ -1871,6 +2050,7 @@ module Durababble
         workflows_state = store.instance_variable_get(:@workflows)
         steps_state = store.instance_variable_get(:@steps)
         attempts_state = store.instance_variable_get(:@attempts)
+        outbox_state = store.instance_variable_get(:@outbox)
         workflows_state.each do |id, row|
           if row.fetch("status") == "completed" && row.fetch("locked_by")
             violations << "completed workflow #{id} still locked"
@@ -1880,10 +2060,13 @@ module Durababble
             violations << "duplicate completed step positions for #{id}"
           end
           attempts_state[id].each do |attempt|
-            if attempt.fetch("status") == "running" && row.fetch("status") == "completed"
-              violations << "completed workflow #{id} has running attempt #{attempt.fetch("id")}"
+            if ["running", "waiting"].include?(attempt.fetch("status")) && ["completed", "failed"].include?(row.fetch("status"))
+              violations << "#{row.fetch("status")} workflow #{id} has #{attempt.fetch("status")} attempt #{attempt.fetch("id")}"
             end
           end
+        end
+        outbox_state.values.group_by { |message| message.fetch("key") }.each do |key, messages|
+          violations << "duplicate outbox key #{key}" if messages.length > 1
         end
       end
     end

@@ -658,6 +658,7 @@ The test suite must keep correctness claims evidence-backed:
 - Shared backend conformance tests cover MySQL/MariaDB and PostgreSQL/YSQL behavior equivalence.
 - Backend-specific tests must pin SQL behavior that differs by adapter, including lock/claim semantics and EXPLAIN-backed query-plan assertions for hot paths when practical.
 - Deterministic simulation tests (DST) are useful for exploring lease/race schedules, but any DST-found storage bug should be pinned by a real backend regression test.
+- DST mutation meta-tests intentionally enable test-only virtual-store bugs for stale step completion, stale lease commits, missed/duplicated event wakes, duplicate/stuck outbox delivery, and retry attempt-history corruption. Each mutation must report a first failing seed, trace digest, scenario, and violation so the harness fails loudly if it stops detecting a guarantee class. See `docs/deterministic-testing.md` for commands and the current mutation matrix.
 - Subprocess crash harnesses cover real process death around durable boundaries.
 - RPC tests must cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, gRPC serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
 - Object mailbox tests must cover strict FIFO, blocked head behavior, ask/tell ordering, wake ordering, idempotency conflicts, owner crash, lease takeover, dead-letter, and operator repair paths.
