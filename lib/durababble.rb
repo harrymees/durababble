@@ -81,6 +81,7 @@ module Durababble
 end
 
 require_relative "durababble/retry_policy"
+require_relative "durababble/async_dispatch"
 require_relative "durababble/workflow"
 require_relative "durababble/async_future"
 require_relative "durababble/durable_object"

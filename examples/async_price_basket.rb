@@ -11,7 +11,7 @@ class AsyncPriceBasketWorkflow < Durababble::Workflow
   workflow_name "async_price_basket"
 
   def execute(input)
-    futures = input.fetch("items").map { |item| async { quote_item(item) } }
+    futures = input.fetch("items").map { |item| async(:quote_item, item) }
     quotes = await_all(futures)
 
     {

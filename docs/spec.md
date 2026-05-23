@@ -405,7 +405,7 @@ Durababble supports workflow-local async fan-out/fan-in for durable workflow ste
 ```ruby
 class PriceBasket < Durababble::Workflow
   def execute(items)
-    quotes = items.map { |item| async { quote(item) } }
+    quotes = items.map { |item| async(:quote, item) }
     await_all(quotes).sum
   end
 
@@ -415,11 +415,11 @@ class PriceBasket < Durababble::Workflow
 end
 ```
 
-The async model is deliberately narrower than arbitrary Ruby fibers. An `async` block is orchestration code that may contain exactly one durable boundary: one workflow step call or one step that returns a `WaitRequest`. It must not run non-durable side effects before the step or schedule multiple durable boundaries. General deterministic futures/fibers remain future scope.
+The async model is deliberately narrower than arbitrary Ruby fibers. The normal form is `async(:step_name, *args, **kwargs)`, which validates that the target is a registered workflow step before reserving durable work and then dispatches exactly that one step when the future starts. The block form, `async { ... }`, is retained for advanced experiments; it is orchestration code that may contain exactly one durable boundary: one workflow step call or one step that returns a `WaitRequest`. It must not run non-durable side effects before the step or schedule multiple durable boundaries. General deterministic futures/fibers remain future scope.
 
 Semantics:
 
-- `async { ... }` reserves the next method/order step position synchronously when the future is created. That reservation, not Ruby thread scheduling or completion order, defines the stable step identity and `step_context.idempotency_key`.
+- `async(:step_name, *args, **kwargs)` and `async { ... }` reserve the next method/order step position synchronously when the future is created. That reservation, not Ruby thread scheduling or completion order, defines the stable step identity and `step_context.idempotency_key`.
 - `future.start` dispatches a pending future. `future.value` starts the future if needed and waits for it. `await_all(futures)` starts every pending future, waits for all started futures to settle, returns results in the caller-provided future order, and raises the first error by that same order.
 - Every future must be awaited or canceled before workflow completion. A workflow that starts or reserves async work and then returns without observing it fails with `AsyncBoundaryError`; Durababble does not provide fire-and-forget workflow steps.
 - Step start, completion, failure, wait, retry scheduling, heartbeat, and workflow completion use the same persisted `steps`, `step_attempts`, `waits`, and `workflows` rows as ordinary sequential steps. Store access from async futures is serialized inside the workflow execution object; user step bodies may run concurrently outside the store mutex.

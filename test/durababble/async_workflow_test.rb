@@ -15,8 +15,8 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           workflow_name "async_order"
 
           define_method(:execute) do |input|
-            slow_future = async { slow(input) }
-            fast_future = async { fast(input) }
+            slow_future = async(:slow, input)
+            fast_future = async(:fast, input)
 
             { "results" => await_all([slow_future, fast_future]) }
           end
@@ -50,6 +50,48 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         observed_contexts = 2.times.map { contexts.pop }.sort_by { |name, _index, _key| name }
         assert_equal ["fast", 1, "durababble:v1:workflow:#{run.id}:step:1"], observed_contexts.fetch(0)
         assert_equal ["slow", 0, "durababble:v1:workflow:#{run.id}:step:0"], observed_contexts.fetch(1)
+      end
+    end
+
+    test "validates method-targeted async step names before reserving work with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow_test") do |store|
+        store.migrate!
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "async_method_validation"
+
+          def execute(input)
+            async(:missing_step, input)
+          end
+        end
+
+        run = Durababble::Engine.new(store:).run(workflow, input: {})
+
+        assert_equal "failed", run.status
+        assert_includes run.error, "ArgumentError: async step :missing_step is not registered with step"
+        assert_empty store.steps_for(run.id)
+      end
+    end
+
+    test "rejects ambiguous method-targeted async blocks before reserving work with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow_test") do |store|
+        store.migrate!
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "async_method_block_validation"
+
+          def execute(input)
+            async(:ok, input) { "ambiguous" }
+          end
+
+          step def ok(input)
+            input
+          end
+        end
+
+        run = Durababble::Engine.new(store:).run(workflow, input: {})
+
+        assert_equal "failed", run.status
+        assert_includes run.error, "ArgumentError: async step method form does not accept a block"
+        assert_empty store.steps_for(run.id)
       end
     end
 

@@ -174,8 +174,21 @@ module Durababble
       Durababble.wait_event(event_key, context)
     end
 
-    #: () { -> untyped } -> untyped
-    def async(&block)
+    #: (?untyped, *untyped, **untyped) { (?) -> untyped } -> untyped
+    def async(method_name = nil, *args, **kwargs, &block)
+      if method_name
+        raise ArgumentError, "async step method form does not accept a block" if block
+
+        method_name = method_name.to_sym
+        unless self.class.steps.key?(method_name)
+          raise ArgumentError, "async step #{method_name.inspect} is not registered with step"
+        end
+
+        block = proc { AsyncDispatch.call(self, method_name, args, kwargs) }
+      elsif !block
+        raise ArgumentError, "async requires a step method name or a block"
+      end
+
       __durababble_execution__.async(self, &block)
     end
 

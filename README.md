@@ -124,14 +124,14 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-Workflow steps can also be fanned out with workflow-local async futures. `async` reserves the next durable step position immediately; `await_all` dispatches pending futures, waits for them, and returns results in the order supplied by workflow code even when the steps complete in another order.
+Workflow steps can also be fanned out with workflow-local async futures. `async(:step_name, *args, **kwargs)` reserves the next durable step position immediately for that registered step; `await_all` dispatches pending futures, waits for them, and returns results in the order supplied by workflow code even when the steps complete in another order.
 
 ```ruby
 class PriceBasket < Durababble::Workflow
   workflow_name "price_basket"
 
   def execute(items)
-    quotes = items.map { |item| async { quote_item(item) } }
+    quotes = items.map { |item| async(:quote_item, item) }
     await_all(quotes)
   end
 
@@ -142,7 +142,7 @@ class PriceBasket < Durababble::Workflow
 end
 ```
 
-Async blocks are intentionally narrow: each block should contain one durable step or one step that returns a durable wait. Canceling a future before it starts persists a canceled step position; once a future has started, Durababble does not interrupt user side effects.
+The method-targeted form is the normal API because it names exactly one registered workflow step before reserving durable work. The block form, `async { quote_item(item) }`, is retained for advanced orchestration experiments and is runtime-checked: it must reach exactly one durable step or one step that returns a durable wait. Canceling a future before it starts persists a canceled step position; once a future has started, Durababble does not interrupt user side effects.
 
 See `examples/async_price_basket.rb` for a runnable fan-out/fan-in workflow.
 

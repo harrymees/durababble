@@ -88,6 +88,7 @@ module Durababble
     def step_context: () -> StepContext
     def wait_until: (Time time, ?untyped context) -> WaitRequest
     def wait_event: (String event_key, ?untyped context) -> WaitRequest
+    def async: (Symbol method_name, *untyped args, **untyped kwargs) -> AsyncFuture[untyped]
     def async: () { () -> untyped } -> AsyncFuture[untyped]
     def await_all: (*AsyncFuture[untyped] | Array[AsyncFuture[untyped]] futures) -> Array[untyped]
   end
