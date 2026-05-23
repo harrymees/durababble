@@ -20,7 +20,7 @@ module Durababble
     #: untyped
     attr_reader :workflow_id, :reason
 
-    #: (untyped, ?workflow_id: untyped) -> void
+    #: (?untyped, ?workflow_id: untyped) -> void
     def initialize(reason = nil, workflow_id: nil)
       @workflow_id = workflow_id
       @reason = reason

@@ -50,10 +50,7 @@ module Durababble
       end
 
       raise_if_cancel_requested!
-      attempt_started = false
-      step_completed = false
       @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
-      attempt_started = true
       crash!(:step_started)
       heartbeat = build_heartbeat(position)
       attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
@@ -75,15 +72,12 @@ module Durababble
 
       assert_workflow_lease!
       @store.record_step_completed(workflow_id: @workflow_id, position:, result: output)
-      step_completed = true
       crash!(:step_completed)
       raise_if_cancel_requested!
       output
     rescue CancellationError => e
-      if attempt_started && !step_completed
-        assert_workflow_lease!
-        @store.record_step_canceled(workflow_id: @workflow_id, position:, error: "#{e.class}: #{e.message}")
-      end
+      assert_workflow_lease!
+      @store.record_step_canceled(workflow_id: @workflow_id, position:, error: "#{e.class}: #{e.message}")
       raise
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError)

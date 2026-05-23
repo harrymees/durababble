@@ -341,7 +341,7 @@ module Durababble
         trace("complete_workflow", id: workflow_id, result:)
       end
 
-      #: (untyped, reason: untyped, result: untyped) -> untyped
+      #: (untyped, reason: untyped, ?result: untyped) -> untyped
       def cancel_workflow(workflow_id, reason:, result: nil)
         row = @workflows.fetch(workflow_id)
         row["status"] = "canceled"
@@ -1605,10 +1605,11 @@ module Durababble
             workflow_name "cancelable"
 
             define_method(:execute) do |input|
-              wait_for_signal(input)
+              instance = self #: as untyped
+              instance.wait_for_signal(input)
               { "done" => true }
             rescue Durababble::CancellationError => e
-              cleanup(input.merge("reason" => e.reason))
+              instance.cleanup(input.merge("reason" => e.reason))
             end
 
             define_method(:wait_for_signal) do |input|

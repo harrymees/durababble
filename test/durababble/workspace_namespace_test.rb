@@ -61,6 +61,31 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     Durababble.default_store = nil
   end
 
+  test "store accessor raises until configured and returns configured store" do
+    store = NamespaceStoreDouble.new
+    Durababble.default_store = nil
+
+    error = assert_raises(Durababble::Error) { Durababble.store }
+    assert_match(/not configured/, error.message)
+
+    Durababble.default_store = store
+    assert_same(store, Durababble.store)
+  ensure
+    Durababble.default_store = nil
+  end
+
+  test "cancellation error exposes workflow id and default message" do
+    default_error = Durababble::CancellationError.new(nil, workflow_id: "wf-1")
+    reason_error = Durababble::CancellationError.new("operator request", workflow_id: "wf-2")
+
+    assert_equal("workflow cancellation requested", default_error.message)
+    assert_equal("wf-1", default_error.workflow_id)
+    assert_nil(default_error.reason)
+    assert_equal("operator request", reason_error.message)
+    assert_equal("wf-2", reason_error.workflow_id)
+    assert_equal("operator request", reason_error.reason)
+  end
+
   test "worker runtime threads the selected default schema to owned stores" do
     store = NamespaceStoreDouble.new
 

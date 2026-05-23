@@ -479,7 +479,7 @@ module Durababble
       )
     end
 
-    #: (untyped, reason: untyped, result: untyped) -> untyped
+    #: (untyped, reason: untyped, ?result: untyped) -> untyped
     def cancel_workflow(workflow_id, reason:, result: nil)
       execute_params(
         "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
@@ -1546,7 +1546,7 @@ module Durababble
       SQL
     end
 
-    #: (untyped, reason: untyped, result: untyped) -> untyped
+    #: (untyped, reason: untyped, ?result: untyped) -> untyped
     def cancel_workflow(workflow_id, reason:, result: nil)
       execute_params(<<~SQL, [dump_serialized(result), reason, workflow_id])
         UPDATE #{table("workflows")}
