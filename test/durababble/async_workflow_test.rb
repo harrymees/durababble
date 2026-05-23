@@ -170,9 +170,14 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           define_method(:execute) do |input|
             canceled = async { never(input) }
             canceled_result = canceled.cancel
+            canceled_value = begin
+              canceled.value
+            rescue Durababble::AsyncCanceled => e
+              e.message
+            end
             kept = async { ok(input) }
 
-            { "canceled" => canceled_result, "values" => await_all(kept) }
+            { "canceled" => canceled_result, "canceled_value" => canceled_value, "values" => await_all(kept) }
           end
 
           step define_method(:never) { |_input|
@@ -188,7 +193,14 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         run = Durababble::Engine.new(store:).run(workflow, input: {})
 
         assert_equal "completed", run.status
-        assert_equal({ "canceled" => true, "values" => [{ "ok" => true }] }, run.result)
+        assert_equal(
+          {
+            "canceled" => true,
+            "canceled_value" => "async step at position 0 was canceled",
+            "values" => [{ "ok" => true }],
+          },
+          run.result,
+        )
         assert_equal false, canceled_ran
         assert_equal(
           [["async", "canceled"], ["ok", "completed"]],
