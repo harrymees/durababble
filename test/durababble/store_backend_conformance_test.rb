@@ -335,6 +335,28 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "retries failed durable object commands with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        store.migrate!
+        command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [1],
+          kwargs: {},
+        )
+
+        store.fail_object_command(command_id:, error: "handler crashed")
+        # [DURABABBLE-OBJ-1] Failed command rows remain durable and can be reclaimed for retry.
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "retry-object-worker", lease_seconds: 30),
+          "id" => command_id,
+          "status" => "running",
+          "locked_by" => "retry-object-worker",
+        )
+      end
+    end
+
     test "does not leave MySQL transactions open after no-op claim paths with #{backend.name}" do
       skip("only the MySQL backend exposes transaction metadata") unless backend.mysql?
 

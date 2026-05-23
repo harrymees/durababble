@@ -58,6 +58,11 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       update_state("value" => current_state.fetch("value", 0) + amount)
     end
 
+    expose_command
+    def read_value
+      current_state.fetch("value", 0)
+    end
+
     expose_command retry: { maximum_attempts: 2, schedule: [0] }
     def flaky_add(amount:)
       state = current_state
@@ -92,6 +97,10 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     def signal_event(event_key, payload:)
       @events << [event_key, payload]
       1
+    end
+
+    def enqueue_workflow(name:, input:)
+      [name, input]
     end
 
     def object_state(object_type:, object_id:)
@@ -149,6 +158,11 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     assert_equal "plain", workflow.echo("plain")
     assert_equal "keyword", workflow.kw_echo(value: "keyword")
     assert_equal [:echo, :kw_echo], execution.calls.map { |(_klass, method_name, _args, _kwargs)| method_name }
+
+    store = BranchTestStore.new
+    assert_equal ["branch_test_workflow", { "queued" => true }], BranchTestWorkflow.enqueue({ "queued" => true }, store:)
+    assert_equal "timer", BranchTestWorkflow.new.wait_until(Time.utc(2026, 1, 1)).kind
+    assert_equal "event", BranchTestWorkflow.new.wait_event("approval").kind
   end
 
   test "exposes workflow refs for keyword queries and command events and rejects missing methods" do
@@ -181,12 +195,14 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     assert_respond_to account, :formatted
     assert_equal "balance:0", account.formatted(prefix: "balance")
     assert_equal({ "value" => 3 }, account.add(amount: 3))
+    assert_equal 3, account.read_value
     assert_equal({ "value" => 7, "attempts" => 1 }, account.flaky_add(amount: 4))
     assert_equal "balance:7", account.formatted(prefix: "balance")
     assert_equal 1, store.failed_commands.length
-    assert_equal 2, store.completed_commands.length
+    assert_equal 3, store.completed_commands.length
     assert_raises(NoMethodError) { account.not_exposed }
 
+    assert_nil Class.new(Durababble::DurableObject).new.current_state
     transient = BranchTestDurableObject.new
     assert_equal({ "value" => 9 }, transient.update_state("value" => 9))
   end
@@ -195,6 +211,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     Durababble::Store.expects(:connect).returns(BranchTestStore.new)
     Durababble.default_store = nil
 
+    assert_raises_matching(Durababble::Error, /not configured/) { Durababble.store }
     Durababble.configure(database_url: "postgresql://example.invalid/db", schema: "branch_test")
 
     assert_kind_of(BranchTestStore, Durababble.default_store)
