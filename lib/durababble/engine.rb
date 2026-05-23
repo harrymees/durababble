@@ -33,12 +33,14 @@ module Durababble
     def call_step(instance, method_name:, args:, kwargs:, &block)
       position = @position
       @position += 1
+      step = instance.class.step_definition(method_name)
 
       if @completed_steps.key?(position)
-        return @completed_steps.fetch(position).fetch("result")
+        completed_step = @completed_steps.fetch(position)
+        validate_completed_step_shape!(completed_step, step:, position:)
+        return completed_step.fetch("result")
       end
 
-      step = instance.class.step_definition(method_name)
       @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
       crash!(:step_started)
       heartbeat = build_heartbeat(position)
@@ -64,7 +66,7 @@ module Durababble
       crash!(:step_completed)
       output
     rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended)
+      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError)
 
       message = "#{e.class}: #{e.message}"
       assert_workflow_lease!
@@ -81,6 +83,16 @@ module Durababble
     end
 
     private
+
+    #: (untyped, step: untyped, position: untyped) -> void
+    def validate_completed_step_shape!(completed_step, step:, position:)
+      persisted_name = completed_step.fetch("name")
+      return if persisted_name == step.name
+
+      message = "workflow #{@workflow_id} replay reached step #{position} named #{step.name.inspect}, " \
+        "but durable history already completed #{persisted_name.inspect}"
+      raise NonDeterminismError, message
+    end
 
     #: (untyped) -> untyped
     def build_heartbeat(position)
