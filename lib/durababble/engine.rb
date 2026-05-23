@@ -39,15 +39,17 @@ module Durababble
     def call_step(instance, method_name:, args:, kwargs:, &block)
       position = @position
       @position += 1
+      step = instance.class.step_definition(method_name)
 
       if @completed_steps.key?(position)
-        result = @completed_steps.fetch(position).fetch("result")
+        completed_step = @completed_steps.fetch(position)
+        validate_completed_step_shape!(completed_step, step:, position:)
+        result = completed_step.fetch("result")
         raise_if_cancel_requested!
         return result
       end
 
       raise_if_cancel_requested!
-      step = instance.class.step_definition(method_name)
       attempt_started = false
       step_completed = false
       @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
@@ -84,7 +86,7 @@ module Durababble
       end
       raise
     rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended)
+      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError)
 
       message = "#{e.class}: #{e.message}"
       assert_workflow_lease!
@@ -100,6 +102,19 @@ module Durababble
       @step_context = nil
     end
 
+    #: () -> void
+    def validate_replay_complete!
+      extra_steps = @completed_steps
+        .select { |position, _step| position >= @position }
+        .sort_by { |position, _step| position }
+      return if extra_steps.empty?
+
+      rendered = extra_steps
+        .map { |position, step| "#{position}:#{step.fetch("name")}" }
+        .join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable step history: #{rendered}"
+    end
+
     private
 
     #: () -> untyped
@@ -113,6 +128,16 @@ module Durababble
       @store.mark_workflow_cancellation_delivered(workflow_id: @workflow_id)
       reason = cancellation["reason"]
       raise CancellationError.new(reason, workflow_id: @workflow_id)
+    end
+
+    #: (untyped, step: untyped, position: untyped) -> void
+    def validate_completed_step_shape!(completed_step, step:, position:)
+      persisted_name = completed_step.fetch("name")
+      return if persisted_name == step.name
+
+      message = "workflow #{@workflow_id} replay reached step #{position} named #{step.name.inspect}, " \
+        "but durable history already completed #{persisted_name.inspect}"
+      raise NonDeterminismError, message
     end
 
     #: (untyped) -> untyped
@@ -196,6 +221,7 @@ module Durababble
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
+      execution.validate_replay_complete!
       assert_workflow_lease!(workflow_id)
       if execution.cancellation_delivered?
         @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)

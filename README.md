@@ -94,6 +94,7 @@ Durababble exposes two complementary abstractions on the same durable store:
 Workflow code is plain Ruby in `#execute`.
 Methods declared with `step` are durable side-effect boundaries; replay returns persisted step results instead of rerunning completed work.
 Cancellation is cooperative: `Workflow.handle(run_id).cancel(reason:)` durably records a request and the next deterministic yield point raises `Durababble::CancellationError` inside workflow code. User code can rescue it, run durable cleanup steps, and the run finishes as `canceled`; cleanup failures are recorded as workflow failures.
+If replayed code reaches a different step method at a completed position, or returns before consuming all completed step positions, the run fails with `Durababble::NonDeterminismError` instead of silently reusing incompatible history.
 
 ```ruby
 class FulfillOrder < Durababble::Workflow
