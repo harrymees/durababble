@@ -33,11 +33,11 @@ module Durababble
     def workspace_schema(workspace_path = ENV.fetch("DURABABBLE_WORKSPACE_ROOT", Dir.pwd), prefix: DEFAULT_SCHEMA_PREFIX)
       expanded_path = File.expand_path(workspace_path)
       path = File.exist?(expanded_path) ? File.realpath(expanded_path) : expanded_path
-      suffix = Digest::SHA256.hexdigest(path)[0, 12]
+      suffix = Digest::SHA256.hexdigest(path).slice(0, 12).to_s
       leaf = schema_component(File.basename(path))
       base = "#{schema_component(prefix)}_#{leaf}"
       max_base_length = MAX_SCHEMA_IDENTIFIER_LENGTH - suffix.length - 1
-      trimmed_base = base[0, max_base_length].sub(/_+\z/, "")
+      trimmed_base = base.slice(0, max_base_length).to_s.sub(/_+\z/, "")
       "#{trimmed_base}_#{suffix}"
     end
 
