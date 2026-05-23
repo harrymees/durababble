@@ -32,10 +32,19 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
 
-      - name: Run tests
+      - name: Run coverage gate
         env:
           DURABABBLE_MYSQL_HOST: 127.0.0.1
-        run: bundle exec rake test
+        run: bundle exec rake test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: ignore
+          include-hidden-files: true
 
   lint-typecheck:
     runs-on: ubuntu-latest

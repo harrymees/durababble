@@ -22,4 +22,12 @@ Rake::TestTask.new(:test) do |task|
   task.pattern = "test/**/*_test.rb"
 end
 
+namespace :test do
+  desc "Run the full test suite with SimpleCov line and branch coverage gates"
+  task :coverage do
+    ENV["DURABABBLE_COVERAGE"] = "1"
+    Rake::Task[:test].invoke
+  end
+end
+
 task default: :test

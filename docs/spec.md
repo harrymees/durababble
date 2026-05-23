@@ -666,10 +666,14 @@ The test suite must keep correctness claims evidence-backed:
 - Exposed transient method tests must verify no durable state mutation and deadline/crash semantics. The home spec proposed an `expose_safety_check` helper.
 - Observability tests should verify required span/metric labels without depending on a particular vendor backend.
 
-SimpleCov thresholds currently required by the suite:
+SimpleCov thresholds required by the CI coverage gate:
 
-- line coverage: 85% minimum
-- branch coverage: 60% minimum
+- global line coverage: 88.3% minimum
+- global branch coverage: 70.5% minimum
+- per-file line coverage: 59% minimum
+- per-file branch coverage: 41% minimum
+
+These are initial ratchet thresholds based on the current CI MySQL suite. They are below the target of 95% line coverage and 90% branch coverage because the current measured branch coverage is materially lower; meaningful tests should raise the configured minimums as coverage improves, and the minimums must not be lowered without an explicit spec update. The gate is `mise exec -- bundle exec rake test:coverage`. It enables branch coverage, measures library files under `lib/**/*.rb`, excludes tests and non-library support surfaces from the metric, excludes `lib/durababble/version.rb` because Bundler loads that gem metadata before SimpleCov starts, prints the SimpleCov summary in CI logs, and writes the HTML report plus SimpleCov result JSON to `coverage/` for CI artifact upload.
 
 ## Prototype boundaries and anti-goals
 
