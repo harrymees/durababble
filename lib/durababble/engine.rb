@@ -82,6 +82,19 @@ module Durababble
       @step_context = nil
     end
 
+    #: () -> void
+    def validate_replay_complete!
+      extra_steps = @completed_steps
+        .select { |position, _step| position >= @position }
+        .sort_by { |position, _step| position }
+      return if extra_steps.empty?
+
+      rendered = extra_steps
+        .map { |position, step| "#{position}:#{step.fetch("name")}" }
+        .join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable step history: #{rendered}"
+    end
+
     private
 
     #: (untyped, step: untyped, position: untyped) -> void
@@ -174,6 +187,7 @@ module Durababble
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
+      execution.validate_replay_complete!
       assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result:)
       crash!(:workflow_completed)

@@ -49,7 +49,7 @@ When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution
 6. persists success, wait, retryable failure, or final failure.
 
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
-If replay reaches a completed position with a different current method name, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse a stale result for a different step.
+If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 

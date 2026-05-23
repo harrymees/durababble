@@ -79,6 +79,7 @@ Durababble exposes two complementary abstractions on the same durable store:
 
 Workflow code is plain Ruby in `#execute`.
 Methods declared with `step` are durable side-effect boundaries; replay returns persisted step results instead of rerunning completed work.
+If replayed code reaches a different step method at a completed position, or returns before consuming all completed step positions, the run fails with `Durababble::NonDeterminismError` instead of silently reusing incompatible history.
 
 ```ruby
 class FulfillOrder < Durababble::Workflow
