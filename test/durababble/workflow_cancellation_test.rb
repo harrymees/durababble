@@ -230,6 +230,27 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
       end
     end
 
+    test "stores cancellation metadata on the workflow row with #{backend.name}" do
+      with_durababble_store(backend, "workflow_cancellation_storage_test") do |store|
+        store.migrate!
+        workflow = cancelable_workflow("cancel-storage", work: ->(input, _heartbeat) { input }, cleanup: ->(input) { input })
+        workflow_id = workflow.enqueue({}, store:)
+
+        workflow.handle(workflow_id, store:).cancel(reason: "stored on workflow")
+        store.mark_workflow_cancellation_delivered(workflow_id:)
+
+        row = store.workflow(workflow_id)
+        cancellation = store.workflow_cancellation(workflow_id)
+
+        assert_equal "stored on workflow", row.fetch("cancel_reason")
+        refute_nil row.fetch("cancel_requested_at")
+        refute_nil row.fetch("cancel_delivered_at")
+        assert_equal workflow_id, cancellation.fetch("workflow_id")
+        assert_equal row.fetch("cancel_reason"), cancellation.fetch("reason")
+        refute_workflow_cancellations_table(store, backend)
+      end
+    end
+
     test "terminal workflow cancellation is a no-op unless already canceled with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
         store.migrate!
@@ -256,6 +277,24 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
   end
 
   private
+
+  def refute_workflow_cancellations_table(store, backend)
+    exists = if backend.mysql?
+      store.send(:execute_params, <<~SQL, [store.send(:raw_table_name, "workflow_cancellations")]).first
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = ?
+      SQL
+    else
+      store.send(:execute_params, <<~SQL, [schema, "workflow_cancellations"]).first
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = $1 AND table_name = $2
+      SQL
+    end
+
+    assert_nil(exists)
+  end
 
   def cancelable_workflow(name, work:, cleanup:, retry_policy: nil, cleanup_retry_policy: nil)
     Class.new(Durababble::Workflow) do

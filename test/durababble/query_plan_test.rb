@@ -197,7 +197,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "steal_expired_leases" => {
         call: -> { store.steal_expired_leases!(now: Time.now) },
-        allowed_indexes: ["workflows_expired_lease_idx", "workflow_cancellations_pkey"],
+        allowed_indexes: ["workflows_expired_lease_idx"],
       },
       "record_step_started" => {
         call: -> { store.record_step_started(workflow_id: "running-owned", position: 1, name: "next") },

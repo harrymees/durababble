@@ -54,6 +54,9 @@ module Durababble
           locked_by text,
           locked_until timestamptz,
           next_run_at timestamptz,
+          cancel_reason text,
+          cancel_requested_at timestamptz,
+          cancel_delivered_at timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now()
         )
@@ -61,14 +64,10 @@ module Durababble
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_by text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("workflow_cancellations")} (
-          workflow_id text PRIMARY KEY REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
-          reason text,
-          requested_at timestamptz NOT NULL DEFAULT now(),
-          delivered_at timestamptz
-        )
-      SQL
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_reason text")
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz")
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_delivered_at timestamptz")
+      migrate_legacy_workflow_cancellations!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -225,7 +224,7 @@ module Durababble
             WHERE status = 'pending'
               AND (next_run_at IS NULL OR next_run_at <= now())
               #{name_filter}
-            ORDER BY created_at
+            ORDER BY status, created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -234,7 +233,7 @@ module Durababble
             WHERE status = 'failed'
               AND (next_run_at IS NULL OR next_run_at <= now())
               #{name_filter}
-            ORDER BY created_at
+            ORDER BY status, created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -243,7 +242,7 @@ module Durababble
             WHERE status = 'canceling'
               AND (next_run_at IS NULL OR next_run_at <= now())
               #{name_filter}
-            ORDER BY created_at
+            ORDER BY status, created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -316,7 +315,7 @@ module Durababble
         workflows = execute_params(<<~SQL, [worker_id]).cmd_tuples
           UPDATE #{table("workflows")}
           SET status = CASE
-              WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
               ELSE 'pending'
             END,
             locked_by = NULL, locked_until = NULL, updated_at = now()
@@ -336,7 +335,7 @@ module Durababble
       execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, updated_at = now()
@@ -358,12 +357,14 @@ module Durababble
         decoded = decode_row(row)
         next decoded if terminal_for_cancellation?(decoded)
 
-        inserted = execute_params(<<~SQL, [workflow_id, reason])
-          INSERT INTO #{table("workflow_cancellations")} (workflow_id, reason)
-          VALUES ($1, $2)
-          ON CONFLICT (workflow_id) DO NOTHING
-        SQL
-        first_request = inserted.cmd_tuples == 1
+        first_request = row["cancel_requested_at"].nil?
+        if first_request
+          execute_params(<<~SQL, [workflow_id, reason])
+            UPDATE #{table("workflows")}
+            SET cancel_reason = $2, cancel_requested_at = now(), updated_at = now()
+            WHERE id = $1
+          SQL
+        end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
         if first_request && decoded.fetch("status") != "running"
@@ -380,16 +381,21 @@ module Durababble
 
     #: (untyped) -> untyped
     def workflow_cancellation(workflow_id)
-      row = execute_params("SELECT * FROM #{table("workflow_cancellations")} WHERE workflow_id = $1", [workflow_id]).first
+      row = execute_params(<<~SQL, [workflow_id]).first
+        SELECT id AS workflow_id, cancel_reason AS reason,
+          cancel_requested_at AS requested_at, cancel_delivered_at AS delivered_at
+        FROM #{table("workflows")}
+        WHERE id = $1 AND cancel_requested_at IS NOT NULL
+      SQL
       row&.transform_values(&:itself)
     end
 
     #: (workflow_id: untyped) -> untyped
     def mark_workflow_cancellation_delivered(workflow_id:)
       execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("workflow_cancellations")}
-        SET delivered_at = COALESCE(delivered_at, now())
-        WHERE workflow_id = $1
+        UPDATE #{table("workflows")}
+        SET cancel_delivered_at = COALESCE(cancel_delivered_at, now()), updated_at = now()
+        WHERE id = $1 AND cancel_requested_at IS NOT NULL
       SQL
     end
 
@@ -449,7 +455,7 @@ module Durababble
       result = execute_params(<<~SQL, [timestamp(now)])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, updated_at = now()
@@ -482,7 +488,7 @@ module Durababble
     #: (untyped, reason: untyped, ?result: untyped) -> untyped
     def cancel_workflow(workflow_id, reason:, result: nil)
       execute_params(
-        "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
+        "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
         [workflow_id, dump_serialized(result), reason],
       )
     end
@@ -972,6 +978,27 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
     end
 
+    #: () -> untyped
+    def migrate_legacy_workflow_cancellations!
+      exists = execute_params(<<~SQL, [schema, "workflow_cancellations"]).first
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = $1 AND table_name = $2
+      SQL
+      return unless exists
+
+      execute(<<~SQL)
+        UPDATE #{table("workflows")} AS wf
+        SET cancel_reason = COALESCE(wf.cancel_reason, wc.reason),
+          cancel_requested_at = COALESCE(wf.cancel_requested_at, wc.requested_at),
+          cancel_delivered_at = COALESCE(wf.cancel_delivered_at, wc.delivered_at),
+          updated_at = now()
+        FROM #{table("workflow_cancellations")} AS wc
+        WHERE wf.id = wc.workflow_id
+      SQL
+      execute("DROP TABLE IF EXISTS #{table("workflow_cancellations")}")
+    end
+
     #: (untyped, untyped, ?not_null: untyped) -> untyped
     def migrate_serialized_column!(table_name, column_name, not_null: false)
       column = execute_params(<<~SQL, [schema, table_name, column_name]).first
@@ -1073,6 +1100,9 @@ module Durababble
           locked_by VARCHAR(191),
           locked_until DATETIME(6),
           next_run_at DATETIME(6),
+          cancel_reason TEXT,
+          cancel_requested_at DATETIME(6),
+          cancel_delivered_at DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           INDEX #{quote_ident(index_name("workflows", "queue"))} (status, created_at),
@@ -1080,15 +1110,10 @@ module Durababble
           INDEX #{quote_ident(index_name("workflows", "expired_lease"))} (status, locked_until, created_at)
         )
       SQL
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("workflow_cancellations")} (
-          workflow_id VARCHAR(191) PRIMARY KEY,
-          reason TEXT,
-          requested_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          delivered_at DATETIME(6),
-          FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
-        )
-      SQL
+      add_column_if_missing("workflows", "cancel_reason", "TEXT")
+      add_column_if_missing("workflows", "cancel_requested_at", "DATETIME(6)")
+      add_column_if_missing("workflows", "cancel_delivered_at", "DATETIME(6)")
+      migrate_legacy_workflow_cancellations!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id VARCHAR(191) NOT NULL,
@@ -1258,7 +1283,7 @@ module Durababble
           WHERE status = 'pending'
             AND (next_run_at IS NULL OR next_run_at <= NOW(6))
             #{name_sql}
-          ORDER BY created_at
+          ORDER BY status, created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1267,7 +1292,7 @@ module Durababble
           WHERE status = 'failed'
             AND (next_run_at IS NULL OR next_run_at <= NOW(6))
             #{name_sql}
-          ORDER BY created_at
+          ORDER BY status, created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1276,7 +1301,7 @@ module Durababble
           WHERE status = 'canceling'
             AND (next_run_at IS NULL OR next_run_at <= NOW(6))
             #{name_sql}
-          ORDER BY created_at
+          ORDER BY status, created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1361,7 +1386,7 @@ module Durababble
         execute_params(<<~SQL, [worker_id])
           UPDATE #{table("workflows")}
           SET status = CASE
-              WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
               ELSE 'pending'
             END,
             locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
@@ -1382,7 +1407,7 @@ module Durababble
       execute_params(<<~SQL, [run_at, workflow_id, worker_id])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, next_run_at = ?, updated_at = NOW(6)
@@ -1404,11 +1429,14 @@ module Durababble
         decoded = decode_row(row)
         next decoded if terminal_for_cancellation?(decoded)
 
-        inserted = execute_params(<<~SQL, [workflow_id, reason])
-          INSERT IGNORE INTO #{table("workflow_cancellations")} (workflow_id, reason)
-          VALUES (?, ?)
-        SQL
-        first_request = inserted.cmd_tuples == 1
+        first_request = row["cancel_requested_at"].nil?
+        if first_request
+          execute_params(<<~SQL, [reason, workflow_id])
+            UPDATE #{table("workflows")}
+            SET cancel_reason = ?, cancel_requested_at = NOW(6), updated_at = NOW(6)
+            WHERE id = ?
+          SQL
+        end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
         if first_request && decoded.fetch("status") != "running"
@@ -1425,15 +1453,20 @@ module Durababble
 
     #: (untyped) -> untyped
     def workflow_cancellation(workflow_id)
-      execute_params("SELECT * FROM #{table("workflow_cancellations")} WHERE workflow_id = ?", [workflow_id]).first
+      execute_params(<<~SQL, [workflow_id]).first
+        SELECT id AS workflow_id, cancel_reason AS reason,
+          cancel_requested_at AS requested_at, cancel_delivered_at AS delivered_at
+        FROM #{table("workflows")}
+        WHERE id = ? AND cancel_requested_at IS NOT NULL
+      SQL
     end
 
     #: (workflow_id: untyped) -> untyped
     def mark_workflow_cancellation_delivered(workflow_id:)
       execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("workflow_cancellations")}
-        SET delivered_at = COALESCE(delivered_at, NOW(6))
-        WHERE workflow_id = ?
+        UPDATE #{table("workflows")}
+        SET cancel_delivered_at = COALESCE(cancel_delivered_at, NOW(6)), updated_at = NOW(6)
+        WHERE id = ? AND cancel_requested_at IS NOT NULL
       SQL
     end
 
@@ -1495,7 +1528,7 @@ module Durababble
       execute_params(<<~SQL, [now])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
@@ -1548,9 +1581,11 @@ module Durababble
 
     #: (untyped, reason: untyped, ?result: untyped) -> untyped
     def cancel_workflow(workflow_id, reason:, result: nil)
-      execute_params(<<~SQL, [dump_serialized(result), reason, workflow_id])
+      execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id])
         UPDATE #{table("workflows")}
-        SET status = 'canceled', result = ?, error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+        SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
+          cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
+          locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ?
       SQL
     end
@@ -1817,6 +1852,46 @@ module Durababble
 
     private
 
+    #: (untyped, untyped, untyped) -> untyped
+    def add_column_if_missing(table_name, column_name, definition)
+      return if mysql_column_exists?(table_name, column_name)
+
+      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_ident(column_name)} #{definition}")
+    end
+
+    #: () -> untyped
+    def migrate_legacy_workflow_cancellations!
+      return unless mysql_table_exists?("workflow_cancellations")
+
+      execute(<<~SQL)
+        UPDATE #{table("workflows")} AS wf
+        JOIN #{table("workflow_cancellations")} AS wc ON wf.id = wc.workflow_id
+        SET wf.cancel_reason = IF(wf.cancel_requested_at IS NULL, wc.reason, wf.cancel_reason),
+          wf.cancel_requested_at = COALESCE(wf.cancel_requested_at, wc.requested_at),
+          wf.cancel_delivered_at = COALESCE(wf.cancel_delivered_at, wc.delivered_at),
+          wf.updated_at = NOW(6)
+      SQL
+      execute("DROP TABLE IF EXISTS #{table("workflow_cancellations")}")
+    end
+
+    #: (untyped) -> untyped
+    def mysql_table_exists?(table_name)
+      !!execute_params(<<~SQL, [raw_table_name(table_name)]).first
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = ?
+      SQL
+    end
+
+    #: (untyped, untyped) -> untyped
+    def mysql_column_exists?(table_name, column_name)
+      !!execute_params(<<~SQL, [raw_table_name(table_name), column_name]).first
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
+      SQL
+    end
+
     #: (untyped) -> untyped
     def cancel_pending_waits_for_workflow(workflow_id)
       execute_params(<<~SQL, [workflow_id])
@@ -1918,7 +1993,12 @@ module Durababble
 
     #: (untyped) -> untyped
     def table(name)
-      quote_ident("#{table_prefix}_#{name}")
+      quote_ident(raw_table_name(name))
+    end
+
+    #: (untyped) -> untyped
+    def raw_table_name(name)
+      "#{table_prefix}_#{name}"
     end
 
     #: () -> untyped

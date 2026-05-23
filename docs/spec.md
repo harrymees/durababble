@@ -118,7 +118,7 @@ Temporal's cancellation model separates a cancellation request from hard termina
 
 Implemented Durababble semantics:
 
-- `Workflow.handle(workflow_id, store:).cancel(reason:)` is the first-class cancellation API. It inserts one row in `workflow_cancellations`; duplicate requests return the current run and preserve the first recorded reason.
+- `Workflow.handle(workflow_id, store:).cancel(reason:)` is the first-class cancellation API. It stores the first reason plus request/delivery timestamps on the workflow row; duplicate requests return the current run and preserve the first recorded reason.
 - Canceling a terminal `completed`, terminal `failed`, or already `canceled` workflow is idempotent and does not pretend cleanup ran. Already `canceled` workflows retain their original cancellation reason.
 - Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become runnable immediately. Pending waits for the workflow are marked `canceled`, so late timer/event signals cannot resume the old wait.
 - Running workflows keep their live lease. Cancellation is observed at deterministic yield points: before starting a new step, when replay reaches a completed step boundary, after a step completes, and when a running step heartbeats.
@@ -213,8 +213,7 @@ The implemented schema is intentionally smaller than the target schema. Current 
 
 | Table                     | Purpose                                                                            | Current key shape          |
 | ------------------------- | ---------------------------------------------------------------------------------- | -------------------------- |
-| `workflows`               | one workflow execution; status, input/result/error, workflow lease, retry due time | `id`                       |
-| `workflow_cancellations`  | first cooperative cancellation request for a workflow                              | `workflow_id`              |
+| `workflows`               | one workflow execution; status, input/result/error, workflow lease, retry due time, and cooperative cancellation metadata | `id`                       |
 | `steps`                   | latest logical workflow step state by deterministic position                       | `(workflow_id, position)`  |
 | `step_attempts`           | append-only attempt history for steps and waits                                    | `id`                       |
 | `waits`                   | durable timer/event waits                                                          | `id`                       |
@@ -606,7 +605,7 @@ Target requirements:
 | Zombie workers cannot renew expired leases              | Implemented                                        | heartbeat updates only when owner/deadline still match                                                                                                                     | heartbeat spec                                            |
 | Zombie workers cannot complete after lease revocation   | Implemented                                        | `Engine` re-checks workflow lease ownership before terminal durable writes                                                                                                 | worker lifecycle spec                                     |
 | Step retries are durably scheduled                      | Implemented                                        | failed retryable steps store `next_run_at` and release the lease                                                                                                           | step retry spec + DST retry scenario                      |
-| Cancellation requests are durable and idempotent        | Implemented                                        | `workflow_cancellations` records the first reason; duplicate `handle.cancel` calls preserve it                                                                             | workflow cancellation spec                                |
+| Cancellation requests are durable and idempotent        | Implemented                                        | `workflows.cancel_requested_at` / `cancel_reason` record the first request on the workflow row; duplicate `handle.cancel` calls preserve it                                | workflow cancellation spec                                |
 | Cancellation cleanup is replay-safe                     | Implemented                                        | cancellation is delivered at yield points; cleanup runs as ordinary steps and completed cleanup steps are skipped after crash/recovery                                      | workflow cancellation spec + DST cancellation scenario    |
 | Retry options are Temporal-like but Ruby-shaped         | Implemented                                        | `initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors`                                                      | retry policy specs                                        |
 | Final retry failure bubbles to workflow                 | Implemented                                        | exhausted/non-retryable step failure marks workflow `failed`                                                                                                               | step retry spec                                           |
