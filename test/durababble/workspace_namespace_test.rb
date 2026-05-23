@@ -35,6 +35,12 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     assert_operator(first.length, :<=, Durababble::MAX_SCHEMA_IDENTIFIER_LENGTH)
   end
 
+  test "derived schema uses workspace placeholder when path basename has no identifier characters" do
+    schema = Durababble.workspace_schema("/tmp/!!!")
+
+    assert_match(/\Adurababble_workspace_[0-9a-f]{12}\z/, schema)
+  end
+
   test "explicit environment overrides win before derived workspace defaults" do
     with_env(
       "DURABABBLE_DATABASE_URL" => "postgresql://example.invalid/explicit",
