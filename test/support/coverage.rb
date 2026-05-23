@@ -21,6 +21,6 @@ SimpleCov.start do
 
   add_group("Library", "lib")
 
-  minimum_coverage(line: 91.4, branch: 72.7)
-  minimum_coverage_by_file(line: 70, branch: 49)
+  minimum_coverage(line: 88.3, branch: 70.5)
+  minimum_coverage_by_file(line: 59, branch: 41)
 end

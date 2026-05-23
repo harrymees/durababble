@@ -44,6 +44,7 @@ jobs:
           name: coverage-report
           path: coverage/
           if-no-files-found: ignore
+          include-hidden-files: true
 
   lint-typecheck:
     runs-on: ubuntu-latest
