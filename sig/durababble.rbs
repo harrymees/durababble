@@ -166,6 +166,9 @@ module Durababble
     end
   end
 
+  def self.default_database_url: () -> String
+  def self.default_schema: () -> String
+  def self.workspace_schema: (?String workspace_path, ?prefix: String) -> String
   def self.configure: (database_url: String, ?schema: String) -> Store
   def self.store: () -> Store
   def self.wait_until: (Time time, ?untyped context) -> WaitRequest

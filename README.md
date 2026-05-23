@@ -26,6 +26,31 @@ gems/durababble/
 The gemspec owns runtime dependencies used by the app bundle.
 `Durababble::Store.connect` selects the Trilogy-backed MySQL adapter by default, with PostgreSQL/YSQL available when a PostgreSQL URL is provided.
 
+## Workspace/database namespace isolation
+
+Durababble chooses its default database namespace from environment in this order:
+
+1. `DURABABBLE_SCHEMA`, when explicitly set.
+2. `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`, a deterministic, bounded schema name derived from the checkout/workspace path.
+
+Two active checkouts or Symphony workspaces therefore do not share Durababble internal tables by default. The PostgreSQL/YSQL adapter uses the selected value as a SQL schema. The MySQL/MariaDB adapter uses it as a sanitized table-name prefix inside the configured database, so backend conformance still runs without creating separate MySQL databases per worktree.
+
+Symphony-created workspaces write a local `mise.local.toml` with `DURABABBLE_DATABASE_URL`, `DURABABBLE_YUGABYTE_DATABASE_URL`, `DURABABBLE_WORKSPACE_ROOT`, and `DURABABBLE_SCHEMA`; trust it; install the bundle; migrate the isolated namespace; and leave `.durababble-workspace.env` for inspection. These local files are ignored by git.
+
+Inspect the selected namespace:
+
+```sh
+mise exec -- bundle exec ruby -Ilib -e 'require "durababble"; puts Durababble.default_schema'
+```
+
+Override it deliberately:
+
+```sh
+DURABABBLE_SCHEMA=durababble_experiment mise exec -- bundle exec ruby -Ilib -e 'require "durababble"; store = Durababble::Store.connect(database_url: Durababble.default_database_url); store.migrate!; store.close'
+```
+
+`Durababble::Store.connect`, `Durababble.configure`, `Durababble::WorkerRuntime`, examples, and benchmark defaults all honor the selected namespace unless a `schema:` argument or benchmark `--schema` flag is provided.
+
 ## Testing
 
 The tests use the same Minitest stack as `agent-server`.
@@ -39,6 +64,7 @@ shadowenv exec -- bundle exec ruby -I lib -I test test/run_all.rb
 cd ../..
 shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
 DURABABBLE_YUGABYTE_DATABASE_URL=postgresql://127.0.0.1:5433/durababble_test shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
+DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte mise exec -- bundle exec ruby -I lib -I test test/durababble/workspace_namespace_test.rb
 /opt/dev/bin/dev check
 ```
 

@@ -20,7 +20,8 @@ module Durababble
     end
 
     #: (workflows: untyped, worker_pool: untyped, ?store: untyped, ?database_url: untyped, ?schema: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?poll_interval: untyped, ?migrate: untyped) -> void
-    def initialize(workflows:, worker_pool:, store: nil, database_url: nil, schema: "durababble", worker_id: nil, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, poll_interval: DEFAULT_POLL_INTERVAL, migrate: true)
+    def initialize(workflows:, worker_pool:, store: nil, database_url: nil, schema: nil, worker_id: nil, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, poll_interval: DEFAULT_POLL_INTERVAL, migrate: true)
+      schema ||= Durababble.default_schema unless store
       raise ArgumentError, "provide either store: or database_url:" unless store || database_url
 
       @store = store || Store.connect(database_url:, schema:)

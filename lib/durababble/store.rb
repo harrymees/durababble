@@ -19,7 +19,7 @@ module Durababble
 
     class << self
       #: (database_url: untyped, ?schema: untyped) -> untyped
-      def connect(database_url:, schema: "durababble")
+      def connect(database_url:, schema: Durababble.default_schema)
         uri = URI.parse(database_url)
         if ["mysql", "mysql2", "trilogy"].include?(uri.scheme)
           require "trilogy"

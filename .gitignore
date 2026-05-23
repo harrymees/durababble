@@ -3,4 +3,7 @@
 /pkg/
 /coverage/
 /tmp/
+/mise.local.toml
+/.durababble-workspace.env
+/.envrc
 /bench/results/
