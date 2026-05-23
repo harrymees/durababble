@@ -4,6 +4,8 @@
 $LOAD_PATH.unshift(File.expand_path("../lib", __dir__))
 $LOAD_PATH.unshift(__dir__)
 
+require_relative "support/coverage"
+
 require "minitest/autorun"
 require "mocha/minitest"
 require "securerandom"

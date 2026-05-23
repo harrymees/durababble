@@ -68,6 +68,20 @@ DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte mise exec
 /opt/dev/bin/dev check
 ```
 
+CI runs the coverage gate with SimpleCov branch coverage enabled:
+
+```sh
+mise exec -- bundle exec rake test:coverage
+```
+
+For a CI-equivalent local run from a Symphony workspace that has optional Yugabyte coverage enabled in `mise.local.toml`, disable it explicitly:
+
+```sh
+mise exec -- env DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec rake test:coverage
+```
+
+The gate measures library files under `lib/**/*.rb`, excluding the gem metadata version file because Bundler loads it before SimpleCov starts. The current ratchet fails below 91.4% line coverage or 72.7% branch coverage globally, and below 70% line coverage or 49% branch coverage for any measured library file. The target ratchet is 95% line coverage and 90% branch coverage; raise the configured minimums as meaningful tests lift coverage. The HTML report is written to `coverage/`, and GitHub Actions uploads that directory as the `coverage-report` artifact for failed and passing runs.
+
 ## Public API
 
 Durababble exposes two complementary abstractions on the same durable store:

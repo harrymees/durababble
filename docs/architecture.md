@@ -141,4 +141,8 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 - GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
 - Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
 
+## Coverage gate
+
+GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 91.4%, global branch coverage drops below 72.7%, per-file line coverage drops below 70%, or per-file branch coverage drops below 49%. These are initial ratchet thresholds from the current MySQL-backed CI-equivalent suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output.
+
 See `docs/spec.md` for the guarantee and crash matrices implemented by tests.
