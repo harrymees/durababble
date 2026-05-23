@@ -14,6 +14,8 @@ module Durababble
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
   class FenceTimeout < Error; end
+  class AsyncBoundaryError < Error; end
+  class AsyncCanceled < Error; end
 
   class << self
     #: (untyped) -> untyped
@@ -62,6 +64,11 @@ module Durababble
       WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
     end
 
+    #: (*untyped) -> untyped
+    def await_all(*futures)
+      AsyncFuture.await_all(*futures)
+    end
+
     private
 
     #: (untyped) -> String
@@ -74,6 +81,7 @@ end
 
 require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
+require_relative "durababble/async_future"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
 require_relative "durababble/store"

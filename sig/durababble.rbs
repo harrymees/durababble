@@ -11,6 +11,12 @@ module Durababble
   class FenceTimeout < Error
   end
 
+  class AsyncBoundaryError < Error
+  end
+
+  class AsyncCanceled < Error
+  end
+
   type retry_config = {
     ?initial_interval: Numeric,
     ?backoff_coefficient: Float,
@@ -48,6 +54,22 @@ module Durababble
     attr_reader error: String?
   end
 
+  class AsyncFuture[Output]
+    attr_reader position: Integer
+
+    def self.await_all: (*AsyncFuture[untyped] | Array[AsyncFuture[untyped]] futures) -> Array[untyped]
+
+    def start: () -> self
+    def value: () -> Output
+    def cancel: () -> bool
+    def pending?: () -> bool
+    def running?: () -> bool
+    def settled?: () -> bool
+    def state: () -> Symbol
+    def observed?: () -> bool
+    def wait_if_started: () -> void
+  end
+
   class Store
   end
 
@@ -63,6 +85,8 @@ module Durababble
     def step_context: () -> StepContext
     def wait_until: (Time time, ?untyped context) -> WaitRequest
     def wait_event: (String event_key, ?untyped context) -> WaitRequest
+    def async: () { () -> untyped } -> AsyncFuture[untyped]
+    def await_all: (*AsyncFuture[untyped] | Array[AsyncFuture[untyped]] futures) -> Array[untyped]
   end
 
   class WorkflowRef
@@ -173,4 +197,5 @@ module Durababble
   def self.store: () -> Store
   def self.wait_until: (Time time, ?untyped context) -> WaitRequest
   def self.wait_event: (String event_key, ?untyped context) -> WaitRequest
+  def self.await_all: (*AsyncFuture[untyped] | Array[AsyncFuture[untyped]] futures) -> Array[untyped]
 end

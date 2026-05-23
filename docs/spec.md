@@ -121,7 +121,7 @@ The target workflow surface is:
 - `signal def handler` declares deterministic workflow signal handlers.
 - `Durababble::Workflow.wait_condition(timeout: nil) { ... }` blocks a workflow fiber until the condition is true or a durable timeout fires.
 - `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are durable workflow sleeps.
-- Workflow-local deterministic futures are future scope, but if added they must preserve method/order step identity and stable replay order.
+- Workflow-local async step futures are implemented for narrow durable fan-out/fan-in. General deterministic fibers remain future scope.
 - `patched(patch_id)` is the target near-term API for cross-deploy workflow control-flow compatibility. It records/checks a durable patch marker before the new branch emits steps, waits, or signals.
 - `deprecate_patch(patch_id)` is the cleanup API after no live workflows still need the old branch. It keeps replay compatibility while allowing the old branch to be removed before final marker removal.
 - Numeric `version(change_id, default:, max:)` can remain future scope if a concrete need appears, but the preferred target is the simpler Temporal-style boolean patch marker.
@@ -394,6 +394,40 @@ Current repo status:
 Workflow steps are method-level durable side-effect boundaries. On first execution, the engine records a running step/attempt, runs the method, stores the serialized result, and marks the step completed. On resume, completed rows return cached results and do not re-run the method. If the process crashes after an external side effect but before the checkpoint commits, the step may run again; external systems must use `step_context.idempotency_key`.
 
 No workflow row lock is held while user step code runs. The executor holds a renewable lease and fences durable writes with current lease ownership. If the lease is lost while activity code is running, the external activity may still finish, but the checkpoint/status write fails and recovery follows the normal idempotent retry path.
+
+### Async workflow step semantics
+
+Status: **Implemented target for workflow steps; future scope for general deterministic fibers.**
+
+Durababble supports workflow-local async fan-out/fan-in for durable workflow steps through `async` and `await_all`:
+
+```ruby
+class PriceBasket < Durababble::Workflow
+  def execute(items)
+    quotes = items.map { |item| async { quote(item) } }
+    await_all(quotes).sum
+  end
+
+  step def quote(item)
+    Pricing.quote(item, idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+The async model is deliberately narrower than arbitrary Ruby fibers. An `async` block is orchestration code that may contain exactly one durable boundary: one workflow step call or one step that returns a `WaitRequest`. It must not run non-durable side effects before the step or schedule multiple durable boundaries. General deterministic futures/fibers remain future scope.
+
+Semantics:
+
+- `async { ... }` reserves the next method/order step position synchronously when the future is created. That reservation, not Ruby thread scheduling or completion order, defines the stable step identity and `step_context.idempotency_key`.
+- `future.start` dispatches a pending future. `future.value` starts the future if needed and waits for it. `await_all(futures)` starts every pending future, waits for all started futures to settle, returns results in the caller-provided future order, and raises the first error by that same order.
+- Every future must be awaited or canceled before workflow completion. A workflow that starts or reserves async work and then returns without observing it fails with `AsyncBoundaryError`; Durababble does not provide fire-and-forget workflow steps.
+- Step start, completion, failure, wait, retry scheduling, heartbeat, and workflow completion use the same persisted `steps`, `step_attempts`, `waits`, and `workflows` rows as ordinary sequential steps. Store access from async futures is serialized inside the workflow execution object; user step bodies may run concurrently outside the store mutex.
+- Completed async steps replay from the persisted result at their reserved position. If async steps complete in a different order on the original run and replay, workflow code still observes the deterministic order chosen by `await_all` or by the order in which it calls `future.value`.
+- If a future's step returns a `WaitRequest`, the wait is persisted and the workflow suspends when that future is awaited. Already completed sibling futures remain completed and are skipped after the wait wakes.
+- Retryable and non-retryable failures use the step's existing retry policy. A retryable failure records the failed attempt and durable `next_run_at` before `await_all` raises to the engine; the workflow resumes later with completed sibling steps skipped. A final or non-retryable failure records the failed step and fails the workflow.
+- `future.cancel` is deterministic only before the future starts or completes. It persists a `canceled` step/attempt row at the reserved position and returns `true`. Canceling a running or completed future returns `false`; Durababble does not interrupt in-flight user side effects.
+- A canceled future raises `Durababble::AsyncCanceled` if later awaited. A deterministic workflow may rescue that exception and continue; otherwise the workflow fails like any other non-retryable orchestration error.
+- If a worker loses its lease while async step bodies are running, stale completion/failure/wait writes raise `LeaseConflict` before mutating workflow state. External side effects may already have happened, so callers still must use `step_context.idempotency_key`.
 
 ### Step retry policy details
 

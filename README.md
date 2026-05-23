@@ -123,6 +123,28 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
+Workflow steps can also be fanned out with workflow-local async futures. `async` reserves the next durable step position immediately; `await_all` dispatches pending futures, waits for them, and returns results in the order supplied by workflow code even when the steps complete in another order.
+
+```ruby
+class PriceBasket < Durababble::Workflow
+  workflow_name "price_basket"
+
+  def execute(items)
+    quotes = items.map { |item| async { quote_item(item) } }
+    await_all(quotes)
+  end
+
+  step retry: { maximum_attempts: 3 }
+  def quote_item(item)
+    Pricing.quote(item, idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+Async blocks are intentionally narrow: each block should contain one durable step or one step that returns a durable wait. Canceling a future before it starts persists a canceled step position; once a future has started, Durababble does not interrupt user side effects.
+
+See `examples/async_price_basket.rb` for a runnable fan-out/fan-in workflow.
+
 Durable objects are identity-addressed state holders.
 Exposed commands are the durable boundary for state changes.
 
@@ -152,6 +174,7 @@ account.balance
 ## Implemented Prototype Scope
 
 - Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, and class-method enqueueing.
+- Workflow-local async futures for durable step fan-out/fan-in, deterministic joins, persisted cancellation, waits, retries, and lease-checked recovery.
 - Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
 - PostgreSQL/YSQL and MySQL/MariaDB store implementations.
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.

@@ -17,33 +17,114 @@ module Durababble
     #: untyped
     attr_reader :step_context
 
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, completed_steps: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, completed_steps:, crash_after: nil)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, steps: untyped, ?crash_after: untyped) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, steps:, crash_after: nil)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
-      @completed_steps = completed_steps
+      @steps_by_position = steps.to_h { |step| [step.fetch("position").to_i, step] }
       @crash_after = crash_after
+      @mutex = Mutex.new
+      @store_mutex = Mutex.new
       @position = 0
-      @step_context = nil
+      @async_futures = []
+    end
+
+    #: () -> untyped
+    def step_context
+      Thread.current[step_context_key]
+    end
+
+    #: (untyped) { -> untyped } -> untyped
+    def async(workflow, &block)
+      position = next_position
+      future = AsyncFuture.new(execution: self, workflow:, position:, block:)
+      @mutex.synchronize { @async_futures << future }
+      future
+    end
+
+    #: (Integer) { -> untyped } -> untyped
+    def run_async_position(position, &block)
+      key = async_position_key
+      previous = Thread.current[key]
+      reservation = { position:, consumed: false }
+      Thread.current[key] = reservation
+      result = block.call
+      unless reservation.fetch(:consumed)
+        raise AsyncBoundaryError, "async block at position #{position} must call exactly one durable workflow step"
+      end
+
+      result
+    ensure
+      Thread.current[key] = previous
+    end
+
+    #: (Integer) -> bool
+    def cancel_async_position(position)
+      @store_mutex.synchronize do
+        step = @mutex.synchronize { @steps_by_position[position] }
+        return true if step&.fetch("status", nil) == "canceled"
+        return false if step && step.fetch("status") != "canceled"
+
+        assert_workflow_lease!
+        return false unless @store.record_step_canceled(workflow_id: @workflow_id, position:, name: "async")
+
+        @mutex.synchronize do
+          @steps_by_position[position] = {
+            "workflow_id" => @workflow_id,
+            "position" => position,
+            "name" => "async",
+            "status" => "canceled",
+          }
+        end
+      end
+
+      true
+    end
+
+    #: () -> void
+    def assert_async_futures_settled!
+      futures = @mutex.synchronize { @async_futures.dup }
+      futures.each(&:wait_if_started)
+      unobserved = futures.reject(&:observed?)
+      return if unobserved.empty?
+
+      positions = unobserved.map(&:position).join(", ")
+      raise AsyncBoundaryError, "workflow completed with unawaited async step positions: #{positions}"
     end
 
     #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
     def call_step(instance, method_name:, args:, kwargs:, &block)
-      position = @position
-      @position += 1
+      position = consume_position
 
-      if @completed_steps.key?(position)
-        return @completed_steps.fetch(position).fetch("result")
+      known_step = @mutex.synchronize { @steps_by_position[position] }
+      case known_step&.fetch("status")
+      when "completed"
+        return known_step.fetch("result")
+      when "canceled"
+        raise AsyncCanceled, "async step at position #{position} was canceled"
       end
 
       step = instance.class.step_definition(method_name)
-      @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
+      @store_mutex.synchronize do
+        @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
+        @mutex.synchronize do
+          @steps_by_position[position] = {
+            "workflow_id" => @workflow_id,
+            "position" => position,
+            "name" => step.name,
+            "status" => "running",
+          }
+        end
+      end
       crash!(:step_started)
       heartbeat = build_heartbeat(position)
-      attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
-      @step_context = StepContext.new(
+      attempt_number = @store_mutex.synchronize do
+        @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
+      end
+      previous_step_context = Thread.current[step_context_key]
+      Thread.current[step_context_key] = StepContext.new(
         workflow_id: @workflow_id,
         step_index: position,
         attempt_number:,
@@ -53,41 +134,109 @@ module Durababble
 
       output = block.call
       if output.is_a?(WaitRequest)
-        assert_workflow_lease!
-        @store.record_wait(workflow_id: @workflow_id, position:, name: step.name, wait_request: output)
+        @store_mutex.synchronize do
+          assert_workflow_lease!
+          @store.record_wait(workflow_id: @workflow_id, position:, name: step.name, wait_request: output)
+          @mutex.synchronize do
+            @steps_by_position[position] = {
+              "workflow_id" => @workflow_id,
+              "position" => position,
+              "name" => step.name,
+              "status" => "waiting",
+              "result" => output.context,
+            }
+          end
+        end
         crash!(:wait_recorded)
         raise WorkflowSuspended
       end
 
-      assert_workflow_lease!
-      @store.record_step_completed(workflow_id: @workflow_id, position:, result: output)
+      @store_mutex.synchronize do
+        assert_workflow_lease!
+        @store.record_step_completed(workflow_id: @workflow_id, position:, result: output)
+        @mutex.synchronize do
+          @steps_by_position[position] = {
+            "workflow_id" => @workflow_id,
+            "position" => position,
+            "name" => step.name,
+            "status" => "completed",
+            "result" => output,
+          }
+        end
+      end
       crash!(:step_completed)
       output
     rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended)
+      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(AsyncBoundaryError) || e.is_a?(AsyncCanceled)
 
       message = "#{e.class}: #{e.message}"
-      assert_workflow_lease!
-      @store.record_step_failed(workflow_id: @workflow_id, position:, error: message)
-      attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
+      attempt_number = nil
+      @store_mutex.synchronize do
+        assert_workflow_lease!
+        @store.record_step_failed(workflow_id: @workflow_id, position:, error: message)
+        @mutex.synchronize do
+          @steps_by_position[position] = {
+            "workflow_id" => @workflow_id,
+            "position" => position,
+            "name" => step.name,
+            "status" => "failed",
+            "error" => message,
+          }
+        end
+        attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
+      end
       if step.retry_policy.retryable?(e, attempt_number:)
         delay = step.retry_policy.delay_for_attempt(attempt_number)
-        @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: retry_run_at(delay))
+        @store_mutex.synchronize do
+          @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: retry_run_at(delay))
+        end
         raise StepRetryScheduled
       end
       raise
     ensure
-      @step_context = nil
+      Thread.current[step_context_key] = previous_step_context
     end
 
     private
 
+    #: () -> Integer
+    def next_position
+      @mutex.synchronize do
+        position = @position
+        @position += 1
+        position
+      end
+    end
+
+    #: () -> Integer
+    def consume_position
+      reservation = Thread.current[async_position_key]
+      return next_position unless reservation
+
+      raise AsyncBoundaryError, "async block at position #{reservation.fetch(:position)} called more than one durable workflow step" if reservation.fetch(:consumed)
+
+      reservation[:consumed] = true
+      reservation.fetch(:position)
+    end
+
+    #: () -> Symbol
+    def step_context_key
+      :"durababble_step_context_#{object_id}"
+    end
+
+    #: () -> Symbol
+    def async_position_key
+      :"durababble_async_position_#{object_id}"
+    end
+
     #: (untyped) -> untyped
     def build_heartbeat(position)
       Heartbeat.new(
-        cursor: @store.step_heartbeat_cursor(workflow_id: @workflow_id, position:),
+        cursor: @store_mutex.synchronize { @store.step_heartbeat_cursor(workflow_id: @workflow_id, position:) },
         recorder: lambda do |cursor|
-          renewed = @store.heartbeat_step(workflow_id: @workflow_id, position:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
+          renewed = @store_mutex.synchronize do
+            @store.heartbeat_step(workflow_id: @workflow_id, position:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
+          end
           raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before heartbeat" unless renewed
 
           true
@@ -148,20 +297,19 @@ module Durababble
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
-      completed_steps = @store.steps_for(workflow_id)
-        .select { |step| step.fetch("status") == "completed" }
-        .to_h { |step| [step.fetch("position").to_i, step] }
+      steps = @store.steps_for(workflow_id)
       execution = WorkflowExecution.new(
         store: @store,
         workflow_id:,
         worker_id: @worker_id,
         lease_seconds: @lease_seconds,
-        completed_steps:,
+        steps:,
         crash_after: @crash_after,
       )
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
+      execution.assert_async_futures_settled!
       assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result:)
       crash!(:workflow_completed)

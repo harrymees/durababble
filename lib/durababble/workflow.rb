@@ -173,6 +173,18 @@ module Durababble
     def wait_event(event_key, context = {})
       Durababble.wait_event(event_key, context)
     end
+
+    #: () { -> untyped } -> untyped
+    def async(&block)
+      raise ArgumentError, "async requires a block" unless block
+
+      __durababble_execution__.async(self, &block)
+    end
+
+    #: (*untyped) -> untyped
+    def await_all(*futures)
+      Durababble.await_all(*futures)
+    end
   end
 
   class WorkflowRef

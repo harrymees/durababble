@@ -57,6 +57,8 @@ Current scenarios:
 The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping.
 Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.
 
+Async step fan-out/fan-in currently uses host Ruby threads around real SQL-backed step persistence, so it is not modeled inside the virtual scheduler. Async race coverage lives in `test/durababble/async_workflow_test.rb`, which uses explicit queues to deterministically force out-of-order completion, partial failure, waits, retry, cancellation, crash/recovery, and stale lease interleavings against real store backends.
+
 ## Spec gap found during workflow RPC review
 
 The original prototype spec covered distributed workflow leases and lease-aware `Engine#resume`, but it did not define node-to-node workflow RPC routing through the current lease holder. That was a spec gap rather than a known implementation mismatch: there was no `WorkflowRpc` component, no `current_workflow_lease` API, and no matrix row for the race where a caller looks up an owner, sends an RPC, and the lease expires or workflow shuts down in flight. The gap is now explicit in `docs/spec.md` and pinned by the `workflow_rpc_owner_state_matrix` scenario plus ordinary workflow RPC unit tests.

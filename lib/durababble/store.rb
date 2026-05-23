@@ -447,6 +447,27 @@ module Durababble
       record_step_failed_without_transaction(workflow_id:, position:, error:)
     end
 
+    #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
+    def record_step_canceled(workflow_id:, position:, name:)
+      transaction do
+        inserted = execute_params(<<~SQL, [workflow_id, position, name])
+          INSERT INTO #{table("steps")} (workflow_id, position, name, status, error, started_at, completed_at, updated_at)
+          VALUES ($1, $2, $3, 'canceled', NULL, now(), now(), now())
+          ON CONFLICT (workflow_id, position) DO NOTHING
+        SQL
+        if inserted.cmd_tuples == 1
+          attempt_id = SecureRandom.uuid
+          execute_params(<<~SQL, [attempt_id, workflow_id, position, name])
+            INSERT INTO #{table("step_attempts")} (id, workflow_id, position, name, status, completed_at)
+            VALUES ($1, $2, $3, $4, 'canceled', now())
+          SQL
+          true
+        else
+          false
+        end
+      end
+    end
+
     #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
     def record_wait(workflow_id:, position:, name:, wait_request:)
       transaction do
@@ -770,9 +791,9 @@ module Durababble
         @connection.exec(sql)
       rescue PG::TRSerializationFailure, PG::TRDeadlockDetected
         attempts += 1
-        raise if attempts >= 5
+        raise if attempts >= 20
 
-        sleep(0.01 * attempts)
+        sleep(0.05 * attempts)
         retry
       end
     end
@@ -1375,6 +1396,27 @@ module Durababble
         WHERE workflow_id = ? AND position = ?
       SQL
       update_latest_attempt_serialized(workflow_id:, position:, status: "failed", serialized_result: dump_serialized(nil), error:)
+    end
+
+    #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
+    def record_step_canceled(workflow_id:, position:, name:)
+      transaction do
+        inserted = execute_params(<<~SQL, [workflow_id, position, name])
+          INSERT INTO #{table("steps")} (workflow_id, position, name, status, error, started_at, completed_at, updated_at)
+          VALUES (?, ?, ?, 'canceled', NULL, NOW(6), NOW(6), NOW(6))
+          ON DUPLICATE KEY UPDATE status = status
+        SQL
+        if inserted.cmd_tuples == 1
+          attempt_id = SecureRandom.uuid
+          execute_params(<<~SQL, [attempt_id, workflow_id, position, name])
+            INSERT INTO #{table("step_attempts")} (id, workflow_id, position, name, status, completed_at)
+            VALUES (?, ?, ?, ?, 'canceled', NOW(6))
+          SQL
+          true
+        else
+          false
+        end
+      end
     end
 
     #: (untyped) -> untyped

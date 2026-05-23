@@ -5,6 +5,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 ## Components
 
 - `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
+- `Durababble::AsyncFuture`: workflow-local future returned by `Workflow#async`. It reserves a durable step position at creation time, dispatches the block on demand, joins deterministically, and delegates persistence to the same step/wait/retry machinery as sequential steps.
 - `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
 - `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
@@ -49,6 +50,10 @@ When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution
 6. persists success, wait, retryable failure, or final failure.
 
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
+
+Async workflow code keeps that same identity rule. `async { expensive_step(input) }` reserves the next step position immediately and returns a future. `future.start`, `future.value`, and `await_all(futures)` run the reserved block in Ruby threads, but the first durable step call inside the block consumes the reserved position instead of racing on the shared step cursor. `await_all` starts all pending futures, waits for every started future to settle, then returns results in the order the caller supplied the futures. If any future failed, the first failure by supplied order is raised after siblings have settled, so replay does not depend on wall-clock completion order.
+
+Async blocks are intentionally narrow: they may contain one durable boundary, usually one step method. They are not a general deterministic fiber system. Cancellation before start persists a `canceled` step/attempt row at the reserved position; cancellation after a side-effecting step starts is best-effort and returns false.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 
@@ -104,6 +109,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
 - Before a step runs, its current step row and a new attempt row are persisted transactionally.
 - After success/failure/wait, the related step and attempt rows are updated transactionally.
+- For async steps, the reserved position is chosen before dispatch. Store operations from async futures are serialized through the workflow execution object so a single SQL connection is not used concurrently, while user step bodies can still resolve out of order.
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
