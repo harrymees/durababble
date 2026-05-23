@@ -2,8 +2,58 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "pg"
 
 class DurababbleStoreTest < DurababbleTestCase
+  class MigrationProbeStore < Durababble::Store
+    attr_reader :executed
+
+    def initialize(schema:, table_exists:)
+      super(nil, schema:)
+      @table_exists = table_exists
+      @executed = []
+    end
+
+    def execute_params(sql, params)
+      @executed << [:execute_params, sql, params]
+      @table_exists ? [{ "exists" => "1" }] : []
+    end
+
+    def execute(sql)
+      @executed << [:execute, sql]
+    end
+  end
+
+  class MysqlMigrationProbeStore < Durababble::MysqlStore
+    attr_reader :executed
+
+    def initialize(schema:, tables: [], columns: {})
+      super(nil, schema:)
+      @tables = tables
+      @columns = columns
+      @executed = []
+    end
+
+    def execute_params(sql, params)
+      @executed << [:execute_params, sql, params]
+      table = params.first
+      column = params[1]
+      rows = if sql.include?("information_schema.tables")
+        @tables.include?(table) ? [{ "exists" => 1 }] : []
+      elsif sql.include?("information_schema.columns")
+        @columns.fetch(table, []).include?(column) ? [{ "exists" => 1 }] : []
+      else
+        []
+      end
+      Durababble::MysqlStore::MysqlResult.new(rows, rows.length)
+    end
+
+    def execute(sql)
+      @executed << [:execute, sql]
+      Durababble::MysqlStore::MysqlResult.new([], 0)
+    end
+  end
+
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
       store.migrate!
@@ -149,6 +199,54 @@ class DurababbleStoreTest < DurababbleTestCase
     ensure
       connection&.close unless connection&.finished?
     end
+  end
+
+  test "backfills and drops legacy PostgreSQL cancellation tables" do
+    store = MigrationProbeStore.new(schema: "legacy_schema", table_exists: true)
+
+    store.send(:migrate_legacy_workflow_cancellations!)
+
+    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
+    assert_equal 2, executed_sql.length
+    assert_match(/UPDATE "legacy_schema"."workflows" AS wf/, executed_sql.first)
+    assert_match(/FROM "legacy_schema"."workflow_cancellations" AS wc/, executed_sql.first)
+    assert_equal('DROP TABLE IF EXISTS "legacy_schema"."workflow_cancellations"', executed_sql.last)
+  end
+
+  test "skips PostgreSQL legacy cancellation migration when the table is absent" do
+    store = MigrationProbeStore.new(schema: "legacy_schema", table_exists: false)
+
+    store.send(:migrate_legacy_workflow_cancellations!)
+
+    assert_equal [:execute_params], store.executed.map(&:first)
+  end
+
+  test "backfills and drops legacy MySQL cancellation tables" do
+    store = MysqlMigrationProbeStore.new(
+      schema: "mysql_schema",
+      tables: ["mysql_schema_workflow_cancellations"],
+    )
+
+    store.send(:migrate_legacy_workflow_cancellations!)
+
+    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
+    assert_equal 2, executed_sql.length
+    assert_match(/UPDATE `mysql_schema_workflows` AS wf/, executed_sql.first)
+    assert_match(/JOIN `mysql_schema_workflow_cancellations` AS wc/, executed_sql.first)
+    assert_equal("DROP TABLE IF EXISTS `mysql_schema_workflow_cancellations`", executed_sql.last)
+  end
+
+  test "adds missing MySQL workflow cancellation columns only once" do
+    store = MysqlMigrationProbeStore.new(
+      schema: "mysql_schema",
+      columns: { "mysql_schema_workflows" => ["cancel_reason"] },
+    )
+
+    store.send(:add_column_if_missing, "workflows", "cancel_reason", "TEXT")
+    store.send(:add_column_if_missing, "workflows", "cancel_requested_at", "DATETIME(6)")
+
+    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
+    assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
   end
 
   private
