@@ -77,6 +77,12 @@ Durababble exposes two complementary abstractions on the same durable store:
 | `Durababble::Workflow`      | One-off processes: indexing pipelines, multi-step tool sequences, resumable work    | Function that survives restarts  |
 | `Durababble::DurableObject` | Sessions, agent contexts, project state, anything addressed by id and mutable state | Addressed object with durability |
 
+For indefinitely running or recurring work, see
+[`docs/indefinite-workflows.md`](docs/indefinite-workflows.md). The current
+prototype can recover long-running workflows, but the recommended target model is
+library-managed workflow epochs plus durable-object state for long-lived
+entities, not unbounded step history inside one run.
+
 Workflow code is plain Ruby in `#execute`.
 Methods declared with `step` are durable side-effect boundaries; replay returns persisted step results instead of rerunning completed work.
 

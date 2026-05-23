@@ -13,6 +13,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 - `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` currently records durable command events rather than executing through this router.
 - `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: protobuf/gRPC transport for cross-node wakeups, evictions, transient calls, and durable-message wakeups. Workflow transient calls use `Durababble::Rpc::WorkflowClient` to bridge `WorkflowRpc::Router` onto the `CallTransient` gRPC method.
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
+- Target workflow epochs: the proposed bounded-indefinite model in [`docs/indefinite-workflows.md`](indefinite-workflows.md) treats each epoch as an ordinary leased workflow run and adds a logical chain over those runs. The current prototype has no epoch runtime yet.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
 
 ## Public API model
@@ -94,6 +95,11 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
 - `durable_object_commands`: persisted object command calls, arguments, result/error, status, and command lease columns.
 
+The target workflow-epoch design adds logical chain metadata around `workflows`
+while keeping step, attempt, wait, fence, outbox, and inbox rows scoped to one
+epoch/run. Epoch checkpoints must use the same Paquito binary storage policy as
+workflow inputs/results and durable-object state.
+
 ## Durability semantics
 
 - Enqueue persists the workflow before work is claimed.
@@ -114,6 +120,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 - Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry stale ownership, no-active-owner, and transport-unavailable failures only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.
 - Cross-node workflow RPC uses the same lease validation over gRPC: `Rpc::Server#CallTransient` returns protobuf `LeaseMoved`, `not_running`, or `RemoteError` responses, and `Rpc::WorkflowClient` decodes those into the typed `WorkflowRpc` errors the router already understands.
+- Target managed epochs roll over only after a checkpoint is committed under the current workflow lease. A crash after checkpoint commit but before successor enqueue must be recovered by store/worker code that creates the missing successor exactly once.
 
 ## Application worker lifecycle
 

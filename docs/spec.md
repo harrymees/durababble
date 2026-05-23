@@ -22,6 +22,7 @@ These decisions resolve the earlier spec-vs-implementation conflicts:
 6. **Remote RPC:** implement the full four-method gRPC service (`AwakenBatch`, `EvictLease`, `CallTransient`, `DeliverMessage`) for real inter-node communication, not a minimal workflow-only subset.
 7. **Serialized state migration/capability routing:** defer class-level serialized data migration and node capability routing for now. `schema_version` / `on_load` for object state and workflow args/results/errors remain documented future scope, but they are not part of the first gRPC/inbox implementation.
 8. **Workflow patch markers:** add a Temporal-style `patched(...)` event-log checker as target workflow code-evolution machinery. This is separate from serialized state migration: it protects deterministic workflow control-flow changes by recording/checking patch markers in workflow history.
+9. **Bounded indefinite workflows:** prefer library-managed workflow epochs plus durable-object state for long-lived entities over making users manually call Continue-As-New. See [`docs/indefinite-workflows.md`](indefinite-workflows.md).
 
 The current prototype is not a production Temporal replacement. It is a correctness-oriented Ruby 4 durable-execution prototype with explicit durability, recovery, lease, RPC, storage, and testing requirements.
 
@@ -55,6 +56,7 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Inter-node RPC.** Actual remote intranode/inter-pod communication must be gRPC over mTLS/Spiffe, not the current local JSON-line subprocess command RPC. The repo's `Durababble::RpcClient` is only a local command-process protocol used by tests/benchmarks.
 - **Sticky placement.** Target runtime requires pool-local sticky placement for hot durable objects and running workflows, with leases, node registration, owner lookup, in-memory caches, and route-to-owner behavior. Only workflow lease-routing primitives exist today.
 - **Determinism and code evolution.** Current workflows are deterministic by method/order step sequence and persisted outputs. Target code evolution includes Temporal-style `patched` / `deprecate_patch` marker checks for safe workflow control-flow changes. Future scope includes `Ruby::Box` workflow realms, deterministic time/sleep/random shims, workflow-local deterministic fibers, and class-level schema-versioned object/workflow state.
+- **Bounded indefinite workflows.** Target: support logical workflow chains made of finite workflow epochs. Each epoch remains a normal run with bounded step/wait/inbox history; the library commits Paquito-serialized checkpoints and starts successor epochs before current-epoch history grows without bound. See [`docs/indefinite-workflows.md`](indefinite-workflows.md).
 - **RBS typing.** The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only.
 - **High-level worker lifecycle.** `Durababble::WorkerRuntime` is the app/process integration point. It loops `Worker#tick` for one worker pool, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and revokes still-held workflow/outbox leases if the timeout is exceeded.
 - **Coverage thresholds.** The suite uses SimpleCov line and branch coverage thresholds for the library.
@@ -228,6 +230,7 @@ These requirements are not yet reflected in the current schema, but they are the
 - Add object sleep rows keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload.
 - Add append-only workflow history marker rows for `patched` / `deprecate_patch`. This can start as a narrow patch-marker event log and later fold into a full workflow history/inbox table; it must be ordered per workflow and portable to both SQL adapters.
 - Add explicit idempotency rows for workflow starts and any public durable operation not deduped by the inbox itself.
+- Add workflow-chain/epoch metadata for bounded indefinite workflows: logical workflow id, epoch number, current run pointer, prior/next run links, rollover reason, checkpoint bytes, chain status, and chain-level cancellation. The design must preserve SQL portability across PostgreSQL/YSQL schemas and MySQL/MariaDB table prefixes.
 - Consider whether high-risk transactional pieces (`enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, object state + message completion) should become database functions to reduce lock-order drift.
 - Plan retention/partitioning for high-volume history (`steps`, `step_attempts`, `inbox`, idempotency) before production scale.
 
