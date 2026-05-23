@@ -1,9 +1,15 @@
 # typed: true
 # frozen_string_literal: true
 
+require "digest"
+
 require_relative "durababble/version"
 
 module Durababble
+  DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
+  DEFAULT_SCHEMA_PREFIX = "durababble"
+  MAX_SCHEMA_IDENTIFIER_LENGTH = 63
+
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
@@ -13,8 +19,30 @@ module Durababble
     #: (untyped) -> untyped
     attr_accessor :default_store
 
+    #: () -> String
+    def default_database_url
+      ENV.fetch("DURABABBLE_DATABASE_URL", DEFAULT_DATABASE_URL)
+    end
+
+    #: () -> String
+    def default_schema
+      ENV.fetch("DURABABBLE_SCHEMA") { workspace_schema }
+    end
+
+    #: (?String, ?prefix: String) -> String
+    def workspace_schema(workspace_path = ENV.fetch("DURABABBLE_WORKSPACE_ROOT", Dir.pwd), prefix: DEFAULT_SCHEMA_PREFIX)
+      expanded_path = File.expand_path(workspace_path)
+      path = File.exist?(expanded_path) ? File.realpath(expanded_path) : expanded_path
+      suffix = Digest::SHA256.hexdigest(path).slice(0, 12).to_s
+      leaf = schema_component(File.basename(path))
+      base = "#{schema_component(prefix)}_#{leaf}"
+      max_base_length = MAX_SCHEMA_IDENTIFIER_LENGTH - suffix.length - 1
+      trimmed_base = base.slice(0, max_base_length).to_s.sub(/_+\z/, "")
+      "#{trimmed_base}_#{suffix}"
+    end
+
     #: (database_url: untyped, ?schema: untyped) -> untyped
-    def configure(database_url:, schema: "durababble")
+    def configure(database_url:, schema: default_schema)
       @default_store&.close
       @default_store = Store.connect(database_url:, schema:)
     end
@@ -32,6 +60,14 @@ module Durababble
     #: (untyped, ?untyped) -> untyped
     def wait_event(event_key, context = {})
       WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
+    end
+
+    private
+
+    #: (untyped) -> String
+    def schema_component(value)
+      component = value.to_s.downcase.gsub(/[^a-z0-9_]+/, "_").gsub(/\A_+|_+\z/, "")
+      component.empty? ? "workspace" : component
     end
   end
 end

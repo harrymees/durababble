@@ -17,7 +17,7 @@ require "durababble"
 
 module Durababble
   module Benchmarks
-    DEFAULT_DATABASE_URL = ENV.fetch("DURABABBLE_DATABASE_URL", "mysql://root@127.0.0.1:3306/sidekick_server_development")
+    DEFAULT_DATABASE_URL = Durababble.default_database_url
 
     Operation = Struct.new(:name, :iterations, :warmup, :description, :block, keyword_init: true)
 
@@ -564,7 +564,9 @@ end
 options = {
   profile: ENV.fetch("DURABABBLE_BENCH_PROFILE", "smoke"),
   database_url: Durababble::Benchmarks::DEFAULT_DATABASE_URL,
-  schema: ENV.fetch("DURABABBLE_BENCH_SCHEMA", "durababble_bench_#{Time.now.utc.strftime("%Y%m%d%H%M%S")}_#{Process.pid}"),
+  schema: ENV.fetch("DURABABBLE_BENCH_SCHEMA") do
+    Durababble.workspace_schema("#{Dir.pwd}/bench/#{Time.now.utc.strftime("%Y%m%d%H%M%S")}_#{Process.pid}", prefix: "#{Durababble.default_schema}_bench")
+  end,
   output_dir: ENV.fetch("DURABABBLE_BENCH_OUTPUT", File.expand_path("results", __dir__)),
   fixture_size: Integer(ENV.fetch("DURABABBLE_BENCH_FIXTURE_SIZE", ENV.fetch("DURABABBLE_BENCH_PROFILE", "smoke") == "full" ? "100000" : "2000")),
   seed: Integer(ENV.fetch("DURABABBLE_BENCH_SEED", "12345")),

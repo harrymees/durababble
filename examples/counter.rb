@@ -3,8 +3,8 @@
 
 require_relative "../lib/durababble"
 
-database_url = ENV.fetch("DURABABBLE_DATABASE_URL", "mysql://root@127.0.0.1:3306/sidekick_server_development")
-store = Durababble::Store.connect(database_url:, schema: "durababble_example")
+database_url = Durababble.default_database_url
+store = Durababble::Store.connect(database_url:)
 engine = Durababble::Engine.new(store:)
 
 class CounterWorkflow < Durababble::Workflow
