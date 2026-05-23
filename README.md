@@ -93,6 +93,7 @@ Durababble exposes two complementary abstractions on the same durable store:
 
 Workflow code is plain Ruby in `#execute`.
 Methods declared with `step` are durable side-effect boundaries; replay returns persisted step results instead of rerunning completed work.
+Cancellation is cooperative: `Workflow.handle(run_id).cancel(reason:)` durably records a request and the next deterministic yield point raises `Durababble::CancellationError` inside workflow code. User code can rescue it, run durable cleanup steps, and the run finishes as `canceled`; cleanup failures are recorded as workflow failures.
 
 ```ruby
 class FulfillOrder < Durababble::Workflow
@@ -152,6 +153,7 @@ account.balance
 ## Implemented Prototype Scope
 
 - Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, and class-method enqueueing.
+- First-class cooperative workflow cancellation through `Workflow.start` / `Workflow.handle(...).cancel(reason:)`, persisted cancellation requests, `canceling` / `canceled` states, and replay-safe cleanup steps.
 - Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
 - PostgreSQL/YSQL and MySQL/MariaDB store implementations.
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.

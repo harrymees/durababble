@@ -15,6 +15,19 @@ module Durababble
   class LeaseConflict < Error; end
   class FenceTimeout < Error; end
 
+  class CancellationError < Error
+    #: untyped
+    attr_reader :workflow_id, :reason
+
+    #: (untyped, ?workflow_id: untyped) -> void
+    def initialize(reason = nil, workflow_id: nil)
+      @workflow_id = workflow_id
+      @reason = reason
+      message = reason.to_s.empty? ? "workflow cancellation requested" : reason.to_s
+      super(message)
+    end
+  end
+
   class << self
     #: (untyped) -> untyped
     attr_accessor :default_store

@@ -86,6 +86,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 ## Storage model
 
 - `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, and `next_run_at` for durably scheduled step retries.
+- `workflow_cancellations`: one row per cancellation request; stores the first reason plus request/delivery timestamps so duplicate cancel calls are idempotent and recovery can keep delivering the same request.
 - `steps`: one row per workflow step position; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
 - `step_attempts`: append-only attempt history for every started step, including the latest heartbeat cursor observed for each attempt.
 - `waits`: durable timer and external-event waits, including context needed to resume.
@@ -109,6 +110,9 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
+- Workflow cancellation is cooperative, not termination. `Workflow.handle(id).cancel(reason:)` inserts a durable cancellation request. Pending, waiting, and retry-backoff workflows move to `canceling` and become claimable immediately; running workflows keep their current lease and observe the request at the next step boundary, completed-step replay boundary, or step heartbeat. The engine raises `Durababble::CancellationError` into workflow code. Once raised, cleanup steps run as ordinary durable steps; completed cleanup steps are skipped after crash/recovery. If cleanup returns or re-raises the cancellation error, the workflow becomes `canceled`. If cleanup raises an unrelated non-retryable error, the workflow becomes `failed`; retryable cleanup failures keep `next_run_at` and retry under `canceling`.
+- First-class child workflows are still future scope. Cancellation semantics for that future surface must require an explicit durable child-cancellation policy; cooperative parent cancellation must not silently terminate child work or claim that child cleanup completed.
+- Operator termination remains a separate hard-stop concept: it may mark or remove work without running user cleanup and must not report the workflow as cooperatively `canceled`.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.

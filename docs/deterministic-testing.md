@@ -47,6 +47,7 @@ Current scenarios:
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
+- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late signal, and finishes as canceled.
 - `grpc_service_contract` — the protobuf service methods are exercised under the virtual scheduler, including active-owner `DeliverMessage`, stale-owner `DeliverMessage` acknowledgement without work, workflow `CallTransient`, and object/transient `CallTransient`.
 - `grpc_workflow_rpc_response_matrix` — gRPC `CallTransient` response variants are covered together: `LeaseMoved`, `not_running`, and unavailable-node outcomes decode to typed routing failures instead of subprocess protocol errors.
 - `grpc_workflow_rpc_transport_fault_matrix` — workflow `CallTransient` is exposed to timeout, deadline-exceeded, RST, EOF, unavailable, lost-response, and duplicate-response faults.

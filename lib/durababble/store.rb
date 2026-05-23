@@ -62,6 +62,14 @@ module Durababble
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("workflow_cancellations")} (
+          workflow_id text PRIMARY KEY REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          reason text,
+          requested_at timestamptz NOT NULL DEFAULT now(),
+          delivered_at timestamptz
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           position integer NOT NULL,
@@ -232,6 +240,15 @@ module Durababble
           SQL
           candidates.concat(execute_params(<<~SQL, []).to_a)
             SELECT id, created_at FROM #{table("workflows")}
+            WHERE status = 'canceling'
+              AND (next_run_at IS NULL OR next_run_at <= now())
+              #{name_filter}
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidates.concat(execute_params(<<~SQL, []).to_a)
+            SELECT id, created_at FROM #{table("workflows")}
             WHERE status = 'running' AND locked_until < now()
               #{name_filter}
             ORDER BY created_at
@@ -267,7 +284,7 @@ module Durababble
             locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1
           AND (
-            status IN ('pending', 'failed')
+            status IN ('pending', 'failed', 'canceling')
             OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
           )
         RETURNING *
@@ -298,7 +315,11 @@ module Durababble
       transaction do
         workflows = execute_params(<<~SQL, [worker_id]).cmd_tuples
           UPDATE #{table("workflows")}
-          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          SET status = CASE
+              WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+              ELSE 'pending'
+            END,
+            locked_by = NULL, locked_until = NULL, updated_at = now()
           WHERE status = 'running' AND locked_by = $1
         SQL
         outbox = execute_params(<<~SQL, [worker_id]).cmd_tuples
@@ -314,7 +335,11 @@ module Durababble
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
       execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
         UPDATE #{table("workflows")}
-        SET status = 'pending', locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, updated_at = now()
+        SET status = CASE
+            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            ELSE 'pending'
+          END,
+          locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, updated_at = now()
         WHERE id = $1 AND status = 'running' AND locked_by = $2
       SQL
     end
@@ -322,6 +347,50 @@ module Durababble
     #: (untyped, ?now: untyped) -> untyped
     def make_workflow_due!(workflow_id, now: Time.now)
       execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = $2::timestamptz WHERE id = $1", [workflow_id, timestamp(now)])
+    end
+
+    #: (workflow_id: untyped, reason: untyped) -> untyped
+    def request_workflow_cancellation(workflow_id:, reason:)
+      transaction do
+        row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
+        raise KeyError, "workflow not found: #{workflow_id}" unless row
+
+        decoded = decode_row(row)
+        next decoded if terminal_for_cancellation?(decoded)
+
+        inserted = execute_params(<<~SQL, [workflow_id, reason])
+          INSERT INTO #{table("workflow_cancellations")} (workflow_id, reason)
+          VALUES ($1, $2)
+          ON CONFLICT (workflow_id) DO NOTHING
+        SQL
+        first_request = inserted.cmd_tuples == 1
+        cancel_pending_waits_for_workflow(workflow_id) if first_request
+
+        if first_request && decoded.fetch("status") != "running"
+          execute_params(<<~SQL, [workflow_id])
+            UPDATE #{table("workflows")}
+            SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now()
+            WHERE id = $1 AND status NOT IN ('completed', 'canceled')
+          SQL
+        end
+
+        workflow(workflow_id)
+      end
+    end
+
+    #: (untyped) -> untyped
+    def workflow_cancellation(workflow_id)
+      row = execute_params("SELECT * FROM #{table("workflow_cancellations")} WHERE workflow_id = $1", [workflow_id]).first
+      row&.transform_values(&:itself)
+    end
+
+    #: (workflow_id: untyped) -> untyped
+    def mark_workflow_cancellation_delivered(workflow_id:)
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("workflow_cancellations")}
+        SET delivered_at = COALESCE(delivered_at, now())
+        WHERE workflow_id = $1
+      SQL
     end
 
     #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
@@ -379,7 +448,11 @@ module Durababble
     def steal_expired_leases!(now: Time.now)
       result = execute_params(<<~SQL, [timestamp(now)])
         UPDATE #{table("workflows")}
-        SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+        SET status = CASE
+            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            ELSE 'pending'
+          END,
+          locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_until < $1::timestamptz
       SQL
       result.cmd_tuples
@@ -403,6 +476,14 @@ module Durababble
       execute_params(
         "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
         [workflow_id, dump_serialized(result)],
+      )
+    end
+
+    #: (untyped, reason: untyped, result: untyped) -> untyped
+    def cancel_workflow(workflow_id, reason:, result: nil)
+      execute_params(
+        "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
+        [workflow_id, dump_serialized(result), reason],
       )
     end
 
@@ -445,6 +526,15 @@ module Durababble
     #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
     def record_step_failed(workflow_id:, position:, error:)
       record_step_failed_without_transaction(workflow_id:, position:, error:)
+    end
+
+    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
+    def record_step_canceled(workflow_id:, position:, error:)
+      execute_params(
+        "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting')",
+        [workflow_id, position, error],
+      )
+      update_latest_attempt_serialized(workflow_id:, position:, status: "canceled", serialized_result: dump_serialized(nil), error:)
     end
 
     #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
@@ -672,6 +762,32 @@ module Durababble
 
     private
 
+    #: (untyped) -> untyped
+    def terminal_for_cancellation?(row)
+      return true if ["completed", "canceled"].include?(row.fetch("status"))
+
+      row.fetch("status") == "failed" && row["next_run_at"].nil?
+    end
+
+    #: (untyped) -> untyped
+    def cancel_pending_waits_for_workflow(workflow_id)
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("waits")}
+        SET status = 'canceled', completed_at = now()
+        WHERE workflow_id = $1 AND status = 'pending'
+      SQL
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("steps")}
+        SET status = 'canceled', error = 'workflow cancellation requested', updated_at = now()
+        WHERE workflow_id = $1 AND status = 'waiting'
+      SQL
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("step_attempts")}
+        SET status = 'canceled', error = 'workflow cancellation requested', completed_at = now()
+        WHERE workflow_id = $1 AND status = 'waiting'
+      SQL
+    end
+
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
@@ -770,9 +886,9 @@ module Durababble
         @connection.exec(sql)
       rescue PG::TRSerializationFailure, PG::TRDeadlockDetected
         attempts += 1
-        raise if attempts >= 5
+        raise if attempts >= 20
 
-        sleep(0.01 * attempts)
+        sleep([0.05 * attempts, 1.0].min)
         retry
       end
     end
@@ -965,6 +1081,15 @@ module Durababble
         )
       SQL
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("workflow_cancellations")} (
+          workflow_id VARCHAR(191) PRIMARY KEY,
+          reason TEXT,
+          requested_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          delivered_at DATETIME(6),
+          FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id VARCHAR(191) NOT NULL,
           position INT NOT NULL,
@@ -1084,7 +1209,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "durable_objects", "workflow_cancellations", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1148,6 +1273,15 @@ module Durababble
         SQL
         candidates.concat(execute_params(<<~SQL, name_params).to_a)
           SELECT id, created_at FROM #{table("workflows")}
+          WHERE status = 'canceling'
+            AND (next_run_at IS NULL OR next_run_at <= NOW(6))
+            #{name_sql}
+          ORDER BY created_at
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        SQL
+        candidates.concat(execute_params(<<~SQL, name_params).to_a)
+          SELECT id, created_at FROM #{table("workflows")}
           WHERE status = 'running' AND locked_until < NOW(6)
             #{name_sql}
           ORDER BY created_at
@@ -1162,7 +1296,7 @@ module Durababble
           SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed')
+              status IN ('pending', 'failed', 'canceling')
               OR (status = 'running' AND locked_until < NOW(6))
             )
         SQL
@@ -1185,7 +1319,7 @@ module Durababble
           SELECT id FROM #{table("workflows")}
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed')
+              status IN ('pending', 'failed', 'canceling')
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
             )
           FOR UPDATE SKIP LOCKED
@@ -1226,7 +1360,11 @@ module Durababble
         workflows = execute_params("SELECT COUNT(*) AS count FROM #{table("workflows")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
         execute_params(<<~SQL, [worker_id])
           UPDATE #{table("workflows")}
-          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+          SET status = CASE
+              WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+              ELSE 'pending'
+            END,
+            locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
           WHERE status = 'running' AND locked_by = ?
         SQL
         outbox = execute_params("SELECT COUNT(*) AS count FROM #{table("outbox")} WHERE status = 'processing' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
@@ -1243,7 +1381,11 @@ module Durababble
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
       execute_params(<<~SQL, [run_at, workflow_id, worker_id])
         UPDATE #{table("workflows")}
-        SET status = 'pending', locked_by = NULL, locked_until = NULL, next_run_at = ?, updated_at = NOW(6)
+        SET status = CASE
+            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            ELSE 'pending'
+          END,
+          locked_by = NULL, locked_until = NULL, next_run_at = ?, updated_at = NOW(6)
         WHERE id = ? AND status = 'running' AND locked_by = ?
       SQL
     end
@@ -1251,6 +1393,48 @@ module Durababble
     #: (untyped, ?now: untyped) -> untyped
     def make_workflow_due!(workflow_id, now: Time.now)
       execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = ? WHERE id = ?", [now, workflow_id])
+    end
+
+    #: (workflow_id: untyped, reason: untyped) -> untyped
+    def request_workflow_cancellation(workflow_id:, reason:)
+      transaction do
+        row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id]).first
+        raise KeyError, "workflow not found: #{workflow_id}" unless row
+
+        decoded = decode_row(row)
+        next decoded if terminal_for_cancellation?(decoded)
+
+        inserted = execute_params(<<~SQL, [workflow_id, reason])
+          INSERT IGNORE INTO #{table("workflow_cancellations")} (workflow_id, reason)
+          VALUES (?, ?)
+        SQL
+        first_request = inserted.cmd_tuples == 1
+        cancel_pending_waits_for_workflow(workflow_id) if first_request
+
+        if first_request && decoded.fetch("status") != "running"
+          execute_params(<<~SQL, [workflow_id])
+            UPDATE #{table("workflows")}
+            SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+            WHERE id = ? AND status NOT IN ('completed', 'canceled')
+          SQL
+        end
+
+        workflow(workflow_id)
+      end
+    end
+
+    #: (untyped) -> untyped
+    def workflow_cancellation(workflow_id)
+      execute_params("SELECT * FROM #{table("workflow_cancellations")} WHERE workflow_id = ?", [workflow_id]).first
+    end
+
+    #: (workflow_id: untyped) -> untyped
+    def mark_workflow_cancellation_delivered(workflow_id:)
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("workflow_cancellations")}
+        SET delivered_at = COALESCE(delivered_at, NOW(6))
+        WHERE workflow_id = ?
+      SQL
     end
 
     #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
@@ -1310,7 +1494,11 @@ module Durababble
       SQL
       execute_params(<<~SQL, [now])
         UPDATE #{table("workflows")}
-        SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        SET status = CASE
+            WHEN EXISTS (SELECT 1 FROM #{table("workflow_cancellations")} wc WHERE wc.workflow_id = #{table("workflows")}.id) THEN 'canceling'
+            ELSE 'pending'
+          END,
+          locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE status = 'running' AND locked_until < ?
       SQL
       expired
@@ -1358,6 +1546,15 @@ module Durababble
       SQL
     end
 
+    #: (untyped, reason: untyped, result: untyped) -> untyped
+    def cancel_workflow(workflow_id, reason:, result: nil)
+      execute_params(<<~SQL, [dump_serialized(result), reason, workflow_id])
+        UPDATE #{table("workflows")}
+        SET status = 'canceled', result = ?, error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+        WHERE id = ?
+      SQL
+    end
+
     #: (untyped, error: untyped) -> untyped
     def fail_workflow(workflow_id, error:)
       execute_params(<<~SQL, [error, workflow_id])
@@ -1375,6 +1572,16 @@ module Durababble
         WHERE workflow_id = ? AND position = ?
       SQL
       update_latest_attempt_serialized(workflow_id:, position:, status: "failed", serialized_result: dump_serialized(nil), error:)
+    end
+
+    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
+    def record_step_canceled(workflow_id:, position:, error:)
+      execute_params(<<~SQL, [error, workflow_id, position])
+        UPDATE #{table("steps")}
+        SET status = 'canceled', error = ?, updated_at = NOW(6)
+        WHERE workflow_id = ? AND position = ? AND status IN ('running', 'waiting')
+      SQL
+      update_latest_attempt_serialized(workflow_id:, position:, status: "canceled", serialized_result: dump_serialized(nil), error:)
     end
 
     #: (untyped) -> untyped
@@ -1609,6 +1816,25 @@ module Durababble
     end
 
     private
+
+    #: (untyped) -> untyped
+    def cancel_pending_waits_for_workflow(workflow_id)
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("waits")}
+        SET status = 'canceled', completed_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'pending'
+      SQL
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("steps")}
+        SET status = 'canceled', error = 'workflow cancellation requested', updated_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'waiting'
+      SQL
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("step_attempts")}
+        SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'waiting'
+      SQL
+    end
 
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)

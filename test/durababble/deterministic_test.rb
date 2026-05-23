@@ -27,6 +27,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "store_fault_after_outbox_enqueue",
     "duplicate_delivery_signal_and_outbox",
     "workflow_rpc_owner_state_matrix",
+    "cooperative_cancellation_cleanup",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -185,6 +186,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "step_retry_not_due"
     assert_equal 3, result.trace.scan("step_retry_attempt").length
     assert_equal 1, result.summary.fetch(:completed_workflows)
+  end
+
+  test "models cooperative cancellation cleanup" do
+    result = Durababble::Deterministic.prove("cooperative_cancellation_cleanup", seed: 59)
+
+    assert_empty result.violations
+    assert_includes result.trace, "workflow_cancel_requested"
+    assert_includes result.trace, "workflow_cancel_delivered"
+    assert_includes result.trace, "cleanup_ran"
+    assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
   test "models durable store faults after writes and recovers from the persisted state" do
