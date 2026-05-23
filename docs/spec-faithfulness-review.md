@@ -19,31 +19,31 @@ The main divergences found are smaller but important correctness details:
 5. **Test gap: CLI coverage is happy-path only.** It verifies migrate/run/inspect/resume, but not bad commands, missing IDs, or schema/database errors. This is acceptable for prototype scope but not comprehensive CLI behavior.
 6. **Test gap: heartbeats and acknowledgements check positive paths more than negative ownership results.** Lease ownership and outbox ownership are mostly tested through behavior, but return values/cmd tuple effects are not exposed by public API. This is acceptable, though future APIs should return booleans for owner-sensitive mutations.
 
-7. **Spec gap found after initial review: lease-routed workflow RPC was not specified.** The spec covered workflow leases, lease-aware resume, and generic process-boundary command RPC benchmarks, but it did not specify node-to-node workflow RPC routing through the current lease holder or stale in-flight behavior when leases move/shutdown occurs. This was a spec gap, not an implementation drift from an existing requirement. It is now covered by `WorkflowRpc`, `Store#current_workflow_lease`, unit tests, query-plan coverage, and DST scenarios.
+7. **Spec gap found after initial review: lease-routed workflow RPC was not specified.** The spec covered workflow leases, lease-aware resume, and generic process-boundary command RPC benchmarks, but it did not specify node-to-node workflow RPC routing through the current lease holder or stale in-flight behavior when leases move/shutdown occurs. This was a spec gap, not an implementation drift from an existing requirement. It is now covered by `WorkflowRpc`, `Rpc::Server` / `Rpc::Client`, `Store#current_workflow_lease`, unit tests, query-plan coverage, gRPC integration tests, and DST scenarios.
 8. **Step retry policy scope is now explicit.** Durababble implements Temporal Activity-style retry options at the step boundary (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors`) and persists retry wakeups with `workflows.next_run_at`. It does not yet specify workflow-level retry policies; that remains future work, consistent with Temporal's distinction between Activity retry defaults and explicit Workflow Execution retry policy.
 
 ## Spec row-by-row assessment
 
-| Spec assertion | Status | Decision |
-| --- | --- | --- |
-| Ruby 4 gem scaffold managed by mise | Faithful | No change. |
-| Yugabyte storage through PostgreSQL wire protocol | Faithful | No change. |
-| Workflow DSL with ordered named steps | Faithful for basic ordered steps | Spec is intentionally minimal; no need to add duplicate-name validation now. |
-| Durable workflow and step rows | Faithful | No change. |
-| Append-only attempt history | Mostly faithful | Records are appended, terminal statuses are updated in-place. The wording is acceptable because attempts remain as records, but avoid implying immutable event sourcing. |
-| Runnable workflow queue via pending rows | Faithful | No change. |
-| Worker polling | Faithful for registered workflow names; normal polling filters claims to the worker registry | Workflows with no matching worker pool remain pending until a suitable pool starts. |
-| Distributed workflow leases | Mostly faithful | Claims use `FOR UPDATE SKIP LOCKED`; execution itself relies on lease ownership at start and does not heartbeat automatically. Prototype boundary should keep long-running step heartbeat out of scope. |
-| Lease-aware resume | Faithful | No change. |
-| Heartbeat extension | Faithful | Test coverage adequate, but public return value could improve later. |
-| Expired lease stealing | Faithful | No change. |
-| Skip completed steps / retry incomplete work | Faithful after stale-attempt fix | Regression test exists. |
-| Timer waits | Faithful | No change. |
-| Event waits | Faithful | No change. |
-| Side-effect idempotency fences | Faithful for concurrent callers while owner completes/fails | Spec gap for owner crash during fenced block; mark as boundary unless implemented later. |
-| Durable outbox unique keys/leases/ack | Faithful | No change. |
-| CLI commands | Faithful happy path | CLI error-path tests missing; acceptable prototype gap. |
-| SimpleCov thresholds | Faithful | Current full run exceeds thresholds. |
+| Spec assertion                                    | Status                                                                                       | Decision                                                                                                                                                                                                |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ruby 4 gem scaffold managed by mise               | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Yugabyte storage through PostgreSQL wire protocol | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Workflow DSL with ordered named steps             | Faithful for basic ordered steps                                                             | Spec is intentionally minimal; no need to add duplicate-name validation now.                                                                                                                            |
+| Durable workflow and step rows                    | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Append-only attempt history                       | Mostly faithful                                                                              | Records are appended, terminal statuses are updated in-place. The wording is acceptable because attempts remain as records, but avoid implying immutable event sourcing.                                |
+| Runnable workflow queue via pending rows          | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Worker polling                                    | Faithful for registered workflow names; normal polling filters claims to the worker registry | Workflows with no matching worker pool remain pending until a suitable pool starts.                                                                                                                     |
+| Distributed workflow leases                       | Mostly faithful                                                                              | Claims use `FOR UPDATE SKIP LOCKED`; execution itself relies on lease ownership at start and does not heartbeat automatically. Prototype boundary should keep long-running step heartbeat out of scope. |
+| Lease-aware resume                                | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Heartbeat extension                               | Faithful                                                                                     | Test coverage adequate, but public return value could improve later.                                                                                                                                    |
+| Expired lease stealing                            | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Skip completed steps / retry incomplete work      | Faithful after stale-attempt fix                                                             | Regression test exists.                                                                                                                                                                                 |
+| Timer waits                                       | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Event waits                                       | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| Side-effect idempotency fences                    | Faithful for concurrent callers while owner completes/fails                                  | Spec gap for owner crash during fenced block; mark as boundary unless implemented later.                                                                                                                |
+| Durable outbox unique keys/leases/ack             | Faithful                                                                                     | No change.                                                                                                                                                                                              |
+| CLI commands                                      | Faithful happy path                                                                          | CLI error-path tests missing; acceptable prototype gap.                                                                                                                                                 |
+| SimpleCov thresholds                              | Faithful                                                                                     | Current full run exceeds thresholds.                                                                                                                                                                    |
 
 ## Test coverage review
 
@@ -52,13 +52,13 @@ The main divergences found are smaller but important correctness details:
 - Full suite passes against real local Yugabyte/YSQL, not mocks.
 - Multi-connection concurrency tests cover workflow claims, fences, outbox claims, and event signals.
 - Subprocess crash harness covers a real process failure after step completion.
-- DST suite proves same-seed determinism and searches every safety/crash matrix row across many seeds.
-- Coverage is high: latest run before this review reported 28 examples, 0 failures, 97.72% line coverage and 76.61% branch coverage.
+- DST suite proves same-seed determinism and searches each unique fuzz scenario across many seeds; fixed contract/fault-matrix scenarios run once.
+- Coverage is high: latest run before this review reported 28 tests, 0 failures, 97.72% line coverage and 76.61% branch coverage.
 
 ### Weak spots
 
-- `complete_spec.rb` packs many guarantees into broad scenario tests; failures can be harder to diagnose than one-spec-per-row tests.
-- The DST virtual store is useful for exploration but can drift from the real `Store`; real-Yugabyte regression specs should pin every DST-found bug.
+- `complete_test.rb` packs many guarantees into broad scenario tests; failures can be harder to diagnose than one-test-per-row tests.
+- The DST virtual store is useful for exploration but can drift from the real `Store`; real-Yugabyte regression tests should pin every DST-found bug.
 - CLI negative/error behavior is not tested.
 - JSON/text decoding edge cases were not covered before this review.
 - Fence-owner crash semantics are not covered because the spec does not define recovery behavior.

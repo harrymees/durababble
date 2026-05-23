@@ -37,7 +37,7 @@ The only remaining JSON use in `Store` is the legacy JSONB migration reader for 
 
 ## Test coverage
 
-The store specs now explicitly verify:
+The store tests now explicitly verify:
 
 - runtime value columns are `bytea`, not `jsonb`;
 - raw stored bytes have the Paquito version prefix and decode through the Paquito serializer;

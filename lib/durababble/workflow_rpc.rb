@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 module Durababble
@@ -9,7 +10,32 @@ module Durababble
     class StaleLease < Error; end
     class UnknownCommand < Error; end
 
+    class << self
+      #: (untyped) -> untyped
+      def remote_error_from_message(message)
+        klass_name, parsed_message = message.split(": ", 2)
+        remote_error_from_fields(klass_name, parsed_message || message)
+      end
+
+      #: (untyped, untyped) -> untyped
+      def remote_error_from_fields(klass_name, message)
+        case klass_name
+        when "Durababble::WorkflowRpc::StaleLease", "WorkflowRpc::StaleLease", "StaleLease"
+          StaleLease.new(message)
+        when "Durababble::WorkflowRpc::NoActiveLease", "WorkflowRpc::NoActiveLease", "NoActiveLease"
+          NoActiveLease.new(message)
+        when "Durababble::WorkflowRpc::WorkflowNotRunning", "WorkflowRpc::WorkflowNotRunning", "WorkflowNotRunning"
+          WorkflowNotRunning.new(message)
+        when "Durababble::WorkflowRpc::NodeUnavailable", "WorkflowRpc::NodeUnavailable", "NodeUnavailable"
+          NodeUnavailable.new(message)
+        when "Durababble::WorkflowRpc::UnknownCommand", "WorkflowRpc::UnknownCommand", "UnknownCommand"
+          UnknownCommand.new(message)
+        end
+      end
+    end
+
     class LeaseStarter
+      #: (store: untyped, worker_ids: untyped, ?lease_seconds: untyped, ?await_attempts: untyped, ?await_sleep: untyped) -> void
       def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: ->(_attempt) {})
         @store = store
         @worker_ids = worker_ids
@@ -18,6 +44,7 @@ module Durababble
         @await_sleep = await_sleep
       end
 
+      #: (workflow_id: untyped) -> untyped
       def call(workflow_id:)
         @worker_ids.each do |worker_id|
           claimed = @store.claim_workflow(workflow_id:, worker_id:, lease_seconds: @lease_seconds)
@@ -28,6 +55,7 @@ module Durababble
 
       private
 
+      #: (untyped) -> untyped
       def await_started!(workflow_id)
         @await_attempts.times do |attempt|
           lease = @store.current_workflow_lease(workflow_id)
@@ -40,6 +68,7 @@ module Durababble
     end
 
     class Router
+      #: (store: untyped, rpc_clients: untyped, ?retry_on_stale: untyped, ?start_workflow: untyped) -> void
       def initialize(store:, rpc_clients:, retry_on_stale: false, start_workflow: nil)
         @store = store
         @rpc_clients = rpc_clients
@@ -47,12 +76,13 @@ module Durababble
         @start_workflow = start_workflow
       end
 
+      #: (workflow_id: untyped, command: untyped, ?payload: untyped) -> untyped
       def request(workflow_id:, command:, payload: {})
         attempts = 0
 
         begin
           route_once(workflow_id:, command:, payload:)
-        rescue StaleLease, NoActiveLease => e
+        rescue StaleLease, NoActiveLease, NodeUnavailable => e
           raise unless @retry_on_stale
 
           attempts += 1
@@ -65,6 +95,7 @@ module Durababble
 
       private
 
+      #: (workflow_id: untyped, command: untyped, payload: untyped) -> untyped
       def route_once(workflow_id:, command:, payload:)
         lease = @store.current_workflow_lease(workflow_id)
         raise inactive_workflow_error(workflow_id) unless lease
@@ -77,51 +108,41 @@ module Durababble
           "workflow_id" => workflow_id,
           "expected_worker_id" => worker_id,
           "command" => command,
-          "payload" => payload
+          "payload" => payload,
         })
       rescue Durababble::RpcClient::RemoteError => e
         raise translate_remote_error(e)
       end
 
+      #: (untyped) -> untyped
       def start_workflow!(workflow_id)
         starter = @start_workflow || LeaseStarter.new(store: @store, worker_ids: @rpc_clients.keys)
         starter.call(workflow_id:)
       end
 
+      #: (untyped) -> untyped
       def translate_remote_error(error)
-        klass_name, message = error.message.split(": ", 2)
-        message ||= error.message
-        case klass_name
-        when "Durababble::WorkflowRpc::StaleLease", "WorkflowRpc::StaleLease", "StaleLease"
-          StaleLease.new(message)
-        when "Durababble::WorkflowRpc::NoActiveLease", "WorkflowRpc::NoActiveLease", "NoActiveLease"
-          NoActiveLease.new(message)
-        when "Durababble::WorkflowRpc::WorkflowNotRunning", "WorkflowRpc::WorkflowNotRunning", "WorkflowNotRunning"
-          WorkflowNotRunning.new(message)
-        when "Durababble::WorkflowRpc::NodeUnavailable", "WorkflowRpc::NodeUnavailable", "NodeUnavailable"
-          NodeUnavailable.new(message)
-        when "Durababble::WorkflowRpc::UnknownCommand", "WorkflowRpc::UnknownCommand", "UnknownCommand"
-          UnknownCommand.new(message)
-        else
-          error
-        end
+        WorkflowRpc.remote_error_from_message(error.message) || error
       end
 
+      #: (untyped) -> untyped
       def inactive_workflow_error(workflow_id)
         row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if %w[completed waiting].include?(row.fetch("status"))
+        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if ["completed", "waiting"].include?(row.fetch("status"))
 
         NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end
     end
 
     class Handler
+      #: (store: untyped, node_id: untyped, handlers: untyped) -> void
       def initialize(store:, node_id:, handlers:)
         @store = store
         @node_id = node_id
         @handlers = handlers
       end
 
+      #: (untyped) -> untyped
       def call(payload)
         workflow_id = payload.fetch("workflow_id")
         expected_worker_id = payload.fetch("expected_worker_id")
@@ -138,6 +159,7 @@ module Durababble
 
       private
 
+      #: (untyped) -> untyped
       def assert_current_lease!(workflow_id)
         lease = @store.current_workflow_lease(workflow_id)
         raise inactive_workflow_error(workflow_id) unless lease
@@ -146,9 +168,10 @@ module Durababble
         raise StaleLease, "#{@node_id} no longer owns workflow #{workflow_id}; current owner is #{lease.fetch("worker_id")}"
       end
 
+      #: (untyped) -> untyped
       def inactive_workflow_error(workflow_id)
         row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if %w[completed waiting].include?(row.fetch("status"))
+        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if ["completed", "waiting"].include?(row.fetch("status"))
 
         NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end

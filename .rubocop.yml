@@ -1,0 +1,88 @@
+inherit_gem:
+  rubocop-shopify: rubocop.yml
+
+plugins:
+  - rubocop-minitest
+  - rubocop-sorbet
+
+Minitest:
+  Enabled: false
+
+Minitest/AssertNil:
+  Enabled: true
+
+AllCops:
+  NewCops: enable
+  SuggestExtensions: false
+  TargetRubyVersion: 3.4
+  Exclude:
+    - docs/**/*
+    - sig/**/*
+
+Naming/PredicateMethod:
+  Enabled: false
+
+Sorbet/BlockMethodDefinition:
+  Enabled: false
+
+Style/SafeNavigationChainLength:
+  Max: 5
+
+Style/StringLiterals:
+  Enabled: true
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  Enabled: true
+  EnforcedStyle: double_quotes
+
+Layout/LineLength:
+  Max: 120
+
+Sorbet/EnforceSignatures:
+  Enabled: true
+  Style: "rbs"
+  Include:
+    - "lib/**/*.rb"
+
+Sorbet/ForbidSig:
+  Enabled: true
+
+Sorbet/ForbidTAbsurd:
+  Enabled: true
+
+Sorbet/ForbidTBind:
+  Enabled: true
+
+Sorbet/ForbidTCast:
+  Enabled: true
+
+Sorbet/ForbidTLet:
+  Enabled: true
+
+Sorbet/ForbidTMust:
+  Enabled: true
+
+Sorbet/FalseSigil:
+  Enabled: true
+  Include:
+    - "lib/**/*.rb"
+  Exclude:
+    - "bench/**/*.rb"
+    - "examples/**/*.rb"
+    - "test/**/*.rb"
+
+Sorbet/TrueSigil:
+  Enabled: true
+  Include:
+    - "lib/**/*.rb"
+  Exclude:
+    - "bench/**/*.rb"
+    - "examples/**/*.rb"
+    - "test/**/*.rb"
+
+Sorbet/ForbidTTypeAlias:
+  Enabled: true
+
+Sorbet/ForbidTUnsafe:
+  Enabled: true

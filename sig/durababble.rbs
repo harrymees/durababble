@@ -81,6 +81,7 @@ module Durababble
     def initialize_state: () -> State
     def current_state: () -> State
     def update_state: (State state) -> State
+    def state_dirty?: () -> bool
   end
 
   class WaitRequest
@@ -96,6 +97,73 @@ module Durababble
     def initialize: (store: Store, workflows: Array[singleton(Workflow)] | Hash[String, singleton(Workflow)], ?worker_id: String, ?lease_seconds: Integer, ?migrate: bool) -> void
     def tick: () -> Symbol
     def run_until_idle: (?max_ticks: Integer) -> Integer
+  end
+
+  module WorkflowRpc
+    class Error < Durababble::Error
+    end
+
+    class WorkflowNotRunning < Error
+    end
+
+    class NoActiveLease < WorkflowNotRunning
+    end
+
+    class NodeUnavailable < Error
+    end
+
+    class StaleLease < Error
+    end
+
+    class UnknownCommand < Error
+    end
+
+    def self.remote_error_from_message: (String message) -> Error?
+    def self.remote_error_from_fields: (String klass_name, String message) -> Error?
+  end
+
+  module Rpc
+    class Error < Durababble::Error
+    end
+
+    class Unavailable < Error
+    end
+
+    class Unauthenticated < Error
+    end
+
+    class NodeDirectory
+      def initialize: (?Hash[String, String] entries) -> void
+      def register: (node_id: String, rpc_address: String) -> String
+      def rpc_address_for: (String node_id) -> String?
+    end
+
+    class Client
+      attr_reader address: String
+
+      def initialize: (address: String, ?credentials: untyped, ?timeout: Numeric, ?stub: untyped) -> void
+      def awaken_batch: (worker_pool: String, workflow_ids: Array[String]) -> true
+      def evict_lease: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String) -> true
+      def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String) -> true
+      def call_transient_response: (worker_pool: String, method: String, args: untyped, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> untyped
+      def call_transient: (worker_pool: String, method: String, args: untyped, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> untyped
+    end
+
+    class WorkflowClient
+      def initialize: (address: String, ?worker_pool: String, ?credentials: untyped, ?timeout: Numeric) -> void
+      def request: (String command, Hash[String, untyped] payload) -> untyped
+    end
+
+    class Server
+      attr_reader node_id: String
+      attr_reader host: String
+      attr_reader port: Integer?
+
+      def initialize: (node_id: String, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, untyped], ?transient_handler: untyped, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: untyped, ?pool_size: Integer, ?authorize: untyped, ?awaken_batch: untyped, ?evict_lease: untyped, ?deliver_message: untyped) -> void
+      def start: () -> self
+      def stop: () -> void
+      def address: () -> String
+    end
   end
 
   def self.configure: (database_url: String, ?schema: String) -> Store

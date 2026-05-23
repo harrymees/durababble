@@ -1,19 +1,23 @@
+# typed: true
 # frozen_string_literal: true
 
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
 
   Heartbeat = Data.define(:cursor, :recorder) do
+    #: (?untyped) -> untyped
     def record(cursor = self.cursor)
       recorder.call(cursor)
     end
 
-    alias heartbeat record
+    alias_method :heartbeat, :record
   end
 
   class WorkflowExecution
+    #: untyped
     attr_reader :step_context
 
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, completed_steps: untyped, ?crash_after: untyped) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, completed_steps:, crash_after: nil)
       @store = store
       @workflow_id = workflow_id
@@ -25,7 +29,8 @@ module Durababble
       @step_context = nil
     end
 
-    def call_step(instance, method_name:, args:, kwargs:)
+    #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
+    def call_step(instance, method_name:, args:, kwargs:, &block)
       position = @position
       @position += 1
 
@@ -43,10 +48,10 @@ module Durababble
         step_index: position,
         attempt_number:,
         idempotency_key: "durababble:v1:workflow:#{@workflow_id}:step:#{position}",
-        heartbeat:
+        heartbeat:,
       )
 
-      output = yield
+      output = block.call
       if output.is_a?(WaitRequest)
         assert_workflow_lease!
         @store.record_wait(workflow_id: @workflow_id, position:, name: step.name, wait_request: output)
@@ -77,6 +82,7 @@ module Durababble
 
     private
 
+    #: (untyped) -> untyped
     def build_heartbeat(position)
       Heartbeat.new(
         cursor: @store.step_heartbeat_cursor(workflow_id: @workflow_id, position:),
@@ -85,10 +91,11 @@ module Durababble
           raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before heartbeat" unless renewed
 
           true
-        end
+        end,
       )
     end
 
+    #: () -> untyped
     def assert_workflow_lease!
       return unless @store.respond_to?(:workflow_owned?)
       return if @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id)
@@ -96,11 +103,13 @@ module Durababble
       raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
     end
 
+    #: (untyped) -> untyped
     def retry_run_at(delay)
       base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
       base + delay
     end
 
+    #: (untyped) -> untyped
     def crash!(point)
       raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end
@@ -109,6 +118,7 @@ module Durababble
   class Engine
     DEFAULT_LEASE_SECONDS = 60
 
+    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped) -> void
     def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
       @store = store
       @worker_id = worker_id
@@ -117,11 +127,13 @@ module Durababble
       @store.migrate! if migrate
     end
 
+    #: (untyped, input: untyped) -> untyped
     def run(workflow_class, input:)
       workflow_id = @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
       resume(workflow_class, workflow_id:)
     end
 
+    #: (untyped, workflow_id: untyped, ?claimed: untyped) -> untyped
     def resume(workflow_class, workflow_id:, claimed: nil)
       current = claimed || @store.workflow(workflow_id)
       return run_from_row(current) if current.fetch("status") == "completed"
@@ -134,17 +146,18 @@ module Durababble
 
     private
 
+    #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
       completed_steps = @store.steps_for(workflow_id)
-                              .select { |step| step.fetch("status") == "completed" }
-                              .to_h { |step| [step.fetch("position").to_i, step] }
+        .select { |step| step.fetch("status") == "completed" }
+        .to_h { |step| [step.fetch("position").to_i, step] }
       execution = WorkflowExecution.new(
         store: @store,
         workflow_id:,
         worker_id: @worker_id,
         lease_seconds: @lease_seconds,
         completed_steps:,
-        crash_after: @crash_after
+        crash_after: @crash_after,
       )
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
@@ -166,6 +179,7 @@ module Durababble
       workflow.__durababble_execution__ = nil if workflow
     end
 
+    #: (untyped) -> untyped
     def assert_workflow_lease!(workflow_id)
       return unless @store.respond_to?(:workflow_owned?)
       return if @store.workflow_owned?(workflow_id:, worker_id: @worker_id)
@@ -173,18 +187,22 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
+    #: (untyped) -> untyped
     def initial_context(workflow_id)
       @store.workflow(workflow_id).fetch("input")
     end
 
+    #: (untyped) -> untyped
     def snapshot(workflow_id)
       run_from_row(@store.workflow(workflow_id))
     end
 
+    #: (untyped) -> untyped
     def run_from_row(row)
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
     end
 
+    #: (untyped) -> untyped
     def crash!(point)
       raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end

@@ -1,0 +1,116 @@
+PATH
+  remote: .
+  specs:
+    durababble (0.1.0)
+      bigdecimal (~> 3.2)
+      concurrent-ruby (~> 1.3)
+      grpc (~> 1.70)
+      paquito (~> 1.0)
+      pg (~> 1.5)
+      trilogy (~> 2.9)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ast (2.4.3)
+    bigdecimal (3.3.1)
+    concurrent-ruby (1.3.6)
+    google-protobuf (4.35.0-aarch64-linux-gnu)
+      bigdecimal
+      rake (~> 13.3)
+    google-protobuf (4.35.0-arm64-darwin)
+      bigdecimal
+      rake (~> 13.3)
+    google-protobuf (4.35.0-x86_64-linux-gnu)
+      bigdecimal
+      rake (~> 13.3)
+    googleapis-common-protos-types (1.23.0)
+      google-protobuf (~> 4.26)
+    grpc (1.80.0-aarch64-linux-gnu)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.80.0-arm64-darwin)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    grpc (1.80.0-x86_64-linux-gnu)
+      google-protobuf (>= 3.25, < 5.0)
+      googleapis-common-protos-types (~> 1.0)
+    json (2.19.5)
+    language_server-protocol (3.17.0.5)
+    lint_roller (1.1.0)
+    logger (1.7.0)
+    minitest (5.27.0)
+    mocha (2.7.1)
+      ruby2_keywords (>= 0.0.5)
+    msgpack (1.8.0)
+    paquito (1.0.1)
+      msgpack (>= 1.5.2)
+    parallel (2.1.0)
+    parser (3.3.11.1)
+      ast (~> 2.4.1)
+      racc
+    pg (1.6.3-aarch64-linux)
+    pg (1.6.3-arm64-darwin)
+    pg (1.6.3-x86_64-linux)
+    prism (1.9.0)
+    racc (1.8.1)
+    rainbow (3.1.1)
+    rake (13.4.2)
+    rbs (3.10.4)
+      logger
+      tsort
+    regexp_parser (2.12.0)
+    rubocop (1.86.2)
+      json (~> 2.3)
+      language_server-protocol (~> 3.17.0.2)
+      lint_roller (~> 1.1.0)
+      parallel (>= 1.10)
+      parser (>= 3.3.0.2)
+      rainbow (>= 2.2.2, < 4.0)
+      regexp_parser (>= 2.9.3, < 3.0)
+      rubocop-ast (>= 1.49.0, < 2.0)
+      ruby-progressbar (~> 1.7)
+      unicode-display_width (>= 2.4.0, < 4.0)
+    rubocop-ast (1.49.1)
+      parser (>= 3.3.7.2)
+      prism (~> 1.7)
+    rubocop-minitest (0.39.1)
+      lint_roller (~> 1.1)
+      rubocop (>= 1.75.0, < 2.0)
+      rubocop-ast (>= 1.38.0, < 2.0)
+    rubocop-shopify (2.18.0)
+      rubocop (~> 1.62)
+    rubocop-sorbet (0.12.0)
+      lint_roller
+      rubocop (>= 1.75.2)
+    ruby-progressbar (1.13.0)
+    ruby2_keywords (0.0.5)
+    sorbet (0.6.13248)
+      sorbet-static (= 0.6.13248)
+    sorbet-static (0.6.13248-aarch64-linux)
+    sorbet-static (0.6.13248-universal-darwin)
+    sorbet-static (0.6.13248-x86_64-linux)
+    trilogy (2.9.0)
+    tsort (0.2.0)
+    unicode-display_width (3.2.0)
+      unicode-emoji (~> 4.1)
+    unicode-emoji (4.2.0)
+
+PLATFORMS
+  aarch64-linux
+  arm64-darwin
+  x86_64-linux
+
+DEPENDENCIES
+  durababble!
+  minitest (< 6)
+  mocha (~> 2.7)
+  rbs (~> 3.9)
+  rubocop (~> 1.80)
+  rubocop-minitest (~> 0.38)
+  rubocop-shopify (~> 2.17)
+  rubocop-sorbet (~> 0.10)
+  sorbet (~> 0.5)
+
+BUNDLED WITH
+   2.6.7

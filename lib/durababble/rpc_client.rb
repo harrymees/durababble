@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 require "json"
@@ -14,11 +15,16 @@ module Durababble
 
     DEFAULT_TIMEOUT = 5.0
 
-    def self.spawn(command:, env: {}, timeout: DEFAULT_TIMEOUT)
-      stdin, stdout, wait_thread = Open3.popen2e(env, *command)
-      new(stdin:, stdout:, wait_thread:, timeout:, command:, env:)
+    class << self
+      #: (command: untyped, ?env: untyped, ?timeout: untyped) -> untyped
+      def spawn(command:, env: {}, timeout: DEFAULT_TIMEOUT)
+        open3 = Open3 #: as untyped
+        stdin, stdout, wait_thread = open3.popen2e(env, *command)
+        new(stdin:, stdout:, wait_thread:, timeout:, command:, env:)
+      end
     end
 
+    #: (stdin: untyped, stdout: untyped, wait_thread: untyped, ?timeout: untyped, ?command: untyped, ?env: untyped) -> void
     def initialize(stdin:, stdout:, wait_thread:, timeout: DEFAULT_TIMEOUT, command: nil, env: {})
       @stdin = stdin
       @stdout = stdout
@@ -28,6 +34,7 @@ module Durababble
       @env = env
     end
 
+    #: (untyped, ?untyped) -> untyped
     def request(command, payload = {})
       recover_poisoned_connection
       reconnect_if_idle_connection_died
@@ -35,6 +42,7 @@ module Durababble
       read_response(command)
     end
 
+    #: () -> untyped
     def close
       @stdin.close unless @stdin.closed?
       return if @wait_thread.join(1)
@@ -49,6 +57,7 @@ module Durababble
 
     private
 
+    #: () -> untyped
     def recover_poisoned_connection
       return unless @poisoned
 
@@ -57,22 +66,26 @@ module Durababble
       end
 
       close_streams
-      @stdin, @stdout, @wait_thread = Open3.popen2e(@env, *@command)
+      open3 = Open3 #: as untyped
+      @stdin, @stdout, @wait_thread = open3.popen2e(@env, *@command)
       @poisoned = false
     rescue SystemCallError, IOError => e
       raise ConnectionError, "failed to reconnect RPC worker after timeout: #{e.class}: #{e.message}"
     end
 
+    #: () -> untyped
     def reconnect_if_idle_connection_died
       return unless @command
       return unless @wait_thread.join(0)
 
       close_streams
-      @stdin, @stdout, @wait_thread = Open3.popen2e(@env, *@command)
+      open3 = Open3 #: as untyped
+      @stdin, @stdout, @wait_thread = open3.popen2e(@env, *@command)
     rescue SystemCallError, IOError => e
       raise ConnectionError, "failed to reconnect RPC worker: #{e.class}: #{e.message}"
     end
 
+    #: () -> untyped
     def close_streams
       @stdin.close if @stdin.respond_to?(:closed?) && !@stdin.closed?
       @stdout.close if @stdout.respond_to?(:closed?) && !@stdout.closed?
@@ -80,6 +93,7 @@ module Durababble
       nil
     end
 
+    #: (untyped, untyped) -> untyped
     def write_request(command, payload)
       @stdin.puts(JSON.generate({ command:, payload: }))
       @stdin.flush
@@ -87,6 +101,7 @@ module Durababble
       raise ConnectionError, "failed to write RPC request #{command}: #{e.class}: #{e.message}"
     end
 
+    #: (untyped) -> untyped
     def read_response(command)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @timeout
       loop do
@@ -104,6 +119,7 @@ module Durababble
       end
     end
 
+    #: (untyped, untyped) -> untyped
     def read_line_before(deadline, command)
       if @stdout.respond_to?(:to_io)
         remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -120,6 +136,7 @@ module Durababble
       raise ConnectionError, "failed to read RPC response for #{command}: #{e.class}: #{e.message}"
     end
 
+    #: (untyped) -> untyped
     def timeout!(command)
       @poisoned = true
       raise TimeoutError, "RPC request #{command} timed out after #{@timeout}s"

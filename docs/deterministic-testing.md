@@ -22,7 +22,8 @@ Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc
 - `violations` — invariant violations detected after the run.
 - `summary` — stable counters for completed workflows, side effects, and processed outbox messages.
 
-The RSpec prover runs the same scenario twice with the same seed and asserts identical trace and digest. It also asserts different seeds produce different traces, proving the seed controls scheduling/fault order.
+The Minitest prover runs the same scenario twice with the same seed and asserts identical trace and digest.
+It also asserts different seeds produce different traces, proving the seed controls scheduling/fault order.
 
 ## Scenario set
 
@@ -45,16 +46,20 @@ Current scenarios:
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
-- `workflow_rpc_lease_change` — a workflow RPC races with lease expiry and a new owner; stale receiver rejects and caller retries to the fresh holder.
-- `workflow_rpc_no_active_owner_recovery` — a workflow RPC races with lease expiry and no replacement owner exists yet; the router starts and awaits a new workflow lease internally, then reroutes the original RPC to the fresh holder without requiring caller-visible retry.
-- `workflow_rpc_shutdown_midflight` — a workflow RPC races with workflow completion/shutdown; stale receiver rejects and the unowned handler does not run.
+- `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
+- `grpc_service_contract` — the protobuf service methods are exercised under the virtual scheduler, including active-owner `DeliverMessage`, stale-owner `DeliverMessage` acknowledgement without work, workflow `CallTransient`, and object/transient `CallTransient`.
+- `grpc_workflow_rpc_response_matrix` — gRPC `CallTransient` response variants are covered together: `LeaseMoved`, `not_running`, and unavailable-node outcomes decode to typed routing failures instead of subprocess protocol errors.
+- `grpc_workflow_rpc_transport_fault_matrix` — workflow `CallTransient` is exposed to timeout, deadline-exceeded, RST, EOF, unavailable, lost-response, and duplicate-response faults.
+- `grpc_workflow_rpc_transport_fault_reroute` — owner transport failures race with lease movement, forcing the router to refresh the active lease and reroute.
+- `grpc_wakeup_fault_matrix` — `AwakenBatch`, `DeliverMessage`, and `EvictLease` wakeups are exposed to drop, duplicate, timeout, RST, EOF, and unavailable faults while polling remains the correctness path.
 - `bug_duplicate_completion` — intentionally broken fixture used to prove invariant detection reports violations.
 
-The RSpec matrix maps each guarantee/safety condition and each crash matrix row to one or more scenarios and searches seeds `1..100` for each mapped scenario.
+The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping.
+Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.
 
 ## Spec gap found during workflow RPC review
 
-The original prototype spec covered distributed workflow leases and lease-aware `Engine#resume`, but it did not define node-to-node workflow RPC routing through the current lease holder. That was a spec gap rather than a known implementation mismatch: there was no `WorkflowRpc` component, no `current_workflow_lease` API, and no matrix row for the race where a caller looks up an owner, sends an RPC, and the lease expires or workflow shuts down in flight. The gap is now explicit in `docs/spec.md` and pinned by the `workflow_rpc_lease_change` and `workflow_rpc_shutdown_midflight` scenarios plus ordinary workflow RPC unit specs.
+The original prototype spec covered distributed workflow leases and lease-aware `Engine#resume`, but it did not define node-to-node workflow RPC routing through the current lease holder. That was a spec gap rather than a known implementation mismatch: there was no `WorkflowRpc` component, no `current_workflow_lease` API, and no matrix row for the race where a caller looks up an owner, sends an RPC, and the lease expires or workflow shuts down in flight. The gap is now explicit in `docs/spec.md` and pinned by the `workflow_rpc_owner_state_matrix` scenario plus ordinary workflow RPC unit tests.
 
 ## Seed search
 

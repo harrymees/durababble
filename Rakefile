@@ -1,8 +1,25 @@
 # frozen_string_literal: true
 
 require "bundler/gem_tasks"
-require "rspec/core/rake_task"
+require "rake/testtask"
 
-RSpec::Core::RakeTask.new(:spec)
+task :rubocop do
+  sh("bundle exec rubocop")
+end
 
-task default: :spec
+task :rbs do
+  sh("bundle exec rbs validate")
+end
+
+task :typecheck do
+  sh("bundle exec srb tc")
+end
+
+task lint: [:rubocop, :rbs, :typecheck]
+
+Rake::TestTask.new(:test) do |task|
+  task.libs << "test"
+  task.pattern = "test/**/*_test.rb"
+end
+
+task default: :test

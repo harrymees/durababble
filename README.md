@@ -1,52 +1,62 @@
 # Durababble
 
-Durababble is a prototype durable execution engine in Ruby 4. It stores workflow runs, workflow steps, durable-object state/commands, waits, attempts, fences, and outbox messages in a SQL store. The primary tested backends are YugabyteDB through the PostgreSQL-compatible YSQL endpoint and MySQL/MariaDB through the `mysql2` adapter.
+Durababble is an incubating Ruby library for durable workflow orchestration, durable objects, and lease-routed RPCs.
+This copy is vendored into `agent-server` as a local path gem while the API settles.
 
-Durababble's public API is intentionally Ruby-shaped:
+The app depends on it with:
 
-- workflows are classes;
-- workflow code is simple Ruby in `#execute`;
-- workflow side-effect boundaries are `step def ...` methods on `self`;
-- workflows and durable objects both use `expose` for public queries and `expose_command` for public commands;
-- durable object methods are not workflow steps: exposed object commands are already the serialized durable boundary;
-- types live in RBS, not in runtime validators.
-
-## Local setup
-
-```sh
-mise install
-mise exec -- bundle install
-export DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte
-mise exec -- bundle exec rake spec
+```ruby
+gem "durababble", path: "gems/durababble"
 ```
 
-The local Yugabyte instance used by default is `ybsqlite-vfs-yugabyte`, exposed as `127.0.0.1:15433 -> 5433`. A second Yugabyte container, `yugalite-test-yugabyte`, is reachable at `127.0.0.1:32770`.
+Bundler loads the library directly from this folder.
+There is no publish step while it is incubating in the app.
 
-## Store backends
+## Layout
 
-`Durababble::Store.connect(database_url:, schema:)` selects a backend from the URL scheme:
-
-- `postgresql://...` / `postgres://...` use the PostgreSQL/YSQL adapter backed by the `pg` gem. This is the default path used for local YugabyteDB.
-- `mysql2://...` / `mysql://...` use the MySQL/MariaDB adapter backed by the `mysql2` gem.
-
-Both adapters implement the same durable store contract for workflows, steps, attempts, waits, fences, outbox messages, durable-object state, and durable-object commands. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). The shared backend specs run representative engine, durable-object, heartbeat, retry, queue-correctness, and crash/guarantee behavior against both stores.
-
-Local MySQL/MariaDB development uses a normal database URL supplied by environment variable, for example:
-
-```sh
-export DURABABBLE_MYSQL_DATABASE_URL='mysql2://USER:[REDACTED]@127.0.0.1:3306/durababble_test'
-DURABABBLE_DATABASE_URL="$DURABABBLE_MYSQL_DATABASE_URL" mise exec -- bundle exec rspec spec/durababble/store_backend_conformance_spec.rb
+```text
+gems/durababble/
+  durababble.gemspec
+  lib/
+    durababble.rb
+    durababble/version.rb
+  test/
 ```
 
-The benchmark harness accepts either backend via `DURABABBLE_DATABASE_URL` or `--database-url`, so the same smoke/full benchmark profiles can compare YugabyteDB and MySQL/MariaDB.
+The gemspec owns runtime dependencies used by the app bundle.
+`Durababble::Store.connect` selects the Trilogy-backed MySQL adapter by default, with PostgreSQL/YSQL available when a PostgreSQL URL is provided.
 
-## Workflow API
+## Testing
 
-A workflow is a class. `#execute` is deterministic orchestration. Methods declared with `step` are the durable side-effect boundaries; replay returns persisted step results instead of re-running completed steps.
+The tests use the same Minitest stack as `agent-server`.
+They live under `gems/durababble/test` and run directly from the gem without booting Rails.
+
+Useful commands from the `agent-server` zone:
+
+```sh
+cd gems/durababble
+shadowenv exec -- bundle exec ruby -I lib -I test test/run_all.rb
+cd ../..
+shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
+DURABABBLE_YUGABYTE_DATABASE_URL=postgresql://127.0.0.1:5433/durababble_test shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
+/opt/dev/bin/dev check
+```
+
+## Public API
+
+Durababble exposes two complementary abstractions on the same durable store:
+
+| Abstraction                 | Best for                                                                            | Mental model                     |
+| --------------------------- | ----------------------------------------------------------------------------------- | -------------------------------- |
+| `Durababble::Workflow`      | One-off processes: indexing pipelines, multi-step tool sequences, resumable work    | Function that survives restarts  |
+| `Durababble::DurableObject` | Sessions, agent contexts, project state, anything addressed by id and mutable state | Addressed object with durability |
+
+Workflow code is plain Ruby in `#execute`.
+Methods declared with `step` are durable side-effect boundaries; replay returns persisted step results instead of rerunning completed work.
 
 ```ruby
 class FulfillOrder < Durababble::Workflow
-  workflow_name "fulfill_order" # optional; defaults from the class name
+  workflow_name "fulfill_order"
 
   def execute(order)
     payment = charge_card(order)
@@ -60,48 +70,25 @@ class FulfillOrder < Durababble::Workflow
     Payments.charge(
       order.fetch("card_token"),
       amount: order.fetch("total_cents"),
-      idempotency_key: step_context.idempotency_key
+      idempotency_key: step_context.idempotency_key,
     )
   end
 
   step def buy_shipping_label(order, payment)
     Shipping.buy_label(
       order.fetch("address"),
-      idempotency_key: step_context.idempotency_key
+      idempotency_key: step_context.idempotency_key,
     )
-  end
-
-  expose_command def cancel(reason:)
-    # Workflow.ref(run_id).cancel(reason:) records a durable command event.
-    reason
-  end
-
-  expose def description
-    self.class.workflow_name
   end
 end
 ```
 
-Run inline or enqueue for a worker:
-
-```ruby
-store = Durababble::Store.connect(database_url: ENV.fetch("DURABABBLE_DATABASE_URL"), schema: "durababble")
-run = Durababble::Engine.new(store:).run(FulfillOrder, input: order)
-run_id = FulfillOrder.enqueue(order, store:)
-Durababble::Worker.new(store:, workflows: [FulfillOrder]).run_until_idle
-```
-
-Step retry options are defined at the method declaration site. Supported options are `initial_interval:`, `backoff_coefficient:`, `maximum_interval:`, `maximum_attempts:`, `schedule:`, and `non_retryable_errors:`. Step idempotency keys are generated by Durababble and exposed only through `step_context.idempotency_key`; workflow code does not provide or override them.
-
-`expose` and `expose_command` define the public surface for `Workflow.ref(run_id, store:)`. In the current prototype, exposed workflow queries execute the Ruby query method against a lightweight ref instance. Exposed workflow commands are persisted as workflow command events with keys like `workflow:<run_id>:command:<method>`; a full lease-routed command executor with return values is future work.
-
-## Durable object API
-
-A durable object is an identity-addressed object. It has no workflow-step split: exposed commands are the durable command boundary, and exposed queries read current state. The spec requires exposed commands for the same object identity to serialize through that identity; the current prototype persists command rows and executes commands inline while this queue/worker path is hardened.
+Durable objects are identity-addressed state holders.
+Exposed commands are the durable boundary for state changes.
 
 ```ruby
 class Account < Durababble::DurableObject
-  object_type "account" # optional; defaults from the class name
+  object_type "account"
 
   def initialize_state
     { "balance_cents" => 0 }
@@ -112,13 +99,6 @@ class Account < Durababble::DurableObject
     update_state("balance_cents" => current_state.fetch("balance_cents") + amount_cents)
   end
 
-  expose_command retry: { maximum_attempts: 5, non_retryable_errors: [InsufficientFunds] }
-  def debit(amount_cents)
-    raise InsufficientFunds if current_state.fetch("balance_cents") < amount_cents
-
-    update_state("balance_cents" => current_state.fetch("balance_cents") - amount_cents)
-  end
-
   expose def balance
     current_state.fetch("balance_cents")
   end
@@ -126,69 +106,20 @@ end
 
 account = Account.ref("acct_123", store:)
 account.credit(1_000)
-account.debit(250)
-account.balance # => 750
+account.balance
 ```
 
-Inside an exposed command, `command_context.idempotency_key` is library-generated for that durable command. Commands normally mutate state by calling `update_state(new_state)`. Queries declared with `expose` do not create command rows and should not mutate state.
+## Implemented Prototype Scope
 
-## RBS typing with no runtime overhead
-
-Durababble does not inspect or enforce user RBS at runtime. The Ruby DSL marks durability boundaries; `.rbs` files provide static contracts for Steep/RBS-aware tooling.
-
-```rbs
-class FulfillOrder < Durababble::Workflow[OrderInput, OrderResult]
-  def execute: (OrderInput order) -> OrderResult
-  def charge_card: (OrderInput order) -> Payment
-  def buy_shipping_label: (OrderInput order, Payment payment) -> ShippingLabel
-  def cancel: (reason: String) -> String
-  def description: () -> String
-end
-
-class Account < Durababble::DurableObject[String, AccountState]
-  def credit: (Integer amount_cents) -> AccountState
-  def debit: (Integer amount_cents) -> AccountState
-  def balance: () -> Integer
-end
-```
-
-## Implemented prototype scope
-
-- Class-oriented workflow API with `#execute`, `step def`, step-local retry policy, generated step idempotency keys, and class-method enqueueing.
-- Class-oriented durable object API with `ref`, `expose`, `expose_command`, generated command idempotency keys, and explicit state updates.
-- PostgreSQL/YSQL and MySQL/MariaDB schema migration.
+- Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, and class-method enqueueing.
+- Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
+- PostgreSQL/YSQL and MySQL/MariaDB store implementations.
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
-- Worker polling with one-at-a-time leased workflow claims.
+- Worker polling with leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
-- Transactional multi-row step and wait transitions.
-- Run and resume behavior that skips completed steps and retries incomplete work.
-- Timer waits and external event waits with concurrent signal protection.
-- Side-effect idempotency fences that acquire before the side effect executes.
-- Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement. It is intentionally not modeled as a first-class public workflow API yet.
-- CLI commands: `migrate`, `run-counter`, `inspect`, `resume-counter`, `version`.
-- Comprehensive RSpec integration suite against real Yugabyte/PostgreSQL-compatible and MySQL/MariaDB stores plus SimpleCov line/branch thresholds.
-- Silo/mad-turmoil-inspired deterministic simulation suite with virtual clients, worker nodes, network, and Yugabyte store.
+- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Lease-routed workflow RPC helpers.
+- Deterministic simulation tests for workflow safety and crash-recovery scenarios.
 
-See `docs/spec.md` for the implemented spec, guarantee matrix, crash matrix, and coverage standard.
-See `docs/deterministic-testing.md` for deterministic scenario testing and seed search.
-
-## CLI
-
-```sh
-exe/durababble migrate --schema durababble
-exe/durababble run-counter --schema durababble --count 2
-exe/durababble inspect RUN_ID --schema durababble
-exe/durababble resume-counter RUN_ID --schema durababble
-```
-
-## Deterministic seed search
-
-```sh
-mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
-```
-
-The RSpec DST matrix searches every safety/guarantee row and every crash/recovery row across seeds `1..100`. Bugs found by DST are promoted into clear non-DST regression tests.
-
-## Prototype boundaries
-
-This is still a prototype, not a production Temporal replacement. It implements the workflow guarantee and crash matrices in `docs/spec.md`, but does not yet include workflow versioning, cron scheduling, metrics, tracing, a packaged daemon supervisor, production operational tooling, or the full durable-object command worker/serialization runtime implied by the durable-object spec.
+This is still a prototype, not a production Temporal replacement.
+The implementation is intentionally kept as a plain Ruby gem until it needs Rails hooks, initializers, models, or routes.
