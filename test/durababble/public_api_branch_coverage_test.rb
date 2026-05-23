@@ -73,6 +73,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   end
 
   class BranchTestStore
+    attr_accessor :lose_completion
     attr_reader :events, :completed_commands, :failed_commands, :migrations, :closed
 
     def initialize
@@ -123,6 +124,8 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
 
     def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
+      return if lose_completion
+
       save_object_state(object_type:, object_id:, state:) unless state.equal?(Durababble::Store::NO_OBJECT_STATE)
       @completed_commands << [command_id, result]
     end
@@ -205,6 +208,17 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     assert_nil Class.new(Durababble::DurableObject).new.current_state
     transient = BranchTestDurableObject.new
     assert_equal({ "value" => 9 }, transient.update_state("value" => 9))
+  end
+
+  test "raises when durable object command completion loses its lease" do
+    store = BranchTestStore.new
+    store.lose_completion = true
+    account = BranchTestDurableObject.ref("acct-lease-lost", store:)
+
+    assert_raises_matching(Durababble::LeaseConflict, /lost durable object command lease/) do
+      account.add(amount: 1)
+    end
+    assert_equal 1, store.failed_commands.length
   end
 
   test "configures a default store when no previous store exists" do
