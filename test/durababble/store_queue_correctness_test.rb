@@ -9,7 +9,12 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       with_durababble_store(backend, "queue_correctness") do |store|
         store.migrate!
         pending_newer = enqueue_workflow_at("pending-newer", status: "pending", created_at: Time.now - 60)
-        failed_middle = enqueue_workflow_at("failed-middle", status: "failed", created_at: Time.now - 120)
+        failed_middle = enqueue_workflow_at(
+          "failed-middle",
+          status: "failed",
+          created_at: Time.now - 120,
+          next_run_at: Time.now - 120,
+        )
         expired_oldest = enqueue_workflow_at(
           "expired-oldest",
           status: "running",
@@ -205,18 +210,18 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
   private
 
-  def enqueue_workflow_at(label, status:, created_at:, locked_by: nil, locked_until: nil)
+  def enqueue_workflow_at(label, status:, created_at:, locked_by: nil, locked_until: nil, next_run_at: nil)
     id = store.enqueue_workflow(name: label, input: { "label" => label })
     if backend_descriptor.mysql?
-      store.send(:execute_params, <<~SQL, [status, locked_by, timestamp_or_nil(locked_until), timestamp(created_at), timestamp(created_at), id])
+      store.send(:execute_params, <<~SQL, [status, locked_by, timestamp_or_nil(locked_until), timestamp_or_nil(next_run_at), timestamp(created_at), timestamp(created_at), id])
         UPDATE #{table("workflows")}
-        SET status = ?, locked_by = ?, locked_until = ?, created_at = ?, updated_at = ?
+        SET status = ?, locked_by = ?, locked_until = ?, next_run_at = ?, created_at = ?, updated_at = ?
         WHERE id = ?
       SQL
     else
-      store.send(:execute_params, <<~SQL, [id, status, locked_by, timestamp_or_nil(locked_until), timestamp(created_at)])
+      store.send(:execute_params, <<~SQL, [id, status, locked_by, timestamp_or_nil(locked_until), timestamp_or_nil(next_run_at), timestamp(created_at)])
         UPDATE #{table("workflows")}
-        SET status = $2, locked_by = $3, locked_until = $4::timestamptz, created_at = $5::timestamptz, updated_at = $5::timestamptz
+        SET status = $2, locked_by = $3, locked_until = $4::timestamptz, next_run_at = $5::timestamptz, created_at = $6::timestamptz, updated_at = $6::timestamptz
         WHERE id = $1
       SQL
     end

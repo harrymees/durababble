@@ -226,7 +226,7 @@ module Durababble
           candidates.concat(execute_params(<<~SQL, []).to_a)
             SELECT id, created_at FROM #{table("workflows")}
             WHERE status = 'failed'
-              AND (next_run_at IS NULL OR next_run_at <= now())
+              AND next_run_at <= now()
               #{name_filter}
             ORDER BY created_at
             LIMIT 1
@@ -269,7 +269,8 @@ module Durababble
             locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1
           AND (
-            status IN ('pending', 'failed')
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+            OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
           )
         RETURNING *
@@ -414,10 +415,20 @@ module Durababble
 
     #: (untyped, error: untyped) -> untyped
     def fail_workflow(workflow_id, error:)
-      execute_params(
-        "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
-        [workflow_id, error],
-      )
+      transaction do
+        execute_params(
+          "UPDATE #{table("steps")} SET status = 'failed', error = $2, updated_at = now() WHERE workflow_id = $1 AND status IN ('running', 'waiting')",
+          [workflow_id, error],
+        )
+        execute_params(
+          "UPDATE #{table("step_attempts")} SET status = 'failed', error = $2, completed_at = now() WHERE workflow_id = $1 AND status IN ('running', 'waiting')",
+          [workflow_id, error],
+        )
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1",
+          [workflow_id, error],
+        )
+      end
     end
 
     #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
@@ -586,7 +597,10 @@ module Durababble
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
       # [DURABABBLE-OUTBOX-1] Only the sender that owns the processing lease can ack.
-      execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2", [outbox_id, worker_id])
+      execute_params(
+        "UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND status = 'processing' AND locked_by = $2 AND locked_until >= now()",
+        [outbox_id, worker_id],
+      )
     end
 
     #: (untyped) -> untyped
@@ -634,21 +648,59 @@ module Durababble
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
       # [DURABABBLE-OBJ-1] Commands are persisted by target identity before execution.
       id = SecureRandom.uuid
-      execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
-        INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
-        VALUES ($1, $2, $3, $4, $5::bytea, $6::bytea, 'pending')
-      SQL
+      transaction do
+        execute_params(<<~SQL, [object_type, object_id])
+          INSERT INTO #{table("durable_objects")} (object_type, object_id, state)
+          VALUES ($1, $2, NULL)
+          ON CONFLICT (object_type, object_id) DO NOTHING
+        SQL
+        execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
+          INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
+          VALUES ($1, $2, $3, $4, $5::bytea, $6::bytea, 'pending')
+        SQL
+      end
       id
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
-      row = execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
-        UPDATE #{table("durable_object_commands")}
-        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
-        WHERE id = $1 AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < now()))
-        RETURNING *
-      SQL
+      row = retry_serialization_failures do
+        transaction do
+          command = execute_params(<<~SQL, [command_id]).first
+            SELECT * FROM #{table("durable_object_commands")}
+            WHERE id = $1 AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < now()))
+            FOR UPDATE SKIP LOCKED
+          SQL
+          next nil unless command
+
+          object_type = command.fetch("object_type")
+          object_id = command.fetch("object_id")
+          execute_params(<<~SQL, [object_type, object_id])
+            INSERT INTO #{table("durable_objects")} (object_type, object_id, state)
+            VALUES ($1, $2, NULL)
+            ON CONFLICT (object_type, object_id) DO NOTHING
+          SQL
+          execute_params(<<~SQL, [object_type, object_id]).first
+            SELECT 1 FROM #{table("durable_objects")}
+            WHERE object_type = $1 AND object_id = $2
+            FOR UPDATE
+          SQL
+          active = execute_params(<<~SQL, [object_type, object_id, command_id]).first
+            SELECT 1 FROM #{table("durable_object_commands")}
+            WHERE object_type = $1 AND object_id = $2 AND id <> $3
+              AND status = 'running' AND locked_until >= now()
+            LIMIT 1
+          SQL
+          next nil if active
+
+          execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
+            UPDATE #{table("durable_object_commands")}
+            SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
+            WHERE id = $1
+            RETURNING *
+          SQL
+        end
+      end
       decode_row(row) if row
     end
 
@@ -1153,7 +1205,7 @@ module Durababble
         candidates.concat(execute_params(<<~SQL, name_params).to_a)
           SELECT id, created_at FROM #{table("workflows")}
           WHERE status = 'failed'
-            AND (next_run_at IS NULL OR next_run_at <= NOW(6))
+            AND next_run_at <= NOW(6)
             #{name_sql}
           ORDER BY created_at
           LIMIT 1
@@ -1175,7 +1227,8 @@ module Durababble
           SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed')
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+              OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'running' AND locked_until < NOW(6))
             )
         SQL
@@ -1198,7 +1251,8 @@ module Durababble
           SELECT id FROM #{table("workflows")}
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed')
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+              OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
             )
           FOR UPDATE SKIP LOCKED
@@ -1373,11 +1427,21 @@ module Durababble
 
     #: (untyped, error: untyped) -> untyped
     def fail_workflow(workflow_id, error:)
-      execute_params(<<~SQL, [error, workflow_id])
-        UPDATE #{table("workflows")}
-        SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
-      SQL
+      transaction do
+        execute_params(
+          "UPDATE #{table("steps")} SET status = 'failed', error = ?, updated_at = NOW(6) WHERE workflow_id = ? AND status IN ('running', 'waiting')",
+          [error, workflow_id],
+        )
+        execute_params(
+          "UPDATE #{table("step_attempts")} SET status = 'failed', error = ?, completed_at = NOW(6) WHERE workflow_id = ? AND status IN ('running', 'waiting')",
+          [error, workflow_id],
+        )
+        execute_params(<<~SQL, [error, workflow_id])
+          UPDATE #{table("workflows")}
+          SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+      end
     end
 
     #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
@@ -1448,7 +1512,10 @@ module Durababble
 
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
-      execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?", [outbox_id, worker_id])
+      execute_params(
+        "UPDATE #{table("outbox")} SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND status = 'processing' AND locked_by = ? AND locked_until >= NOW(6)",
+        [outbox_id, worker_id],
+      )
     end
 
     #: (untyped) -> untyped
@@ -1564,10 +1631,16 @@ module Durababble
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
       id = SecureRandom.uuid
-      execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
-        INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-      SQL
+      transaction do
+        execute_params(<<~SQL, [object_type, object_id])
+          INSERT IGNORE INTO #{table("durable_objects")} (object_type, object_id, state)
+          VALUES (?, ?, NULL)
+        SQL
+        execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
+          INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
+          VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        SQL
+      end
       id
     end
 
@@ -1575,12 +1648,31 @@ module Durababble
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
       transaction do
         row = execute_params(<<~SQL, [command_id]).first
-          SELECT id FROM #{table("durable_object_commands")}
+          SELECT * FROM #{table("durable_object_commands")}
           WHERE id = ? AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < NOW(6)))
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
         next unless row
+
+        object_type = row.fetch("object_type")
+        object_id = row.fetch("object_id")
+        execute_params(<<~SQL, [object_type, object_id])
+          INSERT IGNORE INTO #{table("durable_objects")} (object_type, object_id, state)
+          VALUES (?, ?, NULL)
+        SQL
+        execute_params(<<~SQL, [object_type, object_id]).first
+          SELECT 1 FROM #{table("durable_objects")}
+          WHERE object_type = ? AND object_id = ?
+          FOR UPDATE
+        SQL
+        active = execute_params(<<~SQL, [object_type, object_id, command_id]).first
+          SELECT 1 FROM #{table("durable_object_commands")}
+          WHERE object_type = ? AND object_id = ? AND id <> ?
+            AND status = 'running' AND locked_until >= NOW(6)
+          LIMIT 1
+        SQL
+        next if active
 
         execute_params(<<~SQL, [worker_id, lease_seconds, command_id])
           UPDATE #{table("durable_object_commands")}

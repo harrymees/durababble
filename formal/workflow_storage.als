@@ -26,7 +26,7 @@ sig InboxRow { inbox_target: one ObjectTarget }
 sig HistoryRow { history_workflow: one Workflow }
 
 abstract sig WorkflowStatus {}
-one sig Pending, Running, Waiting, Retrying, Completed, Failed, Cancelled, Terminated extends WorkflowStatus {}
+one sig Pending, Running, Waiting, Completed, Failed, Cancelled, Terminated extends WorkflowStatus {}
 
 abstract sig StepStatus {}
 one sig StepRunning, StepWaiting, StepCompleted, StepFailed extends StepStatus {}
@@ -101,6 +101,7 @@ sig CommandRow {
   command_row: one ObjectCommand,
   command_status: one CommandStatus,
   command_owner: lone Worker,
+  command_expiresAt: lone Time,
   command_time: one Time
 }
 
@@ -144,7 +145,6 @@ pred terminal[s: WorkflowStatus] {
 
 pred terminalWorkflow[wf: Workflow, t: Time] {
   some workflowStatus[wf, t] and workflowStatus[wf, t] in (Completed + Cancelled + Terminated)
-  or (workflowStatus[wf, t] = Failed and no workflowNextRun[wf, t])
 }
 
 fun workflowStatus[w: Workflow, t: Time]: set WorkflowStatus {
@@ -188,6 +188,11 @@ pred liveOutboxLease[o: OutboxMessage, worker: Worker, t: Time] {
     r.outbox_owner = worker and r.outbox_time = t and some r.outbox_expiresAt and gt[r.outbox_expiresAt, t]
 }
 
+pred liveCommandLease[cmd: ObjectCommand, worker: Worker, t: Time] {
+  some r: CommandRow | r.command_row = cmd and r.command_status = CommandRunning and
+    r.command_owner = worker and r.command_time = t and some r.command_expiresAt and gt[r.command_expiresAt, t]
+}
+
 pred workflowSame[w: Workflow, t: Time, tnext: Time] {
   workflowStatus[w, tnext] = workflowStatus[w, t]
   workflowNextRun[w, tnext] = workflowNextRun[w, t]
@@ -211,10 +216,14 @@ pred fenceSame[f: Fence, t: Time, tnext: Time] {
 
 pred outboxSame[o: OutboxMessage, t: Time, tnext: Time] {
   outboxStatus[o, tnext] = outboxStatus[o, t]
+  ((outbox_row.o) & (outbox_time.tnext)).outbox_owner = ((outbox_row.o) & (outbox_time.t)).outbox_owner
+  ((outbox_row.o) & (outbox_time.tnext)).outbox_expiresAt = ((outbox_row.o) & (outbox_time.t)).outbox_expiresAt
 }
 
 pred commandSame[c: ObjectCommand, t: Time, tnext: Time] {
   commandStatus[c, tnext] = commandStatus[c, t]
+  ((command_row.c) & (command_time.tnext)).command_owner = ((command_row.c) & (command_time.t)).command_owner
+  ((command_row.c) & (command_time.tnext)).command_expiresAt = ((command_row.c) & (command_time.t)).command_expiresAt
 }
 
 fact wellFormedRows {
@@ -233,6 +242,50 @@ fact wellFormedRows {
   all o: OutboxMessage, t: Time | some outboxStatus[o, t] implies some workflowStatus[o.outbox_workflow, t]
 
   all l: LeaseRow | some workflowStatus[l.lr_workflow, l.lr_time] and gte[l.lr_expiresAt, l.lr_time]
+  all r: CommandRow | some r.command_expiresAt implies gte[r.command_expiresAt, r.command_time]
+}
+
+fact durableEventsComeFromRows {
+  all c: DurableCommit | c.commit_time != last
+  all c: DurableCommit | c.commit_kind = WorkflowCommit implies {
+    no c.commit_step
+    no c.commit_outbox
+    no c.commit_command
+    completeWorkflow[c.commit_workflow, c.commit_worker, c.commit_time, c.commit_time.next]
+  }
+  all c: DurableCommit | c.commit_kind = StepCommit implies {
+    no c.commit_outbox
+    no c.commit_command
+    some att: Attempt | completeStep[c.commit_workflow, c.commit_step, att, c.commit_worker, c.commit_time, c.commit_time.next]
+  }
+  all c: DurableCommit | c.commit_kind = WaitCommit implies {
+    no c.commit_outbox
+    no c.commit_command
+    some att: Attempt, wait: Wait | recordWait[c.commit_workflow, c.commit_step, att, wait, c.commit_worker, c.commit_time, c.commit_time.next]
+  }
+  all c: DurableCommit | c.commit_kind = FenceCommit implies {
+    no c.commit_step
+    no c.commit_outbox
+    no c.commit_command
+    some f: Fence | f.fence_workflow = c.commit_workflow and completeFence[f, c.commit_worker, c.commit_time, c.commit_time.next]
+  }
+  all c: DurableCommit | c.commit_kind = OutboxCommit implies {
+    some c.commit_outbox
+    no c.commit_step
+    no c.commit_command
+  }
+  all c: DurableCommit | c.commit_kind = ObjectCommandCommit implies {
+    no c.commit_workflow
+    no c.commit_step
+    no c.commit_outbox
+    completeObjectCommand[c.commit_command, c.commit_worker, c.commit_time, c.commit_time.next]
+  }
+
+  all e: WakeEvent | e.wake_time != last
+  all e: WakeEvent | some wf: Workflow, st: Step, att: Attempt | wakeWait[wf, st, att, e.wake_wait, e.wake_signal, e.wake_time, e.wake_time.next]
+
+  all a: OutboxAck | a.ack_time != last
+  all a: OutboxAck | ackOutbox[a.ack_message, a.ack_worker, a.ack_time, a.ack_time.next]
 }
 
 pred init[t: Time] {
@@ -282,7 +335,12 @@ pred enqueueWorkflow[wf: Workflow, t: Time, tnext: Time] {
 
 pred claimWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-LEASE-1] Claim writes exactly one active owner for runnable work.
-  workflowStatus[wf, t] in (Pending + Retrying) or (workflowStatus[wf, t] = Failed and some workflowNextRun[wf, t])
+  (
+    workflowStatus[wf, t] = Pending and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
+  )
+  or (
+    workflowStatus[wf, t] = Failed and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
+  )
   no live: LeaseRow | live.lr_workflow = wf and live.lr_time = t and gt[live.lr_expiresAt, t]
   workflowStatus[wf, tnext] = Running
   no workflowNextRun[wf, tnext]
@@ -306,10 +364,13 @@ pred heartbeatWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   globalFrame[t, tnext]
 }
 
-pred releaseOrStealLease[wf: Workflow, t: Time, tnext: Time] {
+pred releaseOrStealLease[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-LEASE-3] Shutdown release and expiry reclaim make the workflow runnable again.
   workflowStatus[wf, t] = Running
-  some l: LeaseRow | l.lr_workflow = wf and l.lr_time = t
+  some l: LeaseRow | l.lr_workflow = wf and l.lr_time = t and (
+    (l.lr_worker = worker and gt[l.lr_expiresAt, t])
+    or not gt[l.lr_expiresAt, t]
+  )
   workflowStatus[wf, tnext] = Pending
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   unchangedExcept[wf, none, none, none, none, none, none, t, tnext]
@@ -355,7 +416,8 @@ pred retryStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, 
   liveWorkflowLease[wf, worker, t]
   stepStatus[st, t] = StepRunning
   attemptStatus[att, t] = AttemptRunning
-  workflowStatus[wf, tnext] = Retrying
+  gt[due, tnext]
+  workflowStatus[wf, tnext] = Pending
   workflowNextRun[wf, tnext] = due
   stepStatus[st, tnext] = StepFailed
   attemptStatus[att, tnext] = AttemptFailed
@@ -372,6 +434,7 @@ pred recordWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker
   liveWorkflowLease[wf, worker, t]
   workflowStatus[wf, t] = Running
   stepStatus[st, t] = StepRunning
+  attemptStatus[att, t] = AttemptRunning
   workflowStatus[wf, tnext] = Waiting
   stepStatus[st, tnext] = StepWaiting
   attemptStatus[att, tnext] = AttemptWaiting
@@ -382,18 +445,21 @@ pred recordWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker
   globalFrame[t, tnext]
 }
 
-pred wakeWait[wf: Workflow, st: Step, wait: Wait, signal: Signal, t: Time, tnext: Time] {
+pred wakeWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, signal: Signal, t: Time, tnext: Time] {
   -- [DURABABBLE-WAIT-1] A pending timer/event wait completes once and wakes the workflow.
   st.step_workflow = wf
+  att.attempt_step = st
   wait.wait_step = st
   workflowStatus[wf, t] = Waiting
   stepStatus[st, t] = StepWaiting
+  attemptStatus[att, t] = AttemptWaiting
   waitStatus[wait, t] = WaitPending
   workflowStatus[wf, tnext] = Pending
   stepStatus[st, tnext] = StepCompleted
+  attemptStatus[att, tnext] = AttemptCompleted
   waitStatus[wait, tnext] = WaitCompleted
   one e: WakeEvent | e.wake_wait = wait and e.wake_signal = signal and e.wake_time = t
-  unchangedExcept[wf, st, none, wait, none, none, none, t, tnext]
+  unchangedExcept[wf, st, att, wait, none, none, none, t, tnext]
   preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
 }
@@ -401,6 +467,8 @@ pred wakeWait[wf: Workflow, st: Step, wait: Wait, signal: Signal, t: Time, tnext
 pred completeWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   liveWorkflowLease[wf, worker, t]
   workflowStatus[wf, t] = Running
+  all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] = StepCompleted
+  all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] = AttemptCompleted
   workflowStatus[wf, tnext] = Completed
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   one c: DurableCommit | c.commit_workflow = wf and c.commit_worker = worker and c.commit_kind = WorkflowCommit and c.commit_time = t
@@ -411,8 +479,10 @@ pred completeWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
 
 pred failCancelOrTerminateWorkflow[wf: Workflow, worker: lone Worker, status: WorkflowStatus, t: Time, tnext: Time] {
   status in (Failed + Cancelled + Terminated)
-  workflowStatus[wf, t] in (Pending + Running + Waiting + Retrying)
+  workflowStatus[wf, t] in (Pending + Running + Waiting)
   worker in Worker implies liveWorkflowLease[wf, worker, t]
+  all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] not in (StepRunning + StepWaiting)
+  all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting)
   workflowStatus[wf, tnext] = status
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   unchangedExcept[wf, none, none, none, none, none, none, t, tnext]
@@ -469,7 +539,8 @@ pred enqueueOutbox[o: OutboxMessage, wf: Workflow, t: Time, tnext: Time] {
 }
 
 pred claimOutbox[o: OutboxMessage, worker: Worker, t: Time, tnext: Time] {
-  outboxStatus[o, t] in (OutboxPending + OutboxProcessing)
+  outboxStatus[o, t] = OutboxPending
+  or some r: OutboxRow | r.outbox_row = o and r.outbox_status = OutboxProcessing and r.outbox_time = t and some r.outbox_expiresAt and not gt[r.outbox_expiresAt, t]
   workflowSame[o.outbox_workflow, t, tnext]
   outboxStatus[o, tnext] = OutboxProcessing
   one r: OutboxRow | r.outbox_row = o and r.outbox_status = OutboxProcessing and r.outbox_owner = worker and r.outbox_time = tnext and some r.outbox_expiresAt and gt[r.outbox_expiresAt, tnext]
@@ -495,23 +566,40 @@ pred enqueueObjectCommand[cmd: ObjectCommand, t: Time, tnext: Time] {
   some inbox: InboxState | inbox.inbox_row.inbox_target = cmd.command_target and inbox.inbox_time = tnext
   unchangedExcept[none, none, none, none, none, none, cmd, t, tnext]
   preserveLeasesExcept[none, t, tnext]
+  globalFrame[t, tnext]
 }
 
 pred claimObjectCommand[cmd: ObjectCommand, worker: Worker, t: Time, tnext: Time] {
-  commandStatus[cmd, t] in (CommandPending + CommandFailed)
-  no other: ObjectCommand - cmd | other.command_target = cmd.command_target and commandStatus[other, t] = CommandRunning
+  (
+    commandStatus[cmd, t] in (CommandPending + CommandFailed)
+  )
+  or (
+    commandStatus[cmd, t] = CommandRunning and no owner: Worker | liveCommandLease[cmd, owner, t]
+  )
+  no other: ObjectCommand - cmd | other.command_target = cmd.command_target and some owner: Worker | liveCommandLease[other, owner, t]
   commandStatus[cmd, tnext] = CommandRunning
-  one r: CommandRow | r.command_row = cmd and r.command_status = CommandRunning and r.command_owner = worker and r.command_time = tnext
+  one r: CommandRow | r.command_row = cmd and r.command_status = CommandRunning and r.command_owner = worker and r.command_time = tnext and some r.command_expiresAt and gt[r.command_expiresAt, tnext]
   unchangedExcept[none, none, none, none, none, none, cmd, t, tnext]
   preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
 }
 
 pred completeObjectCommand[cmd: ObjectCommand, worker: Worker, t: Time, tnext: Time] {
-  commandStatus[cmd, t] = CommandRunning
-  one r: CommandRow | r.command_row = cmd and r.command_time = t and r.command_owner = worker
+  liveCommandLease[cmd, worker, t]
   commandStatus[cmd, tnext] = CommandCompleted
+  no ((command_row.cmd) & (command_time.tnext)).command_owner
+  no ((command_row.cmd) & (command_time.tnext)).command_expiresAt
   one c: DurableCommit | c.commit_command = cmd and c.commit_worker = worker and c.commit_kind = ObjectCommandCommit and c.commit_time = t
+  unchangedExcept[none, none, none, none, none, none, cmd, t, tnext]
+  preserveLeasesExcept[none, t, tnext]
+  globalFrame[t, tnext]
+}
+
+pred failObjectCommand[cmd: ObjectCommand, worker: Worker, t: Time, tnext: Time] {
+  liveCommandLease[cmd, worker, t]
+  commandStatus[cmd, tnext] = CommandFailed
+  no ((command_row.cmd) & (command_time.tnext)).command_owner
+  no ((command_row.cmd) & (command_time.tnext)).command_expiresAt
   unchangedExcept[none, none, none, none, none, none, cmd, t, tnext]
   preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
@@ -534,12 +622,12 @@ pred step[t: Time, tnext: Time] {
   or some wf: Workflow | enqueueWorkflow[wf, t, tnext]
   or some wf: Workflow, worker: Worker | claimWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | heartbeatWorkflow[wf, worker, t, tnext]
-  or some wf: Workflow | releaseOrStealLease[wf, t, tnext]
+  or some wf: Workflow, worker: Worker | releaseOrStealLease[wf, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt | startStep[wf, st, att, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker | completeStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | retryStep[wf, st, att, worker, due, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker | recordWait[wf, st, att, wait, worker, t, tnext]
-  or some wf: Workflow, st: Step, wait: Wait, signal: Signal | wakeWait[wf, st, wait, signal, t, tnext]
+  or some wf: Workflow, st: Step, att: Attempt, wait: Wait, signal: Signal | wakeWait[wf, st, att, wait, signal, t, tnext]
   or some wf: Workflow, worker: Worker | completeWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, status: WorkflowStatus | failCancelOrTerminateWorkflow[wf, none, status, t, tnext]
   or some wf: Workflow, worker: Worker, status: WorkflowStatus | failCancelOrTerminateWorkflow[wf, worker, status, t, tnext]
@@ -552,6 +640,7 @@ pred step[t: Time, tnext: Time] {
   or some cmd: ObjectCommand | enqueueObjectCommand[cmd, t, tnext]
   or some cmd: ObjectCommand, worker: Worker | claimObjectCommand[cmd, worker, t, tnext]
   or some cmd: ObjectCommand, worker: Worker | completeObjectCommand[cmd, worker, t, tnext]
+  or some cmd: ObjectCommand, worker: Worker | failObjectCommand[cmd, worker, t, tnext]
 }
 
 fact traces {
@@ -594,9 +683,23 @@ assert incompleteStepsRetrySafely {
 }
 
 /**
+ * [DURABABBLE-STEP-2] Pending retry backoff rows are not claimable before
+ * their due time.
+ */
+assert retryBackoffPreventsEarlyClaim {
+  all wf: Workflow, due: Time, t: Time - last |
+    workflowStatus[wf, t] = Pending and workflowNextRun[wf, t] = due and gt[due, t]
+    implies workflowStatus[wf, t.next] != Running
+  all wf: Workflow, due: Time, t: Time - last |
+    workflowStatus[wf, t] = Failed and workflowNextRun[wf, t] = due and gt[due, t]
+    implies workflowStatus[wf, t.next] != Running
+}
+
+/**
  * [DURABABBLE-WAIT-1] A wait can produce at most one durable wake event.
  */
 assert waitsWakeOnce {
+  all w: Wait | lone e: WakeEvent | e.wake_wait = w
   all w: Wait | lone t: Time - last | waitStatus[w, t] = WaitPending and waitStatus[w, t.next] = WaitCompleted
   all w: Wait, t: Time - last | waitStatus[w, t] = WaitCompleted implies waitStatus[w, t.next] = WaitCompleted
 }
@@ -606,12 +709,8 @@ assert waitsWakeOnce {
  * results.
  */
 assert staleOwnersCannotCommit {
-  all wf: Workflow, worker: Worker, t: Time - last |
-    completeWorkflow[wf, worker, t, t.next] implies liveWorkflowLease[wf, worker, t]
-  all wf: Workflow, st: Step, att: Attempt, worker: Worker, t: Time - last |
-    completeStep[wf, st, att, worker, t, t.next] implies liveWorkflowLease[wf, worker, t]
-  all wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker, t: Time - last |
-    recordWait[wf, st, att, wait, worker, t, t.next] implies liveWorkflowLease[wf, worker, t]
+  all c: DurableCommit |
+    c.commit_kind in (WorkflowCommit + StepCommit + WaitCommit) implies liveWorkflowLease[c.commit_workflow, c.commit_worker, c.commit_time]
 }
 
 /**
@@ -628,8 +727,7 @@ assert idempotencyFencesPreventDuplicateSideEffects {
  * lease owner, and acknowledgement is final.
  */
 assert outboxAckLeaseBehaviorIsSafe {
-  all o: OutboxMessage, worker: Worker, t: Time - last |
-    ackOutbox[o, worker, t, t.next] implies liveOutboxLease[o, worker, t]
+  all a: OutboxAck | liveOutboxLease[a.ack_message, a.ack_worker, a.ack_time]
   all o: OutboxMessage, t: Time - last | outboxStatus[o, t] = OutboxAcked implies outboxStatus[o, t.next] = OutboxAcked
 }
 
@@ -639,7 +737,21 @@ assert outboxAckLeaseBehaviorIsSafe {
  */
 assert durableObjectCommandSerializationHolds {
   all target: ObjectTarget, t: Time |
-    lone cmd: ObjectCommand | cmd.command_target = target and commandStatus[cmd, t] = CommandRunning
+    lone cmd: ObjectCommand | cmd.command_target = target and some worker: Worker | liveCommandLease[cmd, worker, t]
+  all c: DurableCommit |
+    c.commit_kind = ObjectCommandCommit implies liveCommandLease[c.commit_command, c.commit_worker, c.commit_time]
+}
+
+/**
+ * [DURABABBLE-WF-1] Completed/cancelled/terminated workflows cannot retain
+ * unfinished step or attempt rows. Failed rows remain explicitly resumable.
+ */
+assert terminalWorkflowsHaveNoIncompleteWork {
+  all wf: Workflow, t: Time |
+    terminalWorkflow[wf, t] implies {
+      no st: Step | st.step_workflow = wf and some stepStatus[st, t] and stepStatus[st, t] in (StepRunning + StepWaiting)
+      no att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] and attemptStatus[att, t] in (AttemptRunning + AttemptWaiting)
+    }
 }
 
 pred exampleWorkflowCompletes {
@@ -656,9 +768,10 @@ pred exampleLeaseStealAndReplay {
     worker1 != worker2
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker1, first.next, first.next.next]
-    releaseOrStealLease[wf, first.next.next, first.next.next.next]
-    claimWorkflow[wf, worker2, first.next.next.next, first.next.next.next.next]
-    startStep[wf, st, att, first.next.next.next.next, first.next.next.next.next.next]
+    stutter[first.next.next, first.next.next.next]
+    releaseOrStealLease[wf, worker2, first.next.next.next, first.next.next.next.next]
+    claimWorkflow[wf, worker2, first.next.next.next.next, first.next.next.next.next.next]
+    startStep[wf, st, att, first.next.next.next.next.next, first.next.next.next.next.next.next]
   }
 }
 
@@ -668,7 +781,7 @@ pred exampleWaitWake {
     claimWorkflow[wf, worker, first.next, first.next.next]
     startStep[wf, st, att, first.next.next, first.next.next.next]
     recordWait[wf, st, att, wait, worker, first.next.next.next, first.next.next.next.next]
-    wakeWait[wf, st, wait, signal, first.next.next.next.next, first.next.next.next.next.next]
+    wakeWait[wf, st, att, wait, signal, first.next.next.next.next, first.next.next.next.next.next]
   }
 }
 
@@ -678,7 +791,10 @@ pred exampleRetryBackoff {
     claimWorkflow[wf, worker, first.next, first.next.next]
     startStep[wf, st, att, first.next.next, first.next.next.next]
     retryStep[wf, st, att, worker, due, first.next.next.next, first.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next] = Retrying
+    workflowStatus[wf, first.next.next.next.next] = Pending
+    workflowNextRun[wf, first.next.next.next.next] = due
+    stutter[first.next.next.next.next, first.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next] = Pending
   }
 }
 
@@ -690,18 +806,35 @@ pred exampleStepStart {
   }
 }
 
-pred exampleFenceOutboxObject {
-  some wf: Workflow, worker: Worker, f: Fence, o: OutboxMessage, target: ObjectTarget, cmd: ObjectCommand | {
-    cmd.command_target = target
+pred exampleFenceOutbox {
+  some wf: Workflow, worker: Worker, f: Fence, o: OutboxMessage | {
     enqueueWorkflow[wf, first, first.next]
     acquireFence[f, wf, worker, first.next, first.next.next]
     completeFence[f, worker, first.next.next, first.next.next.next]
     enqueueOutbox[o, wf, first.next.next.next, first.next.next.next.next]
     claimOutbox[o, worker, first.next.next.next.next, first.next.next.next.next.next]
     ackOutbox[o, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
-    enqueueObjectCommand[cmd, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
-    claimObjectCommand[cmd, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
-    completeObjectCommand[cmd, worker, first.next.next.next.next.next.next.next.next, last]
+  }
+}
+
+pred exampleObjectCommandCompletes {
+  some target: ObjectTarget, cmd: ObjectCommand, worker: Worker | {
+    cmd.command_target = target
+    enqueueObjectCommand[cmd, first, first.next]
+    claimObjectCommand[cmd, worker, first.next, first.next.next]
+    completeObjectCommand[cmd, worker, first.next.next, first.next.next.next]
+  }
+}
+
+pred exampleObjectCommandFailureRetry {
+  some target: ObjectTarget, cmd: ObjectCommand, worker1, worker2: Worker | {
+    cmd.command_target = target
+    worker1 != worker2
+    enqueueObjectCommand[cmd, first, first.next]
+    claimObjectCommand[cmd, worker1, first.next, first.next.next]
+    failObjectCommand[cmd, worker1, first.next.next, first.next.next.next]
+    claimObjectCommand[cmd, worker2, first.next.next.next, first.next.next.next.next]
+    commandStatus[cmd, first.next.next.next.next] = CommandRunning
   }
 }
 
@@ -710,12 +843,16 @@ run exampleLeaseStealAndReplay for 10 but exactly 1 Workflow, 2 Worker, 1 Step, 
 run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 Signal, 8 Time
 run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 6 Time
 run exampleStepStart for 6 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 5 Time
-run exampleFenceOutboxObject for 12 but exactly 1 Workflow, 1 Worker, 1 Fence, 1 OutboxMessage, 1 ObjectTarget, 1 ObjectCommand, 10 Time
+run exampleFenceOutbox for 9 but exactly 1 Workflow, 1 Worker, 1 Fence, 1 OutboxMessage, 7 Time
+run exampleObjectCommandCompletes for 6 but exactly 1 ObjectTarget, 1 ObjectCommand, 1 Worker, 4 Time
+run exampleObjectCommandFailureRetry for 7 but exactly 1 ObjectTarget, 1 ObjectCommand, 2 Worker, 6 Time
 
 check atMostOneLiveOwner for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
 check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
+check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
 check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
 check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
+check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
 check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 Signal, 6 Time
 check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
 check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 6 Time

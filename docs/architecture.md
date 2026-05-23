@@ -43,13 +43,14 @@ end
 When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object:
 
 1. assigns the next step position;
-2. returns a persisted result immediately if that position already completed;
+2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
 3. records the step start and attempt;
 4. builds `step_context` with a generated idempotency key and heartbeat;
 5. invokes the original Ruby method body;
 6. persists success, wait, retryable failure, or final failure.
 
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
+If replay reaches any persisted step position with a different current method name, or if workflow execution returns before all persisted step positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 
@@ -108,6 +109,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
+- Worker polling skips failed rows with no retry due time. Explicit `Engine#resume` can still manually claim a failed workflow so operators or tests can retry it without making every failed row automatically runnable.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.

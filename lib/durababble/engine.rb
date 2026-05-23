@@ -17,12 +17,13 @@ module Durababble
     #: untyped
     attr_reader :step_context
 
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, completed_steps: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, completed_steps:, crash_after: nil)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, persisted_steps: untyped, completed_steps: untyped, ?crash_after: untyped) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, persisted_steps:, completed_steps:, crash_after: nil)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
+      @persisted_steps = persisted_steps
       @completed_steps = completed_steps
       @crash_after = crash_after
       @position = 0
@@ -33,13 +34,16 @@ module Durababble
     def call_step(instance, method_name:, args:, kwargs:, &block)
       position = @position
       @position += 1
+      step = instance.class.step_definition(method_name)
 
       if @completed_steps.key?(position)
         # [DURABABBLE-STEP-1] Replay returns the completed step result without rerunning user code.
-        return @completed_steps.fetch(position).fetch("result")
+        completed_step = @completed_steps.fetch(position)
+        validate_step_shape!(completed_step, step:, position:)
+        return completed_step.fetch("result")
       end
 
-      step = instance.class.step_definition(method_name)
+      validate_step_shape!(@persisted_steps[position], step:, position:) if @persisted_steps.key?(position)
       @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
       crash!(:step_started)
       heartbeat = build_heartbeat(position)
@@ -67,7 +71,7 @@ module Durababble
       crash!(:step_completed)
       output
     rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended)
+      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError)
 
       message = "#{e.class}: #{e.message}"
       assert_workflow_lease!
@@ -83,7 +87,30 @@ module Durababble
       @step_context = nil
     end
 
+    #: () -> void
+    def validate_replay_complete!
+      extra_steps = @persisted_steps
+        .select { |position, _step| position >= @position }
+        .sort_by { |position, _step| position }
+      return if extra_steps.empty?
+
+      rendered = extra_steps
+        .map { |position, step| "#{position}:#{step.fetch("name")}:#{step.fetch("status")}" }
+        .join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable step history: #{rendered}"
+    end
+
     private
+
+    #: (untyped, step: untyped, position: untyped) -> void
+    def validate_step_shape!(persisted_step, step:, position:)
+      persisted_name = persisted_step.fetch("name")
+      return if persisted_name == step.name
+
+      message = "workflow #{@workflow_id} replay reached step #{position} named #{step.name.inspect}, " \
+        "but durable history already recorded #{persisted_name.inspect}"
+      raise NonDeterminismError, message
+    end
 
     #: (untyped) -> untyped
     def build_heartbeat(position)
@@ -151,20 +178,23 @@ module Durababble
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
-      completed_steps = @store.steps_for(workflow_id)
-        .select { |step| step.fetch("status") == "completed" }
+      persisted_steps = @store.steps_for(workflow_id)
         .to_h { |step| [step.fetch("position").to_i, step] }
+      completed_steps = persisted_steps
+        .select { |_position, step| step.fetch("status") == "completed" }
       execution = WorkflowExecution.new(
         store: @store,
         workflow_id:,
         worker_id: @worker_id,
         lease_seconds: @lease_seconds,
+        persisted_steps:,
         completed_steps:,
         crash_after: @crash_after,
       )
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
+      execution.validate_replay_complete!
       # [DURABABBLE-LEASE-4] Final workflow commits use the same stale-owner fence as steps.
       assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result:)

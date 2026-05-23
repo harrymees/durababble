@@ -58,6 +58,16 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
         store.ack_outbox(first_id, worker_id: "sender-a")
         assert_hash_includes store.outbox_message(first_id), "status" => "processed", "locked_by" => "sender-a"
+
+        expired_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "event" => 2 }, key: "events:expired")
+        assert_hash_includes store.claim_outbox(worker_id: "expired-sender", lease_seconds: -1), "id" => expired_id
+        # [DURABABBLE-OUTBOX-1] Expired senders cannot ack stale outbox work.
+        store.ack_outbox(expired_id, worker_id: "expired-sender")
+        assert_hash_includes store.outbox_message(expired_id), "status" => "processing", "locked_by" => "expired-sender"
+
+        assert_hash_includes store.claim_outbox(worker_id: "recovery-sender", lease_seconds: 30), "id" => expired_id, "locked_by" => "recovery-sender"
+        store.ack_outbox(expired_id, worker_id: "recovery-sender")
+        assert_hash_includes store.outbox_message(expired_id), "status" => "processed", "locked_by" => "recovery-sender"
       end
     end
 
@@ -182,8 +192,25 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           "locked_by" => "object-worker",
         )
 
+        serialized_command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [2],
+          kwargs: {},
+        )
+        # [DURABABBLE-OBJ-1] A live command lease blocks other commands for the same object.
+        assert_nil store.claim_object_command(command_id: serialized_command_id, worker_id: "object-worker-2", lease_seconds: 30)
+
         store.complete_object_command(command_id:, result: { "count" => 3 })
         assert_nil store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
+        assert_hash_includes(
+          store.claim_object_command(command_id: serialized_command_id, worker_id: "object-worker-2", lease_seconds: 30),
+          "id" => serialized_command_id,
+          "status" => "running",
+          "locked_by" => "object-worker-2",
+        )
+        store.complete_object_command(command_id: serialized_command_id, result: { "count" => 5 })
 
         fenced_command_id = store.enqueue_object_command(
           object_type: "counter",
@@ -254,6 +281,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         run_at = Time.now + 60
         store.schedule_workflow_retry(workflow_id:, worker_id: "worker-a", run_at:)
         assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30)
+        assert_nil store.claim_workflow(workflow_id:, worker_id: "worker-b", lease_seconds: 30)
         store.make_workflow_due!(workflow_id, now: Time.now)
         assert_hash_includes store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30), "id" => workflow_id, "locked_by" => "worker-b"
 
@@ -262,6 +290,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-c", lease_seconds: 30), "locked_by" => "worker-c"
         store.fail_workflow(workflow_id, error: "fatal")
         assert_hash_includes store.workflow(workflow_id), "status" => "failed", "error" => "fatal"
+        assert_nil store.claim_runnable_workflow(worker_id: "worker-d", lease_seconds: 30)
+        assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-d", lease_seconds: 30), "locked_by" => "worker-d"
         assert_equal 0, store.steal_expired_leases!(now: Time.now)
       end
     end
