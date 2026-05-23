@@ -112,6 +112,19 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  test "binds MySQL boolean and fallback literal parameters" do
+    connection = Class.new do
+      def escape(value)
+        value.gsub("'", "\\\\'")
+      end
+    end.new
+    store = Durababble::MysqlStore.new(connection, schema: "store_test")
+
+    sql = store.send(:bind_params, "SELECT ?, ?, ?", [true, false, :symbolic])
+
+    assert_equal "SELECT TRUE, FALSE, 'symbolic'", sql
+  end
+
   test "migrates legacy JSONB runtime columns into Paquito bytea columns in Yugabyte" do
     with_yugabyte_store do |store|
       connection = PG.connect(durababble_yugabyte_database_url)
