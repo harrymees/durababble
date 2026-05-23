@@ -189,6 +189,7 @@ module Durababble
 
     #: (name: untyped, input: untyped) -> untyped
     def enqueue_workflow(name:, input:)
+      # [DURABABBLE-WF-1] The workflow row is durable before any claim path can run it.
       id = SecureRandom.uuid
       execute_params(
         "INSERT INTO #{table("workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::bytea)",
@@ -208,6 +209,7 @@ module Durababble
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
       return if workflow_names&.empty?
 
+      # [DURABABBLE-LEASE-1] Queue selection and lease assignment are one locked update.
       name_filter = workflow_name_filter(workflow_names)
       row = retry_serialization_failures do
         transaction do
@@ -277,6 +279,7 @@ module Durababble
 
     #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
+      # [DURABABBLE-LEASE-2] Heartbeats extend only an unexpired lease held by this worker.
       execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds])
         UPDATE #{table("workflows")}
         SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
@@ -295,6 +298,7 @@ module Durababble
 
     #: (worker_id: untyped) -> untyped
     def release_worker_leases!(worker_id:)
+      # [DURABABBLE-LEASE-3] Shutdown releases owned workflow/outbox leases back to pending.
       transaction do
         workflows = execute_params(<<~SQL, [worker_id]).cmd_tuples
           UPDATE #{table("workflows")}
@@ -326,6 +330,7 @@ module Durababble
 
     #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
     def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+      # [DURABABBLE-LEASE-2] Step heartbeat stores progress only while the workflow lease is live.
       renewed = transaction do
         workflow = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
           UPDATE #{table("workflows")}
@@ -377,6 +382,7 @@ module Durababble
 
     #: (?now: untyped) -> untyped
     def steal_expired_leases!(now: Time.now)
+      # [DURABABBLE-LEASE-3] Expired workflow leases are reclaimed durably for another owner.
       result = execute_params(<<~SQL, [timestamp(now)])
         UPDATE #{table("workflows")}
         SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
@@ -417,6 +423,7 @@ module Durababble
     #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
     def record_step_started(workflow_id:, position:, name:)
       transaction do
+        # [DURABABBLE-STEP-2] Recovery appends a retry attempt and closes stale running attempts.
         execute_params(<<~SQL, [workflow_id, position])
           UPDATE #{table("step_attempts")}
           SET status = 'failed', error = 'superseded by retry', completed_at = now()
@@ -484,6 +491,7 @@ module Durababble
 
     #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
+      # [DURABABBLE-FENCE-1] The fence row is inserted before yielding to the side effect.
       token = SecureRandom.uuid
       inserted = execute_params(<<~SQL, [workflow_id, key, token, timeout])
         INSERT INTO #{table("fences")} (workflow_id, key, status, locked_by, locked_until)
@@ -528,6 +536,7 @@ module Durababble
 
     #: (workflow_id: untyped, topic: untyped, payload: untyped, key: untyped) -> untyped
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
+      # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row.
       existing = execute_params("SELECT id FROM #{table("outbox")} WHERE key = $1", [key]).first
       return existing.fetch("id") if existing
 
@@ -576,6 +585,7 @@ module Durababble
 
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
+      # [DURABABBLE-OUTBOX-1] Only the sender that owns the processing lease can ack.
       execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2", [outbox_id, worker_id])
     end
 
@@ -622,6 +632,7 @@ module Durababble
 
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+      # [DURABABBLE-OBJ-1] Commands are persisted by target identity before execution.
       id = SecureRandom.uuid
       execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
         INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
@@ -644,6 +655,7 @@ module Durababble
     #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
     def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
       transaction do
+        # [DURABABBLE-OBJ-1] Completion and state update require the command lease.
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
 
@@ -688,6 +700,7 @@ module Durababble
     #: (untyped, untyped, untyped) -> untyped
     def complete_waits(where_sql, params, payload)
       transaction do
+        # [DURABABBLE-WAIT-1] Locked wait completion makes concurrent wakeups observe one winner.
         returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
           UPDATE #{table("waits")}
           SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()

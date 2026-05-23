@@ -68,6 +68,22 @@ DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte mise exec
 /opt/dev/bin/dev check
 ```
 
+## Formal verification
+
+The Alloy model in `formal/workflow_storage.als` checks the prototype workflow,
+lease, wait, fence, outbox, and durable-object command safety invariants. The
+model is tied back to Ruby implementation/tests with `[DURABABBLE-*]` sigils.
+
+```sh
+mise exec -- bundle exec rake formal
+scripts/verify-alloy.sh
+node scripts/validate-durababble-sigils.js --verbose
+```
+
+CI runs the same verifier and sigil validator in the `formal` job. Alloy passes
+when all `run` examples are SAT and all safety `check` commands are UNSAT. See
+`docs/formal-model.md` for the Silo design review and invariant matrix.
+
 ## Public API
 
 Durababble exposes two complementary abstractions on the same durable store:

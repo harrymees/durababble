@@ -80,6 +80,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     store = ClaimlessTestStore.new
 
     assert_raises_matching(Durababble::LeaseConflict, /could not claim durable object command/) do
+      # [DURABABBLE-OBJ-1] Commands do not run unless their durable command lease is claimed.
       ClaimlessTestObject.ref("object-1", store:).mutate
     end
     assert_nil store.state
@@ -106,6 +107,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         store.migrate!
         counter = RetryStateTestCounter.ref("counter-1", store:)
 
+        # [DURABABBLE-OBJ-1] Command completion persists state with the command lifecycle.
         assert_equal({ "count" => 1 }, counter.increment_with_transient_failure)
         assert_equal 1, counter.count
 

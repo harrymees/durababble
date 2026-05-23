@@ -25,6 +25,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     store.migrate!
     ids = 20.times.map { |i| store.enqueue_workflow(name: "counter", input: { "count" => i }) }
 
+    # [DURABABBLE-LEASE-1] Concurrent pollers cannot obtain duplicate live ownership.
     claimed = run_threads(10) do |index, local|
       worker_claims = []
       loop do
@@ -50,6 +51,7 @@ class DurababbleHardeningTest < DurababbleTestCase
       Durababble::Engine.new(store:, worker_id: "intruder").resume(counter_workflow, workflow_id:)
     end
 
+    # [DURABABBLE-LEASE-4] A non-owner cannot commit workflow or step results.
     run = Durababble::Engine.new(store:, worker_id: "owner").resume(counter_workflow, workflow_id:)
     assert_equal "completed", run.status
   end
@@ -77,6 +79,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     store.steal_expired_leases!(now: Time.now + 61)
     run = Durababble::Engine.new(store:, worker_id: "recover").resume(workflow, workflow_id:)
 
+    # [DURABABBLE-STEP-2] Stale running attempts are closed before appending the retry attempt.
     assert_equal "completed", run.status
     assert_equal ["failed", "completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
   end
@@ -102,6 +105,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     calls = Queue.new
 
+    # [DURABABBLE-FENCE-1] The unique fence row serializes concurrent side-effect callers.
     results = run_threads(8) do |_index, local|
       local.with_fence(workflow_id:, key: "charge:concurrent", poll_interval: 0.01, timeout: 5) do
         calls << true
@@ -119,6 +123,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     outbox_id = store.enqueue_outbox(workflow_id:, topic: "notify", payload: { "n" => 1 }, key: "notify:once")
 
+    # [DURABABBLE-OUTBOX-1] One sender owns the outbox lease until ack or lease expiry.
     claims = run_threads(8) do |index, local|
       local.claim_outbox(worker_id: "sender-#{index}", lease_seconds: 1)&.fetch("id")
     end.compact
@@ -140,6 +145,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     workflow_id = store.enqueue_workflow(name: "waiting", input: { "id" => "x" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
 
+    # [DURABABBLE-WAIT-1] Concurrent signalers race through the same pending wait row.
     signaled = run_threads(8) do |index, local|
       local.signal_event("approval:x", payload: { "signaler" => index })
     end

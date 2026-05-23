@@ -9,6 +9,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "conformance") do |store|
         store.migrate!
 
+        # [DURABABBLE-WF-1] [DURABABBLE-LEASE-1] Shared backend contract: durable enqueue then exclusive claim.
         workflow_id = store.enqueue_workflow(name: "conformance", input: { "count" => 1 })
         claimed = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 30)
 
@@ -35,6 +36,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         store.migrate!
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
 
+        # [DURABABBLE-OUTBOX-1] Duplicate producer keys resolve to the same outbox row.
         first_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "event" => 1 }, key: "events:1")
         duplicate_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "event" => "ignored" }, key: "events:1")
 
@@ -79,6 +81,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
 
         assert_equal 1, store.signal_event("approval:#{workflow_id}", payload: { "approved" => true })
+        # [DURABABBLE-WAIT-1] A completed event wait ignores duplicate signals.
         assert_equal 0, store.signal_event("approval:#{workflow_id}", payload: { "approved" => false })
 
         assert_hash_includes store.workflow(workflow_id), "status" => "pending"
@@ -123,6 +126,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         calls = 0
 
         first = store.with_fence(workflow_id:, key: "charge:1", poll_interval: 0.001, timeout: 1) do
+          # [DURABABBLE-FENCE-1] The second caller must not enter this block.
           calls += 1
           { "charged" => true }
         end
@@ -164,6 +168,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           args: [1],
           kwargs: { "by" => 2 },
         )
+        # [DURABABBLE-OBJ-1] Durable object command rows enforce a claimed command lifecycle.
         claimed = store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
         assert_hash_includes(
           claimed,
@@ -224,6 +229,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal true, store.workflow_owned?(workflow_id:, worker_id: "worker-a")
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "worker-b")
         assert_hash_includes store.current_workflow_lease(workflow_id), "workflow_id" => workflow_id, "worker_id" => "worker-a"
+        # [DURABABBLE-LEASE-2] Live owners can heartbeat; non-owners and expired owners cannot.
         assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).cmd_tuples
 
         store.record_step_started(workflow_id:, position: 0, name: "heartbeat")
@@ -251,6 +257,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         store.make_workflow_due!(workflow_id, now: Time.now)
         assert_hash_includes store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30), "id" => workflow_id, "locked_by" => "worker-b"
 
+        # [DURABABBLE-LEASE-3] Explicit release makes a live lease claimable by the next worker.
         assert_hash_includes store.release_worker_leases!(worker_id: "worker-b"), "workflows" => 1
         assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-c", lease_seconds: 30), "locked_by" => "worker-c"
         store.fail_workflow(workflow_id, error: "fatal")

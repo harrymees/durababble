@@ -9,12 +9,14 @@ class DurababbleCompleteTest < DurababbleTestCase
       with_durababble_store(backend, "complete_test") do |store|
         store.migrate!
 
+        # [DURABABBLE-WF-1] [DURABABBLE-LEASE-1] Enqueue is durable and one worker claims it.
         workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 2 })
         claim = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 60)
         assert_equal workflow_id, claim.fetch("id")
         assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 60)
 
         before = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+        # [DURABABBLE-LEASE-2] [DURABABBLE-LEASE-3] Heartbeat extends ownership; expiry is reclaimable.
         store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 120)
         after = parse_time(store.workflow(workflow_id).fetch("locked_until"))
         assert_operator after, :>, before
@@ -29,10 +31,12 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal ["increment", "double"], events
         again = engine(worker_id: "worker-b").resume(counter_workflow(events:), workflow_id:)
         assert_equal({ "count" => 6 }, again.result)
+        # [DURABABBLE-STEP-1] Completed step positions replay without adding user-code events.
         assert_equal ["increment", "double"], events
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
 
         side_effects = 0
+        # [DURABABBLE-FENCE-1] Repeated fence callers observe the first completed side effect.
         first = store.with_fence(workflow_id:, key: "charge:1") do
           side_effects += 1
           { "charge_id" => "ch_1" }
@@ -45,6 +49,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal({ "charge_id" => "ch_1" }, second)
         assert_equal 1, side_effects
 
+        # [DURABABBLE-OUTBOX-1] Outbox key, lease, and ack behavior are durable.
         outbox_id = store.enqueue_outbox(
           workflow_id:,
           topic: "email",
@@ -94,6 +99,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal "approval:r1", store.waits_for(workflow_id).last.fetch("event_key")
 
         assert_equal 0, store.signal_event("approval:other", payload: {})
+        # [DURABABBLE-WAIT-1] Matching event signals complete the wait once and resume workflow work.
         assert_equal 1, store.signal_event("approval:r1", payload: { "approved" => true })
         assert_equal 1, worker.run_until_idle
         assert_equal "completed", store.workflow(workflow_id).fetch("status")
@@ -127,6 +133,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         end
         assert_equal "running", store.steps_for(started_id).first.fetch("status")
         store.steal_expired_leases!(now: Time.now + 61)
+        # [DURABABBLE-STEP-2] An incomplete step is retried after recovery instead of being skipped.
         assert_equal({ "count" => 8 }, engine(worker_id: "recover").resume(counter_workflow, workflow_id: started_id).result)
 
         events = []

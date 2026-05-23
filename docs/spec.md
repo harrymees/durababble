@@ -58,6 +58,7 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **RBS typing.** The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only.
 - **High-level worker lifecycle.** `Durababble::WorkerRuntime` is the app/process integration point. It loops `Worker#tick` for one worker pool, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and revokes still-held workflow/outbox leases if the timeout is exceeded.
 - **Coverage thresholds.** The suite uses SimpleCov line and branch coverage thresholds for the library.
+- **Formal model.** The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, durable-object commands, and future inbox/history placeholders. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands and validates `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests.
 
 ## Programming model
 
@@ -617,6 +618,7 @@ Target requirements:
 | Method/order-based step identity is preferred           | Implemented / target                               | method declaration + deterministic execution position, not `step(:name)` call-site API                                                                                     | existing workflow specs + future concurrency tests        |
 | Unified inbox is the durable message model              | Target                                             | converge object commands, object wakes, workflow signals/commands                                                                                                          | missing                                                   |
 | CLI can operate the prototype                           | Implemented                                        | executable supports migrate/run/inspect/resume/version                                                                                                                     | CLI spec                                                  |
+| Alloy model tracks storage/lease invariants             | Implemented                                        | `formal/workflow_storage.als` plus Durababble sigil validation keeps model obligations tied to Ruby implementation/tests                                                    | `rake formal` in CI                                       |
 
 ## Crash matrix
 

@@ -35,6 +35,7 @@ module Durababble
       @position += 1
 
       if @completed_steps.key?(position)
+        # [DURABABBLE-STEP-1] Replay returns the completed step result without rerunning user code.
         return @completed_steps.fetch(position).fetch("result")
       end
 
@@ -53,6 +54,7 @@ module Durababble
 
       output = block.call
       if output.is_a?(WaitRequest)
+        # [DURABABBLE-LEASE-4] Wait commits are fenced by a fresh workflow ownership check.
         assert_workflow_lease!
         @store.record_wait(workflow_id: @workflow_id, position:, name: step.name, wait_request: output)
         crash!(:wait_recorded)
@@ -60,6 +62,7 @@ module Durababble
       end
 
       assert_workflow_lease!
+      # [DURABABBLE-LEASE-4] Step result commits are rejected after lease expiry or movement.
       @store.record_step_completed(workflow_id: @workflow_id, position:, result: output)
       crash!(:step_completed)
       output
@@ -162,6 +165,7 @@ module Durababble
       workflow = workflow_class.new
       workflow.__durababble_execution__ = execution
       result = workflow.execute(initial_input || initial_context(workflow_id))
+      # [DURABABBLE-LEASE-4] Final workflow commits use the same stale-owner fence as steps.
       assert_workflow_lease!(workflow_id)
       @store.complete_workflow(workflow_id, result:)
       crash!(:workflow_completed)

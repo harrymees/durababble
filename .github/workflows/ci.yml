@@ -51,3 +51,21 @@ jobs:
 
       - name: Run RuboCop, RBS validation, and typecheck
         run: bundle exec rake lint
+
+  formal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Verify Alloy models
+        run: scripts/verify-alloy.sh
+
+      - name: Validate formal sigils
+        run: node scripts/validate-durababble-sigils.js
