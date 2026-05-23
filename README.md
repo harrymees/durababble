@@ -74,6 +74,17 @@ CI runs the coverage gate with SimpleCov branch coverage enabled:
 mise exec -- bundle exec rake test:coverage
 ```
 
+Static contract validation runs through the normal lint/typecheck path:
+
+```sh
+mise exec -- bundle exec rake typecheck
+```
+
+That task validates `sig/durababble.rbs`, rejects dynamic escape annotations in
+public RBS/RBI files and documented code examples, and then runs Sorbet against
+the inline implementation signatures. Durababble does not load or validate user
+RBS at runtime; runtime values continue to be serialized through Paquito.
+
 For a CI-equivalent local run from a Symphony workspace that has optional Yugabyte coverage enabled in `mise.local.toml`, disable it explicitly:
 
 ```sh

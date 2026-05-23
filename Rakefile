@@ -11,11 +11,17 @@ task :rbs do
   sh("bundle exec rbs validate")
 end
 
+task :rbs_strict do
+  ruby("scripts/validate_rbs_strict.rb")
+end
+
 task :typecheck do
+  Rake::Task[:rbs].invoke
+  Rake::Task[:rbs_strict].invoke
   sh("bundle exec srb tc")
 end
 
-task lint: [:rubocop, :rbs, :typecheck]
+task lint: [:rubocop, :typecheck]
 
 Rake::TestTask.new(:test) do |task|
   task.libs << "test"
