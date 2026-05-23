@@ -14,7 +14,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 - `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: protobuf/gRPC transport for cross-node wakeups, evictions, transient calls, and durable-message wakeups. Workflow transient calls use `Durababble::Rpc::WorkflowClient` to bridge `WorkflowRpc::Router` onto the `CallTransient` gRPC method.
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
-- `formal/workflow_storage.als`: Alloy model for workflow state, leases, waits, fences, outbox rows, durable-object command rows, and future inbox/history placeholders. `scripts/verify-alloy.sh` verifies the model and `scripts/validate-durababble-sigils.js` keeps `[DURABABBLE-*]` obligations synchronized with Ruby implementation/tests.
+- `formal/workflow_storage.als`: Alloy model for workflow state, leases, waits, fences, outbox rows, durable-object command rows, and future inbox/history placeholders. `scripts/verify-alloy.sh` verifies the model and `scripts/validate-durababble-sigils.rb` keeps `[DURABABBLE-*]` obligations synchronized with Ruby implementation/tests.
 
 ## Public API model
 
@@ -145,5 +145,9 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 - The benchmark operation set intentionally covers the main prototype lifecycle: enqueue, claim, heartbeat, lease conflict/recovery, worker tick/drain, end-to-end event and timer waits, resume-with-completed-steps, failed-workflow retry, observability reads, idempotency fences, outbox claim/ack/reclaim, large-table query shapes, and cross-process command RPC.
 - GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
 - Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
+
+## Coverage gate
+
+GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 88.3%, global branch coverage drops below 70.5%, per-file line coverage drops below 59%, or per-file branch coverage drops below 41%. These are initial ratchet thresholds from the current MySQL-backed CI suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output and result JSON.
 
 See `docs/spec.md` for the guarantee and crash matrices implemented by tests.

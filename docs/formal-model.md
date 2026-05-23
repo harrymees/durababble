@@ -4,46 +4,6 @@ Durababble keeps an Alloy model in `formal/workflow_storage.als` to check the
 prototype's workflow, lease, and durable-storage safety claims independently of
 the Ruby implementation.
 
-## Silo reference review
-
-Reviewed reference files from Silo at `86a9229ad8f4554112d2f94b467c797c56797685`:
-
-- `specs/job_shard.als`
-- `specs/coordination.als`
-- `CONTRIBUTING.md` Alloy command docs
-- `scripts/validate-silo-sigils.js`
-- implementation/test comments under `src/job_store_shard/restart.rs`,
-  `src/concurrency.rs`, and `tests/turmoil_runner/`
-
-Parts copied:
-
-- Time-indexed durable rows instead of in-memory state.
-- Explicit transition predicates with preconditions, postconditions, and frame
-  conditions.
-- Safety properties encoded as `assert`/`check`, not as facts when they should
-  catch a broken transition.
-- Representative `run` examples so expected traces are SAT.
-- Bidirectional model-to-implementation sigils.
-
-Parts adapted:
-
-- Silo's job/task/holder vocabulary maps to Durababble workflows, method-order
-  steps, attempts, waits, leases, fences, outbox rows, and durable-object
-  command rows.
-- Silo's permanent shard leases are different from Durababble's expiring
-  workflow/outbox leases, so Durababble models heartbeat extension, expiry,
-  release, and stale-owner commit rejection directly.
-- Silo's Rust-only validator is adapted to scan Alloy files against Ruby
-  implementation and test files.
-
-Parts rejected:
-
-- Silo's broker buffer, shard splitting, tenant range, and concurrency ticket
-  holder details do not exist in Durababble's current storage model.
-- Silo's cancellation-as-separate-flag model does not match Durababble's current
-  workflow row statuses, so cancellation/termination are modeled as terminal
-  status transitions.
-
 ## Commands
 
 Run all formal checks:
@@ -56,7 +16,7 @@ Or run the pieces directly:
 
 ```sh
 scripts/verify-alloy.sh
-node scripts/validate-durababble-sigils.js --verbose
+mise exec -- bundle exec ruby scripts/validate-durababble-sigils.rb --verbose
 ```
 
 `scripts/verify-alloy.sh` uses `alloy6` when installed. Otherwise it downloads

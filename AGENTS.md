@@ -24,3 +24,23 @@ mise exec -- bundle exec rake test
 ```
 
 Set `DURABABBLE_YUGABYTE_DATABASE_URL` to include optional Yugabyte-backed tests. For the host-local Symphony smoke path, use `DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte`.
+
+## HAR-1280 formal model design note
+
+The Durababble Alloy model was designed after reviewing Silo's `specs/job_shard.als`,
+`specs/coordination.als`, Alloy verifier docs, sigil validator, and implementation/test
+sigil comments.
+
+Copied from Silo: time-indexed durable rows, explicit transition predicates with
+preconditions/postconditions/frame conditions, safety properties as `assert`/`check`,
+representative SAT `run` examples, and bidirectional model-to-implementation sigils.
+
+Adapted for Durababble: job/task/holder vocabulary became workflows, method-order
+steps, attempts, waits, leases, fences, outbox rows, and durable-object command rows;
+permanent shard ownership became expiring workflow/outbox leases with heartbeat,
+expiry, release, and stale-owner commit rejection; Silo's Rust validator became a
+Ruby validator over Alloy files and Ruby implementation/test files.
+
+Rejected from Silo: broker buffers, shard splitting, tenant ranges, concurrency ticket
+holders, and a separate cancellation flag model, because those are not current
+Durababble storage concepts.

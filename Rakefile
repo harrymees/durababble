@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "bundler/gem_tasks"
+require "rbconfig"
 require "rake/testtask"
 
 task :rubocop do
@@ -16,7 +17,7 @@ task :typecheck do
 end
 
 task :sigils do
-  sh("node scripts/validate-durababble-sigils.js")
+  sh(RbConfig.ruby, "scripts/validate-durababble-sigils.rb")
 end
 
 task :alloy do
@@ -30,6 +31,14 @@ task lint: [:rubocop, :rbs, :typecheck]
 Rake::TestTask.new(:test) do |task|
   task.libs << "test"
   task.pattern = "test/**/*_test.rb"
+end
+
+namespace :test do
+  desc "Run the full test suite with SimpleCov line and branch coverage gates"
+  task :coverage do
+    ENV["DURABABBLE_COVERAGE"] = "1"
+    Rake::Task[:test].invoke
+  end
 end
 
 task default: :test

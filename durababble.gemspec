@@ -45,5 +45,6 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency("rubocop-minitest", "~> 0.38")
   spec.add_development_dependency("rubocop-shopify", "~> 2.17")
   spec.add_development_dependency("rubocop-sorbet", "~> 0.10")
+  spec.add_development_dependency("simplecov", "~> 0.22")
   spec.add_development_dependency("sorbet", "~> 0.5")
 end

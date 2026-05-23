@@ -68,21 +68,27 @@ DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte mise exec
 /opt/dev/bin/dev check
 ```
 
-## Formal verification
+CI runs the coverage gate with SimpleCov branch coverage enabled:
 
-The Alloy model in `formal/workflow_storage.als` checks the prototype workflow,
-lease, wait, fence, outbox, and durable-object command safety invariants. The
-model is tied back to Ruby implementation/tests with `[DURABABBLE-*]` sigils.
+```sh
+mise exec -- bundle exec rake test:coverage
+```
+
+For a CI-equivalent local run from a Symphony workspace that has optional Yugabyte coverage enabled in `mise.local.toml`, disable it explicitly:
+
+```sh
+mise exec -- env DURABABBLE_DATABASE_URL=mysql://root@127.0.0.1:3306/sidekick_server_test DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec rake test:coverage
+```
+
+The gate measures library files under `lib/**/*.rb`, excluding the gem metadata version file because Bundler loads it before SimpleCov starts. The current ratchet fails below 88.3% line coverage or 70.5% branch coverage globally, and below 59% line coverage or 41% branch coverage for any measured library file. The target ratchet is 95% line coverage and 90% branch coverage; raise the configured minimums as meaningful tests lift coverage. The HTML report and SimpleCov result JSON are written to `coverage/`, and GitHub Actions uploads that directory as the `coverage-report` artifact for failed and passing runs.
+
+Formal checks are part of CI and can be run locally:
 
 ```sh
 mise exec -- bundle exec rake formal
-scripts/verify-alloy.sh
-node scripts/validate-durababble-sigils.js --verbose
 ```
 
-CI runs the same verifier and sigil validator in the `formal` job. Alloy passes
-when all `run` examples are SAT and all safety `check` commands are UNSAT. See
-`docs/formal-model.md` for the Silo design review and invariant matrix.
+See `docs/formal-model.md` for the invariant matrix.
 
 ## Public API
 
