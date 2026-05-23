@@ -57,17 +57,16 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Determinism and code evolution.** Current workflows are deterministic by method/order step sequence and persisted outputs. Target code evolution includes Temporal-style `patched` / `deprecate_patch` marker checks for safe workflow control-flow changes. Future scope includes `Ruby::Box` workflow realms, deterministic time/sleep/random shims, workflow-local deterministic fibers, and class-level schema-versioned object/workflow state.
 - **RBS typing.** The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only.
 - **High-level worker lifecycle.** `Durababble::WorkerRuntime` is the app/process integration point. It loops `Worker#tick` for one worker pool, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and revokes still-held workflow/outbox leases if the timeout is exceeded.
-- **Prototype CLI.** CLI commands include `migrate`, `run-counter`, `inspect`, `resume-counter`, and `version`.
 - **Coverage thresholds.** The suite uses SimpleCov line and branch coverage thresholds for the library.
 
 ## Programming model
 
 Durababble's user-facing model is two Ruby base classes over shared durable coordination machinery:
 
-| Primitive | Current class | Public direction | Best for | Mental model |
-| --- | --- | --- | --- | --- |
-| Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | one-off processes with a start, result, steps, waits, and recovery | function/object that survives restarts |
-| Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.tell` | sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | SQL-backed actor/mailbox object with a current owner |
+| Primitive        | Current class               | Public direction                          | Best for                                                                              | Mental model                                         |
+| ---------------- | --------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Durable workflow | `Durababble::Workflow`      | `Workflow.start` / `Workflow.handle`      | one-off processes with a start, result, steps, waits, and recovery                    | function/object that survives restarts               |
+| Durable object   | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.tell` | sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | SQL-backed actor/mailbox object with a current owner |
 
 The home spec called the workflow class `Durababble::DurableWorkflow`; the repo uses `Durababble::Workflow`. Unless renamed later, `Durababble::Workflow` is the in-repo class name.
 
@@ -195,16 +194,16 @@ Target public-entry idempotency requirements:
 
 The implemented schema is intentionally smaller than the target schema. Current tables are:
 
-| Table | Purpose | Current key shape |
-| --- | --- | --- |
-| `workflows` | one workflow execution; status, input/result/error, workflow lease, retry due time | `id` |
-| `steps` | latest logical workflow step state by deterministic position | `(workflow_id, position)` |
-| `step_attempts` | append-only attempt history for steps and waits | `id` |
-| `waits` | durable timer/event waits | `id` |
-| `fences` | workflow-local side-effect idempotency fences | `(workflow_id, key)` |
-| `outbox` | durable outgoing messages with processing leases | `id`, unique `key` |
-| `durable_objects` | latest object state by object type/id | `(object_type, object_id)` |
-| `durable_object_commands` | transitional persisted durable object command rows | `id` |
+| Table                     | Purpose                                                                            | Current key shape          |
+| ------------------------- | ---------------------------------------------------------------------------------- | -------------------------- |
+| `workflows`               | one workflow execution; status, input/result/error, workflow lease, retry due time | `id`                       |
+| `steps`                   | latest logical workflow step state by deterministic position                       | `(workflow_id, position)`  |
+| `step_attempts`           | append-only attempt history for steps and waits                                    | `id`                       |
+| `waits`                   | durable timer/event waits                                                          | `id`                       |
+| `fences`                  | workflow-local side-effect idempotency fences                                      | `(workflow_id, key)`       |
+| `outbox`                  | durable outgoing messages with processing leases                                   | `id`, unique `key`         |
+| `durable_objects`         | latest object state by object type/id                                              | `(object_type, object_id)` |
+| `durable_object_commands` | transitional persisted durable object command rows                                 | `id`                       |
 
 The PostgreSQL/YSQL adapter uses a schema namespace (default `durababble`). The MySQL/MariaDB adapter prefixes table names with the configured schema name because MySQL has database/table namespace differences. MySQL columns use `VARCHAR`, `DATETIME(6)`, and `LONGBLOB`; PostgreSQL/YSQL columns use `text`, `timestamptz`, and `bytea`.
 
@@ -281,7 +280,10 @@ Routing should keep hot ids on the pod that already has them in memory:
 Current code has two different RPC-ish pieces:
 
 1. `Durababble::RpcClient`: a JSON-line command protocol to a child process. This is useful for local subprocess tests and benchmarks, but it is **not** the target intranode/inter-pod RPC protocol.
-2. `Durababble::WorkflowRpc`: lease-aware workflow RPC routing through injected `rpc_clients` keyed by worker id. It validates current workflow ownership before and after handler execution and handles stale/no-active-owner races. It does not yet provide a real network transport, node registry, gRPC service, or durable inbox integration.
+2. `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: the real four-method gRPC transport for `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage`, using protobuf messages and Paquito-encoded transient args/results. Tests use insecure localhost credentials; production callers provide gRPC credentials from the hosting environment.
+3. `Durababble::WorkflowRpc`: lease-aware workflow RPC routing. It can still be tested with injected clients, but cross-node tests now run through `Durababble::Rpc::WorkflowClient`, which calls the gRPC `CallTransient` method on a real `GRPC::RpcServer`.
+
+The current gRPC transport still does not provide the durable inbox implementation or persistent node registry tables. In tests and the prototype, the node directory is an in-memory mapping from node id to `rpc_address`.
 
 ### Target gRPC requirement
 
@@ -575,78 +577,78 @@ Target requirements:
 
 ## Guarantee matrix
 
-| Guarantee | Status | Implementation / target | Explicit test expectation |
-| --- | --- | --- | --- |
-| Workflows are durable before execution | Implemented | `Store#enqueue_workflow` inserts `pending` rows with Paquito-serialized input | complete spec guarantee + crash matrix |
-| Runnable work is claimable by one worker at a time | Implemented | `Store#claim_runnable_workflow` atomically updates one row and uses `FOR UPDATE SKIP LOCKED` where available | backend conformance + hardening concurrency specs |
-| Resume honors lease ownership | Implemented | `Engine#resume` uses `Store#claim_workflow` and raises `LeaseConflict` for another live owner | hardening lease spec |
-| Active leases can be heartbeated | Implemented | `Store#heartbeat` extends `locked_until` only for the owning worker | complete spec guarantee matrix |
-| Running steps can explicitly heartbeat progress | Implemented | `Heartbeat#record(cursor)` extends the workflow lease and stores an opaque Paquito cursor on the step/attempt | heartbeat spec + DST cursor recovery scenario |
-| Heartbeat cursors survive recovery | Implemented | `Engine#resume` passes the previous incomplete attempt's heartbeat cursor into the next invocation | heartbeat spec + DST cursor recovery scenario |
-| Zombie workers cannot renew expired leases | Implemented | heartbeat updates only when owner/deadline still match | heartbeat spec |
-| Zombie workers cannot complete after lease revocation | Implemented | `Engine` re-checks workflow lease ownership before terminal durable writes | worker lifecycle spec |
-| Step retries are durably scheduled | Implemented | failed retryable steps store `next_run_at` and release the lease | step retry spec + DST retry scenario |
-| Retry options are Temporal-like but Ruby-shaped | Implemented | `initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors` | retry policy specs |
-| Final retry failure bubbles to workflow | Implemented | exhausted/non-retryable step failure marks workflow `failed` | step retry spec |
-| Expired leases can be recovered | Implemented | `Store#steal_expired_leases!` returns expired `running` workflows to `pending` | complete spec guarantee + crash matrix |
-| Completed steps are not re-executed on resume | Implemented | `Engine#resume` reconstructs context from completed step rows and skips them | complete spec guarantee + subprocess crash harness |
-| Incomplete steps are retried | Implemented | non-`completed` step rows are not skipped | crash matrix |
-| Step attempts are append-only | Implemented | `step_attempts` records every started attempt and terminal status | guarantee matrix |
-| Waiting attempts complete when signaled | Implemented | wait completion updates attempts from `waiting` to `completed` | wait-attempt spec |
-| Timer waits survive process exit | Implemented | `waits` rows store timer wake time and context | timer/event tests |
-| Event waits survive process exit | Implemented | `waits` rows store event key and context | timer/event + crash matrix |
-| Signaled waits resume with payload | Implemented | `signal_event` completes waiting step with payload | timer/event test |
-| Concurrent signalers wake a wait once | Implemented | `signal_event` completes pending waits via a locked update | event concurrency spec |
-| Side effects can be fenced by key | Implemented with boundary | `with_fence` inserts `running` before yield; owner crash recovery is future work | fence concurrency spec; missing owner-crash spec |
-| Outbox delivery is durable and leased | Implemented | outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry | outbox specs |
-| Workflow RPCs route to current lease holder | Partially implemented | `WorkflowRpc::Router`/`Handler` validate owner before/after handling; real transport is injected/local | workflow RPC spec + DST scenarios |
-| Actual inter-pod RPC uses full four-method gRPC service | Target | `Durababble::RpcServer` + proto service above over mTLS/Spiffe | missing gRPC integration/contract tests |
-| Multi-row state transitions are transactional | Implemented for current workflow/wait/outbox paths | step start/finish/failure and wait transitions run in DB transactions | implementation + regression suite |
-| Runtime values are not stored as JSONB | Implemented | Paquito bytes in `bytea` / `LONGBLOB` | store storage + legacy migration specs |
-| MySQL/MariaDB honors common store semantics | Implemented | `MysqlStore` with shared conformance tests | backend conformance spec |
-| Durable object query/command API exists | Partially implemented | current `ref`, `expose`, `expose_command`, command rows, inline command execution; public target is `at/tell` | durable object specs |
-| Object commands are per-id FIFO and worker-driven | Target | unified inbox/mailbox + object lease owner + writer gate | missing |
-| Object sleeps convert to durable wake messages | Target | sleeps table + sleep-to-inbox conversion | missing |
-| Workflow signals are durable ordered history | Target | inbox rows accepted into workflow history and replayed at yield points | missing |
-| Workflow patch markers guard code evolution | Target | `patched` / `deprecate_patch` append and check ordered workflow history markers before branch side effects | missing; needs unit, backend-conformance, and crash tests |
-| Transient exposed methods route to owner | Target | `CallTransient` gRPC against object/workflow owner | missing |
-| Worker pool scopes persisted targets and relevant keys | Target | persist/include `worker_pool` where query patterns require it | missing |
-| Workflow boxes isolate deterministic shims | Future scope | `Ruby::Box` template + execution boxes | missing, not near-term gate |
-| Method/order-based step identity is preferred | Implemented / target | method declaration + deterministic execution position, not `step(:name)` call-site API | existing workflow specs + future concurrency tests |
-| Unified inbox is the durable message model | Target | converge object commands, object wakes, workflow signals/commands | missing |
-| CLI can operate the prototype | Implemented | executable supports migrate/run/inspect/resume/version | CLI spec |
+| Guarantee                                               | Status                                             | Implementation / target                                                                                                                                                    | Explicit test expectation                                 |
+| ------------------------------------------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| Workflows are durable before execution                  | Implemented                                        | `Store#enqueue_workflow` inserts `pending` rows with Paquito-serialized input                                                                                              | complete spec guarantee + crash matrix                    |
+| Runnable work is claimable by one worker at a time      | Implemented                                        | `Store#claim_runnable_workflow` atomically updates one row and uses `FOR UPDATE SKIP LOCKED` where available                                                               | backend conformance + hardening concurrency specs         |
+| Resume honors lease ownership                           | Implemented                                        | `Engine#resume` uses `Store#claim_workflow` and raises `LeaseConflict` for another live owner                                                                              | hardening lease spec                                      |
+| Active leases can be heartbeated                        | Implemented                                        | `Store#heartbeat` extends `locked_until` only for the owning worker                                                                                                        | complete spec guarantee matrix                            |
+| Running steps can explicitly heartbeat progress         | Implemented                                        | `Heartbeat#record(cursor)` extends the workflow lease and stores an opaque Paquito cursor on the step/attempt                                                              | heartbeat spec + DST cursor recovery scenario             |
+| Heartbeat cursors survive recovery                      | Implemented                                        | `Engine#resume` passes the previous incomplete attempt's heartbeat cursor into the next invocation                                                                         | heartbeat spec + DST cursor recovery scenario             |
+| Zombie workers cannot renew expired leases              | Implemented                                        | heartbeat updates only when owner/deadline still match                                                                                                                     | heartbeat spec                                            |
+| Zombie workers cannot complete after lease revocation   | Implemented                                        | `Engine` re-checks workflow lease ownership before terminal durable writes                                                                                                 | worker lifecycle spec                                     |
+| Step retries are durably scheduled                      | Implemented                                        | failed retryable steps store `next_run_at` and release the lease                                                                                                           | step retry spec + DST retry scenario                      |
+| Retry options are Temporal-like but Ruby-shaped         | Implemented                                        | `initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors`                                                      | retry policy specs                                        |
+| Final retry failure bubbles to workflow                 | Implemented                                        | exhausted/non-retryable step failure marks workflow `failed`                                                                                                               | step retry spec                                           |
+| Expired leases can be recovered                         | Implemented                                        | `Store#steal_expired_leases!` returns expired `running` workflows to `pending`                                                                                             | complete spec guarantee + crash matrix                    |
+| Completed steps are not re-executed on resume           | Implemented                                        | `Engine#resume` reconstructs context from completed step rows and skips them                                                                                               | complete spec guarantee + subprocess crash harness        |
+| Incomplete steps are retried                            | Implemented                                        | non-`completed` step rows are not skipped                                                                                                                                  | crash matrix                                              |
+| Step attempts are append-only                           | Implemented                                        | `step_attempts` records every started attempt and terminal status                                                                                                          | guarantee matrix                                          |
+| Waiting attempts complete when signaled                 | Implemented                                        | wait completion updates attempts from `waiting` to `completed`                                                                                                             | wait-attempt spec                                         |
+| Timer waits survive process exit                        | Implemented                                        | `waits` rows store timer wake time and context                                                                                                                             | timer/event tests                                         |
+| Event waits survive process exit                        | Implemented                                        | `waits` rows store event key and context                                                                                                                                   | timer/event + crash matrix                                |
+| Signaled waits resume with payload                      | Implemented                                        | `signal_event` completes waiting step with payload                                                                                                                         | timer/event test                                          |
+| Concurrent signalers wake a wait once                   | Implemented                                        | `signal_event` completes pending waits via a locked update                                                                                                                 | event concurrency spec                                    |
+| Side effects can be fenced by key                       | Implemented with boundary                          | `with_fence` inserts `running` before yield; owner crash recovery is future work                                                                                           | fence concurrency spec; missing owner-crash spec          |
+| Outbox delivery is durable and leased                   | Implemented                                        | outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry                                                                                    | outbox specs                                              |
+| Workflow RPCs route to current lease holder             | Implemented for workflow transient RPC             | `WorkflowRpc::Router`/`Handler` validate owner before/after handling, refresh ownership after transport failures, and reroute; `Rpc::WorkflowClient` routes over real gRPC | workflow RPC spec + gRPC transport spec + DST scenarios   |
+| Actual inter-pod RPC uses full four-method gRPC service | Implemented transport; production security pending | `Durababble::Rpc::Server` serves all four proto methods with injectable credentials/auth callbacks                                                                         | gRPC integration/contract tests + DST response scenarios  |
+| Multi-row state transitions are transactional           | Implemented for current workflow/wait/outbox paths | step start/finish/failure and wait transitions run in DB transactions                                                                                                      | implementation + regression suite                         |
+| Runtime values are not stored as JSONB                  | Implemented                                        | Paquito bytes in `bytea` / `LONGBLOB`                                                                                                                                      | store storage + legacy migration specs                    |
+| MySQL/MariaDB honors common store semantics             | Implemented                                        | `MysqlStore` with shared conformance tests                                                                                                                                 | backend conformance spec                                  |
+| Durable object query/command API exists                 | Partially implemented                              | current `ref`, `expose`, `expose_command`, command rows, inline command execution; public target is `at/tell`                                                              | durable object specs                                      |
+| Object commands are per-id FIFO and worker-driven       | Target                                             | unified inbox/mailbox + object lease owner + writer gate                                                                                                                   | missing                                                   |
+| Object sleeps convert to durable wake messages          | Target                                             | sleeps table + sleep-to-inbox conversion                                                                                                                                   | missing                                                   |
+| Workflow signals are durable ordered history            | Target                                             | inbox rows accepted into workflow history and replayed at yield points                                                                                                     | missing                                                   |
+| Workflow patch markers guard code evolution             | Target                                             | `patched` / `deprecate_patch` append and check ordered workflow history markers before branch side effects                                                                 | missing; needs unit, backend-conformance, and crash tests |
+| Transient exposed methods route to owner                | Target                                             | `CallTransient` gRPC against object/workflow owner                                                                                                                         | missing                                                   |
+| Worker pool scopes persisted targets and relevant keys  | Target                                             | persist/include `worker_pool` where query patterns require it                                                                                                              | missing                                                   |
+| Workflow boxes isolate deterministic shims              | Future scope                                       | `Ruby::Box` template + execution boxes                                                                                                                                     | missing, not near-term gate                               |
+| Method/order-based step identity is preferred           | Implemented / target                               | method declaration + deterministic execution position, not `step(:name)` call-site API                                                                                     | existing workflow specs + future concurrency tests        |
+| Unified inbox is the durable message model              | Target                                             | converge object commands, object wakes, workflow signals/commands                                                                                                          | missing                                                   |
+| CLI can operate the prototype                           | Implemented                                        | executable supports migrate/run/inspect/resume/version                                                                                                                     | CLI spec                                                  |
 
 ## Crash matrix
 
-| Crash point | Expected recovery | Status / explicit test |
-| --- | --- | --- |
-| After enqueue, before claim | Later engine/worker can run the pending workflow | implemented; crash matrix |
-| After lease claim, before step start | Lease expiry returns workflow to pending; another worker completes it | implemented; crash matrix |
-| After step start, before step completion | Step remains incomplete/running; recovery retries it | implemented; crash matrix |
-| After step heartbeat, before step completion | Latest heartbeat cursor is available to next invocation | implemented; heartbeat spec + DST |
-| After step failure, before retry due time | Retry schedule persists; workflow is not claimable early | implemented; retry spec + DST |
-| After step completion, before workflow completion | Completed step is skipped and remaining work continues | implemented; subprocess crash harness |
-| While waiting for an event | Wait row survives; signal wakes workflow and execution continues | implemented; crash matrix |
-| After outbox insert, before delivery | Outbox message remains claimable exactly once at a time | implemented; crash matrix |
-| After outbox claim, before ack | Expired outbox lease can be reclaimed by another sender | implemented; outbox recovery spec |
-| During lease-routed workflow RPC | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy | partially implemented; workflow RPC spec + DST |
-| During app shutdown with in-flight step | Runtime stops new claims; timeout releases leases; later worker retries | implemented; worker lifecycle spec |
-| Crash after inbox row commits before `DeliverMessage` | Inbox row remains; scheduler safety-net wakes target later | target; missing unified inbox |
-| Crash before inbox row commits | No message row; caller retry decides whether to enqueue | target; missing unified inbox |
-| Crash while allocating mailbox sequence | Transaction rolls back or commits both sequence advance and inbox row | target; missing mailbox sequence |
-| Crash while object command runs before first step | Inbox head remains unconsumed; new owner reruns command after lease expiry | target; current inline command path not sufficient |
-| Crash after object command step completion before state/message completion | Step output is cached; command replays and persists state/result once | target; object command steps/mailbox missing |
-| Crash after object state persists before ask result completion | State persist and message completion must be atomic so this split state is impossible | target; missing mailbox transaction |
-| Crash while head message is in backoff/dead-letter | Later messages remain blocked until operator action | target; missing dead-letter runtime |
-| Crash during object sleep-to-inbox conversion | Either sleep row remains or wake inbox row exists; no wake lost | target; missing object sleeps |
-| Crash while workflow signal is accepted into history | Accepted signal is replayed in sequence | target; missing signal history |
-| Crash after patch marker commit before first new-branch step | Replay sees marker, `patched` returns true, and the new branch continues | target; missing patch event-log checker |
-| Code removes `patched` while normal marker history still exists | Checker raises nondeterminism before any later durable write | target; missing patch event-log checker |
-| Old pod reads future-version durable data | Old pod releases lease; caller routes to compatible node or receives typed future-version error | deferred future scope; class-level schema capabilities not implemented |
-| Owner pod loses lease while activity continues | External effect may finish; checkpoint/status write fails; retry uses idempotency | implemented for workflow lease checks; object target missing |
-| Caller times out waiting for durable ask result | Row may keep running; same idempotency key reattaches later | target; missing asks/inbox idempotency |
-| Database circuit breaker opens before commit | No durable change unless transaction committed; caller receives typed breaker error | target; missing breaker integration |
-| Paquito decode fails for persisted payload | Target/message/workflow moves to operator-visible error/repair state | target; repair UX missing |
+| Crash point                                                                | Expected recovery                                                                               | Status / explicit test                                                 |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| After enqueue, before claim                                                | Later engine/worker can run the pending workflow                                                | implemented; crash matrix                                              |
+| After lease claim, before step start                                       | Lease expiry returns workflow to pending; another worker completes it                           | implemented; crash matrix                                              |
+| After step start, before step completion                                   | Step remains incomplete/running; recovery retries it                                            | implemented; crash matrix                                              |
+| After step heartbeat, before step completion                               | Latest heartbeat cursor is available to next invocation                                         | implemented; heartbeat spec + DST                                      |
+| After step failure, before retry due time                                  | Retry schedule persists; workflow is not claimable early                                        | implemented; retry spec + DST                                          |
+| After step completion, before workflow completion                          | Completed step is skipped and remaining work continues                                          | implemented; subprocess crash harness                                  |
+| While waiting for an event                                                 | Wait row survives; signal wakes workflow and execution continues                                | implemented; crash matrix                                              |
+| After outbox insert, before delivery                                       | Outbox message remains claimable exactly once at a time                                         | implemented; crash matrix                                              |
+| After outbox claim, before ack                                             | Expired outbox lease can be reclaimed by another sender                                         | implemented; outbox recovery spec                                      |
+| During lease-routed workflow RPC                                           | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy      | partially implemented; workflow RPC spec + DST                         |
+| During app shutdown with in-flight step                                    | Runtime stops new claims; timeout releases leases; later worker retries                         | implemented; worker lifecycle spec                                     |
+| Crash after inbox row commits before `DeliverMessage`                      | Inbox row remains; scheduler safety-net wakes target later                                      | target; missing unified inbox                                          |
+| Crash before inbox row commits                                             | No message row; caller retry decides whether to enqueue                                         | target; missing unified inbox                                          |
+| Crash while allocating mailbox sequence                                    | Transaction rolls back or commits both sequence advance and inbox row                           | target; missing mailbox sequence                                       |
+| Crash while object command runs before first step                          | Inbox head remains unconsumed; new owner reruns command after lease expiry                      | target; current inline command path not sufficient                     |
+| Crash after object command step completion before state/message completion | Step output is cached; command replays and persists state/result once                           | target; object command steps/mailbox missing                           |
+| Crash after object state persists before ask result completion             | State persist and message completion must be atomic so this split state is impossible           | target; missing mailbox transaction                                    |
+| Crash while head message is in backoff/dead-letter                         | Later messages remain blocked until operator action                                             | target; missing dead-letter runtime                                    |
+| Crash during object sleep-to-inbox conversion                              | Either sleep row remains or wake inbox row exists; no wake lost                                 | target; missing object sleeps                                          |
+| Crash while workflow signal is accepted into history                       | Accepted signal is replayed in sequence                                                         | target; missing signal history                                         |
+| Crash after patch marker commit before first new-branch step               | Replay sees marker, `patched` returns true, and the new branch continues                        | target; missing patch event-log checker                                |
+| Code removes `patched` while normal marker history still exists            | Checker raises nondeterminism before any later durable write                                    | target; missing patch event-log checker                                |
+| Old pod reads future-version durable data                                  | Old pod releases lease; caller routes to compatible node or receives typed future-version error | deferred future scope; class-level schema capabilities not implemented |
+| Owner pod loses lease while activity continues                             | External effect may finish; checkpoint/status write fails; retry uses idempotency               | implemented for workflow lease checks; object target missing           |
+| Caller times out waiting for durable ask result                            | Row may keep running; same idempotency key reattaches later                                     | target; missing asks/inbox idempotency                                 |
+| Database circuit breaker opens before commit                               | No durable change unless transaction committed; caller receives typed breaker error             | target; missing breaker integration                                    |
+| Paquito decode fails for persisted payload                                 | Target/message/workflow moves to operator-visible error/repair state                            | target; repair UX missing                                              |
 
 ## Testing and coverage standard
 
@@ -657,7 +659,7 @@ The test suite must keep correctness claims evidence-backed:
 - Backend-specific tests must pin SQL behavior that differs by adapter, including lock/claim semantics and EXPLAIN-backed query-plan assertions for hot paths when practical.
 - Deterministic simulation tests (DST) are useful for exploring lease/race schedules, but any DST-found storage bug should be pinned by a real backend regression test.
 - Subprocess crash harnesses cover real process death around durable boundaries.
-- RPC tests must cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, and future gRPC serialization/auth failures.
+- RPC tests must cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, gRPC serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
 - Object mailbox tests must cover strict FIFO, blocked head behavior, ask/tell ordering, wake ordering, idempotency conflicts, owner crash, lease takeover, dead-letter, and operator repair paths.
 - Workflow signal tests must cover history acceptance, deterministic replay order, timeout behavior, terminal-workflow rejection, and idempotency dedup.
 - Workflow patch-marker tests must cover first-run marker recording, old-history `false` branches, marker-history `true` branches, missing-marker nondeterminism failures, `deprecate_patch` cleanup, duplicate-id handling, backend conformance, and crash after marker commit.
@@ -679,7 +681,7 @@ Current explicit boundaries:
 - CLI coverage is happy-path oriented and not a complete UX/error-contract specification.
 - Workflow `expose_command` currently records durable command events; full inbox-routed workflow command execution with return values is future work.
 - Durable object command rows and inline execution exist, but per-object queue serialization, lease recovery, and worker-driven object command execution are target behavior.
-- Unified inbox, gRPC transport, node registry, sticky object placement, object sleeps, workflow signals, patch-marker event checking, metrics/tracing, admin UI, and circuit breakers are not implemented.
+- Unified inbox, persistent node registry, sticky object placement, object sleeps, workflow signals, patch-marker event checking, metrics/tracing, admin UI, and circuit breakers are not implemented.
 - Ruby::Box execution and deterministic fibers are future scope rather than current prototype gates. Numeric workflow version APIs beyond `patched` remain future scope unless a concrete need appears.
 - Class-level data schema versioning/capability routing is explicitly deferred future scope.
 

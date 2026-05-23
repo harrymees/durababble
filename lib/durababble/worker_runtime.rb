@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 require "securerandom"
@@ -7,13 +8,19 @@ module Durababble
     DEFAULT_POLL_INTERVAL = 0.1
     DEFAULT_SHUTDOWN_TIMEOUT = 10
 
+    #: untyped
     attr_reader :store, :workflows, :worker_pool, :worker_id, :last_error
 
-    def self.start(**kwargs)
-      new(**kwargs).tap(&:start)
+    class << self
+      #: (**untyped) -> untyped
+      def start(**kwargs)
+        runtime = self #: as untyped
+        runtime.new(**kwargs).tap(&:start)
+      end
     end
 
-    def initialize(store: nil, database_url: nil, schema: "durababble", workflows:, worker_pool:, worker_id: nil, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, poll_interval: DEFAULT_POLL_INTERVAL, migrate: true)
+    #: (workflows: untyped, worker_pool: untyped, ?store: untyped, ?database_url: untyped, ?schema: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?poll_interval: untyped, ?migrate: untyped) -> void
+    def initialize(workflows:, worker_pool:, store: nil, database_url: nil, schema: "durababble", worker_id: nil, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, poll_interval: DEFAULT_POLL_INTERVAL, migrate: true)
       raise ArgumentError, "provide either store: or database_url:" unless store || database_url
 
       @store = store || Store.connect(database_url:, schema:)
@@ -30,6 +37,7 @@ module Durababble
       @last_error = nil
     end
 
+    #: () -> untyped
     def start
       @mutex.synchronize do
         return self if running?
@@ -42,11 +50,11 @@ module Durababble
       self
     end
 
+    #: (?timeout: untyped) -> untyped
     def shutdown(timeout: DEFAULT_SHUTDOWN_TIMEOUT)
-      thread = nil
-      @mutex.synchronize do
+      thread = @mutex.synchronize do
         @stopping = true
-        thread = @thread
+        @thread
       end
       return :stopped unless thread
 
@@ -56,17 +64,20 @@ module Durababble
       :timeout
     end
 
-    alias stop shutdown
+    alias_method :stop, :shutdown
 
+    #: (?timeout: untyped) -> untyped
     def wait(timeout: nil)
       thread = @mutex.synchronize { @thread }
       timeout ? thread&.join(timeout) : thread&.join
     end
 
+    #: () -> untyped
     def running?
       @thread&.alive? || false
     end
 
+    #: () -> untyped
     def close
       shutdown
       @store.close if @owns_store
@@ -74,13 +85,14 @@ module Durababble
 
     private
 
+    #: (untyped) -> untyped
     def run_loop(worker)
       loop do
         break if stopping?
 
         begin
           result = worker.tick
-          sleep @poll_interval if result == :idle && !stopping?
+          sleep(@poll_interval) if result == :idle && !stopping?
         rescue LeaseConflict => e
           @last_error = e
           break if stopping?
@@ -88,13 +100,14 @@ module Durababble
           @last_error = e
           break if stopping?
 
-          sleep @poll_interval
+          sleep(@poll_interval)
         end
       end
     ensure
       @mutex.synchronize { @thread = nil if Thread.current == @thread }
     end
 
+    #: () -> untyped
     def stopping?
       @mutex.synchronize { @stopping }
     end

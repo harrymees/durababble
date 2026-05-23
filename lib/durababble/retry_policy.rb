@@ -1,3 +1,4 @@
+# typed: true
 # frozen_string_literal: true
 
 module Durababble
@@ -5,15 +6,20 @@ module Durababble
     DEFAULT_INITIAL_INTERVAL = 1
     DEFAULT_BACKOFF_COEFFICIENT = 2.0
 
+    #: untyped
     attr_reader :initial_interval, :backoff_coefficient, :maximum_interval, :maximum_attempts, :schedule, :non_retryable_errors
 
-    def self.from(value)
-      return value if value.is_a?(self)
-      return new(maximum_attempts: 1) if value.nil?
+    class << self
+      #: (untyped) -> untyped
+      def from(value)
+        return value if value.is_a?(self)
+        return new(maximum_attempts: 1) if value.nil?
 
-      new(**value)
+        new(**value)
+      end
     end
 
+    #: (?initial_interval: untyped, ?backoff_coefficient: untyped, ?maximum_interval: untyped, ?maximum_attempts: untyped, ?schedule: untyped, ?non_retryable_errors: untyped) -> void
     def initialize(initial_interval: DEFAULT_INITIAL_INTERVAL, backoff_coefficient: DEFAULT_BACKOFF_COEFFICIENT, maximum_interval: nil, maximum_attempts: 1, schedule: nil, non_retryable_errors: [])
       @initial_interval = interval_seconds(initial_interval)
       @backoff_coefficient = Float(backoff_coefficient)
@@ -23,6 +29,7 @@ module Durababble
       @non_retryable_errors = Array(non_retryable_errors)
     end
 
+    #: (untyped, attempt_number: untyped) -> untyped
     def retryable?(error, attempt_number:)
       return false if attempt_number >= maximum_attempts
       return false if non_retryable_errors.any? { |error_class| error.is_a?(error_class) || error.class.name == error_class.to_s }
@@ -30,6 +37,7 @@ module Durababble
       true
     end
 
+    #: (untyped) -> untyped
     def delay_for_attempt(attempt_number)
       explicit = schedule[attempt_number - 1]
       return explicit if explicit
@@ -41,6 +49,7 @@ module Durababble
 
     private
 
+    #: (untyped) -> untyped
     def interval_seconds(value)
       return value.to_f if value.is_a?(Numeric)
       return value.to_f if value.respond_to?(:to_f)

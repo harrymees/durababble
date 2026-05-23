@@ -17,7 +17,7 @@ mise exec -- ruby bench/run.rb --profile full --fixture-size 100000
 
 Environment variables:
 
-- `DURABABBLE_DATABASE_URL` defaults to the local Yugabyte/YSQL endpoint.
+- `DURABABBLE_DATABASE_URL` defaults to the local agent-server MySQL development database.
 - `DURABABBLE_BENCH_PROFILE=smoke|full` controls iteration counts.
 - `DURABABBLE_BENCH_FIXTURE_SIZE` controls the large-table fixture size.
 - `DURABABBLE_BENCH_OUTPUT` controls output directory.

@@ -1,4 +1,5 @@
 #!/usr/bin/env ruby
+# typed: false
 # frozen_string_literal: true
 
 require "csv"
@@ -16,7 +17,7 @@ require "durababble"
 
 module Durababble
   module Benchmarks
-    DEFAULT_DATABASE_URL = ENV.fetch("DURABABBLE_DATABASE_URL", "postgresql://yugabyte@127.0.0.1:15433/yugabyte")
+    DEFAULT_DATABASE_URL = ENV.fetch("DURABABBLE_DATABASE_URL", "mysql://root@127.0.0.1:3306/sidekick_server_development")
 
     Operation = Struct.new(:name, :iterations, :warmup, :description, :block, keyword_init: true)
 
@@ -63,7 +64,7 @@ module Durababble
           seed: @seed,
           samples: @samples,
           environment: environment,
-          operations: results
+          operations: results,
         }
         stamp = start.strftime("%Y%m%dT%H%M%SZ")
         json_path = File.join(@output_dir, "durababble-bench-#{@profile}-#{stamp}.json")
@@ -109,7 +110,7 @@ module Durababble
           Operation.new(name: "large_table_signal_miss", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "event-signal miss against a large pending wait set", block: method(:bench_large_table_signal_miss)),
           Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
           Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
-          Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch))
+          Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
         ]
       end
 
@@ -178,7 +179,7 @@ module Durababble
           max_ms: seconds.last * 1000.0,
           avg_allocations: allocations.sum.to_f / allocations.length,
           p95_allocations: percentile(allocations, 0.95),
-          sample_count: samples.length
+          sample_count: samples.length,
         }
       end
 
@@ -222,10 +223,11 @@ module Durababble
           workflow_id:,
           position: 0,
           name: "wait",
-          wait_request: Durababble.wait_event("bench:event:#{i}:#{warmup}", context: { "i" => i })
+          wait_request: Durababble.wait_event("bench:event:#{i}:#{warmup}", context: { "i" => i }),
         )
         woken = @store.signal_event("bench:event:#{i}:#{warmup}", payload: { "ok" => true })
         raise "wait not woken" unless woken == 1
+
         @store.complete_workflow(workflow_id, result: { "signaled" => true })
       end
 
@@ -234,6 +236,7 @@ module Durababble
         workflow = event_resume_workflow(key)
         run = Durababble::Engine.new(store: @store, worker_id: "event-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
         raise "workflow did not wait" unless run.status == "waiting"
+
         @store.signal_event(key, payload: { "signal" => true })
         resumed = Durababble::Engine.new(store: @store, worker_id: "event-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
         raise "engine did not resume signaled workflow" unless resumed.status == "completed"
@@ -243,6 +246,7 @@ module Durababble
         workflow = timer_resume_workflow
         run = Durababble::Engine.new(store: @store, worker_id: "timer-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
         raise "workflow did not wait" unless run.status == "waiting"
+
         @store.wake_due_timers(now: Time.now)
         resumed = Durababble::Engine.new(store: @store, worker_id: "timer-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
         raise "engine did not resume timer workflow" unless resumed.status == "completed"
@@ -295,7 +299,7 @@ module Durababble
         @store.claim_workflow(workflow_id:, worker_id: "expired-owner", lease_seconds: 30)
         expire_workflow_lease(workflow_id)
         recovered = @store.steal_expired_leases!(now: Time.now)
-        raise "expired workflow lease was not recovered" unless recovered >= 1
+        raise "expired workflow lease was not recovered" if recovered < 1
       end
 
       def bench_fence_first_execution(i, warmup:)
@@ -319,6 +323,7 @@ module Durababble
         outbox_id = @store.enqueue_outbox(workflow_id:, topic: "bench.topic", payload: { "i" => i, "warmup" => warmup }, key: "bench:#{warmup}:#{i}:#{SecureRandom.hex(4)}")
         message = @store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         raise "outbox not claimed" unless message && message.fetch("id") == outbox_id
+
         @store.ack_outbox(outbox_id, worker_id: "outbox-worker")
       end
 
@@ -327,6 +332,7 @@ module Durababble
         outbox_id = @store.enqueue_outbox(workflow_id:, topic: "bench.topic", payload: { "i" => i, "warmup" => warmup }, key: "bench-expired:#{warmup}:#{i}:#{SecureRandom.hex(4)}")
         first = @store.claim_outbox(worker_id: "outbox-owner", lease_seconds: 30)
         raise "outbox not initially claimed" unless first && first.fetch("id") == outbox_id
+
         expire_outbox_lease(outbox_id)
         second = @store.claim_outbox(worker_id: "outbox-reclaimer", lease_seconds: 30)
         raise "expired outbox was not reclaimed" unless second && second.fetch("id") == outbox_id
@@ -348,17 +354,18 @@ module Durababble
           workflow_id:,
           position: 0,
           name: "timer",
-          wait_request: Durababble.wait_until(Time.now - 1, context: { "i" => i })
+          wait_request: Durababble.wait_until(Time.now - 1, context: { "i" => i }),
         )
         woke = @store.wake_due_timers(now: Time.now)
-        raise "due timer not woken" unless woke >= 1
+        raise "due timer not woken" if woke < 1
+
         @store.complete_workflow(workflow_id, result: { "woke" => true })
       end
 
       def bench_large_table_signal_miss(i, warmup:)
         ensure_large_fixture!
         woken = @store.signal_event("bench:missing:event:#{warmup}:#{i}:#{SecureRandom.hex(4)}", payload: { "ok" => false })
-        raise "missing event unexpectedly woke waits" unless woken.zero?
+        raise "missing event unexpectedly woke waits" if woken.nonzero?
       end
 
       def bench_rpc_ping(i, warmup:)
@@ -382,7 +389,7 @@ module Durababble
           workflows: { workflow.name => workflow },
           worker_id:,
           lease_seconds: 30,
-          migrate: false
+          migrate: false,
         )
       end
 
@@ -491,7 +498,7 @@ module Durababble
           "DURABABBLE_DATABASE_URL" => @database_url,
           "DURABABBLE_BENCH_SCHEMA" => @schema,
           "DURABABBLE_BENCH_FIXTURE_SIZE" => @fixture_size.to_s,
-          "DURABABBLE_BENCH_SEED" => @seed.to_s
+          "DURABABBLE_BENCH_SEED" => @seed.to_s,
         }
         system(env, ruby, script, exception: true)
       end
@@ -500,7 +507,7 @@ module Durababble
         @rpc ||= Durababble::RpcClient.spawn(
           command: [RbConfig.ruby, File.expand_path("rpc_worker.rb", __dir__)],
           env: { "DURABABBLE_DATABASE_URL" => @database_url, "DURABABBLE_BENCH_SCHEMA" => @schema },
-          timeout: 10
+          timeout: 10,
         )
       end
 
@@ -515,7 +522,7 @@ module Durababble
           pid: Process.pid,
           gc: GC.stat.slice(:heap_live_slots, :heap_free_slots, :total_allocated_objects),
           git_sha: git("rev-parse", "HEAD"),
-          git_branch: git("branch", "--show-current")
+          git_branch: git("branch", "--show-current"),
         }
       end
 
@@ -544,14 +551,13 @@ module Durababble
 
       def csv(report)
         CSV.generate do |csv|
-          csv << %w[profile started_at git_sha operation iterations ops_per_second median_ms p95_ms p99_ms avg_allocations fixture_size]
+          csv << ["profile", "started_at", "git_sha", "operation", "iterations", "ops_per_second", "median_ms", "p95_ms", "p99_ms", "avg_allocations", "fixture_size"]
           report.fetch(:operations).each do |op|
             csv << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
           end
         end
       end
     end
-
   end
 end
 
@@ -563,7 +569,7 @@ options = {
   fixture_size: Integer(ENV.fetch("DURABABBLE_BENCH_FIXTURE_SIZE", ENV.fetch("DURABABBLE_BENCH_PROFILE", "smoke") == "full" ? "100000" : "2000")),
   seed: Integer(ENV.fetch("DURABABBLE_BENCH_SEED", "12345")),
   samples: Integer(ENV.fetch("DURABABBLE_BENCH_SAMPLES", "1")),
-  keep_schema: ENV["DURABABBLE_BENCH_KEEP_SCHEMA"] == "1"
+  keep_schema: ENV["DURABABBLE_BENCH_KEEP_SCHEMA"] == "1",
 }
 
 OptionParser.new do |parser|

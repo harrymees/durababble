@@ -1,0 +1,13 @@
+.
+--ignore=.git/
+--ignore=vendor/
+--ignore=bench/
+--ignore=docs/
+--ignore=examples/
+--ignore=sig/
+--ignore=test/
+--allowed-extension=.rb
+--allowed-extension=.rbi
+--parser=prism
+--enable-experimental-rbs-comments
+--typed-super=true

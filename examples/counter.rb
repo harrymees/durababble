@@ -1,8 +1,9 @@
+# typed: false
 # frozen_string_literal: true
 
 require_relative "../lib/durababble"
 
-database_url = ENV.fetch("DURABABBLE_DATABASE_URL", "postgresql://yugabyte@127.0.0.1:15433/yugabyte")
+database_url = ENV.fetch("DURABABBLE_DATABASE_URL", "mysql://root@127.0.0.1:3306/sidekick_server_development")
 store = Durababble::Store.connect(database_url:, schema: "durababble_example")
 engine = Durababble::Engine.new(store:)
 
