@@ -170,9 +170,6 @@ No `.with(id) { ... }` block API is part of v1. Multi-method atomicity should be
 ### Typing
 
 Durababble's runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
-The public RBS contract uses explicit generic parameters plus named serialized-payload aliases for values that are intentionally Paquito/Marshal-backed.
-`rbs validate` checks signature syntax and name resolution, Sorbet checks the inline implementation comments, and the repo-local strict RBS gate rejects new dynamic escape annotations in public signatures and documented code examples.
-Steep and TypeProf are not part of the current gate: Steep would require a larger public/private signature split before it provides useful implementation checking for this prototype, and TypeProf inference is too broad for the durable API's metaprogrammed `step`, `expose`, and proxy surfaces.
 
 ## Idempotency contract
 

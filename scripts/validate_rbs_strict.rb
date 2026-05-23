@@ -13,6 +13,7 @@ markdown_paths = [
   File.join(root, "README.md"),
   File.join(root, "WORKFLOW.md"),
   File.join(root, "bench/README.md"),
+  *Dir.glob(File.join(root, ".agents/skills/**/*.md")),
   *Dir.glob(File.join(root, "docs/**/*.md")),
 ].select { |path| File.file?(path) }.sort.uniq
 
