@@ -240,6 +240,19 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 2, failures.length
     assert_includes failures.first.last.join, "running attempt"
+    assert_includes failures.first.last.join, "live step"
+  end
+
+  test "reports deterministic store shape invariant violations" do
+    failures = Durababble::Deterministic.search("bug_invalid_store_shape", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "running workflow"
+    assert_includes messages, "no attempt history"
+    assert_includes messages, "references missing step"
+    assert_includes messages, "references missing workflow"
+    assert_includes messages, "processing outbox"
   end
 
   test "fuzzes each unique scenario target across many deterministic seeds" do

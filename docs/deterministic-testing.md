@@ -54,6 +54,7 @@ Current scenarios:
 - `grpc_workflow_rpc_transport_fault_reroute` — owner transport failures race with lease movement, forcing the router to refresh the active lease and reroute.
 - `grpc_wakeup_fault_matrix` — `AwakenBatch`, `DeliverMessage`, and `EvictLease` wakeups are exposed to drop, duplicate, timeout, RST, EOF, and unavailable faults while polling remains the correctness path.
 - `bug_duplicate_completion` — intentionally broken fixture used to prove invariant detection reports violations.
+- `bug_invalid_store_shape` — intentionally broken fixture used to prove DST catches invalid virtual-store row shape, missing cross-references, and missing leases.
 
 The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping.
 Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.

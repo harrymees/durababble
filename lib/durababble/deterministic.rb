@@ -841,6 +841,60 @@ module Durababble
       end
 
       #: (untyped) -> untyped
+      def bug_invalid_store_shape(seed)
+        run(seed, "bug_invalid_store_shape") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.mark_workflow_running(id)
+
+          steps_state = h.store.instance_variable_get(:@steps)
+          attempts_state = h.store.instance_variable_get(:@attempts)
+          waits_state = h.store.instance_variable_get(:@waits)
+          outbox_state = h.store.instance_variable_get(:@outbox)
+
+          steps_state[id][0] = {
+            "workflow_id" => id,
+            "position" => 0,
+            "name" => "orphaned_step",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state[id] << {
+            "id" => "bad-attempt",
+            "workflow_id" => id,
+            "position" => 1,
+            "name" => "missing_step",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          waits_state["bad-wait"] = {
+            "id" => "bad-wait",
+            "workflow_id" => id,
+            "position" => 2,
+            "kind" => "event",
+            "event_key" => "missing-step",
+            "wake_at" => nil,
+            "context" => {},
+            "payload" => nil,
+            "status" => "completed",
+          }
+          outbox_state["bad-outbox"] = {
+            "id" => "bad-outbox",
+            "workflow_id" => "missing-workflow",
+            "topic" => "email",
+            "payload" => {},
+            "key" => "bad-outbox",
+            "status" => "processing",
+            "locked_by" => nil,
+            "locked_until" => nil,
+          }
+        end
+      end
+
+      #: (untyped) -> untyped
       def rpc_fault_injection(seed)
         run(seed, "rpc_fault_injection") do |h|
           outcomes = ["success", "timeout", "connection_error", "eof", "remote_error", "idle_disconnect_reconnect"]
@@ -1549,12 +1603,14 @@ module Durababble
       def stale_wait_signal_terminal_workflow(seed)
         run(seed, "stale_wait_signal_terminal_workflow") do |h|
           id = h.store.create_workflow(name: "waiting", input: { "seed" => seed })
+          h.store.record_step_started(workflow_id: id, position: 0, name: "wait")
           h.store.record_wait(
             workflow_id: id,
             position: 0,
             name: "wait",
             wait_request: Durababble.wait_event("stale:#{seed}", { "seed" => seed }),
           )
+          h.store.signal_event("stale:#{seed}", payload: { "early" => true })
           h.store.complete_workflow(id, result: { "done" => true })
           h.scheduler.schedule(actor: "signaler", delay: h.scheduler.rng.int(5), name: "stale_signal") do
             signaled = h.store.signal_event("stale:#{seed}", payload: { "late" => true })
@@ -2057,21 +2113,144 @@ module Durababble
           violations << "check errored: #{description}: #{e.class}: #{e.message}"
         end
 
+        verify_store_invariants!
+      end
+
+      private
+
+      #: () -> untyped
+      def verify_store_invariants!
         workflows_state = store.instance_variable_get(:@workflows)
         steps_state = store.instance_variable_get(:@steps)
         attempts_state = store.instance_variable_get(:@attempts)
+        waits_state = store.instance_variable_get(:@waits)
+        outbox_state = store.instance_variable_get(:@outbox)
+
+        verify_workflow_invariants!(workflows_state)
+        verify_step_invariants!(workflows_state, steps_state, attempts_state)
+        verify_wait_invariants!(workflows_state, steps_state, waits_state)
+        verify_outbox_invariants!(workflows_state, outbox_state)
+      end
+
+      WORKFLOW_STATUSES = ["pending", "running", "waiting", "failed", "completed"].freeze
+      STEP_STATUSES = ["running", "waiting", "failed", "completed"].freeze
+      ATTEMPT_STATUSES = ["running", "waiting", "failed", "completed"].freeze
+      WAIT_STATUSES = ["pending", "completed"].freeze
+      OUTBOX_STATUSES = ["pending", "processing", "processed"].freeze
+      LIVE_ATTEMPT_STATUSES = ["running", "waiting"].freeze
+      TERMINAL_WORKFLOW_STATUSES = ["completed", "failed"].freeze
+
+      #: (untyped) -> untyped
+      def verify_workflow_invariants!(workflows_state)
         workflows_state.each do |id, row|
-          if row.fetch("status") == "completed" && row.fetch("locked_by")
-            violations << "completed workflow #{id} still locked"
+          status = row.fetch("status")
+          violations << "workflow #{id} has unknown status #{status.inspect}" unless WORKFLOW_STATUSES.include?(status)
+          if row.fetch("locked_by").nil? != row.fetch("locked_until").nil?
+            violations << "workflow #{id} has partial lease"
           end
-          completed_positions = steps_state[id].values.select { |step| step.fetch("status") == "completed" }.map { |step| step.fetch("position") }
+          if status == "running"
+            violations << "running workflow #{id} has no lease" unless row.fetch("locked_by") && row.fetch("locked_until")
+          elsif row.fetch("locked_by") || row.fetch("locked_until")
+            violations << "#{status} workflow #{id} still locked"
+          end
+        end
+      end
+
+      #: (untyped, untyped, untyped) -> untyped
+      def verify_step_invariants!(workflows_state, steps_state, attempts_state)
+        steps_state.each do |workflow_id, steps|
+          violations << "steps exist for missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
+          completed_positions = steps.values.select { |step| step.fetch("status") == "completed" }.map { |step| step.fetch("position") }
           if completed_positions.uniq.length != completed_positions.length
-            violations << "duplicate completed step positions for #{id}"
+            violations << "duplicate completed step positions for #{workflow_id}"
           end
-          attempts_state[id].each do |attempt|
-            if attempt.fetch("status") == "running" && row.fetch("status") == "completed"
-              violations << "completed workflow #{id} has running attempt #{attempt.fetch("id")}"
+          steps.each do |position, step|
+            status = step.fetch("status")
+            violations << "step #{workflow_id}/#{position} has unknown status #{status.inspect}" unless STEP_STATUSES.include?(status)
+            if step.fetch("workflow_id") != workflow_id || step.fetch("position") != position
+              violations << "step #{workflow_id}/#{position} has inconsistent identity"
             end
+
+            attempts = attempts_state[workflow_id].select { |attempt| attempt.fetch("position") == position }
+            if attempts.empty?
+              violations << "step #{workflow_id}/#{position} has no attempt history"
+            end
+            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && LIVE_ATTEMPT_STATUSES.include?(status)
+              violations << "#{workflows_state.fetch(workflow_id).fetch("status")} workflow #{workflow_id} has live step #{position}"
+            end
+
+            next if attempts.empty?
+
+            latest = attempts.last
+            if latest.fetch("name") != step.fetch("name")
+              violations << "step #{workflow_id}/#{position} name #{step.fetch("name").inspect} does not match latest attempt #{latest.fetch("name").inspect}"
+            end
+            if latest.fetch("status") != status
+              violations << "step #{workflow_id}/#{position} status #{status.inspect} does not match latest attempt #{latest.fetch("status").inspect}"
+            end
+          end
+        end
+
+        attempts_state.each do |workflow_id, attempts|
+          violations << "attempts exist for missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
+          live_attempts = Hash.new { |hash, key| hash[key] = [] }
+          attempts.each do |attempt|
+            position = attempt.fetch("position")
+            status = attempt.fetch("status")
+            violations << "attempt #{attempt.fetch("id")} has unknown status #{status.inspect}" unless ATTEMPT_STATUSES.include?(status)
+            if attempt.fetch("workflow_id") != workflow_id
+              violations << "attempt #{attempt.fetch("id")} has inconsistent workflow id"
+            end
+            live_attempts[position] << attempt if LIVE_ATTEMPT_STATUSES.include?(status)
+            workflow = workflows_state[workflow_id]
+            if workflow&.fetch("status") == "completed" && status == "running"
+              violations << "completed workflow #{workflow_id} has running attempt #{attempt.fetch("id")}"
+            end
+            unless steps_state[workflow_id].key?(position)
+              violations << "attempt #{attempt.fetch("id")} references missing step #{workflow_id}/#{position}"
+            end
+          end
+          live_attempts.each do |position, live|
+            next if live.length <= 1
+
+            ids = live.map { |attempt| attempt.fetch("id") }.join(",")
+            violations << "workflow #{workflow_id} step #{position} has multiple live attempts #{ids}"
+          end
+        end
+      end
+
+      #: (untyped, untyped, untyped) -> untyped
+      def verify_wait_invariants!(workflows_state, steps_state, waits_state)
+        waits_state.each_value do |wait|
+          wait_id = wait.fetch("id")
+          workflow_id = wait.fetch("workflow_id")
+          position = wait.fetch("position")
+          status = wait.fetch("status")
+          violations << "wait #{wait_id} has unknown status #{status.inspect}" unless WAIT_STATUSES.include?(status)
+          violations << "wait #{wait_id} references missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
+          unless steps_state[workflow_id].key?(position)
+            violations << "wait #{wait_id} references missing step #{workflow_id}/#{position}"
+          end
+          step = steps_state[workflow_id][position]
+          if status == "completed" && step && step.fetch("status") != "completed"
+            violations << "completed wait #{wait_id} has non-completed step #{workflow_id}/#{position}"
+          end
+        end
+      end
+
+      #: (untyped, untyped) -> untyped
+      def verify_outbox_invariants!(workflows_state, outbox_state)
+        outbox_state.each_value do |message|
+          outbox_id = message.fetch("id")
+          status = message.fetch("status")
+          violations << "outbox #{outbox_id} has unknown status #{status.inspect}" unless OUTBOX_STATUSES.include?(status)
+          unless workflows_state.key?(message.fetch("workflow_id"))
+            violations << "outbox #{outbox_id} references missing workflow #{message.fetch("workflow_id")}"
+          end
+          next unless status == "processing"
+
+          if message.fetch("locked_by").nil? || message.fetch("locked_until").nil?
+            violations << "processing outbox #{outbox_id} has no lease"
           end
         end
       end
