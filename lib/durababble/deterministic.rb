@@ -863,7 +863,7 @@ module Durababble
             end
           end
           h.check("outbox key stayed unique") do
-            h.store.outbox_messages.count { |message| message.fetch("key") == "email:#{seed}" } == 1
+            h.store.outbox_messages.one? { |message| message.fetch("key") == "email:#{seed}" }
           end
         end
       end
@@ -1994,7 +1994,7 @@ module Durababble
         workflow
       end
 
-      #: (untyped, untyped) { (untyped) -> untyped } -> untyped
+      #: (untyped, untyped, ?mutation: untyped) { (untyped) -> untyped } -> untyped
       def run(seed, scenario, mutation: nil, &block)
         trace = Trace.new
         scheduler = Scheduler.new(seed:, trace:)
