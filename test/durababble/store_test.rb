@@ -363,6 +363,121 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(KeyError) { store.workflow("missing") }
   end
 
+  test "handles postgres cancellation request edge branches" do
+    assert_raises(KeyError) do
+      pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+        .request_workflow_cancellation(workflow_id: "missing", reason: "stop")
+    end
+
+    assert_hash_includes(
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "id" => "done", "status" => "completed", "result" => pg_dump({ "done" => true }) }]),
+      ])).request_workflow_cancellation(workflow_id: "done", reason: "stop"),
+      "status" => "completed",
+      "result" => { "done" => true },
+    )
+
+    running = ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "running", "status" => "running", "cancel_requested_at" => nil }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new([{ "id" => "running", "status" => "running", "cancel_requested_at" => "now" }]),
+    ])
+    pg_store(running).request_workflow_cancellation(workflow_id: "running", reason: "stop")
+    refute running.exec_params_calls.any? { |sql, _params| sql.include?("SET status = 'canceling'") }
+
+    waiting = ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "waiting", "status" => "waiting", "cancel_requested_at" => nil }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new([{ "id" => "waiting", "status" => "canceling", "cancel_requested_at" => "now" }]),
+    ])
+    pg_store(waiting).request_workflow_cancellation(workflow_id: "waiting", reason: "stop")
+    assert waiting.exec_params_calls.any? { |sql, _params| sql.include?("SET status = 'canceling'") }
+
+    repeated = ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "repeat", "status" => "waiting", "cancel_requested_at" => "now" }]),
+      PgResult.new([{ "id" => "repeat", "status" => "waiting", "cancel_requested_at" => "now" }]),
+    ])
+    pg_store(repeated).request_workflow_cancellation(workflow_id: "repeat", reason: "stop")
+    refute repeated.exec_params_calls.any? { |sql, _params| sql.include?("cancel_reason = $2") }
+
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new])).workflow_cancellation("missing")
+    assert_equal(
+      { "workflow_id" => "wf", "reason" => "stop", "requested_at" => "now", "delivered_at" => nil },
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "workflow_id" => "wf", "reason" => "stop", "requested_at" => "now", "delivered_at" => nil }]),
+      ])).workflow_cancellation("wf"),
+    )
+  end
+
+  test "handles postgres cached event wait branches" do
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).record_wait(
+      workflow_id: "timer",
+      position: 0,
+      name: "timer",
+      wait_request: Durababble::WaitRequest.new(kind: "timer", wake_at: Time.utc(2024, 1, 1), event_key: nil, context: { "timer" => true }),
+    )
+
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new([{ "event_key" => "ready" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).record_wait(
+      workflow_id: "event",
+      position: 1,
+      name: "wait",
+      wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "ready", context: { "base" => true }),
+    )
+
+    cached_payload = { "signal" => true }
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new([{ "event_key" => "ready" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new([{ "id" => "event-signal", "payload" => pg_dump(cached_payload) }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).record_wait(
+      workflow_id: "cached",
+      position: 2,
+      name: "wait",
+      wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "ready", context: { "base" => true }),
+    )
+
+    assert_equal 1, pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new([{ "event_key" => "ready" }]),
+      PgResult.new([{ "workflow_id" => "wf", "position" => "3", "context" => pg_dump({ "base" => true }) }]),
+      PgResult.new,
+      PgResult.new,
+    ])).signal_event("ready", payload: { "signal" => true })
+
+    assert_equal 0, pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new([{ "event_key" => "ready" }]),
+      PgResult.new,
+      PgResult.new,
+    ])).signal_event("ready", payload: { "signal" => true })
+  end
+
   test "handles postgres fence replay, serialization migration, retry, and helper branches" do
     completed = { "status" => "completed", "result" => pg_dump({ "done" => true }), "error" => nil }
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }
