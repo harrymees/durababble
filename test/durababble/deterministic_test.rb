@@ -218,6 +218,33 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal "pending", store.workflow(workflow_id).fetch("status")
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
 
+    legacy_waits = store.instance_variable_get(:@waits)
+    legacy_waits["legacy-step-wait"] = {
+      "id" => "legacy-step-wait",
+      "workflow_id" => workflow_id,
+      "position" => 9,
+      "scope" => "step",
+      "kind" => "event",
+      "event_key" => "legacy-step",
+      "wake_at" => nil,
+      "context" => {},
+      "payload" => nil,
+      "status" => "pending",
+    }
+    assert_equal 0, store.signal_event("legacy-step", payload: { "ignored" => true })
+    assert_equal "pending", legacy_waits.fetch("legacy-step-wait").fetch("status")
+
+    running_wait_id = store.enqueue_workflow(name: "running-wait", input: {})
+    store.claim_workflow(workflow_id: running_wait_id, worker_id: "worker-running", lease_seconds: 10)
+    store.record_workflow_wait(
+      workflow_id: running_wait_id,
+      position: 0,
+      wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "running-event", context: {}),
+    )
+    store.mark_workflow_running(running_wait_id, worker_id: "worker-running", lease_seconds: 10)
+    assert_equal 1, store.signal_event("running-event", payload: { "finished" => true })
+    assert_equal "running", store.workflow(running_wait_id).fetch("status")
+
     store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
     store.record_step_started(workflow_id:, command_id: 1, name: "cancelable")
     store.record_step_canceled(workflow_id:, position: 1, error: "workflow cancellation requested")

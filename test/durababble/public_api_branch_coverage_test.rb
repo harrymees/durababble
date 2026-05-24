@@ -67,6 +67,14 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  class BranchUnnamedObject < Durababble::DurableObject
+    @__durababble_wrapping = true
+
+    def wrapped_macro_guard; end
+
+    @__durababble_wrapping = false
+  end
+
   class BranchTestStore
     attr_reader :events, :completed_commands, :failed_commands, :migrations, :closed
 
@@ -120,6 +128,17 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     def fail_object_command(command_id:, error:, worker_id: nil)
       @failed_commands << [command_id, error]
+    end
+  end
+
+  class BranchWorkerStore
+    attr_reader :workflow_names
+
+    def migrate!; end
+
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+      @workflow_names = workflow_names
+      nil
     end
   end
 
@@ -189,6 +208,23 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     transient = BranchTestDurableObject.new
     assert_equal({ "value" => 9 }, transient.update_state("value" => 9))
+  end
+
+  test "covers public API fallback branches" do
+    assert_match(/\Adurababble_har_1299_[0-9a-f]{12}\z/, Durababble.workspace_schema(Dir.pwd))
+    missing_path = File.join(Dir.pwd, "tmp", "definitely-missing-workspace")
+    refute_path_exists missing_path
+    assert_match(/\Adurababble_definitely_missing_workspace_[0-9a-f]{12}\z/, Durababble.workspace_schema(missing_path))
+    assert_equal "branch_unnamed_object", BranchUnnamedObject.object_type
+    refute_includes BranchUnnamedObject.exposed_queries, :wrapped_macro_guard
+  end
+
+  test "covers worker workflow array normalization" do
+    store = BranchWorkerStore.new
+    worker = Durababble::Worker.new(store:, workflows: [BranchTestWorkflow], worker_id: "branch-worker", migrate: false)
+
+    assert_equal 0, worker.run_until_idle
+    assert_equal ["branch_test_workflow"], store.workflow_names
   end
 
   test "configures a default store when no previous store exists" do

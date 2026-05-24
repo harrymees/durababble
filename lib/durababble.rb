@@ -89,17 +89,12 @@ module Durababble
 
     #: (untyped, untyped) -> untyped
     def handle_wait_request(operation, wait_request)
-      step_context = if const_defined?(:StepExecutionContext, false)
-        StepExecutionContext.current
-      end
+      step_context = StepExecutionContext.current
       if step_context
         raise Error, "Durababble.#{operation} is workflow-level only and cannot be called from a durable step"
       end
 
-      execution = if const_defined?(:WorkflowExecutionContext, false)
-        WorkflowExecutionContext.current
-      end
-      execution ||= Thread.current[:durababble_workflow_execution]
+      execution = WorkflowExecutionContext.current || Thread.current[:durababble_workflow_execution]
       unless execution
         raise Error, "Durababble.#{operation} must be called from workflow execution"
       end
