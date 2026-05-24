@@ -5,6 +5,8 @@ require "async"
 require "async/condition"
 require "thread"
 
+Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?(:durababble_workflow_execution)
+
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
 
@@ -16,6 +18,53 @@ module Durababble
 
     alias_method :heartbeat, :record
   end
+
+  module WorkflowExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_workflow_execution
+      end
+
+      #: (untyped) { (?) -> untyped } -> untyped
+      def with_current(execution, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_workflow_execution
+        fiber.durababble_workflow_execution = execution
+        block.call
+      ensure
+        fiber.durababble_workflow_execution = previous
+      end
+    end
+  end
+
+  module AsyncTaskWorkflowContextPatch
+    #: () { (?) -> untyped } -> untyped
+    def schedule(&block)
+      task = self #: as untyped
+      if task.transient?
+        execution = WorkflowExecutionContext.current
+        return super(&block) unless execution
+
+        return super do
+          WorkflowExecutionContext.with_current(nil) { block.call }
+        end
+      end
+
+      execution = WorkflowExecutionContext.current
+      return super(&block) unless execution
+
+      execution.register_workflow_task(self)
+      super do
+        WorkflowExecutionContext.with_current(execution) { block.call }
+      ensure
+        execution.unregister_workflow_task(self)
+      end
+    end
+  end
+
+  Async::Task.prepend(AsyncTaskWorkflowContextPatch) unless Async::Task < AsyncTaskWorkflowContextPatch
 
   class WorkflowTask
     #: (untyped) -> void
@@ -95,7 +144,7 @@ module Durababble
       @next_command_id = 0
       @futures = {}
       @workflow_tasks = {}
-      @workflow_task_count = 1
+      @workflow_task_count = 0
       @step_contexts = {}
       @store_mutex = Mutex.new
       @resolution_index = 0
@@ -118,19 +167,29 @@ module Durababble
       @step_contexts[Async::Task.current]
     end
 
+    #: (untyped) -> void
+    def register_workflow_task(task)
+      return if @workflow_tasks.key?(task)
+
+      @workflow_tasks[task] = true
+      @workflow_task_count += 1
+    end
+
+    #: (untyped) -> void
+    def unregister_workflow_task(task)
+      return unless @workflow_tasks.delete(task)
+
+      @workflow_task_count -= 1
+    end
+
     #: () { -> untyped } -> untyped
     def async(&block)
       assert_workflow_task!("async")
       future = CommandFuture.new(nil)
-      @workflow_task_count += 1
-      @root_task.async do |task|
-        register_workflow_task(task)
+      @root_task.async do
         future.resolve(block.call)
       rescue StandardError => e
         future.reject(e)
-      ensure
-        unregister_workflow_task(task)
-        @workflow_task_count -= 1
       end
       WorkflowTask.new(future)
     end
@@ -193,11 +252,6 @@ module Durababble
 
     private
 
-    #: (untyped) -> void
-    def register_workflow_task(task)
-      @workflow_tasks[task] = true
-    end
-
     #: () -> untyped
     def raise_if_cancel_requested!
       return if @cancellation_delivered
@@ -206,11 +260,6 @@ module Durababble
       return unless cancellation
 
       raise cancellation_error_from(cancellation)
-    end
-
-    #: (untyped) -> void
-    def unregister_workflow_task(task)
-      @workflow_tasks.delete(task)
     end
 
     #: (untyped, untyped) -> untyped
@@ -312,7 +361,7 @@ module Durababble
 
     #: (untyped, step: untyped, shape: untyped) { -> untyped } -> void
     def dispatch_command!(command_id, step:, shape:, &block)
-      @root_task.async do |task|
+      @root_task.async(transient: true) do |task|
         raise_if_cancel_requested!
         synchronize_store do
           @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name)
@@ -565,13 +614,17 @@ module Durababble
         )
         workflow = workflow_class.new
         workflow.__durababble_execution__ = execution
-        result = workflow.execute(initial_input || initial_context(workflow_id))
-        execution.validate_replay_complete!
-        assert_workflow_lease!(workflow_id)
-        if execution.cancellation_delivered?
-          @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
-        else
-          @store.complete_workflow(workflow_id, result:)
+        result = WorkflowExecutionContext.with_current(execution) do
+          workflow.execute(initial_input || initial_context(workflow_id))
+        end
+        WorkflowExecutionContext.with_current(execution) do
+          execution.validate_replay_complete!
+          assert_workflow_lease!(workflow_id)
+          if execution.cancellation_delivered?
+            @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
+          else
+            @store.complete_workflow(workflow_id, result:)
+          end
         end
         crash!(:workflow_completed)
       rescue StandardError => e
