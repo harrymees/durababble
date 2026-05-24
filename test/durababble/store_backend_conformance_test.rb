@@ -95,6 +95,46 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "persists pre-wait events and consumes each cached event once with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        store.migrate!
+
+        assert_equal 0, store.signal_event("approval:pre-wait", payload: { "approved" => true })
+
+        first_workflow_id = store.create_workflow(name: "late-waiter", input: { "first" => true })
+        first_wait_id = store.record_wait(
+          workflow_id: first_workflow_id,
+          position: 0,
+          name: "approval",
+          wait_request: Durababble.wait_event("approval:pre-wait", { "before" => true }),
+        )
+
+        assert_hash_includes store.workflow(first_workflow_id), "status" => "pending"
+        assert_hash_includes(
+          store.waits_for(first_workflow_id).first,
+          "id" => first_wait_id,
+          "status" => "completed",
+          "payload" => { "approved" => true },
+        )
+        assert_hash_includes(
+          store.steps_for(first_workflow_id).first,
+          "status" => "completed",
+          "result" => { "before" => true, "approved" => true },
+        )
+
+        second_workflow_id = store.create_workflow(name: "late-waiter", input: { "second" => true })
+        store.record_wait(
+          workflow_id: second_workflow_id,
+          position: 0,
+          name: "approval",
+          wait_request: Durababble.wait_event("approval:pre-wait", { "second" => true }),
+        )
+
+        assert_hash_includes store.workflow(second_workflow_id), "status" => "waiting"
+        assert_hash_includes store.waits_for(second_workflow_id).first, "status" => "pending"
+      end
+    end
+
     test "persists waits and wakes due timers once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         store.migrate!

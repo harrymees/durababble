@@ -140,7 +140,7 @@ account.balance
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
 - Worker polling with leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
-- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Timer waits, external event waits with durable pre-wait event caching, side-effect fences, and durable outbox primitives.
 - Retry due-time claims distinguish retryable failures from terminal failed workflows.
 - Lease-routed workflow RPC helpers.
 - Deterministic simulation tests for workflow safety and crash-recovery scenarios.

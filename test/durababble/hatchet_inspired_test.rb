@@ -214,6 +214,41 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
       end
     end
 
+    test "delivers an event emitted before the matching wait exists with #{backend.name}" do
+      with_durababble_store(backend, "hatchet_inspired") do |store|
+        store.migrate!
+        workflow = durababble_test_workflow("pre-wait-event") do
+          test_step("wait_for_event") do |ctx|
+            Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx)
+          end
+
+          test_step("finish") do |ctx|
+            ctx.merge("finished" => true)
+          end
+        end
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.name => workflow },
+          worker_id: "pre-wait-worker",
+          migrate: false,
+        )
+
+        assert_equal 0, store.signal_event("approval:early", payload: { "approved" => true })
+        workflow_id = store.enqueue_workflow(name: workflow.name, input: { "id" => "early" })
+
+        assert_equal :worked, worker.tick
+        assert_hash_includes store.workflow(workflow_id), "status" => "pending"
+        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+
+        assert_equal :worked, worker.tick
+        assert_hash_includes(
+          store.workflow(workflow_id),
+          "status" => "completed",
+          "result" => { "id" => "early", "approved" => true, "finished" => true },
+        )
+      end
+    end
+
     test "fans out one external event to all matching durable waiters with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
         store.migrate!

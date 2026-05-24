@@ -108,6 +108,23 @@ module Durababble
         )
       SQL
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("event_keys")} (
+          event_key text PRIMARY KEY,
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("event_signals")} (
+          id text PRIMARY KEY,
+          event_key text NOT NULL REFERENCES #{table("event_keys")}(event_key) ON DELETE CASCADE,
+          payload bytea NOT NULL,
+          status text NOT NULL,
+          wait_id text REFERENCES #{table("waits")}(id) ON DELETE SET NULL,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          delivered_at timestamptz
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("fences")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           key text NOT NULL,
@@ -452,6 +469,7 @@ module Durababble
     #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
     def record_wait(workflow_id:, position:, name:, wait_request:)
       transaction do
+        lock_event_key_without_transaction(wait_request.event_key) if wait_request.kind == "event"
         execute_params(<<~SQL, [workflow_id, position, name, dump_serialized(wait_request.context)])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
           VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
@@ -463,20 +481,38 @@ module Durababble
           INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
           VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::bytea, 'pending')
         SQL
-        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
-        update_latest_attempt(workflow_id:, position:, status: "waiting", result: wait_request.context, error: nil)
+        cached_event = wait_request.kind == "event" ? claim_cached_event_without_transaction(event_key: wait_request.event_key, wait_id:) : nil
+        if cached_event
+          payload = cached_event.fetch("payload")
+          execute_params(
+            "UPDATE #{table("waits")} SET status = 'completed', payload = $2::bytea, completed_at = now() WHERE id = $1",
+            [wait_id, dump_serialized(payload)],
+          )
+          record_step_completed_without_transaction(workflow_id:, position:, result: wait_request.context.merge(payload))
+          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
+        else
+          execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
+          update_latest_attempt(workflow_id:, position:, status: "waiting", result: wait_request.context, error: nil)
+        end
         wait_id
       end
     end
 
     #: (?now: untyped) -> untyped
     def wake_due_timers(now: Time.now)
-      complete_waits("kind = 'timer' AND wake_at <= $1::timestamptz", [timestamp(now)], {})
+      transaction do
+        complete_waits_without_transaction("kind = 'timer' AND wake_at <= $1::timestamptz", [timestamp(now)], {})
+      end
     end
 
     #: (untyped, ?payload: untyped) -> untyped
     def signal_event(event_key, payload: {})
-      complete_waits("kind = 'event' AND event_key = $1", [event_key], payload)
+      transaction do
+        lock_event_key_without_transaction(event_key)
+        completed = complete_waits_without_transaction("kind = 'event' AND event_key = $1", [event_key], payload)
+        cache_event_without_transaction(event_key:, payload:) if completed.zero?
+        completed
+      end
     end
 
     #: (untyped) -> untyped
@@ -688,29 +724,59 @@ module Durababble
     end
 
     #: (untyped, untyped, untyped) -> untyped
-    def complete_waits(where_sql, params, payload)
-      transaction do
-        returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
-          UPDATE #{table("waits")}
-          SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
-          WHERE id IN (
-            SELECT w.id FROM #{table("waits")} AS w
-            JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
-            WHERE w.status = 'pending'
-              AND wf.status = 'waiting'
-              AND #{where_sql}
-            FOR UPDATE OF w, wf SKIP LOCKED
-          )
-          RETURNING *
-        SQL
-        rows = returning.map { |row| decode_row(row) }
-        rows.each do |wait|
-          context = wait.fetch("context").merge(payload)
-          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
-          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
-        end
-        rows.length
+    def complete_waits_without_transaction(where_sql, params, payload)
+      returning = execute_params(<<~SQL, params + [dump_serialized(payload)])
+        UPDATE #{table("waits")}
+        SET status = 'completed', payload = $#{params.length + 1}::bytea, completed_at = now()
+        WHERE id IN (
+          SELECT w.id FROM #{table("waits")} AS w
+          JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
+          WHERE w.status = 'pending'
+            AND wf.status = 'waiting'
+            AND #{where_sql}
+          FOR UPDATE OF w, wf SKIP LOCKED
+        )
+        RETURNING *
+      SQL
+      rows = returning.map { |row| decode_row(row) }
+      rows.each do |wait|
+        context = wait.fetch("context").merge(payload)
+        record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
+        execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
       end
+      rows.length
+    end
+
+    #: (event_key: untyped, payload: untyped) -> untyped
+    def cache_event_without_transaction(event_key:, payload:)
+      execute_params(<<~SQL, [SecureRandom.uuid, event_key, dump_serialized(payload)])
+        INSERT INTO #{table("event_signals")} (id, event_key, payload, status)
+        VALUES ($1, $2, $3::bytea, 'pending')
+      SQL
+    end
+
+    #: (event_key: untyped, wait_id: untyped) -> untyped
+    def claim_cached_event_without_transaction(event_key:, wait_id:)
+      row = execute_params(<<~SQL, [event_key, wait_id]).first
+        UPDATE #{table("event_signals")}
+        SET status = 'delivered', wait_id = $2, delivered_at = now()
+        WHERE id = (
+          SELECT id
+          FROM #{table("event_signals")}
+          WHERE status = 'pending' AND event_key = $1
+          ORDER BY created_at, id
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+      SQL
+      decode_row(row) if row
+    end
+
+    #: (untyped) -> untyped
+    def lock_event_key_without_transaction(event_key)
+      execute_params("INSERT INTO #{table("event_keys")} (event_key) VALUES ($1) ON CONFLICT (event_key) DO NOTHING", [event_key])
+      execute_params("SELECT event_key FROM #{table("event_keys")} WHERE event_key = $1 FOR UPDATE", [event_key]).first
     end
 
     #: (workflow_id: untyped, position: untyped, result: untyped) -> untyped
@@ -836,6 +902,7 @@ module Durababble
       migrate_serialized_column!("step_attempts", "heartbeat_cursor")
       migrate_serialized_column!("waits", "context", not_null: true)
       migrate_serialized_column!("waits", "payload")
+      migrate_serialized_column!("event_signals", "payload", not_null: true)
       migrate_serialized_column!("fences", "result")
       migrate_serialized_column!("outbox", "payload", not_null: true)
       migrate_serialized_column!("durable_objects", "state")
@@ -852,6 +919,7 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, kind, event_key, created_at)")
       execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, kind, wake_at, created_at)")
       execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS event_signals_pending_idx ON #{table("event_signals")} (status, event_key, created_at)")
       execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
       execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
       execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
@@ -1051,6 +1119,27 @@ module Durababble
         )
       SQL
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("event_keys")} (
+          event_key VARCHAR(191) PRIMARY KEY,
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6)
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("event_signals")} (
+          id VARCHAR(191) PRIMARY KEY,
+          event_key VARCHAR(191) NOT NULL,
+          payload LONGBLOB NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          wait_id VARCHAR(191),
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          delivered_at DATETIME(6),
+          INDEX #{quote_ident(index_name("event_signals", "pending"))} (status, event_key, created_at),
+          INDEX #{quote_ident(index_name("event_signals", "wait"))} (wait_id),
+          FOREIGN KEY (event_key) REFERENCES #{table("event_keys")}(event_key) ON DELETE CASCADE,
+          FOREIGN KEY (wait_id) REFERENCES #{table("waits")}(id) ON DELETE SET NULL
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
           object_type VARCHAR(191) NOT NULL,
           object_id VARCHAR(191) NOT NULL,
@@ -1086,7 +1175,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "durable_objects", "event_signals", "event_keys", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1451,6 +1540,7 @@ module Durababble
     #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
     def record_wait(workflow_id:, position:, name:, wait_request:)
       transaction do
+        lock_event_key_without_transaction(wait_request.event_key) if wait_request.kind == "event"
         serialized_context = dump_serialized(wait_request.context)
         execute_params(<<~SQL, [workflow_id, position, name, serialized_context])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
@@ -1462,14 +1552,22 @@ module Durababble
           INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         SQL
-        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
-        update_latest_attempt_serialized(
-          workflow_id:,
-          position:,
-          status: "waiting",
-          serialized_result: serialized_context,
-          error: nil,
-        )
+        cached_event = wait_request.kind == "event" ? claim_cached_event_without_transaction(event_key: wait_request.event_key, wait_id:) : nil
+        if cached_event
+          payload = cached_event.fetch("payload")
+          execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait_id])
+          record_step_completed(workflow_id:, position:, result: wait_request.context.merge(payload))
+          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+        else
+          execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+          update_latest_attempt_serialized(
+            workflow_id:,
+            position:,
+            status: "waiting",
+            serialized_result: serialized_context,
+            error: nil,
+          )
+        end
         wait_id
       end
     end
@@ -1481,12 +1579,19 @@ module Durababble
 
     #: (untyped, ?payload: untyped) -> untyped
     def signal_event(event_key, payload: {})
-      complete_waits_mysql("kind = 'event' AND event_key = ?", [event_key], payload)
+      transaction do
+        lock_event_key_without_transaction(event_key)
+        completed = complete_waits_mysql_without_transaction("kind = 'event' AND event_key = ?", [event_key], payload)
+        cache_event_without_transaction(event_key:, payload:) if completed.zero?
+        completed
+      end
     end
 
     #: (?now: untyped) -> untyped
     def wake_due_timers(now: Time.now)
-      complete_waits_mysql("kind = 'timer' AND wake_at <= ?", [now], {})
+      transaction do
+        complete_waits_mysql_without_transaction("kind = 'timer' AND wake_at <= ?", [now], {})
+      end
     end
 
     #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
@@ -1640,24 +1745,55 @@ module Durababble
     end
 
     #: (untyped, untyped, untyped) -> untyped
-    def complete_waits_mysql(where_sql, params, payload)
-      transaction do
-        waits = execute_params(<<~SQL, params).map { |row| decode_row(row) }
-          SELECT w.* FROM #{table("waits")} AS w
-          JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
-          WHERE w.status = 'pending'
-            AND wf.status = 'waiting'
-            AND #{where_sql}
-          FOR UPDATE SKIP LOCKED
-        SQL
-        waits.each do |wait|
-          execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
-          context = wait.fetch("context").merge(payload)
-          record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
-          execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
-        end
-        waits.length
+    def complete_waits_mysql_without_transaction(where_sql, params, payload)
+      waits = execute_params(<<~SQL, params).map { |row| decode_row(row) }
+        SELECT w.* FROM #{table("waits")} AS w
+        JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
+        WHERE w.status = 'pending'
+          AND wf.status = 'waiting'
+          AND #{where_sql}
+        FOR UPDATE SKIP LOCKED
+      SQL
+      waits.each do |wait|
+        execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
+        context = wait.fetch("context").merge(payload)
+        record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
+        execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
       end
+      waits.length
+    end
+
+    #: (event_key: untyped, payload: untyped) -> untyped
+    def cache_event_without_transaction(event_key:, payload:)
+      execute_params(<<~SQL, [SecureRandom.uuid, event_key, dump_serialized(payload)])
+        INSERT INTO #{table("event_signals")} (id, event_key, payload, status)
+        VALUES (?, ?, ?, 'pending')
+      SQL
+    end
+
+    #: (event_key: untyped, wait_id: untyped) -> untyped
+    def claim_cached_event_without_transaction(event_key:, wait_id:)
+      event = execute_params(<<~SQL, [event_key]).map { |row| decode_row(row) }.first
+        SELECT *
+        FROM #{table("event_signals")}
+        WHERE status = 'pending' AND event_key = ?
+        ORDER BY created_at, id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      SQL
+      return unless event
+
+      execute_params(
+        "UPDATE #{table("event_signals")} SET status = 'delivered', wait_id = ?, delivered_at = NOW(6) WHERE id = ?",
+        [wait_id, event.fetch("id")],
+      )
+      event
+    end
+
+    #: (untyped) -> untyped
+    def lock_event_key_without_transaction(event_key)
+      execute_params("INSERT IGNORE INTO #{table("event_keys")} (event_key) VALUES (?)", [event_key])
+      execute_params("SELECT event_key FROM #{table("event_keys")} WHERE event_key = ? FOR UPDATE", [event_key]).first
     end
 
     #: (untyped) -> untyped

@@ -43,7 +43,7 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Resume semantics.** Completed steps are skipped; incomplete/running/failed/waiting steps are retried or continued according to durable state.
 - **Replay shape checks.** A completed step is only replayed when the current workflow reaches the same durable position with the same recorded step method name. A mismatch fails the workflow with `Durababble::NonDeterminismError` instead of silently returning a stale result for different code. Replay also fails if `#execute` returns before consuming all completed step positions, so removing a durable suffix or skipping an already-recorded branch cannot silently complete with partial history.
 - **Timer waits.** `Durababble.wait_until` persists timer waits and resumes workflows after the wake time.
-- **External event waits.** `Durababble.wait_event` and `Store#signal_event` persist event waits and wake matching workflows.
+- **External event waits.** `Durababble.wait_event` and `Store#signal_event` persist event waits and wake matching workflows. If an event is emitted before a matching wait exists, Durababble durably caches that emission and delivers it to the first later wait with the same event key.
 - **Durable workflow signals.** Target: workflow signals are durable inbox/history messages delivered to declared signal handlers at deterministic workflow yield points. Current implementation has lower-level `wait_event` / `signal_event` and workflow `expose_command` command events, but not the full `signal def` / `wait_condition` inbox-history model.
 - **Object sleeps.** Target: durable objects support one pending `sleep_until`/`cancel_sleep` wakeup per object id, converted atomically into a durable mailbox wake message. Not implemented in the current repo.
 - **Idempotency fences.** `Store#with_fence` acquires a fence before the side-effect block executes so concurrent callers do not duplicate the side effect. Fence owner crash recovery is not implemented.
@@ -110,6 +110,14 @@ end
 `step_context` is available only while a workflow step is executing. It contains `workflow_id`, `step_index`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and are stable across retries of the same logical step.
 
 Workflow exposed commands are currently represented as durable event signals named `workflow:<workflow_id>:command:<method>`. That makes command delivery durable and replay-friendly, but does not yet execute the command method body on the workflow lease owner or return a command result to the caller.
+
+### Event wait semantics
+
+`Store#signal_event(event_key, payload:)` is the lower-level durable event emission API used by `Durababble.wait_event`. When matching event waits are already pending, a signal completes every currently pending wait for that event key and returns the number of waits completed. This preserves the existing fanout behavior for live waiters.
+
+When no matching wait is pending, the signal is still durable: Durababble stores the payload as a pending cached event. The next workflow that records `Durababble.wait_event` for the same event key consumes the oldest cached emission in the same transaction that records its wait, marks the wait and step completed with `context.merge(payload)`, and returns the workflow to `pending` for the next worker tick. Cached emissions are one-shot; a later wait cannot consume the same row again.
+
+The current `signal_event` API does not accept a caller idempotency key, so repeated calls are distinct durable emissions. The target public signal API can add caller idempotency on top of this storage model.
 
 ### Target workflow API requirements
 
@@ -201,6 +209,8 @@ The implemented schema is intentionally smaller than the target schema. Current 
 | `steps`                   | latest logical workflow step state by deterministic position                       | `(workflow_id, position)`  |
 | `step_attempts`           | append-only attempt history for steps and waits                                    | `id`                       |
 | `waits`                   | durable timer/event waits                                                          | `id`                       |
+| `event_keys`              | per-event-key lock rows for serializing signal and wait creation                   | `event_key`                |
+| `event_signals`           | cached pre-wait event emissions and delivery status                                | `id`                       |
 | `fences`                  | workflow-local side-effect idempotency fences                                      | `(workflow_id, key)`       |
 | `outbox`                  | durable outgoing messages with processing leases                                   | `id`, unique `key`         |
 | `durable_objects`         | latest object state by object type/id                                              | `(object_type, object_id)` |
@@ -211,7 +221,7 @@ The PostgreSQL/YSQL adapter uses the selected namespace as a schema. The MySQL/M
 Current query-shape requirements:
 
 - Claim paths use `FOR UPDATE SKIP LOCKED` where supported.
-- Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, event waits, timer waits, step-attempt lookup, outbox claims, and object-command status scans.
+- Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, event waits, timer waits, cached pre-wait events, step-attempt lookup, outbox claims, and object-command status scans.
 - Runtime value decoding must only decode known serialized binary columns.
 - PostgreSQL/YSQL migrations must preserve legacy JSONB values when converting runtime columns to Paquito bytes.
 - MySQL/MariaDB and PostgreSQL/YSQL must pass the same store backend conformance suite.
@@ -383,7 +393,7 @@ The target is a single unified durable inbox:
 
 Current repo status:
 
-- Implemented: `waits`, `Store#signal_event`, workflow event waits, object command rows.
+- Implemented: `waits`, cached `event_signals`, `Store#signal_event`, workflow event waits, object command rows.
 - Partially implemented: workflow `expose_command` durable event recording; object command persistence and inline execution.
 - Transitional: `durable_object_commands` and `signal_event` can remain as compatibility/lower-level implementation details during migration, but the target durable message model is one inbox.
 - Missing: unified `inbox`, mailbox sequence state, object ask/tell split, `signal def`, `wait_condition`, `DeliverMessage`, per-target FIFO mailbox runtime, dead-letter/repair UX, and retention sweepers.
@@ -599,6 +609,7 @@ Target requirements:
 | Timer waits survive process exit                        | Implemented                                        | `waits` rows store timer wake time and context                                                                                                                             | timer/event tests                                         |
 | Event waits survive process exit                        | Implemented                                        | `waits` rows store event key and context                                                                                                                                   | timer/event + crash matrix                                |
 | Signaled waits resume with payload                      | Implemented                                        | `signal_event` completes waiting step with payload                                                                                                                         | timer/event test                                          |
+| Pre-wait events are delivered durably                   | Implemented                                        | `signal_event` caches unmatched event emissions in `event_signals`; a later matching `wait_event` consumes one cached payload and completes the wait step                  | backend conformance + wait recovery specs                 |
 | Concurrent signalers wake a wait once                   | Implemented                                        | `signal_event` completes pending waits via a locked update                                                                                                                 | event concurrency spec                                    |
 | Side effects can be fenced by key                       | Implemented with boundary                          | `with_fence` inserts `running` before yield; owner crash recovery is future work                                                                                           | fence concurrency spec; missing owner-crash spec          |
 | Outbox delivery is durable and leased                   | Implemented                                        | outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry                                                                                    | outbox specs                                              |

@@ -44,6 +44,43 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
       end
     end
 
+    test "recovers a cached pre-wait event after crashing immediately after wait persistence with #{backend.name}" do
+      with_durababble_store(backend, "durable_wait_recovery") do |store|
+        store.migrate!
+        workflow = durababble_test_workflow("durable-pre-wait-event-checkpoint") do
+          test_step("wait_for_event") do |ctx|
+            Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx)
+          end
+
+          test_step("finish") do |ctx|
+            ctx.merge("done" => true)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.name, input: { "id" => "early-crash" })
+
+        assert_equal 0, store.signal_event("approval:early-crash", payload: { "approved" => true })
+        assert_raises(Durababble::InjectedCrash) do
+          Durababble::Engine.new(
+            store:,
+            worker_id: "crasher",
+            crash_after: :wait_recorded,
+            migrate: false,
+          ).resume(workflow, workflow_id:)
+        end
+
+        assert_hash_includes store.workflow(workflow_id), "status" => "pending", "locked_by" => nil
+        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "completed", "result" => { "id" => "early-crash", "approved" => true }
+
+        run = Durababble::Engine.new(store:, worker_id: "recover", migrate: false).resume(workflow, workflow_id:)
+
+        assert_equal "completed", run.status
+        assert_equal({ "id" => "early-crash", "approved" => true, "done" => true }, run.result)
+        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+      end
+    end
+
     test "keeps repeated durable waits from the same step method distinct by position with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
         store.migrate!

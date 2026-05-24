@@ -233,7 +233,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "signal_event" => {
         call: -> { store.signal_event("target-event", payload: { "seen" => true }) },
-        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey"],
+        allowed_indexes: ["event_keys_pkey", "waits_event_pending_idx", "waits_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {

@@ -90,6 +90,8 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `steps`: one row per workflow step position; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
 - `step_attempts`: append-only attempt history for every started step, including the latest heartbeat cursor observed for each attempt.
 - `waits`: durable timer and external-event waits, including context needed to resume.
+- `event_keys`: per-event-key lock rows that serialize event emission with matching wait creation, so a signal and a wait cannot miss each other when they race.
+- `event_signals`: cached event emissions created when `Store#signal_event` runs before a matching wait exists. Rows store the Paquito payload plus pending/delivered status and the wait id that consumed them.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
@@ -111,7 +113,8 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths. Only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
-- Event/timer completion uses a locked update so concurrent signalers wake a wait once.
+- Event signals still fan out to all already-pending waits for the matching key. If no matching wait is pending, the signal is persisted in `event_signals`; the first later wait for the key consumes the oldest cached row, completes its step with the cached payload, and leaves the workflow `pending` for the next worker tick.
+- Event/timer completion uses locked updates, and event signal/wait races additionally lock the `event_keys` row for that key, so concurrent signalers wake a wait once and cached emissions are delivered once.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 - Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry stale ownership, no-active-owner, and transport-unavailable failures only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.
