@@ -50,6 +50,7 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Durable outbox.** Outbox rows have unique keys, leasing, expiry recovery, and acknowledgement. The public workflow/object API does not expose outbox as a first-class concept yet.
 - **Durable object commands.** `expose_command` on durable objects records command rows, creates a stable library-generated idempotency key, and executes inline in the current prototype. Target runtime requires per-object durable mailbox ordering, lease ownership, recovery, and worker-driven execution through the unified inbox.
 - **Workflow exposed commands.** `expose_command` on workflows currently persists durable command events via `Store#signal_event`. Target behavior is durable inbox command/signal delivery to the workflow owner with return values where the API is synchronous.
+- **Cooperative workflow cancellation.** Implemented. `Workflow.handle(workflow_id).cancel(reason:)` durably records the first cancellation request and requests cooperative delivery. Pending, waiting, and retry-backoff runs move to `canceling`; running runs keep their active lease and observe cancellation at deterministic yield points.
 - **Exposed transient methods.** `expose` declares public query/transient methods. Target behavior is owner-local non-durable RPC via gRPC for live objects/workflows; current behavior is local ref/query execution without remote owner routing.
 - **Library-generated operation keys.** Workflow steps and durable object commands receive library-generated idempotency keys (`step_context.idempotency_key`, `command_context.idempotency_key`). Target public APIs also accept caller idempotency keys for starts, asks, tells, and signals.
 - **Worker pools.** Worker pools are runtime groupings for workers that can execute a workflow/object family. Current `WorkerRuntime` accepts a `worker_pool` name and filters claims by registered workflow class names. Target persistence should add `worker_pool` to durable targets and to keys/indexes where query patterns need pool scoping.
@@ -94,10 +95,10 @@ class FulfillOrder < Durababble::Workflow
     Shipping.buy_label(order, idempotency_key: step_context.idempotency_key)
   end
 
-  expose_command def cancel(reason:)
-    # Transitional implementation: Workflow.ref(run_id).cancel(reason:)
+  expose_command def note(message:)
+    # Transitional implementation: Workflow.ref(run_id).note(message:)
     # records a durable command event today.
-    reason
+    message
   end
 
   expose def description
@@ -106,11 +107,26 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.enqueue(input, store:)` creates a durable pending execution today. The public direction is `Workflow.start(...)`, with `enqueue` either becoming an alias or a lower-level store/engine API. `Engine#run(WorkflowClass, input:)` remains the inline convenience path for tests and scripts. `Worker` accepts workflow classes, not old DSL workflow instances. The legacy block DSL is intentionally removed.
+`Workflow.enqueue(input, store:)` creates a durable pending execution today. `Workflow.start(input, store:)` creates a durable execution and returns a handle; `Workflow.handle(workflow_id, store:)` / `Workflow.ref(workflow_id, store:)` returns a handle for management calls. `Engine#run(WorkflowClass, input:)` remains the inline convenience path for tests and scripts. `Worker` accepts workflow classes, not old DSL workflow instances. The legacy block DSL is intentionally removed.
 
 `step_context` is available only while a workflow step is executing. It contains `workflow_id`, `step_index`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and are stable across retries of the same logical step.
 
 Workflow exposed commands are currently represented as durable event signals named `workflow:<workflow_id>:command:<method>`. That makes command delivery durable and replay-friendly, but does not yet execute the command method body on the workflow lease owner or return a command result to the caller.
+
+### Cooperative workflow cancellation
+
+Temporal's cancellation model separates a cancellation request from hard termination: cancellation is delivered cooperatively into workflow execution, workflow code may catch the cancellation exception and run cleanup/compensation, child work follows explicit cancellation policy, and cleanup errors can cause the workflow to fail instead of becoming canceled. Durababble adopts the same shape while keeping the prototype's method/order step model and SQL persistence.
+
+Implemented Durababble semantics:
+
+- `Workflow.handle(workflow_id, store:).cancel(reason:)` is the first-class cancellation API. It stores the first reason plus request/delivery timestamps on the workflow row; duplicate requests return the current run and preserve the first recorded reason.
+- Canceling a terminal `completed`, terminal `failed`, or already `canceled` workflow is idempotent and does not pretend cleanup ran. Already `canceled` workflows retain their original cancellation reason.
+- Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become runnable immediately. Pending waits for the workflow are marked `canceled`, so late timer/event signals cannot resume the old wait.
+- Running workflows keep their live lease. Cancellation is observed at deterministic yield points: before starting a new step, when replay reaches a completed step boundary, after a step completes, and when a running step heartbeats.
+- Delivery raises `Durababble::CancellationError` with the durable reason and workflow id. Once the error has been raised in an execution attempt, cleanup steps can run normally; the same durable request is re-delivered after crash/recovery so cleanup code can resume from already-completed steps.
+- If workflow code catches cancellation and returns after cleanup, the engine records the workflow as `canceled` and stores the cleanup result. Re-raising `CancellationError` also records `canceled`. If cleanup raises an unrelated error, ordinary step retry policy applies; exhausted or non-retryable cleanup failures mark the workflow `failed`.
+- Durababble does not yet have first-class child workflows. When child workflow APIs are added, cancellation must use explicit child-cancellation policy instead of implicitly terminating child work, and parent cleanup must not report `canceled` until the chosen child policy has reached a durable outcome.
+- Cooperative cancellation is not operator termination. A future termination API may stop a run without executing cleanup, but it must use a distinct state/surface and must not report that cooperative cleanup completed.
 
 ### Target workflow API requirements
 
@@ -198,7 +214,7 @@ The implemented schema is intentionally smaller than the target schema. Current 
 
 | Table                     | Purpose                                                                            | Current key shape          |
 | ------------------------- | ---------------------------------------------------------------------------------- | -------------------------- |
-| `workflows`               | one workflow execution; status, input/result/error, workflow lease, retry due time | `id`                       |
+| `workflows`               | one workflow execution; status, input/result/error, workflow lease, retry due time, and cooperative cancellation metadata | `id`                       |
 | `steps`                   | latest logical workflow step state by deterministic position                       | `(workflow_id, position)`  |
 | `step_attempts`           | append-only attempt history for steps and waits                                    | `id`                       |
 | `waits`                   | durable timer/event waits                                                          | `id`                       |
@@ -590,6 +606,8 @@ Target requirements:
 | Zombie workers cannot renew expired leases              | Implemented                                        | heartbeat updates only when owner/deadline still match                                                                                                                     | heartbeat spec                                            |
 | Zombie workers cannot complete after lease revocation   | Implemented                                        | `Engine` re-checks workflow lease ownership before terminal durable writes                                                                                                 | worker lifecycle spec                                     |
 | Step retries are durably scheduled                      | Implemented                                        | failed retryable steps store `next_run_at` and release the lease                                                                                                           | step retry spec + DST retry scenario                      |
+| Cancellation requests are durable and idempotent        | Implemented                                        | `workflows.cancel_requested_at` / `cancel_reason` record the first request on the workflow row; duplicate `handle.cancel` calls preserve it                                | workflow cancellation spec                                |
+| Cancellation cleanup is replay-safe                     | Implemented                                        | cancellation is delivered at yield points; cleanup runs as ordinary steps and completed cleanup steps are skipped after crash/recovery                                      | workflow cancellation spec + DST cancellation scenario    |
 | Retry options are Temporal-like but Ruby-shaped         | Implemented                                        | `initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, `schedule`, `non_retryable_errors`                                                      | retry policy specs                                        |
 | Final retry failure bubbles to workflow                 | Implemented                                        | exhausted/non-retryable step failure marks workflow `failed`                                                                                                               | step retry spec                                           |
 | Expired leases can be recovered                         | Implemented                                        | `Store#steal_expired_leases!` returns expired `running` workflows to `pending`                                                                                             | complete spec guarantee + crash matrix                    |
@@ -630,7 +648,9 @@ Target requirements:
 | After step heartbeat, before step completion                               | Latest heartbeat cursor is available to next invocation                                         | implemented; heartbeat spec + DST                                      |
 | After step failure, before retry due time                                  | Retry schedule persists; workflow is not claimable early                                        | implemented; retry spec + DST                                          |
 | After step completion, before workflow completion                          | Completed step is skipped and remaining work continues                                          | implemented; subprocess crash harness                                  |
+| After cancellation cleanup step completes, before canceled terminal write  | Completed cleanup step is skipped and workflow finishes `canceled` on recovery                  | implemented; workflow cancellation spec                                |
 | While waiting for an event                                                 | Wait row survives; signal wakes workflow and execution continues                                | implemented; crash matrix                                              |
+| While waiting when cancellation is requested                               | Wait row/attempt are marked canceled; cleanup runs on next claim and late signals are ignored   | implemented; workflow cancellation spec + DST cancellation scenario     |
 | After outbox insert, before delivery                                       | Outbox message remains claimable exactly once at a time                                         | implemented; crash matrix                                              |
 | After outbox claim, before ack                                             | Expired outbox lease can be reclaimed by another sender                                         | implemented; outbox recovery spec                                      |
 | During lease-routed workflow RPC                                           | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy      | partially implemented; workflow RPC spec + DST                         |

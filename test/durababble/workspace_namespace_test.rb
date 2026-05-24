@@ -35,6 +35,12 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     assert_operator(first.length, :<=, Durababble::MAX_SCHEMA_IDENTIFIER_LENGTH)
   end
 
+  test "derived schema uses workspace placeholder when path basename has no identifier characters" do
+    schema = Durababble.workspace_schema("/tmp/!!!")
+
+    assert_match(/\Adurababble_workspace_[0-9a-f]{12}\z/, schema)
+  end
+
   test "explicit environment overrides win before derived workspace defaults" do
     with_env(
       "DURABABBLE_DATABASE_URL" => "postgresql://example.invalid/explicit",
@@ -65,6 +71,31 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     end
   ensure
     Durababble.default_store = nil
+  end
+
+  test "store accessor raises until configured and returns configured store" do
+    store = NamespaceStoreDouble.new
+    Durababble.default_store = nil
+
+    error = assert_raises(Durababble::Error) { Durababble.store }
+    assert_match(/not configured/, error.message)
+
+    Durababble.default_store = store
+    assert_same(store, Durababble.store)
+  ensure
+    Durababble.default_store = nil
+  end
+
+  test "cancellation error exposes workflow id and default message" do
+    default_error = Durababble::CancellationError.new(nil, workflow_id: "wf-1")
+    reason_error = Durababble::CancellationError.new("operator request", workflow_id: "wf-2")
+
+    assert_equal("workflow cancellation requested", default_error.message)
+    assert_equal("wf-1", default_error.workflow_id)
+    assert_nil(default_error.reason)
+    assert_equal("operator request", reason_error.message)
+    assert_equal("wf-2", reason_error.workflow_id)
+    assert_equal("operator request", reason_error.reason)
   end
 
   test "worker runtime threads the selected default schema to owned stores" do
