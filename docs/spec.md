@@ -278,7 +278,7 @@ Query-shape and transaction requirements:
 - The node registry is keyed by pool/node identity and records `rpc_address`, advertised pools, draining flag, and heartbeat time.
 - Object asks/tells/wakes and workflow signals/commands use the unified inbox.
 - Per-target mailbox sequence state lets `enqueue_message` allocate a monotonic sequence and lets target executors drain only a contiguous ready prefix from the head.
-- Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload.
+- Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload. Replacing or canceling a sleep is committed with object message completion and state persistence; dispatch inserts the wake mailbox message before removing the sleep row in the same transaction.
 - Append-only workflow history rows are ordered per workflow. Required event families include `step_scheduled`, `step_started`, `step_completed`, `step_failed`, `step_waiting`, timer/wait events, signal delivery events, child-workflow events, and `patched` / `deprecate_patch` marker rows.
 - Store deterministic command ids and replay-relevant command shape on schedule events, and store concrete attempt ids on start/completion/failure/wait events. The command id is the replay identity; the attempt id is the execution/retry identity.
 - Latest-state tables such as `steps` exist for query convenience, but mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution events; execution recovery uses distinct attempt start/completion events.

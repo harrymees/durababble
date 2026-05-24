@@ -53,6 +53,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class ClaimlessMailboxStore < ClaimlessTestStore
+    def claim_next_object_command(**) = nil
+  end
+
   class BranchCommandStore
     attr_reader :completed, :failed
 
@@ -106,8 +110,62 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class SleepyTestObject < Durababble::DurableObject
+    object_type "sleepy_test_object"
+
+    def initialize_state
+      { "events" => [] }
+    end
+
+    expose_command def schedule(label, wake_at)
+      update_state({ "events" => current_state.fetch("events") + [["schedule", label]] })
+      sleep_until(at: wake_at, payload: { "label" => label })
+      current_state
+    end
+
+    expose_command def cancel(label)
+      update_state({ "events" => current_state.fetch("events") + [["cancel", label]] })
+      cancel_sleep
+      current_state
+    end
+
+    expose_command def touch(label)
+      update_state({ "events" => current_state.fetch("events") + [["touch", label]] })
+      current_state
+    end
+
+    def on_wake(payload: nil)
+      update_state({ "events" => current_state.fetch("events") + [["wake", payload.fetch("label")]] })
+      current_state
+    end
+
+    expose def events
+      current_state.fetch("events")
+    end
+  end
+
+  class SleepOnlyTestObject < Durababble::DurableObject
+    object_type "sleep_only_test_object"
+
+    expose_command def schedule(wake_at)
+      sleep_until(at: wake_at, payload: { "kind" => "only" })
+      "scheduled"
+    end
+  end
+
   test "does not execute a durable object command when its lease cannot be claimed" do
     store = ClaimlessTestStore.new
+
+    assert_raises_matching(Durababble::LeaseConflict, /could not claim durable object command/) do
+      ClaimlessTestObject.ref("object-1", store:).mutate
+    end
+    assert_nil store.state
+    assert_nil store.completed
+    assert_nil store.failed
+  end
+
+  test "does not execute a durable object command when the mailbox head cannot be claimed" do
+    store = ClaimlessMailboxStore.new
 
     assert_raises_matching(Durababble::LeaseConflict, /could not claim durable object command/) do
       ClaimlessTestObject.ref("object-1", store:).mutate
@@ -208,6 +266,133 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal 2, seen_keys.length
         assert_equal 1, seen_keys.uniq.length
         assert_equal result, object.snapshot
+      end
+    end
+
+    test "replaces a pending durable object sleep and delivers only the latest wake with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_sleep") do |store|
+        store.migrate!
+        object = SleepyTestObject.ref("object-1", store:)
+        first_wake = Time.utc(2026, 5, 24, 21, 0, 0)
+        second_wake = Time.utc(2026, 5, 24, 21, 5, 0)
+
+        object.schedule("first", first_wake)
+        object.schedule("second", second_wake)
+
+        sleep_row = store.object_sleep(object_type: SleepyTestObject.object_type, object_id: "object-1")
+        assert_equal second_wake.to_i, Time.parse(sleep_row.fetch("wake_at").to_s).to_i
+        assert_equal({ "label" => "second" }, sleep_row.fetch("payload"))
+
+        assert_equal 1, store.wake_due_object_sleeps(now: second_wake + 1)
+        assert_nil store.object_sleep(object_type: SleepyTestObject.object_type, object_id: "object-1")
+        assert_equal 0, store.wake_due_object_sleeps(now: second_wake + 1)
+
+        object.touch("after")
+
+        assert_equal [
+          ["schedule", "first"],
+          ["schedule", "second"],
+          ["wake", "second"],
+          ["touch", "after"],
+        ],
+          object.events
+        wake_rows = store.object_commands_for(object_type: SleepyTestObject.object_type, object_id: "object-1").select { |row| row.fetch("method_name") == Durababble::DurableObjectRef::WAKE_METHOD_NAME }
+        assert_equal 1, wake_rows.length
+        assert_equal "completed", wake_rows.first.fetch("status")
+      end
+    end
+
+    test "cancels a pending durable object sleep in the command completion transaction with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_sleep") do |store|
+        store.migrate!
+        object = SleepyTestObject.ref("object-2", store:)
+        wake_at = Time.utc(2026, 5, 24, 22, 0, 0)
+
+        object.schedule("canceled", wake_at)
+        object.cancel("canceled")
+
+        assert_nil store.object_sleep(object_type: SleepyTestObject.object_type, object_id: "object-2")
+        assert_equal 0, store.wake_due_object_sleeps(now: wake_at + 1)
+        object.touch("after")
+
+        assert_equal [
+          ["schedule", "canceled"],
+          ["cancel", "canceled"],
+          ["touch", "after"],
+        ],
+          object.events
+      end
+    end
+
+    test "persists a sleep-only command without object state changes with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_sleep") do |store|
+        store.migrate!
+        object = SleepOnlyTestObject.ref("object-5", store:)
+        wake_at = Time.utc(2026, 5, 25, 1, 0, 0)
+
+        assert_equal "scheduled", object.schedule(wake_at)
+        assert_nil store.object_state(object_type: SleepOnlyTestObject.object_type, object_id: "object-5")
+        sleep_row = store.object_sleep(object_type: SleepOnlyTestObject.object_type, object_id: "object-5")
+        assert_equal({ "kind" => "only" }, sleep_row.fetch("payload"))
+      end
+    end
+
+    test "orders wakes with earlier and later mailbox commands with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_sleep") do |store|
+        store.migrate!
+        object = SleepyTestObject.ref("object-3", store:)
+        wake_at = Time.utc(2026, 5, 24, 23, 0, 0)
+
+        object.schedule("wake", wake_at)
+        store.enqueue_object_command(
+          object_type: SleepyTestObject.object_type,
+          object_id: "object-3",
+          method_name: "touch",
+          args: ["before"],
+          kwargs: {},
+        )
+        assert_equal 1, store.wake_due_object_sleeps(now: wake_at + 1)
+
+        object.touch("after")
+
+        assert_equal [
+          ["schedule", "wake"],
+          ["touch", "before"],
+          ["wake", "wake"],
+          ["touch", "after"],
+        ],
+          object.events
+      end
+    end
+
+    test "reclaims an expired wake lease without losing or duplicating the wake with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_sleep") do |store|
+        store.migrate!
+        object = SleepyTestObject.ref("object-4", store:)
+        wake_at = Time.utc(2026, 5, 25, 0, 0, 0)
+
+        object.schedule("takeover", wake_at)
+        assert_equal 1, store.wake_due_object_sleeps(now: wake_at + 1)
+        claimed = store.claim_next_object_command(
+          object_type: SleepyTestObject.object_type,
+          object_id: "object-4",
+          worker_id: "crashed-worker",
+          lease_seconds: 0,
+        )
+        assert_equal Durababble::DurableObjectRef::WAKE_METHOD_NAME, claimed.fetch("method_name")
+        sleep 0.02
+
+        object.touch("after")
+
+        assert_equal [
+          ["schedule", "takeover"],
+          ["wake", "takeover"],
+          ["touch", "after"],
+        ],
+          object.events
+        wake_rows = store.object_commands_for(object_type: SleepyTestObject.object_type, object_id: "object-4").select { |row| row.fetch("method_name") == Durababble::DurableObjectRef::WAKE_METHOD_NAME }
+        assert_equal 1, wake_rows.length
+        assert_equal "completed", wake_rows.first.fetch("status")
       end
     end
   end

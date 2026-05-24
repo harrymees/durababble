@@ -5,7 +5,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 ## Components
 
 - `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
-- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
+- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, mutates state explicitly with `update_state(new_state)`, and can schedule one pending wake with `sleep_until(at:, payload:)` or remove it with `cancel_sleep` while a command is executing. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
 - `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
 - `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease. The worker registry contains workflow classes.
@@ -82,7 +82,7 @@ class Account < Durababble::DurableObject
 end
 ```
 
-The desired durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in `durable_object_commands`. The current prototype has the class/ref API, command rows, inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
+The desired durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in `durable_object_commands`. The current prototype has the class/ref API, command rows, inline command execution, generated command idempotency keys, explicit state persistence, and durable object sleep rows that convert into reserved wake command rows. The dedicated object-command worker/lease path is still to be hardened.
 
 ## Storage model
 
@@ -94,6 +94,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
 - `durable_object_commands`: persisted object command calls, arguments, result/error, status, and command lease columns.
+- `object_sleeps`: one pending durable object wakeup by `(object_type, object_id)`, with a generated `sleep_id`, wake time, and Paquito-serialized payload. Due rows convert transactionally into reserved wake rows in `durable_object_commands`, then `on_wake(payload:)` runs through the same command completion path as exposed commands.
 
 ## Durability semantics
 
@@ -115,6 +116,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - First-class child workflows are still future scope. Cancellation semantics for that future surface must require an explicit durable child-cancellation policy; cooperative parent cancellation must not silently terminate child work or claim that child cleanup completed.
 - Operator termination remains a separate hard-stop concept: it may mark or remove work without running user cleanup and must not report the workflow as cooperatively `canceled`.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.
+- Object command completion persists command result, object state changes, and any sleep replacement/cancellation in one transaction. The sleep dispatcher converts matured sleeps into pending wake command rows before deleting the sleep row, so a crash leaves either the sleep row or the wake command visible for recovery.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 - Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry stale ownership, no-active-owner, and transport-unavailable failures only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.

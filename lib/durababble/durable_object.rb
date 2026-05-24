@@ -3,6 +3,7 @@
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
+  ObjectSleepChange = Data.define(:action, :wake_at, :payload)
 
   class DurableObject
     class << self
@@ -81,7 +82,7 @@ module Durababble
     end
 
     #: untyped
-    attr_reader :durable_id, :command_context
+    attr_reader :durable_id, :command_context, :sleep_change
 
     #: (?durable_id: untyped, ?state: untyped, ?store: untyped, ?command_context: untyped) -> void
     def initialize(durable_id: nil, state: nil, store: nil, command_context: nil)
@@ -90,6 +91,7 @@ module Durababble
       @store = store
       @command_context = command_context
       @state_dirty = false
+      @sleep_change = nil
     end
 
     #: () -> untyped
@@ -110,11 +112,41 @@ module Durababble
       new_state
     end
 
+    #: (at: untyped, ?payload: untyped) -> untyped
+    def sleep_until(at:, payload: nil)
+      ensure_command_context!(:sleep_until)
+      @sleep_change = ObjectSleepChange.new(action: :schedule, wake_at: at, payload:)
+      nil
+    end
+
+    #: () -> untyped
+    def cancel_sleep
+      ensure_command_context!(:cancel_sleep)
+      @sleep_change = ObjectSleepChange.new(action: :cancel, wake_at: nil, payload: nil)
+      nil
+    end
+
+    #: (?payload: untyped) -> untyped
+    def on_wake(payload: nil)
+      nil
+    end
+
     #: () -> untyped
     def state_dirty? = @state_dirty
+
+    private
+
+    #: (untyped) -> void
+    def ensure_command_context!(method_name)
+      return if command_context
+
+      raise Error, "#{method_name} is only available while a durable object command is executing"
+    end
   end
 
   class DurableObjectRef
+    WAKE_METHOD_NAME = "__durababble_wake__"
+
     #: (untyped, untyped, store: untyped) -> void
     def initialize(object_class, durable_id, store:)
       @object_class = object_class
@@ -155,18 +187,47 @@ module Durababble
     def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
       @store.migrate!
       command_id = @store.enqueue_object_command(object_type: @object_class.object_type, object_id: @durable_id, method_name: method_name.to_s, args:, kwargs:)
-      run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
+      drain_mailbox_until(command_id, target_method_name: method_name, target_args: args, target_kwargs: kwargs, default_retry_policy: retry_policy, block:)
     end
 
-    #: (untyped, untyped, retry_policy: untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
-    def run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
+    #: (untyped, target_method_name: untyped, target_args: untyped, target_kwargs: untyped, default_retry_policy: untyped, block: untyped) -> untyped
+    def drain_mailbox_until(target_command_id, target_method_name:, target_args:, target_kwargs:, default_retry_policy:, block:)
+      if @store.respond_to?(:claim_next_object_command)
+        loop do
+          claimed = @store.claim_next_object_command(object_type: @object_class.object_type, object_id: @durable_id, worker_id: worker_id)
+          raise LeaseConflict, "could not claim durable object command #{target_command_id}" unless claimed
+
+          command_result = run_claimed_command(claimed, default_retry_policy:, block:)
+          break command_result if claimed.fetch("id") == target_command_id
+        end
+      else
+        claimed = @store.claim_object_command(command_id: target_command_id, worker_id: worker_id)
+        raise LeaseConflict, "could not claim durable object command #{target_command_id}" unless claimed
+
+        run_claimed_command(
+          claimed.merge("id" => target_command_id, "method_name" => target_method_name.to_s, "args" => target_args, "kwargs" => target_kwargs),
+          default_retry_policy:,
+          block:,
+        )
+      end
+    end
+
+    #: (untyped, default_retry_policy: untyped, block: untyped) -> untyped
+    def run_claimed_command(claimed, default_retry_policy:, block:)
+      command_id = claimed.fetch("id")
+      method_name = claimed.fetch("method_name").to_sym
+      args = claimed.fetch("args")
+      kwargs = claimed.fetch("kwargs")
+      retry_policy = if claimed.fetch("method_name", nil) == WAKE_METHOD_NAME
+        RetryPolicy.from(nil)
+      elsif method_name && @object_class.exposed_commands[method_name]
+        @object_class.exposed_commands.fetch(method_name)
+      else
+        default_retry_policy
+      end
       attempt = 0
-      worker_id = "inline-object-worker"
       begin
         attempt += 1
-        claimed = @store.claim_object_command(command_id:, worker_id:)
-        raise LeaseConflict, "could not claim durable object command #{command_id}" unless claimed
-
         state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
         context = CommandContext.new(
           object_type: @object_class.object_type,
@@ -176,29 +237,41 @@ module Durababble
           idempotency_key: "durababble:v1:object:#{@object_class.object_type}:#{@durable_id}:command:#{command_id}",
         )
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, command_context: context) #: as untyped
-        result = kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
-        completed = if object.state_dirty?
-          @store.complete_object_command(
-            command_id:,
-            result:,
-            object_type: @object_class.object_type,
-            object_id: @durable_id,
-            state: object.current_state,
-            worker_id:,
-          )
+        result = if claimed.fetch("method_name", nil) == WAKE_METHOD_NAME
+          object.on_wake(payload: kwargs.fetch(:payload, kwargs["payload"]))
+        elsif kwargs.empty?
+          object.public_send(method_name, *args, &block)
         else
-          @store.complete_object_command(command_id:, result:, worker_id:)
+          object.public_send(method_name, *args, **kwargs, &block)
         end
+        completion = {
+          command_id:,
+          result:,
+          object_type: @object_class.object_type,
+          object_id: @durable_id,
+          state: object.state_dirty? ? object.current_state : Store::NO_OBJECT_STATE,
+          worker_id: worker_id,
+        }
+        completion[:sleep_change] = object.sleep_change if object.sleep_change
+        completed = @store.complete_object_command(**completion)
         unless completed && (!completed.respond_to?(:cmd_tuples) || completed.cmd_tuples.to_i.positive?)
           raise LeaseConflict, "lost durable object command lease #{command_id}"
         end
 
         result
       rescue StandardError => e
-        @store.fail_object_command(command_id:, error: "#{e.class}: #{e.message}", worker_id:) if claimed
-        retry if retry_policy.retryable?(e, attempt_number: attempt)
+        @store.fail_object_command(command_id:, error: "#{e.class}: #{e.message}", worker_id: worker_id)
+        if retry_policy.retryable?(e, attempt_number: attempt)
+          claimed = @store.claim_object_command(command_id:, worker_id: worker_id)
+          raise LeaseConflict, "could not reclaim durable object command #{command_id}" unless claimed
+
+          retry
+        end
         raise
       end
     end
+
+    #: () -> String
+    def worker_id = "inline-object-worker"
   end
 end

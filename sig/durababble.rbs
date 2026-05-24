@@ -150,9 +150,13 @@ module Durababble
     def object_state: (object_type: String, object_id: String) -> serialized_payload
     def save_object_state: (object_type: String, object_id: String, state: serialized_payload) -> void
     def enqueue_object_command: (object_type: String, object_id: String, method_name: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> String
+    def claim_next_object_command: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
     def claim_object_command: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
-    def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?worker_id: String?) -> Object?
+    def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?sleep_change: ObjectSleepChange?, ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?) -> Object?
+    def object_sleep: (object_type: String, object_id: String) -> workflow_row?
+    def object_commands_for: (object_type: String, object_id: String) -> Array[workflow_row]
+    def wake_due_object_sleeps: (?now: Time) -> Integer
   end
 
   class Workflow[Input, Output]
@@ -194,7 +198,11 @@ module Durababble
     def initialize_state: () -> State
     def current_state: () -> State
     def update_state: (State state) -> State
+    def sleep_until: (at: Time, ?payload: serialized_payload) -> nil
+    def cancel_sleep: () -> nil
+    def on_wake: (?payload: serialized_payload) -> serialized_payload
     def state_dirty?: () -> bool
+    def sleep_change: () -> ObjectSleepChange?
   end
 
   class DurableObjectRef[Id, State]
@@ -212,6 +220,14 @@ module Durababble
     attr_reader context: serialized_payload
 
     def initialize: (kind: String, wake_at: Time?, event_key: String?, context: serialized_payload) -> void
+  end
+
+  class ObjectSleepChange
+    attr_reader action: Symbol | String
+    attr_reader wake_at: Time?
+    attr_reader payload: serialized_payload
+
+    def initialize: (action: Symbol | String, wake_at: Time?, payload: serialized_payload) -> void
   end
 
   class Engine

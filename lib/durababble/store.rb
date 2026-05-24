@@ -190,6 +190,18 @@ module Durababble
           completed_at timestamptz
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("object_sleeps")} (
+          object_type text NOT NULL,
+          object_id text NOT NULL,
+          sleep_id text NOT NULL UNIQUE,
+          wake_at timestamptz NOT NULL,
+          payload bytea,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (object_type, object_id)
+        )
+      SQL
       create_performance_indexes!
       migrate_serialized_columns!
       @migrated = true
@@ -797,6 +809,30 @@ module Durababble
       id
     end
 
+    #: (object_type: untyped, object_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
+    def claim_next_object_command(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      row = transaction do
+        head = execute_params(<<~SQL, [object_type, object_id]).first
+          SELECT id, status, locked_until
+          FROM #{table("durable_object_commands")}
+          WHERE object_type = $1 AND object_id = $2 AND status != 'completed'
+          ORDER BY created_at, id
+          LIMIT 1
+          FOR UPDATE
+        SQL
+        next nil unless head
+        next nil unless runnable_object_command_head?(head)
+
+        execute_params(<<~SQL, [worker_id, lease_seconds, head.fetch("id")])
+          UPDATE #{table("durable_object_commands")}
+          SET status = 'running', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+          WHERE id = $3
+          RETURNING *
+        SQL
+      end&.first
+      decode_row(row) if row
+    end
+
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
       row = execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
@@ -808,13 +844,14 @@ module Durababble
       decode_row(row) if row
     end
 
-    #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
+    #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?sleep_change: untyped, ?worker_id: untyped) -> untyped
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, sleep_change: nil, worker_id: nil)
       transaction do
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
+        apply_object_sleep_change(object_type:, object_id:, sleep_change:) if sleep_change
         execute_params(
           "UPDATE #{table("durable_object_commands")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now() WHERE id = $1",
           [command_id, dump_serialized(result)],
@@ -837,7 +874,75 @@ module Durababble
       end
     end
 
+    #: (object_type: untyped, object_id: untyped) -> untyped
+    def object_sleep(object_type:, object_id:)
+      row = execute_params("SELECT * FROM #{table("object_sleeps")} WHERE object_type = $1 AND object_id = $2", [object_type, object_id]).first
+      decode_row(row) if row
+    end
+
+    #: (object_type: untyped, object_id: untyped) -> untyped
+    def object_commands_for(object_type:, object_id:)
+      execute_params(<<~SQL, [object_type, object_id]).map { |row| decode_row(row) }
+        SELECT * FROM #{table("durable_object_commands")}
+        WHERE object_type = $1 AND object_id = $2
+        ORDER BY created_at, id
+      SQL
+    end
+
+    #: (?now: untyped) -> untyped
+    def wake_due_object_sleeps(now: Time.now)
+      transaction do
+        sleeps = execute_params(<<~SQL, [timestamp(now)]).map { |row| decode_row(row) }
+          SELECT * FROM #{table("object_sleeps")}
+          WHERE wake_at <= $1::timestamptz
+          ORDER BY wake_at, updated_at
+          FOR UPDATE
+        SQL
+        sleeps.each do |sleep|
+          execute_params(<<~SQL, [sleep.fetch("sleep_id"), sleep.fetch("object_type"), sleep.fetch("object_id"), dump_serialized([]), dump_serialized({ payload: sleep["payload"] })])
+            INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
+            VALUES ($1, $2, $3, '__durababble_wake__', $4::bytea, $5::bytea, 'pending')
+            ON CONFLICT (id) DO NOTHING
+          SQL
+          execute_params(<<~SQL, [sleep.fetch("object_type"), sleep.fetch("object_id"), sleep.fetch("sleep_id")])
+            DELETE FROM #{table("object_sleeps")}
+            WHERE object_type = $1 AND object_id = $2 AND sleep_id = $3
+          SQL
+        end
+        sleeps.length
+      end
+    end
+
     private
+
+    #: (untyped) -> bool
+    def runnable_object_command_head?(row)
+      status = row.fetch("status")
+      return true if ["pending", "failed"].include?(status)
+      return false unless status == "running"
+
+      locked_until = row["locked_until"]
+      !locked_until || Time.parse(locked_until.to_s) < Time.now
+    end
+
+    #: (object_type: untyped, object_id: untyped, sleep_change: untyped) -> untyped
+    def apply_object_sleep_change(object_type:, object_id:, sleep_change:)
+      raise ArgumentError, "object_type and object_id are required for object sleep changes" unless object_type && object_id
+
+      case sleep_change.action
+      when :schedule, "schedule"
+        execute_params(<<~SQL, [object_type, object_id, SecureRandom.uuid, timestamp(sleep_change.wake_at), dump_serialized(sleep_change.payload)])
+          INSERT INTO #{table("object_sleeps")} (object_type, object_id, sleep_id, wake_at, payload)
+          VALUES ($1, $2, $3, $4::timestamptz, $5::bytea)
+          ON CONFLICT (object_type, object_id) DO UPDATE
+            SET sleep_id = $3, wake_at = $4::timestamptz, payload = $5::bytea, updated_at = now()
+        SQL
+      when :cancel, "cancel"
+        execute_params("DELETE FROM #{table("object_sleeps")} WHERE object_type = $1 AND object_id = $2", [object_type, object_id])
+      else
+        raise ArgumentError, "unknown object sleep change action: #{sleep_change.action.inspect}"
+      end
+    end
 
     #: (untyped) -> bool
     def terminal_for_cancellation?(row)
@@ -1064,6 +1169,7 @@ module Durababble
       migrate_serialized_column!("durable_object_commands", "args", not_null: true)
       migrate_serialized_column!("durable_object_commands", "kwargs", not_null: true)
       migrate_serialized_column!("durable_object_commands", "result")
+      migrate_serialized_column!("object_sleeps", "payload")
     end
 
     #: () -> untyped
@@ -1079,6 +1185,8 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
       execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
       execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
+      execute("CREATE INDEX IF NOT EXISTS durable_object_commands_object_status_idx ON #{table("durable_object_commands")} (object_type, object_id, status, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS object_sleeps_due_idx ON #{table("object_sleeps")} (wake_at, updated_at)")
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped
@@ -1325,13 +1433,27 @@ module Durababble
           INDEX #{quote_ident(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("object_sleeps")} (
+          object_type VARCHAR(191) NOT NULL,
+          object_id VARCHAR(191) NOT NULL,
+          sleep_id VARCHAR(191) NOT NULL,
+          wake_at DATETIME(6) NOT NULL,
+          payload LONGBLOB,
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          PRIMARY KEY (object_type, object_id),
+          UNIQUE INDEX #{quote_ident(index_name("object_sleeps", "sleep_id"))} (sleep_id),
+          INDEX #{quote_ident(index_name("object_sleeps", "due"))} (wake_at, updated_at)
+        )
+      SQL
       @migrated = true
       self
     end
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["object_sleeps", "durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1969,6 +2091,29 @@ module Durababble
       id
     end
 
+    #: (object_type: untyped, object_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
+    def claim_next_object_command(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      transaction do
+        head = execute_params(<<~SQL, [object_type, object_id]).first
+          SELECT id, status, locked_until
+          FROM #{table("durable_object_commands")}
+          WHERE object_type = ? AND object_id = ? AND status != 'completed'
+          ORDER BY created_at, id
+          LIMIT 1
+          FOR UPDATE
+        SQL
+        next nil unless head
+        next nil unless runnable_object_command_head?(head)
+
+        execute_params(<<~SQL, [worker_id, lease_seconds, head.fetch("id")])
+          UPDATE #{table("durable_object_commands")}
+          SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND)
+          WHERE id = ?
+        SQL
+        decode_row(execute_params("SELECT * FROM #{table("durable_object_commands")} WHERE id = ?", [head.fetch("id")]).first)
+      end
+    end
+
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
       transaction do
@@ -1989,13 +2134,14 @@ module Durababble
       end
     end
 
-    #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
+    #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?sleep_change: untyped, ?worker_id: untyped) -> untyped
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, sleep_change: nil, worker_id: nil)
       transaction do
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
+        apply_object_sleep_change(object_type:, object_id:, sleep_change:) if sleep_change
         execute_params(
           "UPDATE #{table("durable_object_commands")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6) WHERE id = ?",
           [dump_serialized(result), command_id],
@@ -2019,7 +2165,73 @@ module Durababble
       end
     end
 
+    #: (object_type: untyped, object_id: untyped) -> untyped
+    def object_sleep(object_type:, object_id:)
+      row = execute_params("SELECT * FROM #{table("object_sleeps")} WHERE object_type = ? AND object_id = ?", [object_type, object_id]).first
+      decode_row(row) if row
+    end
+
+    #: (object_type: untyped, object_id: untyped) -> untyped
+    def object_commands_for(object_type:, object_id:)
+      execute_params(<<~SQL, [object_type, object_id]).map { |row| decode_row(row) }
+        SELECT * FROM #{table("durable_object_commands")}
+        WHERE object_type = ? AND object_id = ?
+        ORDER BY created_at, id
+      SQL
+    end
+
+    #: (?now: untyped) -> untyped
+    def wake_due_object_sleeps(now: Time.now)
+      transaction do
+        sleeps = execute_params(<<~SQL, [now]).map { |row| decode_row(row) }
+          SELECT * FROM #{table("object_sleeps")}
+          WHERE wake_at <= ?
+          ORDER BY wake_at, updated_at
+          FOR UPDATE
+        SQL
+        sleeps.each do |sleep|
+          execute_params(<<~SQL, [sleep.fetch("sleep_id"), sleep.fetch("object_type"), sleep.fetch("object_id"), dump_serialized([]), dump_serialized({ payload: sleep["payload"] })])
+            INSERT IGNORE INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
+            VALUES (?, ?, ?, '__durababble_wake__', ?, ?, 'pending')
+          SQL
+          execute_params(<<~SQL, [sleep.fetch("object_type"), sleep.fetch("object_id"), sleep.fetch("sleep_id")])
+            DELETE FROM #{table("object_sleeps")}
+            WHERE object_type = ? AND object_id = ? AND sleep_id = ?
+          SQL
+        end
+        sleeps.length
+      end
+    end
+
     private
+
+    #: (untyped) -> bool
+    def runnable_object_command_head?(row)
+      status = row.fetch("status")
+      return true if ["pending", "failed"].include?(status)
+      return false unless status == "running"
+
+      locked_until = row["locked_until"]
+      !locked_until || Time.parse(locked_until.to_s) < Time.now
+    end
+
+    #: (object_type: untyped, object_id: untyped, sleep_change: untyped) -> untyped
+    def apply_object_sleep_change(object_type:, object_id:, sleep_change:)
+      raise ArgumentError, "object_type and object_id are required for object sleep changes" unless object_type && object_id
+
+      case sleep_change.action
+      when :schedule, "schedule"
+        execute_params(<<~SQL, [object_type, object_id, SecureRandom.uuid, sleep_change.wake_at, dump_serialized(sleep_change.payload)])
+          INSERT INTO #{table("object_sleeps")} (object_type, object_id, sleep_id, wake_at, payload)
+          VALUES (?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE sleep_id = VALUES(sleep_id), wake_at = VALUES(wake_at), payload = VALUES(payload), updated_at = NOW(6)
+        SQL
+      when :cancel, "cancel"
+        execute_params("DELETE FROM #{table("object_sleeps")} WHERE object_type = ? AND object_id = ?", [object_type, object_id])
+      else
+        raise ArgumentError, "unknown object sleep change action: #{sleep_change.action.inspect}"
+      end
+    end
 
     #: (untyped) -> untyped
     def cancel_pending_waits_for_workflow(workflow_id)

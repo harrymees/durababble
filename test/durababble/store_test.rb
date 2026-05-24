@@ -75,6 +75,19 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  class ScriptedMysqlConnection < FakeMysqlConnection
+    def initialize(results)
+      super()
+      @results = results
+    end
+
+    def query(sql)
+      @queries << sql
+      result = @results.shift || MysqlResultLike.new([])
+      result.respond_to?(:call) ? result.call(sql) : result
+    end
+  end
+
   class MysqlResultLike
     attr_reader :affected_rows
 
@@ -523,6 +536,40 @@ class DurababbleStoreTest < DurababbleTestCase
     }
     assert_includes connection.queries, "ROLLBACK"
     assert_includes connection.queries, "COMMIT"
+  end
+
+  test "covers object sleep and mailbox edge branches in adapters" do
+    pg = pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg.claim_next_object_command(object_type: "account", object_id: "1", worker_id: "w")
+    refute pg.send(:runnable_object_command_head?, { "status" => "completed" })
+    refute pg.send(:runnable_object_command_head?, { "status" => "running", "locked_until" => Time.now + 60 })
+    assert pg.send(:runnable_object_command_head?, { "status" => "running", "locked_until" => Time.now - 60 })
+    assert pg.send(:runnable_object_command_head?, { "status" => "running", "locked_until" => nil })
+    assert_raises(ArgumentError) do
+      pg.send(:apply_object_sleep_change, object_type: nil, object_id: "1", sleep_change: Durababble::ObjectSleepChange.new(action: :cancel, wake_at: nil, payload: nil))
+    end
+    assert_raises(ArgumentError) do
+      pg.send(:apply_object_sleep_change, object_type: "account", object_id: "1", sleep_change: Durababble::ObjectSleepChange.new(action: :unknown, wake_at: nil, payload: nil))
+    end
+
+    future = (Time.now + 60).utc.strftime("%Y-%m-%d %H:%M:%S.%6N")
+    blocked_mysql = Durababble::MysqlStore.new(
+      ScriptedMysqlConnection.new([MysqlResultLike.new([{ "id" => "cmd", "status" => "running", "locked_until" => future }])]),
+      schema: "branch_schema",
+    )
+    assert_nil blocked_mysql.claim_next_object_command(object_type: "account", object_id: "1", worker_id: "w")
+
+    mysql = Durababble::MysqlStore.new(FakeMysqlConnection.new, schema: "branch_schema")
+    assert_nil mysql.claim_next_object_command(object_type: "account", object_id: "1", worker_id: "w")
+    mysql.fail_object_command(command_id: "cmd", error: "boom")
+    assert_nil mysql.object_sleep(object_type: "account", object_id: "1")
+    refute mysql.send(:runnable_object_command_head?, { "status" => "completed" })
+    assert_raises(ArgumentError) do
+      mysql.send(:apply_object_sleep_change, object_type: nil, object_id: "1", sleep_change: Durababble::ObjectSleepChange.new(action: :cancel, wake_at: nil, payload: nil))
+    end
+    assert_raises(ArgumentError) do
+      mysql.send(:apply_object_sleep_change, object_type: "account", object_id: "1", sleep_change: Durababble::ObjectSleepChange.new(action: :unknown, wake_at: nil, payload: nil))
+    end
   end
 
   private

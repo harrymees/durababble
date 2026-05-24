@@ -393,6 +393,35 @@ channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```
 
+### Object Sleeps
+
+Durable object commands can replace the object's one pending wakeup with `sleep_until(at:, payload:)` or remove it with `cancel_sleep`. The sleep row is committed with the command result and any state update, and due sleeps are converted into reserved wake command rows that invoke `on_wake(payload:)` through the same per-object mailbox ordering as exposed commands.
+
+```ruby
+class Reminder < Durababble::DurableObject
+  object_type "reminder"
+
+  def initialize_state
+    { "sent" => [] }
+  end
+
+  expose_command def remind(user_id, at)
+    update_state("sent" => current_state.fetch("sent"))
+    sleep_until(at:, payload: { "user_id" => user_id })
+  end
+
+  expose_command def clear
+    cancel_sleep
+  end
+
+  def on_wake(payload: nil)
+    update_state("sent" => current_state.fetch("sent") + [payload.fetch("user_id")])
+  end
+end
+
+store.wake_due_object_sleeps
+```
+
 ## Why Not Just Use Background Jobs?
 
 Background jobs are still the right tool for simple, short, idempotent work: send one email, refresh one cache entry, enqueue one webhook delivery, or run a task where rerunning the whole job is acceptable.
