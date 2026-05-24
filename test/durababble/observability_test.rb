@@ -140,6 +140,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
       row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
     end
 
+    def workflow_cancellation(_workflow_id) = nil
+
     def steps_for(workflow_id) = steps[workflow_id]
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def step_heartbeat_cursor(workflow_id:, position:) = nil

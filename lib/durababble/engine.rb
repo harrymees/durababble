@@ -290,7 +290,7 @@ module Durababble
     rescue CancellationError => e
       assert_workflow_lease!(workflow_id)
       @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil)
-      Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+      Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
       snapshot(workflow_id)
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
