@@ -251,6 +251,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes messages, "running workflow"
     assert_includes messages, "unknown status"
     assert_includes messages, "partial lease"
+    assert_includes messages, "still locked"
     assert_includes messages, "inconsistent identity"
     assert_includes messages, "duplicate completed step positions"
     assert_includes messages, "no attempt history"
