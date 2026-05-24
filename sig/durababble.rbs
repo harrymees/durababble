@@ -58,6 +58,12 @@ module Durababble
   class FenceTimeout < Error
   end
 
+  class CancellationError < Error
+    attr_reader workflow_id: String?
+    attr_reader reason: serialized_payload
+    def initialize: (?serialized_payload reason, ?workflow_id: String?) -> void
+  end
+
   module Observability
     class Configuration
       attr_reader attributes: Hash[String, serialized_payload]
@@ -161,7 +167,9 @@ module Durababble
   class Workflow[Input, Output]
     def self.workflow_name: (?String value) -> String
     def self.enqueue: (Input input, ?store: Store) -> String
+    def self.start: (Input input, ?store: Store) -> WorkflowRef[Input, Output]
     def self.ref: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
+    def self.handle: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
@@ -178,6 +186,7 @@ module Durababble
     attr_reader workflow_id: String
 
     def initialize: (singleton(Workflow[Input, Output]) workflow_class, String workflow_id, store: Store) -> void
+    def cancel: (?reason: serialized_payload) -> Run[serialized_payload]
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end

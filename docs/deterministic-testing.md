@@ -47,12 +47,14 @@ Current scenarios:
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
+- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late signal, and finishes as canceled.
 - `grpc_service_contract` — the protobuf service methods are exercised under the virtual scheduler, including active-owner `DeliverMessage`, stale-owner `DeliverMessage` acknowledgement without work, workflow `CallTransient`, and object/transient `CallTransient`.
 - `grpc_workflow_rpc_response_matrix` — gRPC `CallTransient` response variants are covered together: `LeaseMoved`, `not_running`, and unavailable-node outcomes decode to typed routing failures instead of subprocess protocol errors.
 - `grpc_workflow_rpc_transport_fault_matrix` — workflow `CallTransient` is exposed to timeout, deadline-exceeded, RST, EOF, unavailable, lost-response, and duplicate-response faults.
 - `grpc_workflow_rpc_transport_fault_reroute` — owner transport failures race with lease movement, forcing the router to refresh the active lease and reroute.
 - `grpc_wakeup_fault_matrix` — `AwakenBatch`, `DeliverMessage`, and `EvictLease` wakeups are exposed to drop, duplicate, timeout, RST, EOF, and unavailable faults while polling remains the correctness path.
 - `bug_duplicate_completion` — intentionally broken fixture used to prove invariant detection reports violations.
+- `bug_invalid_store_shape` — intentionally broken fixture used to prove DST catches invalid virtual-store row shape, missing cross-references, and missing leases.
 
 The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping.
 Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.

@@ -11,8 +11,8 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       "#{prefix}:#{@__durababble_ref_workflow_id}"
     end
 
-    expose_command def cancel(reason:)
-      reason
+    expose_command def note(message:)
+      message
     end
 
     step def echo(input)
@@ -157,10 +157,10 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     assert_respond_to ref, :labeled_status
     assert_equal "status:wf-123", ref.labeled_status(prefix: "status")
-    assert_equal 1, ref.cancel(reason: "nope")
+    assert_equal 1, ref.note(message: "hello")
     assert_equal(
       [
-        ["workflow:wf-123:command:cancel", { "method" => "cancel", "args" => [], "kwargs" => { reason: "nope" } }],
+        ["workflow:wf-123:command:note", { "method" => "note", "args" => [], "kwargs" => { message: "hello" } }],
       ],
       store.events,
     )

@@ -40,8 +40,19 @@ module Durababble
       end
 
       #: (untyped, ?store: untyped) -> untyped
+      def start(input, store: Durababble.store)
+        workflow_id = enqueue(input, store:)
+        handle(workflow_id, store:)
+      end
+
+      #: (untyped, ?store: untyped) -> untyped
       def ref(workflow_id, store: Durababble.store)
         WorkflowRef.new(self, workflow_id, store:)
+      end
+
+      #: (untyped, ?store: untyped) -> untyped
+      def handle(workflow_id, store: Durababble.store)
+        ref(workflow_id, store:)
       end
 
       #: (?untyped, **untyped) -> untyped
@@ -185,6 +196,12 @@ module Durababble
 
     #: untyped
     attr_reader :workflow_id
+
+    #: (?reason: untyped) -> untyped
+    def cancel(reason: nil)
+      row = @store.request_workflow_cancellation(workflow_id: @workflow_id, reason:)
+      Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
+    end
 
     #: (untyped, *untyped, **untyped) { (?) -> untyped } -> untyped
     def method_missing(method_name, *args, **kwargs, &block)
