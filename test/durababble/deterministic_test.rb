@@ -200,6 +200,93 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
+  test "virtual store keeps command history coherent for deferred waits and cancellation" do
+    trace = Durababble::Deterministic::Trace.new
+    scheduler = Durababble::Deterministic::Scheduler.new(seed: 61, trace:)
+    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+
+    workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
+    store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
+    store.record_step_scheduled(workflow_id:, command_id: 0, name: "wait_for_event", args: ["evt"])
+    store.record_step_started(workflow_id:, command_id: 0, name: "wait_for_event")
+    store.record_wait(
+      workflow_id:,
+      command_id: 0,
+      name: "wait_for_event",
+      wait_request: Durababble.wait_event("evt", { "started" => true }),
+      suspend_workflow: false,
+    )
+
+    assert_equal "running", store.workflow(workflow_id).fetch("status")
+    assert_equal 1, store.signal_event("evt", payload: { "finished" => true })
+    assert_equal "running", store.workflow(workflow_id).fetch("status")
+
+    store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
+    store.record_step_started(workflow_id:, command_id: 1, name: "cancelable")
+    store.record_step_canceled(workflow_id:, position: 1, error: "workflow cancellation requested")
+
+    assert_equal(
+      ["step_scheduled", "step_started", "step_waiting", "step_completed", "step_scheduled", "step_started", "step_canceled"],
+      store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
+    )
+    assert_equal ["completed", "canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+
+    pending_id = store.enqueue_workflow(name: "cancel-pending", input: {})
+    first = store.request_workflow_cancellation(workflow_id: pending_id, reason: "first")
+    second = store.request_workflow_cancellation(workflow_id: pending_id, reason: "second")
+    store.mark_workflow_cancellation_delivered(workflow_id: pending_id)
+    store.mark_workflow_cancellation_delivered(workflow_id: "missing-cancel")
+
+    assert_equal "canceling", first.fetch("status")
+    assert_equal "canceling", second.fetch("status")
+    assert_equal "first", store.workflow_cancellation(pending_id).fetch("reason")
+    refute_nil store.workflow_cancellation(pending_id).fetch("delivered_at")
+    assert_equal "running", store.claim_workflow(workflow_id: pending_id, worker_id: "worker-b", lease_seconds: 10).fetch("status")
+
+    retry_id = store.enqueue_workflow(name: "cancel-retry", input: {})
+    store.claim_workflow(workflow_id: retry_id, worker_id: "worker-c", lease_seconds: 10)
+    store.request_workflow_cancellation(workflow_id: retry_id, reason: "retry canceled")
+    store.schedule_workflow_retry(workflow_id: retry_id, worker_id: "worker-c", run_at: scheduler.time + 30)
+    assert_equal "canceling", store.workflow(retry_id).fetch("status")
+
+    expired_id = store.enqueue_workflow(name: "cancel-expired", input: {})
+    store.claim_workflow(workflow_id: expired_id, worker_id: "worker-d", lease_seconds: 1)
+    store.request_workflow_cancellation(workflow_id: expired_id, reason: "expired canceled")
+    scheduler.advance(2)
+    assert_equal 1, store.steal_expired_leases!
+    assert_equal "canceling", store.workflow(expired_id).fetch("status")
+
+    completed_id = store.enqueue_workflow(name: "cancel-terminal", input: {})
+    store.complete_workflow(completed_id, result: { "done" => true })
+    assert_equal "completed", store.request_workflow_cancellation(workflow_id: completed_id, reason: "too late").fetch("status")
+    assert_nil store.workflow_cancellation(completed_id)
+  end
+
+  test "virtual store no-op lease and queue paths stay inert" do
+    trace = Durababble::Deterministic::Trace.new
+    scheduler = Durababble::Deterministic::Scheduler.new(seed: 62, trace:)
+    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+
+    workflow_id = store.enqueue_workflow(name: "virtual-noops", input: {})
+
+    assert_nil store.heartbeat_step(workflow_id:, command_id: 0, worker_id: "worker-a", lease_seconds: 10, cursor: "ignored")
+    assert_nil store.step_heartbeat_cursor(workflow_id:, command_id: 0)
+    assert(store.suspend_workflow(workflow_id:))
+    assert_nil store.claim_outbox(worker_id: "sender", lease_seconds: 10)
+
+    outbox_id = store.enqueue_outbox(workflow_id:, topic: "topic", payload: {}, key: "key")
+    assert_nil store.ack_outbox(outbox_id, worker_id: "wrong-sender")
+    assert_equal "pending", store.outbox_message(outbox_id).fetch("status")
+
+    store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
+
+    assert_nil store.heartbeat_step(workflow_id:, command_id: 99, worker_id: "worker-a", lease_seconds: 10, cursor: "missing")
+    assert_nil store.schedule_workflow_retry(workflow_id:, worker_id: "worker-b", run_at: scheduler.time + 10)
+    refute store.suspend_workflow(workflow_id:, worker_id: "worker-b")
+    assert(store.suspend_workflow(workflow_id:, worker_id: "worker-a"))
+    assert_equal "pending", store.workflow(workflow_id).fetch("status")
+  end
+
   test "models durable store faults after writes and recovers from the persisted state" do
     step = Durababble::Deterministic.prove("store_fault_after_step_completed", seed: 47)
     wait = Durababble::Deterministic.prove("store_fault_after_wait_recorded", seed: 48)

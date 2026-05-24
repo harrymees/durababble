@@ -24,6 +24,11 @@ sig ObjectTarget {}
 sig ObjectCommand { command_target: one ObjectTarget }
 sig InboxRow { inbox_target: one ObjectTarget }
 sig HistoryRow { history_workflow: one Workflow }
+sig WorkflowCommand {
+  wc_workflow: one Workflow,
+  wc_step: one Step
+}
+sig CommandShape {}
 
 abstract sig WorkflowStatus {}
 one sig Pending, Running, Waiting, Completed, Failed, Cancelled, Terminated extends WorkflowStatus {}
@@ -45,6 +50,9 @@ one sig OutboxPending, OutboxProcessing, OutboxAcked extends OutboxStatus {}
 
 abstract sig CommandStatus {}
 one sig CommandPending, CommandRunning, CommandCompleted, CommandFailed extends CommandStatus {}
+
+abstract sig CommandHistoryKind {}
+one sig CommandScheduled, CommandStarted, CommandResolved extends CommandHistoryKind {}
 
 abstract sig CommitKind {}
 one sig WorkflowCommit, StepCommit, WaitCommit, FenceCommit, OutboxCommit, ObjectCommandCommit extends CommitKind {}
@@ -117,6 +125,14 @@ sig HistoryState {
   history_time: one Time
 }
 
+sig CommandHistoryRow {
+  chr_command: one WorkflowCommand,
+  chr_kind: one CommandHistoryKind,
+  chr_shape: lone CommandShape,
+  chr_sequence: one Time,
+  chr_time: one Time
+}
+
 sig DurableCommit {
   commit_workflow: lone Workflow,
   commit_step: lone Step,
@@ -179,6 +195,10 @@ fun commandStatus[c: ObjectCommand, t: Time]: set CommandStatus {
   ((command_row.c) & (command_time.t)).command_status
 }
 
+fun commandScheduledShape[c: WorkflowCommand, t: Time]: set CommandShape {
+  ((chr_command.c) & (chr_kind.CommandScheduled) & (chr_time.t)).chr_shape
+}
+
 pred liveWorkflowLease[w: Workflow, worker: Worker, t: Time] {
   some l: LeaseRow | l.lr_workflow = w and l.lr_worker = worker and l.lr_time = t and gt[l.lr_expiresAt, t]
 }
@@ -226,6 +246,23 @@ pred commandSame[c: ObjectCommand, t: Time, tnext: Time] {
   ((command_row.c) & (command_time.tnext)).command_expiresAt = ((command_row.c) & (command_time.t)).command_expiresAt
 }
 
+pred commandHistorySame[c: WorkflowCommand, t: Time, tnext: Time] {
+  all old: CommandHistoryRow | old.chr_command = c and old.chr_time = t implies
+    some new: CommandHistoryRow |
+      new.chr_command = c and
+      new.chr_kind = old.chr_kind and
+      new.chr_shape = old.chr_shape and
+      new.chr_sequence = old.chr_sequence and
+      new.chr_time = tnext
+  all new: CommandHistoryRow | new.chr_command = c and new.chr_time = tnext implies
+    some old: CommandHistoryRow |
+      old.chr_command = c and
+      old.chr_kind = new.chr_kind and
+      old.chr_shape = new.chr_shape and
+      old.chr_sequence = new.chr_sequence and
+      old.chr_time = t
+}
+
 fact wellFormedRows {
   all w: Workflow, t: Time | lone r: WorkflowRow | r.wr_workflow = w and r.wr_time = t
   all s: Step, t: Time | lone r: StepRow | r.sr_step = s and r.sr_time = t
@@ -234,12 +271,17 @@ fact wellFormedRows {
   all f: Fence, t: Time | lone r: FenceRow | r.fence_row = f and r.fence_time = t
   all o: OutboxMessage, t: Time | lone r: OutboxRow | r.outbox_row = o and r.outbox_time = t
   all c: ObjectCommand, t: Time | lone r: CommandRow | r.command_row = c and r.command_time = t
+  all cmd: WorkflowCommand | cmd.wc_step.step_workflow = cmd.wc_workflow
+  all cmd: WorkflowCommand, t, sequence: Time, kind: CommandHistoryKind |
+    lone r: CommandHistoryRow | r.chr_command = cmd and r.chr_time = t and r.chr_sequence = sequence and r.chr_kind = kind
 
   all s: Step, t: Time | some stepStatus[s, t] implies some workflowStatus[s.step_workflow, t]
   all a: Attempt, t: Time | some attemptStatus[a, t] implies some stepStatus[a.attempt_step, t]
   all w: Wait, t: Time | some waitStatus[w, t] implies some stepStatus[w.wait_step, t]
   all f: Fence, t: Time | some fenceStatus[f, t] implies some workflowStatus[f.fence_workflow, t]
   all o: OutboxMessage, t: Time | some outboxStatus[o, t] implies some workflowStatus[o.outbox_workflow, t]
+  all r: CommandHistoryRow | some workflowStatus[r.chr_command.wc_workflow, r.chr_time]
+  all r: CommandHistoryRow | (r.chr_kind = CommandScheduled) iff (one r.chr_shape)
 
   all l: LeaseRow | some workflowStatus[l.lr_workflow, l.lr_time] and gte[l.lr_expiresAt, l.lr_time]
   all r: CommandRow | some r.command_expiresAt implies gte[r.command_expiresAt, r.command_time]
@@ -299,6 +341,7 @@ pred init[t: Time] {
   no CommandRow & command_time.t
   no InboxState & inbox_time.t
   no HistoryState & history_time.t
+  no CommandHistoryRow & chr_time.t
 }
 
 pred globalFrame[t: Time, tnext: Time] {
@@ -314,6 +357,7 @@ pred unchangedExcept[wf: lone Workflow, st: lone Step, att: lone Attempt, wt: lo
   all other: Fence - f | fenceSame[other, t, tnext]
   all other: OutboxMessage - o | outboxSame[other, t, tnext]
   all other: ObjectCommand - c | commandSame[other, t, tnext]
+  all cmd: WorkflowCommand | commandHistorySame[cmd, t, tnext]
 }
 
 pred preserveLeasesExcept[wf: lone Workflow, t: Time, tnext: Time] {
@@ -375,6 +419,31 @@ pred releaseOrStealLease[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   unchangedExcept[wf, none, none, none, none, none, none, t, tnext]
   preserveLeasesExcept[wf, t, tnext]
+  globalFrame[t, tnext]
+}
+
+pred scheduleWorkflowCommand[wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, t: Time, tnext: Time] {
+  -- [DURABABBLE-CONCURRENCY-1] Concurrent workflow fibers append ordered step command history before side-effect execution.
+  cmd.wc_workflow = wf
+  workflowStatus[wf, t] = Running
+  no r: CommandHistoryRow | r.chr_command = cmd and r.chr_time = t
+  workflowSame[wf, t, tnext]
+  all st: Step | stepSame[st, t, tnext]
+  all att: Attempt | attemptSame[att, t, tnext]
+  all wait: Wait | waitSame[wait, t, tnext]
+  all f: Fence | fenceSame[f, t, tnext]
+  all o: OutboxMessage | outboxSame[o, t, tnext]
+  all c: ObjectCommand | commandSame[c, t, tnext]
+  all other: WorkflowCommand - cmd | commandHistorySame[other, t, tnext]
+  one r: CommandHistoryRow |
+    r.chr_command = cmd and
+    r.chr_kind = CommandScheduled and
+    r.chr_shape = shape and
+    r.chr_sequence = tnext and
+    r.chr_time = tnext
+  all r: CommandHistoryRow | r.chr_command = cmd and r.chr_time = tnext implies
+    r.chr_kind = CommandScheduled and r.chr_shape = shape and r.chr_sequence = tnext
+  preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
 }
 
@@ -481,8 +550,10 @@ pred failCancelOrTerminateWorkflow[wf: Workflow, worker: lone Worker, status: Wo
   status in (Failed + Cancelled + Terminated)
   workflowStatus[wf, t] in (Pending + Running + Waiting)
   worker in Worker implies liveWorkflowLease[wf, worker, t]
-  all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] not in (StepRunning + StepWaiting)
-  all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting)
+  status in (Cancelled + Terminated) implies {
+    all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] not in (StepRunning + StepWaiting)
+    all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting)
+  }
   workflowStatus[wf, tnext] = status
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   unchangedExcept[wf, none, none, none, none, none, none, t, tnext]
@@ -613,6 +684,7 @@ pred stutter[t: Time, tnext: Time] {
   all f: Fence | fenceSame[f, t, tnext]
   all o: OutboxMessage | outboxSame[o, t, tnext]
   all c: ObjectCommand | commandSame[c, t, tnext]
+  all cmd: WorkflowCommand | commandHistorySame[cmd, t, tnext]
   preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
 }
@@ -623,6 +695,7 @@ pred step[t: Time, tnext: Time] {
   or some wf: Workflow, worker: Worker | claimWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | heartbeatWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | releaseOrStealLease[wf, worker, t, tnext]
+  or some wf: Workflow, cmd: WorkflowCommand, shape: CommandShape | scheduleWorkflowCommand[wf, cmd, shape, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt | startStep[wf, st, att, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker | completeStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | retryStep[wf, st, att, worker, due, t, tnext]
@@ -671,6 +744,20 @@ assert terminalStatesDoNotMutate {
 assert completedStepsAreNotReexecuted {
   all st: Step, t: Time - last |
     stepStatus[st, t] = StepCompleted implies stepStatus[st, t.next] = StepCompleted
+}
+
+/**
+ * [DURABABBLE-CONCURRENCY-1] Scheduled workflow command history is ordered,
+ * shape-stable, and unique per workflow command id even when several workflow
+ * fibers schedule work before any completion resolves.
+ */
+assert scheduledCommandHistoryIsReplayStable {
+  all cmd: WorkflowCommand, t1, t2: Time |
+    some commandScheduledShape[cmd, t1] and some commandScheduledShape[cmd, t2]
+    implies commandScheduledShape[cmd, t1] = commandScheduledShape[cmd, t2]
+  all wf: Workflow, sequence, t: Time |
+    lone cmd: WorkflowCommand | cmd.wc_workflow = wf and some r: CommandHistoryRow |
+      r.chr_command = cmd and r.chr_kind = CommandScheduled and r.chr_sequence = sequence and r.chr_time = t
 }
 
 /**
@@ -809,6 +896,21 @@ pred exampleStepStart {
   }
 }
 
+pred exampleParallelCommandSchedules {
+  some wf: Workflow, st1, st2: Step, cmd1, cmd2: WorkflowCommand, shape1, shape2: CommandShape, worker: Worker | {
+    cmd1 != cmd2
+    st1 != st2
+    cmd1.wc_step = st1
+    cmd2.wc_step = st2
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd1, shape1, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd2, shape2, first.next.next.next, first.next.next.next.next]
+    some commandScheduledShape[cmd1, first.next.next.next.next]
+    some commandScheduledShape[cmd2, first.next.next.next.next]
+  }
+}
+
 pred exampleFenceOutbox {
   some wf: Workflow, worker: Worker, f: Fence, o: OutboxMessage | {
     enqueueWorkflow[wf, first, first.next]
@@ -841,23 +943,25 @@ pred exampleObjectCommandFailureRetry {
   }
 }
 
-run exampleWorkflowCompletes for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 6 Time
-run exampleLeaseStealAndReplay for 10 but exactly 1 Workflow, 2 Worker, 1 Step, 1 Attempt, 8 Time
-run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 Signal, 8 Time
-run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 6 Time
-run exampleStepStart for 6 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 5 Time
-run exampleFenceOutbox for 9 but exactly 1 Workflow, 1 Worker, 1 Fence, 1 OutboxMessage, 7 Time
-run exampleObjectCommandCompletes for 6 but exactly 1 ObjectTarget, 1 ObjectCommand, 1 Worker, 4 Time
-run exampleObjectCommandFailureRetry for 7 but exactly 1 ObjectTarget, 1 ObjectCommand, 2 Worker, 6 Time
+run exampleWorkflowCompletes for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+run exampleLeaseStealAndReplay for 10 but exactly 1 Workflow, 2 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time
+run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 Signal, 1 WorkflowCommand, 1 CommandShape, 8 Time
+run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+run exampleStepStart for 6 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 5 Time
+run exampleParallelCommandSchedules for 8 but exactly 1 Workflow, 1 Worker, 2 Step, 2 WorkflowCommand, 2 CommandShape, 6 Time
+run exampleFenceOutbox for 9 but exactly 1 Workflow, 1 Worker, 1 Fence, 1 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time
+run exampleObjectCommandCompletes for 6 but exactly 1 ObjectTarget, 1 ObjectCommand, 1 Worker, 1 WorkflowCommand, 1 CommandShape, 4 Time
+run exampleObjectCommandFailureRetry for 7 but exactly 1 ObjectTarget, 1 ObjectCommand, 2 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time
 
-check atMostOneLiveOwner for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 Signal, 6 Time
-check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 6 Time
-check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 6 Time
-check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 6 Time
-check durableObjectCommandSerializationHolds for 4 but 2 ObjectTarget, 4 ObjectCommand, 3 Worker, 6 Time
+check atMostOneLiveOwner for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check scheduledCommandHistoryIsReplayStable for 4 but 2 Workflow, 2 Worker, 3 Step, 3 WorkflowCommand, 3 CommandShape, 5 Time
+check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 Signal, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check durableObjectCommandSerializationHolds for 4 but 2 ObjectTarget, 4 ObjectCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time

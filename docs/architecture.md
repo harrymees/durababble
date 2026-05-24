@@ -4,17 +4,17 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 
 ## Components
 
-- `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
+- `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine records ordered durable command history, so raw Async workflow fibers can schedule concurrent step work while replay keeps the same command stream.
 - `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
-- `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
+- `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records ordered workflow command history and step transitions, propagates workflow context through raw Async tasks, handles explicit step heartbeats, handles retryable step failures, handles waits, and resolves replay from durable history.
 - `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease. The worker registry contains workflow classes.
 - `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
 - `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` currently records durable command events rather than executing through this router.
 - `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: protobuf/gRPC transport for cross-node wakeups, evictions, transient calls, and durable-message wakeups. Workflow transient calls use `Durababble::Rpc::WorkflowClient` to bridge `WorkflowRpc::Router` onto the `CallTransient` gRPC method.
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
-- `formal/workflow_storage.als`: Alloy model for workflow state, leases, waits, fences, outbox rows, durable-object command rows, and future inbox/history placeholders. `scripts/verify-alloy.sh` verifies the model and `scripts/validate-durababble-sigils.rb` keeps `[DURABABBLE-*]` obligations synchronized with Ruby implementation/tests.
+- `formal/workflow_storage.als`: Alloy model for workflow state, ordered workflow command history, leases, waits, fences, outbox rows, durable-object command rows, and future inbox/history placeholders. `scripts/verify-alloy.sh` verifies the model and `scripts/validate-durababble-sigils.rb` keeps `[DURABABBLE-*]` obligations synchronized with Ruby implementation/tests.
 
 ## Public API model
 
@@ -40,17 +40,9 @@ class CounterWorkflow < Durababble::Workflow
 end
 ```
 
-When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object:
+When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object assigns the next command id, records a `step_scheduled` history event with the method name, args/kwargs, and retry shape, starts the step body in a transient Async task, records a step attempt, builds `step_context` with a generated idempotency key and heartbeat, and then persists success, wait, retryable failure, cancellation, or final failure as terminal command history.
 
-1. assigns the next step position;
-2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
-3. records the step start and attempt;
-4. builds `step_context` with a generated idempotency key and heartbeat;
-5. invokes the original Ruby method body;
-6. persists success, wait, retryable failure, or final failure.
-
-This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
-If replay reaches any persisted step position with a different current method name, or if workflow execution returns before all persisted step positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
+This means step identity is based on deterministic ordered command history. Code with no Async fanout emits one command at a time; code using raw `Async` or `Async::Task#async` can emit several commands before any branch completes. Replay validates scheduled command shape before dispatching work, delivers terminal command resolutions in history order, and fails the run with `Durababble::NonDeterminismError` when current code consumes a different command stream or returns before consuming recorded command history.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 
@@ -88,7 +80,8 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 ## Storage model
 
 - `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, `next_run_at` for durably scheduled step retries, and first cooperative cancellation request metadata (`cancel_reason`, `cancel_requested_at`, `cancel_delivered_at`).
-- `steps`: one row per workflow step position; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
+- `workflow_history`: append-only ordered replay events for workflow command scheduling, starts, completions, waits, failures, cancellations, and future markers/signals.
+- `steps`: latest query/cache row per workflow command id; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
 - `step_attempts`: append-only attempt history for every started step, including the latest heartbeat cursor observed for each attempt.
 - `waits`: durable timer and external-event waits, including context needed to resume.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
@@ -104,13 +97,13 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - A step heartbeat (`step_context.heartbeat.record(cursor)`) compare-and-swaps against the current workflow lease owner/deadline, extends `locked_until`, and stores an opaque Paquito-serialized cursor on the current step/attempt. If the workflow lease expired or moved, the heartbeat raises `LeaseConflict` instead of reviving a zombie owner.
 - Expired leases are returned to `pending` for recovery.
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
-- Before a step runs, its current step row and a new attempt row are persisted transactionally.
+- Before a step runs, a `step_scheduled` history event is persisted. Starting the step then transactionally records the current step row, a new attempt row, and a `step_started` history event.
 - After success/failure/wait, the related step and attempt rows are updated transactionally.
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
 - Claim paths skip retry rows whose `next_run_at` is still in the future. Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths; only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
-- On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
+- On resume, recorded command history is replayed. Completed command results are delivered without rerunning side effects; incomplete/running/failed/waiting work is retried or continued according to durable state. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Workflow cancellation is cooperative, not termination. `Workflow.handle(id).cancel(reason:)` records durable cancellation metadata on the workflow row. Pending, waiting, and retry-backoff workflows move to `canceling` and become claimable immediately; running workflows keep their current lease and observe the request at the next step boundary, completed-step replay boundary, or step heartbeat. The engine raises `Durababble::CancellationError` into workflow code. Once raised, cleanup steps run as ordinary durable steps; completed cleanup steps are skipped after crash/recovery. If cleanup returns or re-raises the cancellation error, the workflow becomes `canceled`. If cleanup raises an unrelated non-retryable error, the workflow becomes `failed`; retryable cleanup failures keep `next_run_at` and retry under `canceling`.
 - First-class child workflows are still future scope. Cancellation semantics for that future surface must require an explicit durable child-cancellation policy; cooperative parent cancellation must not silently terminate child work or claim that child cleanup completed.
