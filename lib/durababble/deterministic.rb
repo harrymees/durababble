@@ -217,6 +217,7 @@ module Durababble
         @id_seq = 0
         @workflows = {}
         @cancellations = {}
+        @history = Hash.new { |hash, key| hash[key] = [] }
         @steps = Hash.new { |hash, key| hash[key] = {} }
         @attempts = Hash.new { |hash, key| hash[key] = [] }
         @waits = {}
@@ -280,25 +281,27 @@ module Durababble
         end
       end
 
-      #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
-      def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
+      def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
         row = @workflows.fetch(workflow_id)
         return unless row.fetch("locked_by") == worker_id && row.fetch("status") == "running" && !expired?(row)
 
         row["locked_until"] = scheduler.time + lease_seconds
-        step = @steps[workflow_id][position]
+        step = @steps[workflow_id][command_id]
         return unless step&.fetch("status") == "running"
 
         step["heartbeat_cursor"] = deep(cursor)
-        latest_attempt = @attempts[workflow_id].reverse.find { |attempt| attempt.fetch("position") == position && attempt.fetch("status") == "running" }
+        latest_attempt = @attempts[workflow_id].reverse.find { |attempt| attempt.fetch("position") == command_id && attempt.fetch("status") == "running" }
         latest_attempt["heartbeat_cursor"] = deep(cursor) if latest_attempt
-        trace("step_heartbeat", id: workflow_id, position:, worker: worker_id, cursor:)
+        trace("step_heartbeat", id: workflow_id, command_id:, worker: worker_id, cursor:)
         row.fetch("locked_until")
       end
 
-      #: (workflow_id: untyped, position: untyped) -> untyped
-      def step_heartbeat_cursor(workflow_id:, position:)
-        deep(@steps[workflow_id][position]&.fetch("heartbeat_cursor", nil))
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
+      def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        deep(@steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil))
       end
 
       #: (untyped) -> untyped
@@ -338,6 +341,21 @@ module Durababble
         deep(row)
       end
 
+      #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
+      def suspend_workflow(workflow_id:, worker_id: nil)
+        row = @workflows.fetch(workflow_id)
+        return true if row.fetch("status") == "waiting"
+        return true if row.fetch("status") == "pending"
+        return false unless row.fetch("status") == "running"
+        return false if worker_id && row.fetch("locked_by") != worker_id
+
+        row["status"] = @waits.values.any? { |wait| wait.fetch("workflow_id") == workflow_id && wait.fetch("status") == "pending" } ? "waiting" : "pending"
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        trace("workflow_suspended", id: workflow_id)
+        true
+      end
+
       #: (untyped, result: untyped) -> untyped
       def complete_workflow(workflow_id, result:)
         row = @workflows.fetch(workflow_id)
@@ -373,58 +391,75 @@ module Durababble
         trace("fail_workflow", id: workflow_id, error:)
       end
 
-      #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
-      def record_step_started(workflow_id:, position:, name:)
+      #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
+      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+        payload = { "name" => name, "args" => deep(args), "kwargs" => deep(kwargs) }.merge(deep(metadata))
+        append_history(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
+        @steps[workflow_id][command_id] ||= { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "scheduled", "result" => nil, "error" => nil, "heartbeat_cursor" => nil }
+        trace("step_scheduled", id: workflow_id, command_id:, name:, payload:)
+      end
+
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
+      def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
         @attempts[workflow_id].each do |attempt|
-          next unless attempt.fetch("position") == position && attempt.fetch("status") == "running"
+          next unless attempt.fetch("position") == command_id && attempt.fetch("status") == "running"
 
           attempt["status"] = "failed"
           attempt["error"] = "superseded by retry"
         end
-        previous_cursor = @steps[workflow_id][position]&.fetch("heartbeat_cursor", nil)
-        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
-        @attempts[workflow_id] << { "id" => next_id("attempt"), "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
-        trace("step_started", id: workflow_id, position:, name:)
+        previous_cursor = @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil)
+        @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
+        attempt_id = next_id("attempt")
+        @attempts[workflow_id] << { "id" => attempt_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
+        append_history(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
+        trace("step_started", id: workflow_id, command_id:, name:)
+        attempt_id
       end
 
-      #: (workflow_id: untyped, position: untyped, result: untyped) -> untyped
-      def record_step_completed(workflow_id:, position:, result:)
-        step = @steps[workflow_id].fetch(position)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
+      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        step = @steps[workflow_id].fetch(command_id)
         step["status"] = "completed"
         step["result"] = deep(result)
-        update_latest_attempt(workflow_id, position, "completed", result, nil)
-        trace("step_completed", id: workflow_id, position:, result:)
+        update_latest_attempt(workflow_id, command_id, "completed", result, nil)
+        append_history(workflow_id:, kind: "step_completed", command_id:, payload: result)
+        trace("step_completed", id: workflow_id, command_id:, result:)
         fault_plan.after(:record_step_completed)
       end
 
-      #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-      def record_step_failed(workflow_id:, position:, error:)
-        step = @steps[workflow_id].fetch(position)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        step = @steps[workflow_id].fetch(command_id)
         step["status"] = "failed"
         step["error"] = error
-        update_latest_attempt(workflow_id, position, "failed", nil, error)
-        trace("step_failed", id: workflow_id, position:, error:)
+        update_latest_attempt(workflow_id, command_id, "failed", nil, error)
+        append_history(workflow_id:, kind: "step_failed", command_id:, error:)
+        trace("step_failed", id: workflow_id, command_id:, error:)
       end
 
-      #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-      def record_step_canceled(workflow_id:, position:, error:)
-        step = @steps[workflow_id].fetch(position)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        step = @steps[workflow_id].fetch(command_id)
         step["status"] = "canceled"
         step["error"] = error
-        update_latest_attempt(workflow_id, position, "canceled", nil, error)
-        trace("step_canceled", id: workflow_id, position:, error:)
+        update_latest_attempt(workflow_id, command_id, "canceled", nil, error)
+        append_history(workflow_id:, kind: "step_canceled", command_id:, error:)
+        trace("step_canceled", id: workflow_id, command_id:, error:)
       end
 
-      #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
-      def record_wait(workflow_id:, position:, name:, wait_request:)
-        @steps[workflow_id][position] = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][position]&.fetch("heartbeat_cursor", nil) }
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
+      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+        command_id = normalize_command_id(command_id, position)
+        @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil) }
         wait_id = next_id("wait")
-        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => position, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
-        update_latest_attempt(workflow_id, position, "waiting", wait_request.context, nil)
-        row = @workflows.fetch(workflow_id)
-        row["status"] = "waiting"
-        row["locked_by"] = nil
-        row["locked_until"] = nil
+        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
+        update_latest_attempt(workflow_id, command_id, "waiting", wait_request.context, nil)
+        append_history(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
+        suspend_workflow(workflow_id:) if suspend_workflow
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
         wait_id
@@ -444,6 +479,11 @@ module Durababble
       #: (untyped) -> untyped
       def waits_for(workflow_id)
         @waits.values.select { |wait| wait.fetch("workflow_id") == workflow_id }.sort_by { |wait| wait.fetch("id") }.map { |row| deep(row) }
+      end
+
+      #: (untyped) -> untyped
+      def workflow_history_for(workflow_id)
+        @history[workflow_id].map { |row| deep(row) }
       end
 
       #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
@@ -629,15 +669,17 @@ module Durababble
         completed = 0
         waits.each do |wait|
           row = @workflows.fetch(wait.fetch("workflow_id"))
-          next unless row.fetch("status") == "waiting"
+          next unless ["waiting", "running"].include?(row.fetch("status"))
 
           wait["status"] = "completed"
           wait["payload"] = deep(payload)
           context = wait.fetch("context").merge(payload)
           record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position"), result: context)
-          row["status"] = "pending"
-          row["locked_by"] = nil
-          row["locked_until"] = nil
+          if row.fetch("status") == "waiting"
+            row["status"] = "pending"
+            row["locked_by"] = nil
+            row["locked_until"] = nil
+          end
           completed += 1
           trace("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
         end
@@ -681,6 +723,30 @@ module Durababble
         attempt["status"] = status
         attempt["result"] = deep(result)
         attempt["error"] = error
+      end
+
+      #: (workflow_id: untyped, kind: untyped, ?command_id: untyped, ?name: untyped, ?attempt_id: untyped, ?payload: untyped, ?error: untyped) -> untyped
+      def append_history(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
+        event = {
+          "workflow_id" => workflow_id,
+          "event_index" => @history[workflow_id].length,
+          "kind" => kind,
+          "command_id" => command_id,
+          "name" => name,
+          "attempt_id" => attempt_id,
+          "payload" => deep(payload),
+          "error" => error,
+        }
+        @history[workflow_id] << event
+        event.fetch("event_index")
+      end
+
+      #: (untyped, untyped) -> untyped
+      def normalize_command_id(command_id, position)
+        id = command_id.nil? ? position : command_id
+        raise ArgumentError, "command_id is required" if id.nil?
+
+        id
       end
 
       #: (untyped) -> untyped

@@ -51,7 +51,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         assert_equal "failed", run.status
         assert_match(/NonDeterminismError/, run.error)
         assert_match(/new_step/, run.error)
-        assert_match(/old_step/, run.error)
+        assert_match(/different durable command shape/, run.error)
         assert_hash_includes store.steps_for(workflow_id).first, "name" => "old_step", "status" => "completed"
         assert_equal ["completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
@@ -96,7 +96,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         assert_equal "failed", run.status
         assert_match(/NonDeterminismError/, run.error)
-        assert_match(/without consuming durable step history/, run.error)
+        assert_match(/without consuming durable command history/, run.error)
         assert_match(/1:wait_for_release/, run.error)
         assert_equal(
           [["0", "first_step", "completed"], ["1", "wait_for_release", "completed"]],
@@ -158,8 +158,8 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         assert_equal "failed", run.status
         assert_match(/NonDeterminismError/, run.error)
-        assert_match(/first/, run.error)
         assert_match(/second/, run.error)
+        assert_match(/different durable command shape/, run.error)
       end
     end
 

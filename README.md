@@ -106,6 +106,35 @@ run.result
 
 <!-- README:workflow-example:end -->
 
+### Parallel steps with Async
+
+Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
+
+```ruby
+class FetchProfiles < Durababble::Workflow
+  def execute(user_ids)
+    Async do |task|
+      user_ids.map do |user_id|
+        task.async do
+          profile = fetch_profile(user_id)
+          score_profile(profile)
+        end
+      end.map(&:wait)
+    end.wait
+  end
+
+  step def fetch_profile(user_id)
+    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def score_profile(profile)
+    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
+
 ### Enqueuing and workflow handles
 
 `Engine#run` is the small-script path: it creates a workflow row, runs it immediately in the current process, and returns the completed `Durababble::Run`. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases.

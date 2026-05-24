@@ -21,12 +21,18 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           "locked_by" => "worker-a",
         )
 
-        store.record_step_started(workflow_id:, position: 0, name: "increment")
-        store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 })
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "increment", args: [{ "count" => 1 }])
+        store.record_step_started(workflow_id:, command_id: 0, name: "increment")
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 2 })
         store.complete_workflow(workflow_id, result: { "count" => 2 })
 
         assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "count" => 2 }
-        assert_hash_includes store.steps_for(workflow_id).first, "status" => "completed", "result" => { "count" => 2 }
+        assert_hash_includes store.steps_for(workflow_id).first, "command_id" => 0, "status" => "completed", "result" => { "count" => 2 }
+        assert_equal(
+          ["step_scheduled", "step_started", "step_completed"],
+          store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
+        )
+        assert_equal [{ "name" => "increment", "args" => [{ "count" => 1 }], "kwargs" => {} }, nil, { "count" => 2 }], store.workflow_history_for(workflow_id).map { |event| event["payload"] }
       end
     end
 
