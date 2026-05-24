@@ -7,8 +7,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "migrates, enqueues, claims, completes, and decodes serialized workflow state with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
-
         workflow_id = store.enqueue_workflow(name: "conformance", input: { "count" => 1 })
         claimed = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 30)
 
@@ -38,7 +36,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
 
         first_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "event" => 1 }, key: "events:1")
@@ -67,7 +64,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "persists waits and wakes event waiters once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.create_workflow(name: "waiter", input: { "start" => true })
         wait_id = store.record_wait(
           workflow_id:,
@@ -103,7 +99,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "persists waits and wakes due timers once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.create_workflow(name: "timer", input: {})
         wait_id = store.record_wait(
           workflow_id:,
@@ -124,7 +119,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "deduplicates fenced work and replays completed or failed results with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.create_workflow(name: "fenced", input: {})
         calls = 0
 
@@ -157,8 +151,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "persists durable object state and command lifecycle payloads with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
-
         assert_nil store.object_state(object_type: "counter", object_id: "abc")
         assert_equal({ "count" => 1 }, store.save_object_state(object_type: "counter", object_id: "abc", state: { "count" => 1 }))
         assert_equal({ "count" => 1 }, store.object_state(object_type: "counter", object_id: "abc"))
@@ -214,7 +206,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "supports lease, heartbeat, retry, failure, and release lifecycle operations with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "lifecycle", input: { "start" => true })
 
         assert_nil store.claim_runnable_workflow(worker_id: "nobody", lease_seconds: 30, workflow_names: [])
@@ -269,7 +260,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "rejects heartbeat attempts after a workflow lease expires with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "expired-heartbeat", input: {})
 
         assert_hash_includes(
@@ -284,7 +274,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     test "reclaims expired durable object command leases with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         command_id = store.enqueue_object_command(
           object_type: "counter",
           object_id: "abc",
@@ -310,7 +299,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       skip("only the MySQL backend exposes transaction metadata") unless backend.mysql?
 
       with_durababble_store(backend, "conformance") do |store|
-        store.migrate!
         assert_nil store.claim_runnable_workflow(worker_id: "idle-worker", lease_seconds: 30)
         assert_equal 0, mysql_transaction_depth
 

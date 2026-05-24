@@ -159,14 +159,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   end
 
   test "keeps hot-path store operations on explicit indexes in production-sized tables" do
-    skip_without_yugabyte!
-    require "pg"
-
-    connection = RecordingConnection.new(PG.connect(durababble_yugabyte_database_url))
-    @durababble_schema = "durababble_plan_test_#{Process.pid}_#{SecureRandom.hex(4)}"
-    @durababble_store = Durababble::Store.new(connection, schema:)
-
-    store.migrate!
+    connection = migrated_recording_connection
     seed_large_workflow_fixture(connection, schema)
 
     operations = {
@@ -301,6 +294,17 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   end
 
   private
+
+  def migrated_recording_connection
+    skip_without_yugabyte!
+    require "pg"
+
+    connection = RecordingConnection.new(PG.connect(durababble_yugabyte_database_url))
+    @durababble_schema = "durababble_plan_test_#{Process.pid}_#{SecureRandom.hex(4)}"
+    @durababble_store = Durababble::Store.new(connection, schema:)
+    @durababble_store.migrate!
+    connection
+  end
 
   def recorded_queries_for(connection, &block)
     connection.transaction do

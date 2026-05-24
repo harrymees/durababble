@@ -7,8 +7,6 @@ class DurababbleCompleteTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "implements the guarantee matrix explicitly with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
-        store.migrate!
-
         workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 2 })
         claim = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 60)
         assert_equal workflow_id, claim.fetch("id")
@@ -68,7 +66,6 @@ class DurababbleCompleteTest < DurababbleTestCase
 
     test "implements timers, external event waits, and worker polling with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
-        store.migrate!
         workflow = durababble_test_workflow("waits") do
           test_step("wait_for_time") do |ctx|
             Durababble.wait_until(Time.now + 3600, ctx.merge("after_timer" => true))
@@ -107,8 +104,6 @@ class DurababbleCompleteTest < DurababbleTestCase
 
     test "implements the crash matrix explicitly with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
-        store.migrate!
-
         enqueue_crash_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
         assert_equal({ "count" => 4 }, engine.resume(counter_workflow, workflow_id: enqueue_crash_id).result)
 
