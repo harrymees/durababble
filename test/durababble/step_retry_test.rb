@@ -7,7 +7,6 @@ class DurababbleStepRetryTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "retries a failed step according to a Ruby-ified Temporal exponential policy with #{backend.name}" do
       with_durababble_store(backend, "step_retry_test") do |store|
-        store.migrate!
         attempts = 0
         workflow = durababble_test_workflow("retry-exponential") do
           test_step(
@@ -53,7 +52,6 @@ class DurababbleStepRetryTest < DurababbleTestCase
 
     test "persists retry schedule across lease expiry and process restart with #{backend.name}" do
       with_durababble_store(backend, "step_retry_test") do |store|
-        store.migrate!
         attempts = 0
         workflow = durababble_test_workflow("retry-restart") do
           test_step("flaky", retry_policy: { initial_interval: 5, maximum_attempts: 2 }) do |ctx|
@@ -99,7 +97,6 @@ class DurababbleStepRetryTest < DurababbleTestCase
 
     test "bubbles the final failure to the workflow when attempts are exhausted with #{backend.name}" do
       with_durababble_store(backend, "step_retry_test") do |store|
-        store.migrate!
         workflow = durababble_test_workflow("retry-exhausted") do
           test_step("always-fails", retry_policy: { initial_interval: 1, maximum_attempts: 2 }) do |_ctx|
             raise ArgumentError, "still bad"
@@ -127,7 +124,6 @@ class DurababbleStepRetryTest < DurababbleTestCase
 
     test "does not retry non-retryable errors with #{backend.name}" do
       with_durababble_store(backend, "step_retry_test") do |store|
-        store.migrate!
         workflow = durababble_test_workflow("retry-nonretryable") do
           test_step("bad-input", retry_policy: { maximum_attempts: 5, non_retryable_errors: [ArgumentError] }) do |_ctx|
             raise ArgumentError, "invalid"

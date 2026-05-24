@@ -147,7 +147,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "exposes commands and queries without step semantics with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         account = ApiTestAccount.ref("acct-1", store:)
 
         assert_not_respond_to ApiTestAccount, :step
@@ -160,7 +159,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     test "persists durable object state atomically with command completion with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         counter = RetryStateTestCounter.ref("counter-1", store:)
 
         assert_equal({ "count" => 1 }, counter.increment_with_transient_failure)
@@ -175,7 +173,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     test "keeps a command idempotency key stable across retry with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         seen_keys = []
         retrying_object = Class.new(Durababble::DurableObject) do
           object_type "retrying_object"
