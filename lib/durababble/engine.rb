@@ -6,6 +6,7 @@ require "async/condition"
 require "thread"
 
 Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?(:durababble_workflow_execution)
+Fiber.attr_accessor(:durababble_step_context) unless Fiber.method_defined?(:durababble_step_context)
 
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
@@ -39,28 +40,61 @@ module Durababble
     end
   end
 
+  module StepExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_step_context
+      end
+
+      #: (untyped) { (?) -> untyped } -> untyped
+      def with_current(context, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_step_context
+        fiber.durababble_step_context = context
+        block.call
+      ensure
+        fiber.durababble_step_context = previous
+      end
+    end
+  end
+
   module AsyncTaskWorkflowContextPatch
     #: () { (?) -> untyped } -> untyped
     def schedule(&block)
       task = self #: as untyped
+      step_context = StepExecutionContext.current
       if task.transient?
         execution = WorkflowExecutionContext.current
-        return super(&block) unless execution
+        return super(&block) unless execution || step_context
 
         return super do
-          WorkflowExecutionContext.with_current(nil) { block.call }
+          WorkflowExecutionContext.with_current(nil) do
+            StepExecutionContext.with_current(step_context) { block.call }
+          end
         end
       end
 
       execution = WorkflowExecutionContext.current
-      return super(&block) unless execution
+      return super(&block) unless execution || step_context
 
-      execution.register_workflow_task(self)
+      execution&.register_workflow_task(self)
       super do
-        WorkflowExecutionContext.with_current(execution) { block.call }
+        WorkflowExecutionContext.with_current(execution) do
+          StepExecutionContext.with_current(step_context) { block.call }
+        end
       ensure
-        execution.unregister_workflow_task(self)
+        execution&.unregister_workflow_task(self)
       end
+    end
+
+    #: () -> untyped
+    def wait
+      execution = WorkflowExecutionContext.current
+      return super() unless execution
+
+      execution.block_current_workflow_task { super() }
     end
   end
 
@@ -74,7 +108,10 @@ module Durababble
 
     #: () -> untyped
     def await
-      @future.await
+      execution = WorkflowExecutionContext.current
+      return @future.await unless execution
+
+      execution.block_current_workflow_task { @future.await }
     end
   end
 
@@ -102,6 +139,11 @@ module Durababble
     #: () -> void
     def wait
       @condition.wait unless @done
+    end
+
+    #: () -> void
+    def wake
+      @condition.signal
     end
 
     #: () -> untyped
@@ -144,6 +186,7 @@ module Durababble
       @next_command_id = 0
       @futures = {}
       @workflow_tasks = {}
+      @blocked_workflow_tasks = {}
       @workflow_task_count = 0
       @step_contexts = {}
       @store_mutex = Mutex.new
@@ -164,7 +207,7 @@ module Durababble
 
     #: () -> untyped
     def step_context
-      @step_contexts[Async::Task.current]
+      StepExecutionContext.current || @step_contexts[Async::Task.current]
     end
 
     #: (untyped) -> void
@@ -179,7 +222,22 @@ module Durababble
     def unregister_workflow_task(task)
       return unless @workflow_tasks.delete(task)
 
+      @blocked_workflow_tasks.delete(task)
       @workflow_task_count -= 1
+      @futures.each_value(&:wake)
+    end
+
+    #: () { (?) -> untyped } -> untyped
+    def block_current_workflow_task(&block)
+      task = Async::Task.current
+      return block.call unless @workflow_tasks.key?(task)
+
+      @blocked_workflow_tasks[task] = true
+      @futures.each_value(&:wake)
+      block.call
+    ensure
+      @blocked_workflow_tasks.delete(task) if task
+      @futures.each_value(&:wake) if task
     end
 
     #: () { -> untyped } -> untyped
@@ -370,15 +428,16 @@ module Durababble
         attempt_number = synchronize_store do
           @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
         end
-        @step_contexts[task] = StepContext.new(
+        step_context = StepContext.new(
           workflow_id: @workflow_id,
           step_index: command_id,
           attempt_number:,
           idempotency_key: "durababble:v1:workflow:#{@workflow_id}:step:#{command_id}",
           heartbeat: build_heartbeat(command_id),
         )
+        @step_contexts[task] = step_context
 
-        output = block.call
+        output = StepExecutionContext.with_current(step_context) { block.call }
         if output.is_a?(WaitRequest)
           assert_workflow_lease!
           suspend_workflow = suspend_workflow_immediately?
@@ -460,13 +519,13 @@ module Durababble
         return future.value if future.done?
 
         missing_command_id = next_undeliverable_resolution_command_id
-        if missing_command_id && @workflow_task_count <= 1
+        if missing_command_id && !other_workflow_task_can_schedule?(Async::Task.current)
           message = "workflow #{@workflow_id} history resolved command #{missing_command_id} before command #{command_id}, " \
             "but current replay has not scheduled command #{missing_command_id}"
           raise NonDeterminismError, message
         end
 
-        future.wait
+        block_current_workflow_task { future.wait }
       end
     end
 
@@ -512,6 +571,13 @@ module Durababble
 
       command_id = @terminal_events.fetch(@resolution_index).fetch("command_id").to_i
       command_id unless @futures[command_id]
+    end
+
+    #: (untyped) -> bool
+    def other_workflow_task_can_schedule?(current_task)
+      @workflow_tasks.any? do |task, _registered|
+        task != current_task && !@blocked_workflow_tasks.key?(task)
+      end
     end
 
     #: (untyped) -> bool

@@ -34,7 +34,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def fetch(id)
-            sleep((4 - id) * 0.005)
+            sleep({ 1 => 0.06, 2 => 0.03, 3 => 0.01 }.fetch(id))
             { "id" => id, "key" => step_context.idempotency_key }
           end
           step :fetch
@@ -52,9 +52,13 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         history = store.workflow_history_for(run.id)
         scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
         completed = history.select { |event| event.fetch("kind") == "step_completed" }
+        scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
+        completed_command_ids = completed.map { |event| event.fetch("command_id").to_i }
         assert_equal [0, 1, 2], scheduled.map { |event| event.fetch("command_id").to_i }
         assert_equal [[1], [2], [3]], scheduled.map { |event| event.fetch("payload").fetch("args") }.sort_by(&:first)
         assert_operator scheduled.last.fetch("event_index").to_i, :<, completed.first.fetch("event_index").to_i
+        refute_equal scheduled_command_ids, completed_command_ids
+        assert_equal [3, 2, 1], completed.map { |event| event.fetch("payload").fetch("id") }
       end
     end
 
@@ -72,7 +76,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def fetch(id)
-            sleep((4 - id) * 0.005)
+            sleep({ 1 => 0.06, 2 => 0.03, 3 => 0.01 }.fetch(id))
             { "id" => id, "key" => step_context.idempotency_key }
           end
           step :fetch
@@ -90,9 +94,111 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         history = store.workflow_history_for(run.id)
         scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
         completed = history.select { |event| event.fetch("kind") == "step_completed" }
+        scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
+        completed_command_ids = completed.map { |event| event.fetch("command_id").to_i }
         assert_equal [0, 1, 2], scheduled.map { |event| event.fetch("command_id").to_i }
         assert_equal [[1], [2], [3]], scheduled.map { |event| event.fetch("payload").fetch("args") }.sort_by(&:first)
         assert_operator scheduled.last.fetch("event_index").to_i, :<, completed.first.fetch("event_index").to_i
+        refute_equal scheduled_command_ids, completed_command_ids
+        assert_equal [3, 2, 1], completed.map { |event| event.fetch("payload").fetch("id") }
+      end
+    end
+
+    test "await_all reports a later branch failure after out-of-order branch completions with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "async-fanout-late-failure"
+
+          def execute(ids)
+            await_all(ids.map { |id| async { maybe_fetch(id) } })
+          end
+
+          def maybe_fetch(id)
+            sleep({ 1 => 0.03, 2 => 0.06, 3 => 0.01 }.fetch(id))
+            raise "boom #{id}" if id == 2
+
+            { "id" => id }
+          end
+          step :maybe_fetch
+        end
+
+        run = Durababble::Engine.new(store:, worker_id: "late-failure-worker").run(workflow, input: [1, 2, 3])
+
+        assert_equal "failed", run.status
+        assert_match(/boom 2/, run.error)
+
+        history = store.workflow_history_for(run.id)
+        scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
+        terminals = history.select { |event| ["step_completed", "step_failed"].include?(event.fetch("kind")) }
+        scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
+        terminal_command_ids = terminals.map { |event| event.fetch("command_id").to_i }
+        input_by_command_id = scheduled.to_h do |event|
+          [event.fetch("command_id").to_i, event.fetch("payload").fetch("args").first]
+        end
+
+        assert_equal [0, 1, 2], scheduled_command_ids
+        assert_operator scheduled.last.fetch("event_index").to_i, :<, terminals.first.fetch("event_index").to_i
+        refute_equal scheduled_command_ids, terminal_command_ids
+        assert_equal(
+          [["step_completed", 3], ["step_completed", 1], ["step_failed", 2]],
+          terminals.map { |event| [event.fetch("kind"), input_by_command_id.fetch(event.fetch("command_id").to_i)] },
+        )
+        assert_equal(
+          ["completed", "completed", "failed"],
+          store.steps_for(run.id).map { |step| step.fetch("status") }.sort,
+        )
+      end
+    end
+
+    test "raw Async reports a later branch failure after out-of-order branch completions with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "raw-async-fanout-late-failure"
+
+          def execute(ids)
+            Async do |task|
+              ids.map { |id| task.async { maybe_fetch(id) } }.map(&:wait)
+            end.wait
+          end
+
+          def maybe_fetch(id)
+            sleep({ 1 => 0.03, 2 => 0.06, 3 => 0.01 }.fetch(id))
+            raise "boom #{id}" if id == 2
+
+            { "id" => id }
+          end
+          step :maybe_fetch
+        end
+
+        run = Durababble::Engine.new(store:, worker_id: "raw-late-failure-worker").run(workflow, input: [1, 2, 3])
+
+        assert_equal "failed", run.status
+        assert_match(/boom 2/, run.error)
+
+        history = store.workflow_history_for(run.id)
+        scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
+        terminals = history.select { |event| ["step_completed", "step_failed"].include?(event.fetch("kind")) }
+        scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
+        terminal_command_ids = terminals.map { |event| event.fetch("command_id").to_i }
+        input_by_command_id = scheduled.to_h do |event|
+          [event.fetch("command_id").to_i, event.fetch("payload").fetch("args").first]
+        end
+
+        assert_equal [0, 1, 2], scheduled_command_ids
+        assert_operator scheduled.last.fetch("event_index").to_i, :<, terminals.first.fetch("event_index").to_i
+        refute_equal scheduled_command_ids, terminal_command_ids
+        assert_equal(
+          [["step_completed", 3], ["step_completed", 1], ["step_failed", 2]],
+          terminals.map { |event| [event.fetch("kind"), input_by_command_id.fetch(event.fetch("command_id").to_i)] },
+        )
+        assert_equal(
+          ["completed", "completed", "failed"],
+          store.steps_for(run.id).map { |step| step.fetch("status") }.sort,
+        )
       end
     end
 
@@ -210,6 +316,87 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         assert_equal true, run.result.fetch("ok")
         assert_equal "durababble:v1:workflow:#{run.id}:step:0", run.result.fetch("key")
         assert_equal ["step_scheduled", "step_started", "step_completed"], store.workflow_history_for(run.id).map { |event| event.fetch("kind") }
+      end
+    end
+
+    test "step context propagates to raw Async children inside step bodies with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "step-context-raw-async-child"
+
+          def execute(input)
+            parent_context = capture_context(input)
+            child_context = capture_context_in_child(input)
+            [parent_context, child_context]
+          end
+
+          def capture_context(input)
+            {
+              "input" => input,
+              "key" => step_context.idempotency_key,
+              "index" => step_context.step_index,
+            }
+          end
+          step :capture_context
+
+          def capture_context_in_child(input)
+            Async do
+              {
+                "input" => input,
+                "key" => step_context.idempotency_key,
+                "index" => step_context.step_index,
+              }
+            end.wait
+          end
+          step :capture_context_in_child
+        end
+
+        run = Durababble::Engine.new(store:, worker_id: "step-context-worker").run(workflow, input: { "ok" => true })
+
+        assert_equal "completed", run.status
+        assert_equal(
+          [
+            { "input" => { "ok" => true }, "key" => "durababble:v1:workflow:#{run.id}:step:0", "index" => 0 },
+            { "input" => { "ok" => true }, "key" => "durababble:v1:workflow:#{run.id}:step:1", "index" => 1 },
+          ],
+          run.result,
+        )
+      end
+    end
+
+    test "durable steps remain unavailable in raw Async children inside step bodies with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "step-child-durable-step-rejected"
+
+          def execute(input)
+            outer_step(input)
+          end
+
+          def outer_step(input)
+            Async do
+              inner_step(input)
+            rescue StandardError => e
+              e.message
+            end.wait
+          end
+          step :outer_step
+
+          def inner_step(input)
+            input
+          end
+          step :inner_step
+        end
+
+        run = Durababble::Engine.new(store:, worker_id: "step-context-worker").run(workflow, input: { "ok" => true })
+
+        assert_equal "completed", run.status
+        assert_match(/Durababble-managed workflow task/, run.result)
+        assert_equal ["outer_step"], store.steps_for(run.id).map { |step| step.fetch("name") }
       end
     end
 
@@ -580,6 +767,86 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
           def execute(_input)
             [fetch_profile(1), fetch_profile(2)]
+          end
+
+          def fetch_profile(id)
+            { "id" => id }
+          end
+          step :fetch_profile
+        end
+
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+        store.claim_workflow(workflow_id:, worker_id: "history-seeder", lease_seconds: 60)
+        retry_shape = default_retry_shape
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape })
+        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile")
+        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape })
+        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile")
+        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 })
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 })
+
+        run = Timeout.timeout(1) do
+          Durababble::Engine.new(store:, worker_id: "history-seeder").resume(workflow, workflow_id:)
+        end
+
+        assert_equal "failed", run.status
+        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/resolved command 1 before command 0/, run.error)
+      end
+    end
+
+    test "replay wakes waiters when sibling async branch exits without scheduling historical command with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "async-removed-branch-replay"
+
+          def execute(_input)
+            kept = async { fetch_profile(1) }
+            removed = async { "removed branch" }
+            await_all(kept, removed)
+          end
+
+          def fetch_profile(id)
+            { "id" => id }
+          end
+          step :fetch_profile
+        end
+
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+        store.claim_workflow(workflow_id:, worker_id: "history-seeder", lease_seconds: 60)
+        retry_shape = default_retry_shape
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape })
+        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile")
+        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape })
+        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile")
+        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 })
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 })
+
+        run = Timeout.timeout(1) do
+          Durababble::Engine.new(store:, worker_id: "history-seeder").resume(workflow, workflow_id:)
+        end
+
+        assert_equal "failed", run.status
+        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/resolved command 1 before command 0/, run.error)
+      end
+    end
+
+    test "raw Async replay wakes waiters when sibling branch exits without scheduling historical command with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        store.migrate!
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "raw-async-removed-branch-replay"
+
+          def execute(_input)
+            Async do |task|
+              kept = task.async { fetch_profile(1) }
+              removed = task.async { "removed branch" }
+              [kept.wait, removed.wait]
+            end.wait
           end
 
           def fetch_profile(id)
