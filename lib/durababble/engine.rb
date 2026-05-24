@@ -252,6 +252,7 @@ module Durababble
       unless Async::Task.current == @root_task
         raise Error, "workflow waits must run from the root workflow task"
       end
+
       position = @workflow_wait_position
       @workflow_wait_position += 1
 
