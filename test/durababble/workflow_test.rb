@@ -99,7 +99,6 @@ class DurababbleWorkflowTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "runs exposed workflow commands from durable inbox activations and returns results with #{backend.name}" do
       with_durababble_store(backend, "workflow_commands") do |store|
-        store.migrate!
         worker = Durababble::Worker.new(
           store:,
           workflows: { ApiTestApprovalWorkflow.workflow_name => ApiTestApprovalWorkflow },
@@ -111,8 +110,8 @@ class DurababbleWorkflowTest < DurababbleTestCase
           input: { "request_id" => "approval-request" },
         )
 
-        assert_equal :worked, worker.tick
-        assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+        assert_equal(:worked, worker.tick)
+        assert_equal("waiting", store.workflow(workflow_id).fetch("status"))
 
         result_queue = Queue.new
         caller = Thread.new do
@@ -132,24 +131,24 @@ class DurababbleWorkflowTest < DurababbleTestCase
           target_type: ApiTestApprovalWorkflow.workflow_name,
           target_id: workflow_id,
         )
-        assert_equal 1, workflow_messages.length
+        assert_equal(1, workflow_messages.length)
         assert_hash_includes(
           workflow_messages.first,
           "message_kind" => "workflow_command",
           "method_name" => "approve",
           "payload" => { "method" => "approve", "args" => [], "kwargs" => { reason: "operator" } },
         )
-        assert_equal :worked, worker.tick
+        assert_equal(:worked, worker.tick)
         status, value = result_queue.pop
         caller.join
-        assert_equal :ok, status
+        assert_equal(:ok, status)
         assert_equal({ "approved_by" => "operator" }, value)
 
-        assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
-        assert_nil store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id)
-        assert_hash_includes store.inbox_message(workflow_messages.first.fetch("id")), "status" => "completed", "result" => { "approved_by" => "operator" }
-        assert_includes store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "workflow_command_completed"
+        assert_hash_includes(store.workflow(workflow_id), "status" => "waiting")
+        assert_equal(["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") })
+        assert_nil(store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id))
+        assert_hash_includes(store.inbox_message(workflow_messages.first.fetch("id")), "status" => "completed", "result" => { "approved_by" => "operator" })
+        assert_includes(store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "workflow_command_completed")
       ensure
         caller&.kill if caller&.alive?
       end
@@ -169,7 +168,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
           input: { "request_id" => "approval-error-request" },
         )
 
-        assert_equal :worked, worker.tick
+        assert_equal(:worked, worker.tick)
         result_queue = Queue.new
         caller = Thread.new do
           caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
@@ -184,17 +183,17 @@ class DurababbleWorkflowTest < DurababbleTestCase
         end
 
         wait_until { store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id) }
-        assert_equal :worked, worker.tick
+        assert_equal(:worked, worker.tick)
         status, error = result_queue.pop
         caller.join
-        assert_equal :error, status
-        assert_kind_of Durababble::Error, error
+        assert_equal(:error, status)
+        assert_kind_of(Durababble::Error, error)
         assert_match(/ApiTestChargeFailed: no/, error.message)
 
         message = store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id).first
-        assert_hash_includes message, "status" => "dead_lettered"
-        assert_nil store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id)
-        assert_includes store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "workflow_command_failed"
+        assert_hash_includes(message, "status" => "dead_lettered")
+        assert_nil(store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id))
+        assert_includes(store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "workflow_command_failed")
       ensure
         caller&.kill if caller&.alive?
       end
@@ -210,7 +209,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
       return value if value
       raise "condition not met before timeout" if Time.now >= deadline
 
-      sleep 0.01
+      sleep(0.01)
     end
   end
 end

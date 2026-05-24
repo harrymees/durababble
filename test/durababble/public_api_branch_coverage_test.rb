@@ -181,7 +181,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           method_name: "note",
           payload: { "method" => "note", "args" => [], "kwargs" => { message: "hello" } },
           idempotency_key: "note:hello",
-        }],
+        },],
       ],
       store.events,
     )

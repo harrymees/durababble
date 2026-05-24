@@ -1193,7 +1193,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ready_at: untyped) -> untyped
     def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
       execute_params(<<~SQL, [target_kind, target_type, target_id, ready_timestamp])
@@ -1249,7 +1249,7 @@ module Durababble
       ["pending", "failed", "running"].include?(status)
     end
 
-    #: (?target_kinds: untyped, ?target_types: untyped) -> untyped
+    #: (target_kinds: untyped, target_types: untyped) -> untyped
     def target_activation_filter(target_kinds:, target_types:)
       filters = []
       if target_kinds
@@ -2920,7 +2920,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ready_at: untyped) -> untyped
     def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       ready_time = ready_at || Time.now.utc
       execute_params(<<~SQL, [target_kind, target_type, target_id, ready_time])
@@ -2975,7 +2975,7 @@ module Durababble
       ["pending", "failed", "running"].include?(status)
     end
 
-    #: (?target_kinds: untyped, ?target_types: untyped) -> untyped
+    #: (target_kinds: untyped, target_types: untyped) -> untyped
     def target_activation_filter_sql(target_kinds:, target_types:)
       filters = []
       params = []
