@@ -202,7 +202,57 @@ class DurababbleOperatorAppTest < DurababbleTestCase
     assert_includes error_body.join, "Durababble store is not configured"
   end
 
+  test "uses configured default store and formats branchy helper values" do
+    previous_store = Durababble.default_store
+    Durababble.default_store = FakeStore.new(
+      workflow: base_workflow.merge("status" => "completed", "result" => { "ok" => true }),
+      steps: [],
+      attempts: [],
+      waits: [],
+      outbox: [],
+    )
+
+    status, _headers, body = Durababble::Operator::App.new.call({
+      "REQUEST_METHOD" => "GET",
+      "SCRIPT_NAME" => "",
+      "PATH_INFO" => "/workflows/",
+      "QUERY_STRING" => "",
+    })
+
+    assert_equal(200, status)
+    assert_includes(body.join, "completed")
+
+    mounted = app
+    assert_includes(mounted.send(:badge, "completed"), "success")
+    assert_includes(mounted.send(:badge, "waiting"), "waiting")
+    assert_includes(mounted.send(:badge, "paused"), "neutral")
+    assert_equal("String", mounted.send(:payload_summary, "payload"))
+    assert_equal("Hash with 1 keys", mounted.send(:display_value, { "x" => 1 }))
+    assert_equal("2026-01-01T00:00:00Z", mounted.send(:display_value, Time.utc(2026, 1, 1)))
+    assert_equal("not-a-time", mounted.send(:time_text, "not-a-time"))
+    assert_equal("No lease deadline", mounted.send(:lease_text, nil))
+    assert_equal("/", mounted.send(:normalize_path, ""))
+  ensure
+    Durababble.default_store = previous_store
+  end
+
   private
+
+  def base_workflow
+    {
+      "id" => "wf-branch",
+      "name" => "branch_test",
+      "status" => "running",
+      "input" => {},
+      "result" => nil,
+      "error" => nil,
+      "locked_by" => nil,
+      "locked_until" => nil,
+      "next_run_at" => nil,
+      "created_at" => Time.now,
+      "updated_at" => Time.now,
+    }
+  end
 
   def call_app(rack_app, path:, script_name: "", query_string: "", extra_env: {})
     rack_app.call({
