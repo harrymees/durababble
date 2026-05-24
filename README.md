@@ -317,7 +317,7 @@ Durababble then helps you RPC to these objects to read or write the state within
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
-Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after.
+Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after. Object commands are inbox messages ordered by a per-object mailbox sequence, so a later command cannot overtake a pending, backoff, or dead-lettered head message for the same object.
 
 <!-- README:durable-object-example:start -->
 
@@ -364,7 +364,7 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: records a command row and persists state changes
+account.credit(1_000) # durable command: this call is written to the database and eventually processed even in the face of crashes
 account.balance       # query: reads latest persisted state
 ```
 

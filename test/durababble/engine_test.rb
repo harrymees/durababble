@@ -4,6 +4,62 @@
 require_relative "../test_helper"
 
 class DurababbleEngineTest < DurababbleTestCase
+  class CommandDrainWorkflow < Durababble::Workflow
+    workflow_name "command-drain"
+
+    expose_command def fail_first
+      raise "stop"
+    end
+
+    expose_command def second
+      "should not run"
+    end
+  end
+
+  class CommandDrainStore
+    attr_reader :claim_limits, :completed, :failed, :suspended
+
+    def initialize
+      @claim_limits = []
+      @completed = []
+      @failed = []
+      @suspended = false
+    end
+
+    def workflow(workflow_id)
+      { "id" => workflow_id, "status" => "waiting", "input" => {} }
+    end
+
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+      { "id" => workflow_id, "status" => "running", "input" => {}, "locked_by" => worker_id, "lease_seconds" => lease_seconds }
+    end
+
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+      @claim_limits << limit
+      return [] unless target_kind == "workflow" && target_type == "command-drain" && target_id == "wf-1"
+      return [] unless worker_id == "worker-a" && lease_seconds == 9
+      return [] unless @failed.empty?
+
+      messages = [
+        { "id" => "msg-1", "message_kind" => "workflow_command", "method_name" => "fail_first", "payload" => { "method" => "fail_first", "args" => [], "kwargs" => {} } },
+        { "id" => "msg-2", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
+      ]
+      messages.first(limit)
+    end
+
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+      @completed << { message_id:, workflow_id:, result:, worker_id: }
+    end
+
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+      @failed << { message_id:, workflow_id:, error:, worker_id: }
+    end
+
+    def suspend_workflow(workflow_id:, worker_id:)
+      @suspended = [workflow_id, worker_id]
+    end
+  end
+
   test "allows lease-free assertions and requested injected crash points" do
     no_lease_store = Object.new
     engine = Durababble::Engine.new(store: no_lease_store, migrate: false)
@@ -11,6 +67,18 @@ class DurababbleEngineTest < DurababbleTestCase
 
     crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
+  end
+
+  test "drains workflow command inbox one message at a time so failed heads block followers" do
+    store = CommandDrainStore.new
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+
+    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    assert_equal [1, 1], store.claim_limits
+    assert_empty store.completed
+    assert_equal "msg-1", store.failed.fetch(0).fetch(:message_id)
+    assert_match(/RuntimeError: stop/, store.failed.fetch(0).fetch(:error))
+    assert_equal ["wf-1", "worker-a"], store.suspended
   end
 
   durababble_store_backends.each do |backend|

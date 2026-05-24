@@ -59,7 +59,7 @@ workflow.description
 workflow.cancel(reason: "user request")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist command events using `Store#signal_event`. A full command executor that routes to the current lease owner, executes the method body, and returns command results is future work.
+In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target and still signal the legacy event-wait key as a compatibility wake path. A full command executor that drains workflow inbox rows through the current lease owner, executes the method body, and returns command results is future work.
 
 ### Durable objects
 
@@ -82,7 +82,7 @@ class Account < Durababble::DurableObject
 end
 ```
 
-The desired durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in `durable_object_commands`. The current prototype has the class/ref API, command rows, inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
+The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. The current prototype has the class/ref API, inbox-backed inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
 
 ## Storage model
 
@@ -93,7 +93,8 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
-- `durable_object_commands`: persisted object command calls, arguments, result/error, status, and command lease columns.
+- `mailbox_sequences`: per-target sequence allocation state for workflow and object inbox messages.
+- `inbox`: persisted object asks/tells/wakes plus workflow command/signal messages, including target identity, mailbox sequence, idempotency key, shape hash, retry/dead-letter fields, result/error, and retention deadline.
 
 ## Durability semantics
 

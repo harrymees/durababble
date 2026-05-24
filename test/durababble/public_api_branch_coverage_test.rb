@@ -94,6 +94,32 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       1
     end
 
+    def workflow(workflow_id)
+      { "id" => workflow_id, "status" => "running" }
+    end
+
+    def enqueue_inbox_message(**kwargs)
+      @events << [:inbox, kwargs]
+      "inbox-1"
+    end
+
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key:)
+      @events << [:inbox, {
+        target_kind: "workflow",
+        target_type: workflow_name,
+        target_id: workflow_id,
+        message_kind: "workflow_command",
+        method_name:,
+        payload:,
+        idempotency_key:,
+      },]
+      "inbox-1"
+    end
+
+    def wait_for_inbox_message(message_id)
+      "result:#{message_id}"
+    end
+
     def object_state(object_type:, object_id:)
       @state
     end
@@ -157,10 +183,18 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     assert_respond_to ref, :labeled_status
     assert_equal "status:wf-123", ref.labeled_status(prefix: "status")
-    assert_equal 1, ref.note(message: "hello")
+    assert_equal "result:inbox-1", ref.note(message: "hello", idempotency_key: "note:hello")
     assert_equal(
       [
-        ["workflow:wf-123:command:note", { "method" => "note", "args" => [], "kwargs" => { message: "hello" } }],
+        [:inbox, {
+          target_kind: "workflow",
+          target_type: "branch_test_workflow",
+          target_id: "wf-123",
+          message_kind: "workflow_command",
+          method_name: "note",
+          payload: { "method" => "note", "args" => [], "kwargs" => { message: "hello" } },
+          idempotency_key: "note:hello",
+        },],
       ],
       store.events,
     )
