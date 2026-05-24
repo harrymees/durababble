@@ -15,6 +15,17 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
 
+## Operator surface
+
+The target operator web UI is specified in `docs/operator-web-ui.md`. It should
+be implemented as a host-mounted web surface backed by durable Store/API reads
+and writes, not by worker memory or in-process caches. The current architecture
+already persists most diagnostic state needed for workflow detail pages
+(`workflows`, `steps`, `step_attempts`, `waits`, `outbox`, `durable_objects`,
+and `durable_object_commands`), but paginated list APIs, management actions,
+audit logging, idempotency rows, unified inbox activity, and several indexes are
+still required before the UI can be production-grade.
+
 ## Public API model
 
 ### Workflows

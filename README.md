@@ -20,6 +20,8 @@ gems/durababble/
   lib/
     durababble.rb
     durababble/version.rb
+  docs/
+    operator-web-ui.md
   test/
 ```
 
@@ -147,3 +149,10 @@ account.balance
 
 This is still a prototype, not a production Temporal replacement.
 The implementation is intentionally kept as a plain Ruby gem until it needs Rails hooks, initializers, models, or routes.
+
+## Operator UI direction
+
+Durababble does not yet ship an operator-facing web UI. `docs/operator-web-ui.md`
+specifies the target screens, management actions, security posture, Store/API
+gaps, and follow-up implementation work for a future UI that inspects workflow
+and durable-object state without bypassing persisted storage.

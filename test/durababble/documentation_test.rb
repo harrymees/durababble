@@ -9,7 +9,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
   end
 
   test "does not present removed Workflow.define as the current public API" do
-    current_docs = ["README.md", "docs/spec.md", "docs/architecture.md"]
+    current_docs = ["README.md", "docs/spec.md", "docs/architecture.md", "docs/operator-web-ui.md"]
 
     current_docs.each do |path|
       refute_includes read(path), "Workflow.define", "#{path} still documents the removed API"
@@ -19,6 +19,16 @@ class DurababbleDocumentationTest < DurababbleTestCase
   test "marks the Shikibu comparison and old faithfulness review as historical" do
     assert_includes read("docs/shikibu-comparison.md"), "Historical note"
     assert_includes read("docs/spec-faithfulness-review.md"), "Historical note"
+  end
+
+  test "operator web UI spec is linked and includes stuck workflow scenario" do
+    assert_includes read("README.md"), "docs/operator-web-ui.md"
+    assert_includes read("docs/spec.md"), "docs/operator-web-ui.md"
+    assert_includes read("docs/architecture.md"), "docs/operator-web-ui.md"
+
+    operator_spec = read("docs/operator-web-ui.md")
+    assert_includes operator_spec, "Realistic operator scenario"
+    assert_includes operator_spec, "Cancel, not Terminate"
   end
 
   test "ships RBS declarations for the public class API" do
