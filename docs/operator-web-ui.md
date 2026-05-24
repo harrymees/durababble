@@ -3,7 +3,7 @@
 Status: implementation spec plus prototype read-only UI. This document
 specifies the operator-facing web UI and supporting management API that should be
 built after the current prototype storage/API gaps are closed. The current repo
-also ships `Durababble::Operator::App`, a small Rack-compatible read-only UI for
+also ships `Durababble::OperatorApp`, a small Rack-compatible read-only UI for
 local smoke testing and host-app mounting.
 
 Durababble already persists workflow runs, steps, attempts, waits, workflow
@@ -27,8 +27,8 @@ the store or adding process-local views of truth.
 ## Deployment assumptions
 
 - The UI is mounted by the host application, for example at
-  `/durababble/operator`. The prototype mount surface is
-  `Durababble::Operator::App`, a Rack-compatible callable. The host app owns
+  `/durababble`. The prototype mount surface is
+  `Durababble::OperatorApp`, a Rack-compatible callable. The host app owns
   routing, session middleware, CSRF protection, and production authentication.
 - The UI talks only to a Durababble management API backed by `Durababble::Store`
   reads and writes. It must not inspect Ruby worker memory, in-process caches, or
@@ -48,7 +48,7 @@ the store or adding process-local views of truth.
 Production deployments should default to read-only access until mutating roles
 are configured.
 
-The prototype `Durababble::Operator::App` is read-only and deliberately does not
+The prototype `Durababble::OperatorApp` is read-only and deliberately does not
 authenticate users. Mount it behind the host app's own authentication and
 authorization middleware. In a Falcon-powered Rails app, Falcon serves the Rails
 Rack stack, so the operator app can be mounted the same way as any other Rack
@@ -57,8 +57,8 @@ callable:
 ```ruby
 # config/routes.rb
 mount(
-  MyAdminAuthMiddleware.new(Durababble::Operator::App.new(store: Durababble.store)),
-  at: "/durababble/operator",
+  MyAdminAuthMiddleware.new(Durababble::OperatorApp.new(store: Durababble.store)),
+  at: "/durababble",
 )
 ```
 
@@ -81,7 +81,7 @@ authorization check.
 ## Prototype smoke screenshots
 
 The current read-only Rack prototype was smoke-tested locally against a real
-Durababble store and mounted at `/durababble/operator`.
+Durababble store and mounted at `/durababble`.
 
 Screenshot evidence is kept in the implementation PR description instead of committed repository assets.
 
@@ -89,7 +89,7 @@ Screenshot evidence is kept in the implementation PR description instead of comm
 
 ### Workflow list
 
-Route: `GET /durababble/operator/workflows`
+Route: `GET /durababble/workflows`
 
 Purpose: find workflow executions by health, status, owner, name, age, and
 customer/application correlation metadata once available.
@@ -126,7 +126,7 @@ Missing support:
 
 ### Workflow detail and progress
 
-Route: `GET /durababble/operator/workflows/:workflow_id`
+Route: `GET /durababble/workflows/:workflow_id`
 
 Tabs:
 
@@ -167,7 +167,7 @@ Missing support:
 
 ### Worker and lease state
 
-Route: `GET /durababble/operator/workers`
+Route: `GET /durababble/workers`
 
 Purpose: show whether stuck work is genuinely owned, recoverable after lease
 expiry, or blocked by a missing node.
@@ -195,7 +195,7 @@ Missing support:
 
 ### Durable-object list
 
-Route: `GET /durababble/operator/objects`
+Route: `GET /durababble/objects`
 
 Purpose: find durable objects by type/id, update time, command backlog, lease
 owner, and state metadata.
@@ -225,7 +225,7 @@ Missing support:
 
 ### Durable-object detail and history
 
-Route: `GET /durababble/operator/objects/:object_type/:object_id`
+Route: `GET /durababble/objects/:object_type/:object_id`
 
 Tabs:
 
@@ -257,7 +257,7 @@ Missing support:
 
 ### Recent command and inbox activity
 
-Route: `GET /durababble/operator/activity`
+Route: `GET /durababble/activity`
 
 Purpose: answer "what changed recently?" across workflows, objects, waits,
 commands, inbox messages, outbox messages, and operator actions.
@@ -547,7 +547,7 @@ Write response shape:
 
 Scenario: a nightly import workflow appears stuck.
 
-1. The on-call opens `/durababble/operator/workflows` and filters to
+1. The on-call opens `/durababble/workflows` and filters to
    `status=running` plus `lease=expired`. The list shows `wf_123` running
    `nightly_import`, current work `step 2 fetch_page`, and a lease that expired
    12 minutes ago.

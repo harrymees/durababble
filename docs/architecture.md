@@ -17,7 +17,7 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 
 ## Operator surface
 
-`Durababble::Operator::App` is a read-only Rack-compatible web surface that can
+`Durababble::OperatorApp` is a read-only Rack-compatible web surface that can
 be mounted by a Rails/Rack app behind host-owned authentication middleware.
 Falcon-powered Rails deployments use the same Rack callable; Durababble does not
 own sessions, CSRF policy, or user authorization. The app is backed by durable

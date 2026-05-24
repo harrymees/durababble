@@ -89,18 +89,18 @@ class DurababbleOperatorAppTest < DurababbleTestCase
   end
 
   def app
-    Durababble::Operator::App.new(store: FakeStore.new)
+    Durababble::OperatorApp.new(store: FakeStore.new)
   end
 
   test "renders workflow overview with mount-aware links and redacted payload summaries" do
-    status, headers, body = call_app(app, path: "/workflows", script_name: "/durababble/operator")
+    status, headers, body = call_app(app, path: "/workflows", script_name: "/durababble")
 
     assert_equal 200, status
     assert_equal "text/html; charset=utf-8", headers.fetch("content-type")
     html = body.join
     assert_includes html, "Durababble Operator"
     assert_includes html, "operator_test"
-    assert_includes html, "/durababble/operator/workflows/wf-1"
+    assert_includes html, "/durababble/workflows/wf-1"
     assert_includes html, "nightly_import"
     refute_includes html, "secret-shop-value"
   end
@@ -165,9 +165,9 @@ class DurababbleOperatorAppTest < DurababbleTestCase
       outbox: [],
     )
 
-    overview_status, _headers, overview_body = call_app(Durababble::Operator::App.new(store:), path: "/workflows", query_string: "status=failed")
-    detail_status, _detail_headers, detail_body = call_app(Durababble::Operator::App.new(store:), path: "/workflows/wf+failed")
-    empty_status, _empty_headers, empty_body = call_app(Durababble::Operator::App.new(store:), path: "/workflows", query_string: "status=completed")
+    overview_status, _headers, overview_body = call_app(Durababble::OperatorApp.new(store:), path: "/workflows", query_string: "status=failed")
+    detail_status, _detail_headers, detail_body = call_app(Durababble::OperatorApp.new(store:), path: "/workflows/wf+failed")
+    empty_status, _empty_headers, empty_body = call_app(Durababble::OperatorApp.new(store:), path: "/workflows", query_string: "status=completed")
 
     assert_equal 200, overview_status
     assert_includes overview_body.join, "Expired"
@@ -184,10 +184,10 @@ class DurababbleOperatorAppTest < DurababbleTestCase
     empty_store = FakeStore.new(workflow: nil, objects: [], object_states: {}, commands: [])
 
     method_status, method_headers, method_body = call_app(app, path: "/workflows", extra_env: { "REQUEST_METHOD" => "POST" })
-    empty_objects_status, _objects_headers, empty_objects_body = call_app(Durababble::Operator::App.new(store: empty_store), path: "/objects")
+    empty_objects_status, _objects_headers, empty_objects_body = call_app(Durababble::OperatorApp.new(store: empty_store), path: "/objects")
     missing_status, _missing_headers, missing_body = call_app(app, path: "/workflows/missing")
     bad_query_status, _bad_query_headers, bad_query_body = call_app(app, path: "/workflows", query_string: "%")
-    error_status, _error_headers, error_body = call_app(Durababble::Operator::App.new(store: ErrorStore.new), path: "/workflows")
+    error_status, _error_headers, error_body = call_app(Durababble::OperatorApp.new(store: ErrorStore.new), path: "/workflows")
 
     assert_equal 405, method_status
     assert_equal "text/plain; charset=utf-8", method_headers.fetch("content-type")
@@ -212,7 +212,7 @@ class DurababbleOperatorAppTest < DurababbleTestCase
       outbox: [],
     )
 
-    status, _headers, body = Durababble::Operator::App.new.call({
+    status, _headers, body = Durababble::OperatorApp.new.call({
       "REQUEST_METHOD" => "GET",
       "SCRIPT_NAME" => "",
       "PATH_INFO" => "/workflows/",

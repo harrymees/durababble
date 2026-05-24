@@ -158,11 +158,9 @@ module Durababble
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?) -> Object?
   end
 
-  module Operator
-    class App
-      def initialize: (?store: Store?, ?title: String) -> void
-      def call: (rack_env env) -> rack_response
-    end
+  class OperatorApp
+    def initialize: (?store: Store?, ?title: String) -> void
+    def call: (rack_env env) -> rack_response
   end
 
   class Workflow[Input, Output]

@@ -375,7 +375,7 @@ store = Durababble::Store.connect(
   schema: Durababble.default_schema,
 )
 
-run Durababble::Operator::App.new(store:)
+run Durababble::OperatorApp.new(store:)
 ```
 
 In Rails, mount the callable behind the host application's own authentication and authorization middleware. Falcon runs the normal Rails Rack stack, so no Durababble-specific server adapter is required:
@@ -383,8 +383,8 @@ In Rails, mount the callable behind the host application's own authentication an
 ```ruby
 # config/routes.rb
 mount(
-  MyAdminAuthMiddleware.new(Durababble::Operator::App.new(store: Durababble.store)),
-  at: "/durababble/operator",
+  MyAdminAuthMiddleware.new(Durababble::OperatorApp.new(store: Durababble.store)),
+  at: "/durababble",
 )
 ```
 
