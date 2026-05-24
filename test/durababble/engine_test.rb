@@ -16,7 +16,6 @@ class DurababbleEngineTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "runs a workflow once and records durable step outputs with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
-        store.migrate!
         workflow = durababble_test_workflow("counter") do
           test_step("increment") { |ctx| { "count" => ctx.fetch("count") + 1 } }
           test_step("double") { |ctx| { "count" => ctx.fetch("count") * 2 } }
@@ -39,7 +38,6 @@ class DurababbleEngineTest < DurababbleTestCase
 
     test "can resume a due retry without rerunning completed steps with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
-        store.migrate!
         first_step_runs = 0
         attempts = 0
         workflow = durababble_test_workflow("flaky") do
@@ -73,7 +71,6 @@ class DurababbleEngineTest < DurababbleTestCase
 
     test "replays a large completed step prefix without rerunning side effects with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
-        store.migrate!
         side_effect_count = 0
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "large-history-replay"
