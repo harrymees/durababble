@@ -134,6 +134,37 @@ at_exit { WORKER.shutdown(timeout: 10) }
 
 The runtime only claims workflow names present in its `workflows` registry, so separate pools can run different workflow families without claiming work they cannot execute. Shutdown is cooperative: the loop stops after the current tick and returns `:stopped` if the tick completes before the deadline. If user step code exceeds the deadline, `shutdown` releases this worker's workflow and outbox leases and returns `:timeout`; the still-running thread may later observe `LeaseConflict`, but it cannot commit stale step output because state updates are lease-checked.
 
+## Observability
+
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and SQL store adapters. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+
+The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Store instrumentation wraps SQL adapter calls with a query-shape label such as `select.workflows` or `update.outbox` and never records SQL text or serialized payloads.
+
+Primary spans:
+
+| Span name | Emitted by |
+| --- | --- |
+| `durababble.workflow.start`, `.resume`, `.execute`, `.step` | `Engine` / `WorkflowExecution` |
+| `durababble.object.query`, `.command.enqueue`, `.command` | `DurableObjectRef` |
+| `durababble.worker.tick` | `Worker#tick` |
+| `durababble.workflow_rpc.*` | workflow RPC lease start, route, and handler paths |
+| `durababble.rpc.client.*`, `durababble.rpc.server.*` | gRPC transport methods |
+| `durababble.store.operation` | PostgreSQL/YSQL and MySQL/MariaDB SQL execution |
+
+Primary metrics:
+
+| Metric | Purpose |
+| --- | --- |
+| `durababble.workflow.starts/completions/failures/cancellations` | workflow lifecycle; cancellations are reserved until the cancel API lands |
+| `durababble.workflow.step.attempts/successes/failures/retries` | step health and retry scheduling |
+| `durababble.waits.started/completed`, `durababble.wait.latency` | wait persistence and wake latency |
+| `durababble.queue.claim_latency` | workflow/outbox claim delay where creation time is available |
+| `durababble.leases.heartbeats/conflicts/expired_recovery` | lease health and recovery |
+| `durababble.outbox.pending/processed/failures` | outbox backlog and delivery result surface; explicit delivery failure is future work |
+| `durababble.store.operation.duration/errors` | SQL adapter latency/error rate |
+| `durababble.worker.ticks`, `durababble.worker.tick.duration` | worker loop health |
+| `durababble.workflow.history.steps`, `durababble.workflow.replay.steps` | replay/history size and replay cost proxy |
+
 ## Benchmarking and query-shape validation
 
 - `bench/run.rb` is a macro benchmark harness for the storage and coordination operations that dominate durable execution performance.

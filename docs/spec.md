@@ -562,7 +562,7 @@ Current repo status:
 
 - Prototype CLI supports migration, counter workflow run/resume, inspection, and version output.
 - Benchmarks record operation latency/throughput/allocation reports for workflow queueing, leases, waits, outbox, fences, and local command RPC.
-- Production metrics/tracing/admin UI are not implemented.
+- Optional OpenTelemetry tracing/metrics are implemented for current runtime, RPC, worker, and store paths. Production admin UI is not implemented.
 
 Target requirements:
 
@@ -651,6 +651,44 @@ Target requirements:
 | Database circuit breaker opens before commit                               | No durable change unless transaction committed; caller receives typed breaker error             | target; missing breaker integration                                    |
 | Paquito decode fails for persisted payload                                 | Target/message/workflow moves to operator-visible error/repair state                            | target; repair UX missing                                              |
 
+## Observability contract
+
+OpenTelemetry support is implemented as an optional integration layer over the official OpenTelemetry API gems. `Durababble.configure_observability(enabled: true, attributes:)` activates instrumentation against `OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`, so Durababble does not select or configure a collector/exporter for the host application. With observability disabled, instrumentation only executes cheap no-op checks. With observability enabled before an SDK is configured, OpenTelemetry's API-level no-op providers are used until the host application installs SDK/exporter delegates.
+
+Durababble emits spans for the currently implemented execution paths:
+
+| Span name | Surface |
+| --- | --- |
+| `durababble.workflow.start` | workflow enqueue/start through `Engine#run` |
+| `durababble.workflow.resume` | lease-aware resume and claim |
+| `durababble.workflow.execute` | workflow method execution and completion/failure |
+| `durababble.workflow.step` | durable step attempt, wait, success, failure, and retry |
+| `durababble.object.query` | durable-object `expose` reads |
+| `durababble.object.command.enqueue` / `durababble.object.command` | durable-object command persistence and inline command execution |
+| `durababble.worker.tick` | worker poll/claim/execute tick |
+| `durababble.workflow_rpc.lease_start`, `durababble.workflow_rpc.route`, `durababble.workflow_rpc.handle` | lease-routed workflow RPC |
+| `durababble.rpc.client.*`, `durababble.rpc.server.*` | gRPC client/server methods for awaken, evict, deliver, and transient calls |
+| `durababble.store.operation` | SQL adapter operation with backend and query-shape labels |
+
+Stable attributes use the `durababble.*` namespace and include workflow id/name/status, step name/index/attempt, object type/id/method, worker pool/id, lease owner, wait kind/event key, retry delay, store backend/query shape/schema, RPC method/target shape, and `error.type` when failures are surfaced. Instrumentation must not attach SQL text, serialized payloads, arguments, secret-bearing values, or unbounded free-form payload data.
+
+Metrics currently emitted:
+
+| Metric name | Type | Surface |
+| --- | --- | --- |
+| `durababble.workflow.starts`, `.completions`, `.failures`, `.cancellations` | counter | workflow lifecycle; cancellation is reserved until cancel/terminate is implemented |
+| `durababble.workflow.step.attempts`, `.successes`, `.failures`, `.retries` | counter | step attempts and retry scheduling |
+| `durababble.waits.started`, `.completed` | counter | wait persistence and wake completion |
+| `durababble.wait.latency` | histogram | time from wait creation to completion when available |
+| `durababble.queue.claim_latency` | histogram | claim delay for workflow and outbox queues when row creation time is available |
+| `durababble.leases.heartbeats`, `.conflicts`, `.expired_recovery` | counter | workflow/object lease health and recovery |
+| `durababble.outbox.pending`, `.processed`, `.failures` | counter | outbox enqueue/process path; failures are reserved for explicit delivery failure handling |
+| `durababble.store.operation.duration`, `.errors` | histogram/counter | SQL operation latency and exceptions |
+| `durababble.worker.ticks`, `durababble.worker.tick.duration` | counter/histogram | worker health and runtime loop behavior |
+| `durababble.workflow.history.steps`, `durababble.workflow.replay.steps` | histogram/counter | replay/history size and replay cost proxy |
+
+Known deferred gaps: first-class cancellation/termination metrics, explicit outbox delivery failure metrics, unified-inbox metrics, object mailbox queue depth, and richer replay cost measurements are catalogued but depend on those runtime features being implemented.
+
 ## Testing and coverage standard
 
 The test suite must keep correctness claims evidence-backed:
@@ -686,7 +724,7 @@ Current explicit boundaries:
 - CLI coverage is happy-path oriented and not a complete UX/error-contract specification.
 - Workflow `expose_command` currently records durable command events; full inbox-routed workflow command execution with return values is future work.
 - Durable object command rows and inline execution exist, but per-object queue serialization, lease recovery, and worker-driven object command execution are target behavior.
-- Unified inbox, persistent node registry, sticky object placement, object sleeps, workflow signals, patch-marker event checking, metrics/tracing, admin UI, and circuit breakers are not implemented.
+- Unified inbox, persistent node registry, sticky object placement, object sleeps, workflow signals, patch-marker event checking, admin UI, and circuit breakers are not implemented.
 - Ruby::Box execution and deterministic fibers are future scope rather than current prototype gates. Numeric workflow version APIs beyond `patched` remain future scope unless a concrete need appears.
 - Class-level data schema versioning/capability routing is explicitly deferred future scope.
 

@@ -45,6 +45,11 @@ module Durababble
 
         @stopping = false
         @last_error = nil
+        Observability.count(
+          "durababble.worker.runtime.starts",
+          "durababble.worker.pool" => @worker_pool,
+          "durababble.worker.id" => @worker_id,
+        )
         worker = Worker.new(store: @store, workflows: @workflows, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
         @thread = Thread.new { run_loop(worker) }
       end
@@ -59,9 +64,18 @@ module Durababble
       end
       return :stopped unless thread
 
-      return :stopped if thread.join(timeout)
+      attributes = {
+        "durababble.worker.pool" => @worker_pool,
+        "durababble.worker.id" => @worker_id,
+      }
+      if thread.join(timeout)
+        Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "stopped"))
+        return :stopped
+      end
 
-      @store.release_worker_leases!(worker_id: @worker_id)
+      released = @store.release_worker_leases!(worker_id: @worker_id)
+      Observability.count("durababble.leases.expired_recovery", attributes, by: released.fetch("workflows", 0).to_i)
+      Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "timeout"))
       :timeout
     end
 

@@ -80,52 +80,60 @@ module Durababble
 
       #: (worker_pool: untyped, workflow_ids: untyped) -> untyped
       def awaken_batch(worker_pool:, workflow_ids:)
-        with_rpc_errors do
-          @stub.awaken_batch(
-            Proto::AwakenBatchRequest.new(worker_pool:, workflow_ids:),
-            deadline: deadline,
-          )
+        Observability.trace("durababble.rpc.client.awaken_batch", "durababble.worker.pool" => worker_pool) do
+          with_rpc_errors do
+            @stub.awaken_batch(
+              Proto::AwakenBatchRequest.new(worker_pool:, workflow_ids:),
+              deadline: deadline,
+            )
+          end
         end
         true
       end
 
       #: (worker_pool: untyped, target_kind: untyped, target_id: untyped, ?target_class: untyped) -> untyped
       def evict_lease(worker_pool:, target_kind:, target_id:, target_class: "")
-        with_rpc_errors do
-          @stub.evict_lease(
-            Proto::EvictLeaseRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
-            deadline: deadline,
-          )
+        Observability.trace("durababble.rpc.client.evict_lease", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
+          with_rpc_errors do
+            @stub.evict_lease(
+              Proto::EvictLeaseRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
+              deadline: deadline,
+            )
+          end
         end
         true
       end
 
       #: (worker_pool: untyped, target_kind: untyped, target_id: untyped, ?target_class: untyped) -> untyped
       def deliver_message(worker_pool:, target_kind:, target_id:, target_class: "")
-        with_rpc_errors do
-          @stub.deliver_message(
-            Proto::DeliverMessageRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
-            deadline: deadline,
-          )
+        Observability.trace("durababble.rpc.client.deliver_message", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
+          with_rpc_errors do
+            @stub.deliver_message(
+              Proto::DeliverMessageRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
+              deadline: deadline,
+            )
+          end
         end
         true
       end
 
       #: (worker_pool: untyped, method: untyped, args: untyped, ?class_name: untyped, ?object_id: untyped, ?workflow_id: untyped, ?deadline_ms: untyped) -> untyped
       def call_transient_response(worker_pool:, method:, args:, class_name: "", object_id: "", workflow_id: "", deadline_ms: 0)
-        with_rpc_errors do
-          @stub.call_transient(
-            Proto::TransientRequest.new(
-              worker_pool:,
-              class_name:,
-              object_id:,
-              workflow_id:,
-              method:,
-              args: Rpc.dump(args),
-              deadline_ms:,
-            ),
-            deadline: deadline,
-          )
+        Observability.trace("durababble.rpc.client.call_transient", "durababble.worker.pool" => worker_pool, "durababble.rpc.method" => method, "durababble.workflow.id" => workflow_id, "durababble.object.type" => class_name, "durababble.object.id" => object_id) do
+          with_rpc_errors do
+            @stub.call_transient(
+              Proto::TransientRequest.new(
+                worker_pool:,
+                class_name:,
+                object_id:,
+                workflow_id:,
+                method:,
+                args: Rpc.dump(args),
+                deadline_ms:,
+              ),
+              deadline: deadline,
+            )
+          end
         end
       end
 
@@ -289,46 +297,54 @@ module Durababble
 
       #: (untyped, untyped) -> untyped
       def awaken_batch(request, call)
-        authorize!(call)
-        @awaken_batch&.call(worker_pool: request.worker_pool, workflow_ids: request.workflow_ids.to_a)
-        Proto::AwakenBatchResponse.new
+        Observability.trace("durababble.rpc.server.awaken_batch", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id) do
+          authorize!(call)
+          @awaken_batch&.call(worker_pool: request.worker_pool, workflow_ids: request.workflow_ids.to_a)
+          Proto::AwakenBatchResponse.new
+        end
       end
 
       #: (untyped, untyped) -> untyped
       def evict_lease(request, call)
-        authorize!(call)
-        @evict_lease&.call(
-          worker_pool: request.worker_pool,
-          target_kind: request.target_kind,
-          target_class: request.target_class,
-          target_id: request.target_id,
-        )
-        Proto::EvictLeaseResponse.new
-      end
-
-      #: (untyped, untyped) -> untyped
-      def deliver_message(request, call)
-        authorize!(call)
-        unless stale_workflow_message?(request)
-          @deliver_message&.call(
+        Observability.trace("durababble.rpc.server.evict_lease", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
+          authorize!(call)
+          @evict_lease&.call(
             worker_pool: request.worker_pool,
             target_kind: request.target_kind,
             target_class: request.target_class,
             target_id: request.target_id,
           )
+          Proto::EvictLeaseResponse.new
         end
-        Proto::DeliverMessageResponse.new
+      end
+
+      #: (untyped, untyped) -> untyped
+      def deliver_message(request, call)
+        Observability.trace("durababble.rpc.server.deliver_message", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
+          authorize!(call)
+          unless stale_workflow_message?(request)
+            @deliver_message&.call(
+              worker_pool: request.worker_pool,
+              target_kind: request.target_kind,
+              target_class: request.target_class,
+              target_id: request.target_id,
+            )
+          end
+          Proto::DeliverMessageResponse.new
+        end
       end
 
       #: (untyped, untyped) -> untyped
       def call_transient(request, call)
-        authorize!(call)
-        result = if request.workflow_id.empty?
-          call_custom_transient(request)
-        else
-          call_workflow_transient(request)
+        Observability.trace("durababble.rpc.server.call_transient", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => request.object_id) do
+          authorize!(call)
+          result = if request.workflow_id.empty?
+            call_custom_transient(request)
+          else
+            call_workflow_transient(request)
+          end
+          Proto::TransientResponse.new(ok: Rpc.dump(result))
         end
-        Proto::TransientResponse.new(ok: Rpc.dump(result))
       rescue WorkflowRpc::NoActiveLease
         Proto::TransientResponse.new(not_running: true)
       rescue WorkflowRpc::StaleLease => e

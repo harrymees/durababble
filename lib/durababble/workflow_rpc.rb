@@ -46,11 +46,13 @@ module Durababble
 
       #: (workflow_id: untyped) -> untyped
       def call(workflow_id:)
-        @worker_ids.each do |worker_id|
-          claimed = @store.claim_workflow(workflow_id:, worker_id:, lease_seconds: @lease_seconds)
-          return await_started!(workflow_id) if claimed
+        Observability.trace("durababble.workflow_rpc.lease_start", "durababble.workflow.id" => workflow_id) do
+          @worker_ids.each do |worker_id|
+            claimed = @store.claim_workflow(workflow_id:, worker_id:, lease_seconds: @lease_seconds)
+            return await_started!(workflow_id) if claimed
+          end
+          await_started!(workflow_id)
         end
-        await_started!(workflow_id)
       end
 
       private
@@ -78,18 +80,25 @@ module Durababble
 
       #: (workflow_id: untyped, command: untyped, ?payload: untyped) -> untyped
       def request(workflow_id:, command:, payload: {})
-        attempts = 0
+        attributes = {
+          "durababble.workflow.id" => workflow_id,
+          "durababble.rpc.command" => command,
+        }
+        Observability.trace("durababble.workflow_rpc.route", attributes) do
+          attempts = 0
 
-        begin
-          route_once(workflow_id:, command:, payload:)
-        rescue StaleLease, NoActiveLease, NodeUnavailable => e
-          raise unless @retry_on_stale
+          begin
+            route_once(workflow_id:, command:, payload:)
+          rescue StaleLease, NoActiveLease, NodeUnavailable => e
+            Observability.count("durababble.workflow_rpc.reroutes", attributes.merge("error.type" => e.class.name))
+            raise unless @retry_on_stale
 
-          attempts += 1
-          raise if attempts > 3
+            attempts += 1
+            raise if attempts > 3
 
-          start_workflow!(workflow_id) if e.is_a?(NoActiveLease)
-          retry
+            start_workflow!(workflow_id) if e.is_a?(NoActiveLease)
+            retry
+          end
         end
       end
 
@@ -146,15 +155,23 @@ module Durababble
       def call(payload)
         workflow_id = payload.fetch("workflow_id")
         expected_worker_id = payload.fetch("expected_worker_id")
-        raise StaleLease, "RPC expected #{expected_worker_id}, but reached #{@node_id}" unless expected_worker_id == @node_id
+        attributes = {
+          "durababble.workflow.id" => workflow_id,
+          "durababble.rpc.command" => payload.fetch("command"),
+          "durababble.worker.id" => @node_id,
+          "durababble.lease.owner" => expected_worker_id,
+        }
+        Observability.trace("durababble.workflow_rpc.handle", attributes) do
+          raise StaleLease, "RPC expected #{expected_worker_id}, but reached #{@node_id}" unless expected_worker_id == @node_id
 
-        assert_current_lease!(workflow_id)
-        handler = @handlers.fetch(payload.fetch("command")) do
-          raise UnknownCommand, "unknown workflow RPC command #{payload.fetch("command")}"
+          assert_current_lease!(workflow_id)
+          handler = @handlers.fetch(payload.fetch("command")) do
+            raise UnknownCommand, "unknown workflow RPC command #{payload.fetch("command")}"
+          end
+          result = handler.call(payload.fetch("payload", {}))
+          assert_current_lease!(workflow_id)
+          result
         end
-        result = handler.call(payload.fetch("payload", {}))
-        assert_current_lease!(workflow_id)
-        result
       end
 
       private

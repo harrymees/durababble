@@ -58,6 +58,15 @@ module Durababble
   class FenceTimeout < Error
   end
 
+  module Observability
+    class Configuration
+      attr_reader attributes: Hash[String, serialized_payload]
+      def enabled?: () -> bool
+      def tracer: () -> Object?
+      def meter: () -> Object?
+    end
+  end
+
   class Step
     attr_reader name: String
     attr_reader retry_policy: RetryPolicy
@@ -97,6 +106,9 @@ module Durababble
     attr_reader result: Output?
     attr_reader error: String?
   end
+
+  def self.configure_observability: (?enabled: bool, ?attributes: Hash[String | Symbol, serialized_payload]) -> Observability::Configuration
+  def self.observability: () -> Observability::Configuration
 
   class Store
     attr_reader schema: String

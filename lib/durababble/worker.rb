@@ -14,12 +14,21 @@ module Durababble
 
     #: () -> untyped
     def tick
-      claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)
-      return :idle unless claimed
+      attributes = { "durababble.worker.id" => @worker_id }
+      Observability.measure("durababble.worker.tick", attributes) do
+        Observability.trace("durababble.worker.tick", attributes) do
+          claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)
+          unless claimed
+            Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "idle"))
+            return :idle
+          end
 
-      workflow = @workflows.fetch(claimed.fetch("name"))
-      Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
-      :worked
+          workflow = @workflows.fetch(claimed.fetch("name"))
+          Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+          Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
+          :worked
+        end
+      end
     end
 
     #: (?max_ticks: untyped) -> untyped
