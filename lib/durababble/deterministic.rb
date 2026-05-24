@@ -105,6 +105,12 @@ module Durababble
         trace.event(@time, actor, "schedule", at: @time + delay, name:)
       end
 
+      #: (untyped) -> untyped
+      def advance(duration)
+        @time += duration
+        trace.event(@time, "scheduler", "advance", by: duration)
+      end
+
       #: (?max_events: untyped) -> untyped
       def run(max_events: 10_000)
         count = 0
@@ -1601,6 +1607,8 @@ module Durababble
       def cooperative_cancellation_cleanup(seed)
         run(seed, "cooperative_cancellation_cleanup") do |h|
           cleanup_runs = 0
+          cleanup_lease_observations = []
+          workflow_id_for_cleanup = nil
           h.workflows["cancelable"] = workflow = Class.new(Durababble::Workflow) do
             workflow_name "cancelable"
 
@@ -1618,7 +1626,18 @@ module Durababble
             step :wait_for_signal
 
             define_method(:cleanup) do |input|
+              instance = self #: as untyped
               cleanup_runs += 1
+              before = h.store.workflow(workflow_id_for_cleanup)
+              h.scheduler.advance(5)
+              instance.step_context.heartbeat.record({ "phase" => "cleanup", "run" => cleanup_runs })
+              after = h.store.workflow(workflow_id_for_cleanup)
+              cleanup_lease_observations << {
+                before_locked_by: before.fetch("locked_by"),
+                before_locked_until: before.fetch("locked_until"),
+                after_locked_by: after.fetch("locked_by"),
+                after_locked_until: after.fetch("locked_until"),
+              }
               h.scheduler.trace.event(h.scheduler.time, "worker", "cleanup_ran", count: cleanup_runs, reason: input.fetch("reason"))
               { "cleaned" => true, "reason" => input.fetch("reason") }
             end
@@ -1626,6 +1645,7 @@ module Durababble
           end
 
           id = h.store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => seed.to_s })
+          workflow_id_for_cleanup = id
           h.scheduler.schedule(actor: "worker-a", delay: 1, name: "park") do
             Durababble::Engine.new(store: h.store, worker_id: "worker-a").resume(workflow, workflow_id: id)
           end
@@ -1633,14 +1653,22 @@ module Durababble
             workflow.handle(id, store: h.store).cancel(reason: "stop #{seed}")
           end
           h.scheduler.schedule(actor: "worker-b", delay: 10, name: "cleanup") do
-            Durababble::Engine.new(store: h.store, worker_id: "worker-b").resume(workflow, workflow_id: id)
+            Durababble::Engine.new(store: h.store, worker_id: "worker-b", lease_seconds: 20).resume(workflow, workflow_id: id)
           end
-          h.scheduler.schedule(actor: "client-signal", delay: 12, name: "late_signal") do
+          h.scheduler.schedule(actor: "client-signal", delay: 30, name: "late_signal") do
             signaled = h.store.signal_event("cancelable:#{seed}", payload: { "late" => true })
             h.scheduler.trace.event(h.scheduler.time, "client-signal", "late_signal", signaled:)
           end
           h.check("workflow canceled after cleanup") { h.store.workflow(id).fetch("status") == "canceled" }
           h.check("cleanup ran once") { cleanup_runs == 1 }
+          h.check("cleanup heartbeat kept ownership") do
+            cleanup_lease_observations.any? do |observation|
+              observation.fetch(:before_locked_by) == "worker-b" &&
+                observation.fetch(:after_locked_by) == "worker-b" &&
+                observation.fetch(:after_locked_until) > observation.fetch(:before_locked_until)
+            end
+          end
+          h.check("cleanup heartbeat persisted") { h.store.steps_for(id).any? { |step| step.fetch("name") == "cleanup" && step.fetch("heartbeat_cursor") == { "phase" => "cleanup", "run" => 1 } } }
           h.check("late signal ignored") { h.scheduler.trace.to_s.include?("late_signal signaled=0") }
           h.check("waiting attempt canceled") { h.store.step_attempts_for(id).any? { |attempt| attempt.fetch("status") == "canceled" } }
         end

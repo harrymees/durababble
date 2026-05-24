@@ -60,8 +60,8 @@ module Durababble
 
   class CancellationError < Error
     attr_reader workflow_id: String?
-    attr_reader reason: untyped
-    def initialize: (?untyped reason, ?workflow_id: String?) -> void
+    attr_reader reason: serialized_payload
+    def initialize: (?serialized_payload reason, ?workflow_id: String?) -> void
   end
 
   class Step

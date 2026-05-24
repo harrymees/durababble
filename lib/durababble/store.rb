@@ -67,7 +67,6 @@ module Durababble
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_reason text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_delivered_at timestamptz")
-      migrate_legacy_workflow_cancellations!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -978,27 +977,6 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
     end
 
-    #: () -> untyped
-    def migrate_legacy_workflow_cancellations!
-      exists = execute_params(<<~SQL, [schema, "workflow_cancellations"]).first
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = $1 AND table_name = $2
-      SQL
-      return unless exists
-
-      execute(<<~SQL)
-        UPDATE #{table("workflows")} AS wf
-        SET cancel_reason = COALESCE(wf.cancel_reason, wc.reason),
-          cancel_requested_at = COALESCE(wf.cancel_requested_at, wc.requested_at),
-          cancel_delivered_at = COALESCE(wf.cancel_delivered_at, wc.delivered_at),
-          updated_at = now()
-        FROM #{table("workflow_cancellations")} AS wc
-        WHERE wf.id = wc.workflow_id
-      SQL
-      execute("DROP TABLE IF EXISTS #{table("workflow_cancellations")}")
-    end
-
     #: (untyped, untyped, ?not_null: untyped) -> untyped
     def migrate_serialized_column!(table_name, column_name, not_null: false)
       column = execute_params(<<~SQL, [schema, table_name, column_name]).first
@@ -1113,7 +1091,6 @@ module Durababble
       add_column_if_missing("workflows", "cancel_reason", "TEXT")
       add_column_if_missing("workflows", "cancel_requested_at", "DATETIME(6)")
       add_column_if_missing("workflows", "cancel_delivered_at", "DATETIME(6)")
-      migrate_legacy_workflow_cancellations!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id VARCHAR(191) NOT NULL,
@@ -1234,7 +1211,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "workflow_cancellations", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1857,30 +1834,6 @@ module Durababble
       return if mysql_column_exists?(table_name, column_name)
 
       execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_ident(column_name)} #{definition}")
-    end
-
-    #: () -> untyped
-    def migrate_legacy_workflow_cancellations!
-      return unless mysql_table_exists?("workflow_cancellations")
-
-      execute(<<~SQL)
-        UPDATE #{table("workflows")} AS wf
-        JOIN #{table("workflow_cancellations")} AS wc ON wf.id = wc.workflow_id
-        SET wf.cancel_reason = IF(wf.cancel_requested_at IS NULL, wc.reason, wf.cancel_reason),
-          wf.cancel_requested_at = COALESCE(wf.cancel_requested_at, wc.requested_at),
-          wf.cancel_delivered_at = COALESCE(wf.cancel_delivered_at, wc.delivered_at),
-          wf.updated_at = NOW(6)
-      SQL
-      execute("DROP TABLE IF EXISTS #{table("workflow_cancellations")}")
-    end
-
-    #: (untyped) -> untyped
-    def mysql_table_exists?(table_name)
-      !!execute_params(<<~SQL, [raw_table_name(table_name)]).first
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = DATABASE() AND table_name = ?
-      SQL
     end
 
     #: (untyped, untyped) -> untyped

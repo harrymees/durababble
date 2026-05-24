@@ -194,6 +194,8 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "workflow_cancel_requested"
     assert_includes result.trace, "workflow_cancel_delivered"
+    assert_includes result.trace, "step_heartbeat"
+    assert_includes result.trace, "advance by=5"
     assert_includes result.trace, "cleanup_ran"
     assert_equal 1, result.summary.fetch(:canceled_workflows)
   end

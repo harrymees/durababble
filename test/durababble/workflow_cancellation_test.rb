@@ -129,6 +129,71 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
       end
     end
 
+    test "keeps the workflow lease through long-running cancellation cleanup with #{backend.name}" do
+      with_durababble_store(backend, "workflow_cancellation_test") do |store|
+        store.migrate!
+        observations = []
+        workflow = nil
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "cancel-cleanup-lease"
+
+          define_method(:execute) do |input|
+            run_work(input)
+          rescue Durababble::CancellationError => e
+            cleanup_after_cancel(input.merge("reason" => e.reason))
+          end
+
+          define_method(:run_work) do |input|
+            workflow.handle(input.fetch("workflow_id"), store:).cancel(reason: "keep cleaning")
+            row = store.workflow(input.fetch("workflow_id"))
+            observations << {
+              phase: "request",
+              status: row.fetch("status"),
+              locked_by: row.fetch("locked_by"),
+              locked_until: row.fetch("locked_until"),
+            }
+            step_context.heartbeat.record({ "phase" => "work" })
+          end
+          step :run_work
+
+          define_method(:cleanup_after_cancel) do |input|
+            before = store.workflow(input.fetch("workflow_id"))
+            sleep 0.02
+            step_context.heartbeat.record({ "phase" => "cleanup" })
+            after = store.workflow(input.fetch("workflow_id"))
+            observations << {
+              phase: "cleanup",
+              before_status: before.fetch("status"),
+              before_locked_by: before.fetch("locked_by"),
+              before_locked_until: before.fetch("locked_until"),
+              after_status: after.fetch("status"),
+              after_locked_by: after.fetch("locked_by"),
+              after_locked_until: after.fetch("locked_until"),
+            }
+            { "cleaned" => input.fetch("reason") }
+          end
+          step :cleanup_after_cancel
+        end
+        workflow_id = workflow.enqueue({}, store:)
+        update_workflow_input(store, workflow_id, { "workflow_id" => workflow_id }, backend)
+
+        run = Durababble::Engine.new(store:, worker_id: "cleanup-owner", lease_seconds: 5).resume(workflow, workflow_id:)
+
+        request = observations.fetch(0)
+        cleanup = observations.fetch(1)
+        assert_equal "canceled", run.status
+        assert_equal "running", request.fetch(:status)
+        assert_equal "cleanup-owner", request.fetch(:locked_by)
+        assert_equal "running", cleanup.fetch(:before_status)
+        assert_equal "cleanup-owner", cleanup.fetch(:before_locked_by)
+        assert_equal "running", cleanup.fetch(:after_status)
+        assert_equal "cleanup-owner", cleanup.fetch(:after_locked_by)
+        assert_operator timestamp_value(cleanup.fetch(:after_locked_until)), :>, timestamp_value(cleanup.fetch(:before_locked_until))
+        assert_nil store.workflow(workflow_id).fetch("locked_by")
+        assert_equal ["canceled", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+      end
+    end
+
     test "does not repeat completed cleanup after crash and recovery with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
         store.migrate!
@@ -155,6 +220,37 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
         assert_equal "canceled", run.status
         assert_equal 1, cleanup_runs
         assert_equal ["completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+      end
+    end
+
+    test "resumes cancellation cleanup after a crash before cleanup body runs with #{backend.name}" do
+      with_durababble_store(backend, "workflow_cancellation_test") do |store|
+        store.migrate!
+        cleanup_runs = 0
+        workflow = cancelable_workflow(
+          "cancel-cleanup-start-crash",
+          work: ->(input, _heartbeat) { input },
+          cleanup: ->(input) {
+            cleanup_runs += 1
+            { "cleaned" => input.fetch("reason") }
+          },
+        )
+        workflow_id = workflow.enqueue({}, store:)
+        workflow.handle(workflow_id, store:).cancel(reason: "recover started cleanup")
+
+        assert_raises(Durababble::InjectedCrash) do
+          Durababble::Engine.new(store:, worker_id: "crashy", lease_seconds: 1, crash_after: :step_started).resume(workflow, workflow_id:)
+        end
+        assert_equal "running", store.workflow(workflow_id).fetch("status")
+        assert_equal "crashy", store.workflow(workflow_id).fetch("locked_by")
+
+        assert_equal 1, store.steal_expired_leases!(now: Time.now + 2)
+        assert_equal "canceling", store.workflow(workflow_id).fetch("status")
+        run = Durababble::Engine.new(store:, worker_id: "recover").resume(workflow, workflow_id:)
+
+        assert_equal "canceled", run.status
+        assert_equal 1, cleanup_runs
+        assert_equal ["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
 
@@ -325,5 +421,11 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
     else
       store.send(:execute_params, "UPDATE #{store.send(:table, "workflows")} SET input = $2::bytea WHERE id = $1", [workflow_id, payload])
     end
+  end
+
+  def timestamp_value(value)
+    return value if value.is_a?(Time)
+
+    Time.parse(value.to_s)
   end
 end
