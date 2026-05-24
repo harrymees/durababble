@@ -398,6 +398,19 @@ class DurababbleStoreTest < DurababbleTestCase
     )
     assert_equal "existing-inbox-id", duplicate
 
+    pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      PgResult.new,
+    ])).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+    assert_equal "pending-inbox-id", pending_duplicate
+
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
         PgResult.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
@@ -410,6 +423,117 @@ class DurababbleStoreTest < DurababbleTestCase
         idempotency_key: "signal:wf-1",
       )
     end
+  end
+
+  test "handles postgres target activation and inbox wait branches" do
+    assert_nil pg_store.claim_target_activation(worker_id: "w", lease_seconds: 5, target_kinds: [])
+    assert_nil pg_store.claim_target_activation(worker_id: "w", lease_seconds: 5, target_types: [])
+
+    assert_equal(
+      { "id" => "wf", "input" => {} },
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "id" => "wf", "input" => pg_dump({}) }]),
+      ])).claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5),
+    )
+    assert_equal(
+      { "id" => "wf", "input" => { "claimed" => true } },
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new,
+        PgResult.new([{ "id" => "wf", "input" => pg_dump({ "claimed" => true }) }]),
+      ])).claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5),
+    )
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+      .claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5)
+
+    activation = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "target_kind" => "workflow", "target_type" => "late", "target_id" => "wf-late", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-02T00:00:00Z" }]),
+      PgResult.new([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-01T00:00:00Z" }]),
+      PgResult.new([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early" }]),
+    ])).claim_target_activation(worker_id: "w", lease_seconds: 5, target_kinds: ["workflow"], target_types: ["early"])
+    assert_hash_includes activation, "target_type" => "early", "target_id" => "wf-early"
+
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+      .claim_target_activation(worker_id: "w", lease_seconds: 5)
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+      .complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "present" => 1 }]),
+      PgResult.new([{ "status" => "pending", "ready_at" => nil }]),
+      PgResult.new,
+    ])).complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "present" => 1 }]),
+      PgResult.new([{ "status" => "dead_lettered", "ready_at" => nil }]),
+      PgResult.new,
+    ])).complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
+
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+      .target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf")
+    assert_hash_includes(
+      pg_store(ScriptedPgConnection.new(params_results: [PgResult.new([{ "target_id" => "wf" }])]))
+        .target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf"),
+      "target_id" => "wf",
+    )
+
+    helper = pg_store
+    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil)
+    assert helper.send(:activatable_inbox_status?, "pending")
+    refute helper.send(:activatable_inbox_status?, "completed")
+    assert_equal "", helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)
+    assert_includes helper.send(:target_activation_filter, target_kinds: ["workflow"], target_types: nil), "target_kind IN"
+    assert_includes helper.send(:target_activation_filter, target_kinds: nil, target_types: ["approval"]), "target_type IN"
+    assert_equal Time.utc(2024, 1, 1), helper.send(:target_activation_ready_at_for, { "status" => "pending", "ready_at" => nil }, now: Time.utc(2024, 1, 1))
+    assert_equal "2024-01-02T00:00:00Z", helper.send(:target_activation_ready_at_for, { "status" => "pending", "ready_at" => "2024-01-02T00:00:00Z" }, now: Time.utc(2024, 1, 1))
+    assert_equal "2024-01-02T00:00:00Z", helper.send(:target_activation_ready_at_for, { "status" => "running", "locked_until" => "2024-01-02T00:00:00Z" }, now: Time.utc(2024, 1, 1))
+    refute helper.send(:inbox_row_claimable?, { "status" => "dead_lettered" }, now: Time.utc(2024, 1, 1))
+    refute helper.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => nil }, now: Time.utc(2024, 1, 1))
+    assert helper.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2023-12-31T00:00:00Z" }, now: Time.utc(2024, 1, 1))
+    refute helper.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => "2024-01-02T00:00:00Z" }, now: Time.utc(2024, 1, 1))
+
+    messages = [{ "status" => "completed", "result" => { "ok" => true } }]
+    helper.define_singleton_method(:inbox_message) { |_message_id| messages.shift }
+    assert_equal({ "ok" => true }, helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0.01))
+    messages = [{ "status" => "failed", "error" => "boom" }]
+    assert_raises_matching(Durababble::Error, /boom/) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0.01) }
+    messages = [nil]
+    assert_raises(KeyError) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0.01) }
+    messages = [{ "status" => "pending" }]
+    assert_raises(Durababble::CommandTimeout) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0) }
+
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).complete_object_command(command_id: "cmd", result: "ok", worker_id: "w")
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).fail_object_command(command_id: "cmd", error: "boom", worker_id: "w")
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+      .complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+      .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      PgResult.new,
+      PgResult.new([{ "event_index" => "0" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
+    pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      PgResult.new,
+      PgResult.new([{ "event_index" => "1" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
   end
 
   test "handles postgres fence replay, serialization migration, retry, and helper branches" do
