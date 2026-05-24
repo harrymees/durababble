@@ -3,13 +3,13 @@
 
 require_relative "../test_helper"
 
-class DurababbleAbsurdInspiredTest < DurababbleTestCase
+class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "does not recreate a timer wait after crashing immediately after persistence with #{backend.name}" do
-      with_durababble_store(backend, "absurd_inspired") do |store|
+      with_durababble_store(backend, "durable_wait_recovery") do |store|
         store.migrate!
         wake_at = Time.utc(2026, 2, 1, 12, 0, 0)
-        workflow = durababble_test_workflow("absurd-timer-checkpoint") do
+        workflow = durababble_test_workflow("durable-timer-checkpoint") do
           test_step("sleep") do |ctx|
             Durababble.wait_until(wake_at, ctx.merge("slept" => true))
           end
@@ -45,12 +45,12 @@ class DurababbleAbsurdInspiredTest < DurababbleTestCase
     end
 
     test "keeps repeated durable waits from the same step method distinct by position with #{backend.name}" do
-      with_durababble_store(backend, "absurd_inspired") do |store|
+      with_durababble_store(backend, "durable_wait_recovery") do |store|
         store.migrate!
         first_wake = Time.utc(2026, 3, 1, 0, 0, 0)
         second_wake = Time.utc(2026, 3, 2, 0, 0, 0)
         workflow = Class.new(Durababble::Workflow) do
-          workflow_name "absurd-repeated-sleeps"
+          workflow_name "durable-repeated-waits"
 
           define_method(:execute) do |input|
             first = pause_until(input.merge("phase" => "first"), first_wake)
