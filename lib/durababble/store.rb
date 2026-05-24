@@ -605,6 +605,35 @@ module Durababble
       execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = $1 ORDER BY started_at, position", [workflow_id]).map { |row| decode_row(row) }
     end
 
+    #: (?status: untyped, ?limit: untyped) -> untyped
+    def list_workflows(status: nil, limit: 50)
+      params = []
+      where_sql = ""
+      if status
+        params << status
+        where_sql = "WHERE status = $1"
+      end
+      params << bounded_limit(limit)
+      execute_params(<<~SQL, params).map { |row| decode_row(row) }
+        SELECT id, name, status, input, result, error, locked_by, locked_until, next_run_at, created_at, updated_at
+        FROM #{table("workflows")}
+        #{where_sql}
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT $#{params.length}
+      SQL
+    end
+
+    #: (workflow_id: untyped, ?limit: untyped) -> untyped
+    def list_outbox_messages(workflow_id:, limit: 50)
+      execute_params(<<~SQL, [workflow_id, bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT *
+        FROM #{table("outbox")}
+        WHERE workflow_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped) -> untyped
     def object_state(object_type:, object_id:)
       row = execute_params("SELECT state FROM #{table("durable_objects")} WHERE object_type = $1 AND object_id = $2", [object_type, object_id]).first
@@ -622,6 +651,16 @@ module Durababble
       state
     end
 
+    #: (?limit: untyped) -> untyped
+    def list_durable_objects(limit: 50)
+      execute_params(<<~SQL, [bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT object_type, object_id, state, locked_by, locked_until, created_at, updated_at
+        FROM #{table("durable_objects")}
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT $1
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
       id = SecureRandom.uuid
@@ -630,6 +669,17 @@ module Durababble
         VALUES ($1, $2, $3, $4, $5::bytea, $6::bytea, 'pending')
       SQL
       id
+    end
+
+    #: (object_type: untyped, object_id: untyped, ?limit: untyped) -> untyped
+    def list_object_commands(object_type:, object_id:, limit: 50)
+      execute_params(<<~SQL, [object_type, object_id, bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT *
+        FROM #{table("durable_object_commands")}
+        WHERE object_type = $1 AND object_id = $2
+        ORDER BY created_at DESC
+        LIMIT $3
+      SQL
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
@@ -673,6 +723,11 @@ module Durababble
     end
 
     private
+
+    #: (untyped) -> Integer
+    def bounded_limit(limit)
+      limit.to_i.clamp(1, 250)
+    end
 
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
@@ -1537,6 +1592,35 @@ module Durababble
       execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = ? ORDER BY started_at, position", [workflow_id]).map { |row| decode_row(row) }
     end
 
+    #: (?status: untyped, ?limit: untyped) -> untyped
+    def list_workflows(status: nil, limit: 50)
+      params = []
+      where_sql = ""
+      if status
+        params << status
+        where_sql = "WHERE status = ?"
+      end
+      params << bounded_limit(limit)
+      execute_params(<<~SQL, params).map { |row| decode_row(row) }
+        SELECT id, name, status, input, result, error, locked_by, locked_until, next_run_at, created_at, updated_at
+        FROM #{table("workflows")}
+        #{where_sql}
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT ?
+      SQL
+    end
+
+    #: (workflow_id: untyped, ?limit: untyped) -> untyped
+    def list_outbox_messages(workflow_id:, limit: 50)
+      execute_params(<<~SQL, [workflow_id, bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT *
+        FROM #{table("outbox")}
+        WHERE workflow_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped) -> untyped
     def object_state(object_type:, object_id:)
       row = execute_params("SELECT state FROM #{table("durable_objects")} WHERE object_type = ? AND object_id = ?", [object_type, object_id]).first
@@ -1553,6 +1637,16 @@ module Durababble
       state
     end
 
+    #: (?limit: untyped) -> untyped
+    def list_durable_objects(limit: 50)
+      execute_params(<<~SQL, [bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT object_type, object_id, state, locked_by, locked_until, created_at, updated_at
+        FROM #{table("durable_objects")}
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT ?
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
       id = SecureRandom.uuid
@@ -1561,6 +1655,17 @@ module Durababble
         VALUES (?, ?, ?, ?, ?, ?, 'pending')
       SQL
       id
+    end
+
+    #: (object_type: untyped, object_id: untyped, ?limit: untyped) -> untyped
+    def list_object_commands(object_type:, object_id:, limit: 50)
+      execute_params(<<~SQL, [object_type, object_id, bounded_limit(limit)]).map { |row| decode_row(row) }
+        SELECT *
+        FROM #{table("durable_object_commands")}
+        WHERE object_type = ? AND object_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+      SQL
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
@@ -1614,6 +1719,11 @@ module Durababble
     end
 
     private
+
+    #: (untyped) -> Integer
+    def bounded_limit(limit)
+      limit.to_i.clamp(1, 250)
+    end
 
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)

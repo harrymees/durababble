@@ -59,6 +59,30 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "lists operator UI workflow, outbox, object, and command rows with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        store.migrate!
+
+        workflow_id = store.enqueue_workflow(name: "operator-list", input: { "secret" => "redacted" })
+        store.claim_workflow(workflow_id:, worker_id: "operator-worker", lease_seconds: 30)
+        outbox_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "event" => 1 }, key: "events:operator")
+        store.save_object_state(object_type: "account", object_id: "acct-1", state: { "balance" => 10 })
+        command_id = store.enqueue_object_command(
+          object_type: "account",
+          object_id: "acct-1",
+          method_name: "credit",
+          args: [10],
+          kwargs: {},
+        )
+
+        assert_hash_includes store.list_workflows(status: "running").first, "id" => workflow_id, "input" => { "secret" => "redacted" }
+        assert_equal [], store.list_workflows(status: "completed")
+        assert_hash_includes store.list_outbox_messages(workflow_id:).first, "id" => outbox_id, "payload" => { "event" => 1 }
+        assert_hash_includes store.list_durable_objects.first, "object_type" => "account", "object_id" => "acct-1", "state" => { "balance" => 10 }
+        assert_hash_includes store.list_object_commands(object_type: "account", object_id: "acct-1").first, "id" => command_id, "method_name" => "credit"
+      end
+    end
+
     test "persists waits and wakes event waiters once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         store.migrate!

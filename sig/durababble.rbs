@@ -2,6 +2,8 @@ module Durababble
   type serialized_payload = Object?
   type payload_map = Hash[String | Symbol, serialized_payload]
   type workflow_row = Hash[String, serialized_payload]
+  type rack_env = Hash[Object, Object]
+  type rack_response = [Integer, Hash[String, String], Array[String]]
   type retry_config = {
     ?initial_interval: Numeric,
     ?backoff_coefficient: Float,
@@ -138,12 +140,23 @@ module Durababble
     def workflow: (String workflow_id) -> workflow_row
     def steps_for: (String workflow_id) -> Array[workflow_row]
     def step_attempts_for: (String workflow_id) -> Array[workflow_row]
+    def list_workflows: (?status: String?, ?limit: Integer) -> Array[workflow_row]
+    def list_outbox_messages: (workflow_id: String, ?limit: Integer) -> Array[workflow_row]
     def object_state: (object_type: String, object_id: String) -> serialized_payload
     def save_object_state: (object_type: String, object_id: String, state: serialized_payload) -> void
+    def list_durable_objects: (?limit: Integer) -> Array[workflow_row]
     def enqueue_object_command: (object_type: String, object_id: String, method_name: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> String
+    def list_object_commands: (object_type: String, object_id: String, ?limit: Integer) -> Array[workflow_row]
     def claim_object_command: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
     def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?) -> Object?
+  end
+
+  module Operator
+    class App
+      def initialize: (?store: Store?, ?title: String) -> void
+      def call: (rack_env env) -> rack_response
+    end
   end
 
   class Workflow[Input, Output]

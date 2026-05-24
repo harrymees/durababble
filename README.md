@@ -150,9 +150,35 @@ account.balance
 This is still a prototype, not a production Temporal replacement.
 The implementation is intentionally kept as a plain Ruby gem until it needs Rails hooks, initializers, models, or routes.
 
-## Operator UI direction
+## Operator UI
 
-Durababble does not yet ship an operator-facing web UI. `docs/operator-web-ui.md`
-specifies the target screens, management actions, security posture, Store/API
-gaps, and follow-up implementation work for a future UI that inspects workflow
-and durable-object state without bypassing persisted storage.
+Durababble ships a small Rack-compatible operator UI prototype:
+
+```ruby
+require "durababble"
+
+store = Durababble::Store.connect(
+  database_url: ENV.fetch("DURABABBLE_DATABASE_URL"),
+  schema: Durababble.default_schema,
+)
+
+run Durababble::Operator::App.new(store:)
+```
+
+In Rails, mount the callable behind the host application's own authentication
+and authorization middleware. Falcon runs the normal Rails Rack stack, so no
+Durababble-specific server adapter is required:
+
+```ruby
+# config/routes.rb
+mount(
+  MyAdminAuthMiddleware.new(Durababble::Operator::App.new(store: Durababble.store)),
+  at: "/durababble/operator",
+)
+```
+
+The prototype UI is intentionally read-only. It renders persisted workflow,
+step, attempt, wait, outbox, durable-object, and command rows through
+`Durababble::Store`; it does not inspect worker memory or own authentication.
+`docs/operator-web-ui.md` specifies the broader target screens, management
+actions, security posture, Store/API gaps, and follow-up implementation work.

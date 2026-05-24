@@ -1,9 +1,10 @@
 # Operator web UI spec
 
-Status: target implementation spec. This document specifies the operator-facing
-web UI and supporting management API that should be built after the current
-prototype storage/API gaps are closed. It does not add runtime behavior by
-itself.
+Status: implementation spec plus prototype read-only UI. This document
+specifies the operator-facing web UI and supporting management API that should be
+built after the current prototype storage/API gaps are closed. The current repo
+also ships `Durababble::Operator::App`, a small Rack-compatible read-only UI for
+local smoke testing and host-app mounting.
 
 Durababble already persists workflow runs, steps, attempts, waits, workflow
 leases, outbox rows, durable-object state, and transitional durable-object
@@ -26,9 +27,9 @@ the store or adding process-local views of truth.
 ## Deployment assumptions
 
 - The UI is mounted by the host application, for example at
-  `/durababble/operator`. Durababble should provide Rack/Rails integration later,
-  but the host app owns routing, session middleware, CSRF protection, and
-  production authentication.
+  `/durababble/operator`. The prototype mount surface is
+  `Durababble::Operator::App`, a Rack-compatible callable. The host app owns
+  routing, session middleware, CSRF protection, and production authentication.
 - The UI talks only to a Durababble management API backed by `Durababble::Store`
   reads and writes. It must not inspect Ruby worker memory, in-process caches, or
   local deterministic simulation state.
@@ -47,6 +48,20 @@ the store or adding process-local views of truth.
 Production deployments should default to read-only access until mutating roles
 are configured.
 
+The prototype `Durababble::Operator::App` is read-only and deliberately does not
+authenticate users. Mount it behind the host app's own authentication and
+authorization middleware. In a Falcon-powered Rails app, Falcon serves the Rails
+Rack stack, so the operator app can be mounted the same way as any other Rack
+callable:
+
+```ruby
+# config/routes.rb
+mount(
+  MyAdminAuthMiddleware.new(Durababble::Operator::App.new(store: Durababble.store)),
+  at: "/durababble/operator",
+)
+```
+
 | Permission | Allows | Denies |
 | --- | --- | --- |
 | `durababble.read` | Lists, details, timelines, payload metadata, decoded payloads when allowed | All writes |
@@ -62,6 +77,17 @@ with `durababble.payload.read`; other users see type, byte size, serializer
 version, and redacted summaries. Every mutating API requires CSRF protection,
 host-authenticated user identity, an idempotency key, a reason string, and an
 authorization check.
+
+## Prototype smoke screenshots
+
+The current read-only Rack prototype was smoke-tested locally against a real
+Durababble store and mounted at `/durababble/operator`.
+
+![Workflow list](assets/operator-ui-workflows.png)
+
+![Workflow detail](assets/operator-ui-workflow-detail.png)
+
+![Durable object detail](assets/operator-ui-object-detail.png)
 
 ## Core information architecture
 
@@ -91,11 +117,13 @@ Filters:
 Current store support:
 
 - `Store#workflow(id)` can read one workflow.
+- `Store#list_workflows(status:, limit:)` can render the prototype's recent
+  workflow list with a status filter.
 - Claim paths already query pending/running/failed due rows.
 
 Missing support:
 
-- paginated `Store#list_workflows` with filters and stable ordering
+- paginated workflow listing with richer filters and stable cursor ordering
 - workflow summary projection with latest step, wait, lease, and outbox counts
 - status/index coverage for list filters on both SQL adapters
 - optional application correlation metadata columns or tags
@@ -128,13 +156,13 @@ Current store support:
 
 - `Store#workflow(id)`, `Store#steps_for(id)`, `Store#step_attempts_for(id)`,
   and `Store#waits_for(id)`.
-- Outbox individual reads through `Store#outbox_message(id)`.
+- Outbox individual reads through `Store#outbox_message(id)`, and prototype
+  detail reads through `Store#list_outbox_messages(workflow_id:, limit:)`.
 - Workflow exposed commands currently persist command events through
   `Store#signal_event`.
 
 Missing support:
 
-- list outbox rows by workflow id
 - list workflow command events by workflow id
 - current workflow lease read API suitable for UI summaries
 - consistent decoded-payload redaction hooks
@@ -187,12 +215,14 @@ Default columns:
 Current store support:
 
 - `Store#object_state(object_type:, object_id:)` reads one state blob.
+- `Store#list_durable_objects(limit:)` can render the prototype's recent object
+  list.
 - `durable_objects` table stores `object_type`, `object_id`, state, timestamps,
   and transitional lock columns.
 
 Missing support:
 
-- paginated `Store#list_objects`
+- paginated object listing with filters and stable cursor ordering
 - state size/serializer metadata projection without full decode
 - object command counts and head-of-line command query
 - indexed object metadata/tags if applications need search beyond type/id
@@ -216,6 +246,7 @@ Tabs:
 Current store support:
 
 - `Store#object_state`
+- `Store#list_object_commands(object_type:, object_id:, limit:)`
 - `Store#enqueue_object_command`, `Store#claim_object_command`,
   `Store#complete_object_command`, and `Store#fail_object_command`
 - `durable_object_commands` rows include status, result/error, command lease,
@@ -223,7 +254,6 @@ Current store support:
 
 Missing support:
 
-- list durable-object commands by object
 - command retry/resume API with idempotency and audit
 - object pause/resume state in schema
 - durable object destroy/terminate semantics

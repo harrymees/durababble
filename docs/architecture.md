@@ -17,14 +17,18 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 
 ## Operator surface
 
-The target operator web UI is specified in `docs/operator-web-ui.md`. It should
-be implemented as a host-mounted web surface backed by durable Store/API reads
-and writes, not by worker memory or in-process caches. The current architecture
-already persists most diagnostic state needed for workflow detail pages
-(`workflows`, `steps`, `step_attempts`, `waits`, `outbox`, `durable_objects`,
-and `durable_object_commands`), but paginated list APIs, management actions,
-audit logging, idempotency rows, unified inbox activity, and several indexes are
-still required before the UI can be production-grade.
+`Durababble::Operator::App` is a read-only Rack-compatible web surface that can
+be mounted by a Rails/Rack app behind host-owned authentication middleware.
+Falcon-powered Rails deployments use the same Rack callable; Durababble does not
+own sessions, CSRF policy, or user authorization. The app is backed by durable
+Store reads, not by worker memory or in-process caches.
+
+The broader target operator web UI is specified in `docs/operator-web-ui.md`.
+The current architecture already persists most diagnostic state needed for
+workflow detail pages (`workflows`, `steps`, `step_attempts`, `waits`, `outbox`,
+`durable_objects`, and `durable_object_commands`), but mutating management
+actions, audit logging, idempotency rows, unified inbox activity, and several
+indexes are still required before the UI can be production-grade.
 
 ## Public API model
 
