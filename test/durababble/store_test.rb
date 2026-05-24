@@ -107,6 +107,33 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  class MysqlMigrationProbeStore < Durababble::MysqlStore
+    attr_reader :executed
+
+    def initialize(schema:, columns: {})
+      super(nil, schema:)
+      @columns = columns
+      @executed = []
+    end
+
+    def execute_params(sql, params)
+      @executed << [:execute_params, sql, params]
+      table = params.first
+      column = params[1]
+      rows = if sql.include?("information_schema.columns")
+        @columns.fetch(table, []).include?(column) ? [{ "exists" => 1 }] : []
+      else
+        []
+      end
+      Durababble::MysqlStore::MysqlResult.new(rows, rows.length)
+    end
+
+    def execute(sql)
+      @executed << [:execute, sql]
+      Durababble::MysqlStore::MysqlResult.new([], 0)
+    end
+  end
+
   test "routes configured database URLs through mysql and postgres adapters" do
     mysql = Object.new
     pg = ScriptedPgConnection.new
@@ -268,10 +295,24 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  test "adds missing MySQL workflow cancellation columns only once" do
+    store = MysqlMigrationProbeStore.new(
+      schema: "mysql_schema",
+      columns: { "mysql_schema_workflows" => ["cancel_reason"] },
+    )
+
+    store.send(:add_column_if_missing, "workflows", "cancel_reason", "TEXT")
+    store.send(:add_column_if_missing, "workflows", "cancel_requested_at", "DATETIME(6)")
+
+    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
+    assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
+  end
+
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
       PgResult.new([{ "id" => "pending", "created_at" => "2024-01-02T00:00:00Z" }]),
       PgResult.new([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
+      PgResult.new,
       PgResult.new,
       PgResult.new([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
       PgResult.new([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
@@ -436,7 +477,7 @@ class DurababbleStoreTest < DurababbleTestCase
     ])
     pg_store(retry_connection).send(:execute, "SELECT 1")
     assert_raises(PG::TRDeadlockDetected) do
-      pg_store(ScriptedPgConnection.new(exec_results: Array.new(5) { ->(_sql) { raise PG::TRDeadlockDetected } }))
+      pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise PG::TRDeadlockDetected } }))
         .send(:execute, "SELECT 1")
     end
 

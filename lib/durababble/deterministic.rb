@@ -105,6 +105,12 @@ module Durababble
         trace.event(@time, actor, "schedule", at: @time + delay, name:)
       end
 
+      #: (untyped) -> untyped
+      def advance(duration)
+        @time += duration
+        trace.event(@time, "scheduler", "advance", by: duration)
+      end
+
       #: (?max_events: untyped) -> untyped
       def run(max_events: 10_000)
         count = 0
@@ -210,6 +216,7 @@ module Durababble
         @fault_plan = fault_plan || FaultPlan.new(scheduler:)
         @id_seq = 0
         @workflows = {}
+        @cancellations = {}
         @steps = Hash.new { |hash, key| hash[key] = {} }
         @attempts = Hash.new { |hash, key| hash[key] = [] }
         @waits = {}
@@ -258,6 +265,7 @@ module Durababble
         return deep(row) if row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
         return unless row.fetch("status") == "pending" ||
           retryable_failed?(row) ||
+          canceling_due?(row) ||
           (row.fetch("status") == "running" && (row.fetch("locked_by") == worker_id || expired?(row)))
 
         claim_row(row, worker_id, lease_seconds)
@@ -308,7 +316,7 @@ module Durababble
         @workflows.each_value do |row|
           next unless row.fetch("status") == "running" && row.fetch("locked_until") && row.fetch("locked_until") < now
 
-          row["status"] = "pending"
+          row["status"] = @cancellations.key?(row.fetch("id")) ? "canceling" : "pending"
           row["locked_by"] = nil
           row["locked_until"] = nil
           count += 1
@@ -340,6 +348,18 @@ module Durababble
         row["locked_until"] = nil
         row["next_run_at"] = nil
         trace("complete_workflow", id: workflow_id, result:)
+      end
+
+      #: (untyped, reason: untyped, ?result: untyped) -> untyped
+      def cancel_workflow(workflow_id, reason:, result: nil)
+        row = @workflows.fetch(workflow_id)
+        row["status"] = "canceled"
+        row["result"] = deep(result)
+        row["error"] = reason
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        row["next_run_at"] = nil
+        trace("cancel_workflow", id: workflow_id, reason:, result:)
       end
 
       #: (untyped, error: untyped) -> untyped
@@ -384,6 +404,15 @@ module Durababble
         step["error"] = error
         update_latest_attempt(workflow_id, position, "failed", nil, error)
         trace("step_failed", id: workflow_id, position:, error:)
+      end
+
+      #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
+      def record_step_canceled(workflow_id:, position:, error:)
+        step = @steps[workflow_id].fetch(position)
+        step["status"] = "canceled"
+        step["error"] = error
+        update_latest_attempt(workflow_id, position, "canceled", nil, error)
+        trace("step_canceled", id: workflow_id, position:, error:)
       end
 
       #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
@@ -488,11 +517,43 @@ module Durababble
         row = @workflows.fetch(workflow_id)
         return unless row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
 
-        row["status"] = "pending"
+        row["status"] = @cancellations.key?(workflow_id) ? "canceling" : "pending"
         row["locked_by"] = nil
         row["locked_until"] = nil
         row["next_run_at"] = run_at
         trace("workflow_retry_scheduled", id: workflow_id, run_at:)
+      end
+
+      #: (workflow_id: untyped, reason: untyped) -> untyped
+      def request_workflow_cancellation(workflow_id:, reason:)
+        row = @workflows.fetch(workflow_id)
+        return deep(row) if terminal_for_cancellation?(row)
+
+        first_request = !@cancellations.key?(workflow_id)
+        @cancellations[workflow_id] ||= { "workflow_id" => workflow_id, "reason" => reason, "requested_at" => scheduler.time, "delivered_at" => nil }
+        cancel_pending_waits_for_workflow(workflow_id) if first_request
+        if first_request && row.fetch("status") != "running"
+          row["status"] = "canceling"
+          row["locked_by"] = nil
+          row["locked_until"] = nil
+          row["next_run_at"] = nil
+        end
+        trace("workflow_cancel_requested", id: workflow_id, reason: @cancellations.fetch(workflow_id).fetch("reason"), status: row.fetch("status"))
+        deep(row)
+      end
+
+      #: (untyped) -> untyped
+      def workflow_cancellation(workflow_id)
+        deep(@cancellations[workflow_id])
+      end
+
+      #: (workflow_id: untyped) -> untyped
+      def mark_workflow_cancellation_delivered(workflow_id:)
+        cancellation = @cancellations[workflow_id]
+        return unless cancellation
+
+        cancellation["delivered_at"] ||= scheduler.time
+        trace("workflow_cancel_delivered", id: workflow_id)
       end
 
       #: (untyped, ?now: untyped) -> untyped
@@ -511,6 +572,7 @@ module Durababble
       def summary
         {
           completed_workflows: @workflows.values.count { |row| row.fetch("status") == "completed" },
+          canceled_workflows: @workflows.values.count { |row| row.fetch("status") == "canceled" },
           side_effects: @side_effects,
           processed_outbox: @outbox.values.count { |row| row.fetch("status") == "processed" },
           workflows: @workflows.length,
@@ -526,6 +588,8 @@ module Durababble
           row.fetch("next_run_at", nil).nil? || row.fetch("next_run_at") <= scheduler.time
         when "failed"
           retryable_failed?(row)
+        when "canceling"
+          canceling_due?(row)
         when "running"
           expired?(row)
         else
@@ -537,6 +601,12 @@ module Durababble
       def retryable_failed?(row)
         next_run_at = row.fetch("next_run_at", nil)
         row.fetch("status") == "failed" && !next_run_at.nil? && next_run_at <= scheduler.time
+      end
+
+      #: (untyped) -> untyped
+      def canceling_due?(row)
+        next_run_at = row.fetch("next_run_at", nil)
+        row.fetch("status") == "canceling" && (next_run_at.nil? || next_run_at <= scheduler.time)
       end
 
       #: (untyped) -> untyped
@@ -572,6 +642,35 @@ module Durababble
           trace("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
         end
         completed
+      end
+
+      #: (untyped) -> untyped
+      def terminal_for_cancellation?(row)
+        return true if ["completed", "canceled"].include?(row.fetch("status"))
+
+        row.fetch("status") == "failed" && row["next_run_at"].nil?
+      end
+
+      #: (untyped) -> untyped
+      def cancel_pending_waits_for_workflow(workflow_id)
+        @waits.each_value do |wait|
+          next unless wait.fetch("workflow_id") == workflow_id && wait.fetch("status") == "pending"
+
+          wait["status"] = "canceled"
+          trace("wait_canceled", id: workflow_id, wait_id: wait.fetch("id"))
+        end
+        @steps[workflow_id].each_value do |step|
+          next unless step.fetch("status") == "waiting"
+
+          step["status"] = "canceled"
+          step["error"] = "workflow cancellation requested"
+        end
+        @attempts[workflow_id].each do |attempt|
+          next unless attempt.fetch("status") == "waiting"
+
+          attempt["status"] = "canceled"
+          attempt["error"] = "workflow cancellation requested"
+        end
       end
 
       #: (untyped, untyped, untyped, untyped, untyped) -> untyped
@@ -1526,6 +1625,77 @@ module Durababble
           h.check("retry waited for due time") { h.scheduler.trace.to_s.include?("step_retry_not_due") }
           h.check("workflow completed after durable retries") { h.store.workflow(id).fetch("status") == "completed" }
           h.check("attempt history records retries") { h.store.step_attempts_for(id).map { |a| a.fetch("status") } == ["failed", "failed", "completed"] }
+        end
+      end
+
+      #: (untyped) -> untyped
+      def cooperative_cancellation_cleanup(seed)
+        run(seed, "cooperative_cancellation_cleanup") do |h|
+          cleanup_runs = 0
+          cleanup_lease_observations = []
+          workflow_id_for_cleanup = nil
+          h.workflows["cancelable"] = workflow = Class.new(Durababble::Workflow) do
+            workflow_name "cancelable"
+
+            define_method(:execute) do |input|
+              instance = self #: as untyped
+              instance.wait_for_signal(input)
+              { "done" => true }
+            rescue Durababble::CancellationError => e
+              instance.cleanup(input.merge("reason" => e.reason))
+            end
+
+            define_method(:wait_for_signal) do |input|
+              Durababble.wait_event("cancelable:#{input.fetch("id")}", input)
+            end
+            step :wait_for_signal
+
+            define_method(:cleanup) do |input|
+              instance = self #: as untyped
+              cleanup_runs += 1
+              before = h.store.workflow(workflow_id_for_cleanup)
+              h.scheduler.advance(5)
+              instance.step_context.heartbeat.record({ "phase" => "cleanup", "run" => cleanup_runs })
+              after = h.store.workflow(workflow_id_for_cleanup)
+              cleanup_lease_observations << {
+                before_locked_by: before.fetch("locked_by"),
+                before_locked_until: before.fetch("locked_until"),
+                after_locked_by: after.fetch("locked_by"),
+                after_locked_until: after.fetch("locked_until"),
+              }
+              h.scheduler.trace.event(h.scheduler.time, "worker", "cleanup_ran", count: cleanup_runs, reason: input.fetch("reason"))
+              { "cleaned" => true, "reason" => input.fetch("reason") }
+            end
+            step :cleanup
+          end
+
+          id = h.store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => seed.to_s })
+          workflow_id_for_cleanup = id
+          h.scheduler.schedule(actor: "worker-a", delay: 1, name: "park") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker-a").resume(workflow, workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "client", delay: 5, name: "cancel") do
+            workflow.handle(id, store: h.store).cancel(reason: "stop #{seed}")
+          end
+          h.scheduler.schedule(actor: "worker-b", delay: 10, name: "cleanup") do
+            Durababble::Engine.new(store: h.store, worker_id: "worker-b", lease_seconds: 20).resume(workflow, workflow_id: id)
+          end
+          h.scheduler.schedule(actor: "client-signal", delay: 30, name: "late_signal") do
+            signaled = h.store.signal_event("cancelable:#{seed}", payload: { "late" => true })
+            h.scheduler.trace.event(h.scheduler.time, "client-signal", "late_signal", signaled:)
+          end
+          h.check("workflow canceled after cleanup") { h.store.workflow(id).fetch("status") == "canceled" }
+          h.check("cleanup ran once") { cleanup_runs == 1 }
+          h.check("cleanup heartbeat kept ownership") do
+            cleanup_lease_observations.any? do |observation|
+              observation.fetch(:before_locked_by) == "worker-b" &&
+                observation.fetch(:after_locked_by) == "worker-b" &&
+                observation.fetch(:after_locked_until) > observation.fetch(:before_locked_until)
+            end
+          end
+          h.check("cleanup heartbeat persisted") { h.store.steps_for(id).any? { |step| step.fetch("name") == "cleanup" && step.fetch("heartbeat_cursor") == { "phase" => "cleanup", "run" => 1 } } }
+          h.check("late signal ignored") { h.scheduler.trace.to_s.include?("late_signal signaled=0") }
+          h.check("waiting attempt canceled") { h.store.step_attempts_for(id).any? { |attempt| attempt.fetch("status") == "canceled" } }
         end
       end
 
