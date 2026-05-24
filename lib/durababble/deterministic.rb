@@ -263,7 +263,10 @@ module Durababble
       def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
         row = @workflows.fetch(workflow_id)
         return deep(row) if row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
-        return unless row.fetch("status") == "pending" || row.fetch("status") == "failed" || row.fetch("status") == "canceling" || (row.fetch("status") == "running" && (row.fetch("locked_by") == worker_id || expired?(row)))
+        return unless row.fetch("status") == "pending" ||
+          retryable_failed?(row) ||
+          canceling_due?(row) ||
+          (row.fetch("status") == "running" && (row.fetch("locked_by") == worker_id || expired?(row)))
 
         claim_row(row, worker_id, lease_seconds)
       end
@@ -580,8 +583,30 @@ module Durababble
 
       #: (untyped) -> untyped
       def runnable?(row)
-        due = row.fetch("next_run_at", nil).nil? || row.fetch("next_run_at") <= scheduler.time
-        due && (row.fetch("status") == "pending" || row.fetch("status") == "failed" || row.fetch("status") == "canceling" || (row.fetch("status") == "running" && expired?(row)))
+        case row.fetch("status")
+        when "pending"
+          row.fetch("next_run_at", nil).nil? || row.fetch("next_run_at") <= scheduler.time
+        when "failed"
+          retryable_failed?(row)
+        when "canceling"
+          canceling_due?(row)
+        when "running"
+          expired?(row)
+        else
+          false
+        end
+      end
+
+      #: (untyped) -> untyped
+      def retryable_failed?(row)
+        next_run_at = row.fetch("next_run_at", nil)
+        row.fetch("status") == "failed" && !next_run_at.nil? && next_run_at <= scheduler.time
+      end
+
+      #: (untyped) -> untyped
+      def canceling_due?(row)
+        next_run_at = row.fetch("next_run_at", nil)
+        row.fetch("status") == "canceling" && (next_run_at.nil? || next_run_at <= scheduler.time)
       end
 
       #: (untyped) -> untyped
@@ -1873,11 +1898,14 @@ module Durababble
       def attempt_history_append_only(seed)
         run(seed, "attempt_history_append_only") do |h|
           h.workflows["flaky"] = workflow_class("flaky") do
-            test_step("fail") { |_ctx| raise "boom" }
+            test_step("fail", retry_policy: { schedule: [0, 0], maximum_attempts: 3 }) { |_ctx| raise "boom" }
           end
           id = h.store.enqueue_workflow(name: "flaky", input: { "seed" => seed })
           3.times do |i|
-            h.scheduler.schedule(actor: "worker-#{i}", delay: i * 20, name: "attempt") { Durababble::Engine.new(store: h.store, worker_id: "worker-#{i}").resume(h.workflows.fetch("flaky"), workflow_id: id) }
+            h.scheduler.schedule(actor: "worker-#{i}", delay: i * 20, name: "attempt") do
+              h.store.make_workflow_due!(id, now: h.scheduler.time) if i.positive?
+              Durababble::Engine.new(store: h.store, worker_id: "worker-#{i}").resume(h.workflows.fetch("flaky"), workflow_id: id)
+            end
           end
           h.check("each retry appended an attempt") { h.store.step_attempts_for(id).length == 3 }
           h.check("attempts are failed terminal records") { h.store.step_attempts_for(id).all? { |a| a.fetch("status") == "failed" } }

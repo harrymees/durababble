@@ -230,7 +230,8 @@ module Durababble
           candidates.concat(execute_params(<<~SQL, []).to_a)
             SELECT id, created_at FROM #{table("workflows")}
             WHERE status = 'failed'
-              AND (next_run_at IS NULL OR next_run_at <= now())
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= now()
               #{name_filter}
             ORDER BY status, created_at
             LIMIT 1
@@ -282,7 +283,9 @@ module Durababble
             locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1
           AND (
-            status IN ('pending', 'failed', 'canceling')
+            status = 'pending'
+            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
           )
         RETURNING *
@@ -1267,7 +1270,8 @@ module Durababble
         candidates.concat(execute_params(<<~SQL, name_params).to_a)
           SELECT id, created_at FROM #{table("workflows")}
           WHERE status = 'failed'
-            AND (next_run_at IS NULL OR next_run_at <= NOW(6))
+            AND next_run_at IS NOT NULL
+            AND next_run_at <= NOW(6)
             #{name_sql}
           ORDER BY status, created_at
           LIMIT 1
@@ -1298,7 +1302,9 @@ module Durababble
           SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed', 'canceling')
+              status = 'pending'
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'running' AND locked_until < NOW(6))
             )
         SQL
@@ -1321,7 +1327,9 @@ module Durababble
           SELECT id FROM #{table("workflows")}
           WHERE id = ?
             AND (
-              status IN ('pending', 'failed', 'canceling')
+              status = 'pending'
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
             )
           FOR UPDATE SKIP LOCKED
