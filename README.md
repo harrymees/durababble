@@ -56,28 +56,10 @@ DURABABBLE_SCHEMA=durababble_experiment mise exec -- bundle exec ruby -Ilib -e '
 The tests use the same Minitest stack as `agent-server`.
 They live under `gems/durababble/test` and run directly from the gem without booting Rails.
 
-Useful commands from the `agent-server` zone:
-
-```sh
-cd gems/durababble
-shadowenv exec -- bundle exec ruby -I lib -I test test/run_all.rb
-cd ../..
-shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
-DURABABBLE_YUGABYTE_DATABASE_URL=postgresql://127.0.0.1:5433/durababble_test shadowenv exec -- bundle exec ruby -I gems/durababble/lib -I gems/durababble/test gems/durababble/test/run_all.rb
-DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte mise exec -- bundle exec ruby -I lib -I test test/durababble/workspace_namespace_test.rb
-/opt/dev/bin/dev check
-```
-
 CI runs the coverage gate with SimpleCov branch coverage enabled:
 
 ```sh
 mise exec -- bundle exec rake test:coverage
-```
-
-For a CI-equivalent local run from a Symphony workspace that has optional Yugabyte coverage enabled in `mise.local.toml`, disable it explicitly:
-
-```sh
-mise exec -- env DURABABBLE_DATABASE_URL=mysql://root@127.0.0.1:3306/sidekick_server_test DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec rake test:coverage
 ```
 
 The gate measures library files under `lib/**/*.rb`, excluding the gem metadata version file because Bundler loads it before SimpleCov starts. The current ratchet fails below 88.3% line coverage or 70.5% branch coverage globally, and below 59% line coverage or 41% branch coverage for any measured library file. The target ratchet is 95% line coverage and 90% branch coverage; raise the configured minimums as meaningful tests lift coverage. The HTML report and SimpleCov result JSON are written to `coverage/`, and GitHub Actions uploads that directory as the `coverage-report` artifact for failed and passing runs.
