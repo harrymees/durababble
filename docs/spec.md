@@ -24,9 +24,9 @@ These decisions define the intended runtime, storage, and API model:
 - **Backend conformance.** Both SQL adapters must implement the same durable state-machine semantics. Backend-specific SQL is allowed, but behavior must be proven through shared conformance tests plus backend-specific plan/locking tests when query shape matters.
 - **Binary runtime payloads.** Runtime values (`input`, `result`, `context`, `payload`, state, arguments, kwargs, and heartbeat cursors) are serialized with Paquito into binary columns, not JSON/JSONB. PostgreSQL/YSQL stores these columns as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`.
 - **Durable workflow rows and step rows.** Workflows are durable before execution. The runtime emits ordered workflow commands for every durable workflow operation. Latest step rows are query state derived from or updated alongside history, not the source of replay truth.
-- **Workflow execution model.** All workflow orchestration code runs on a Durababble-managed deterministic scheduler. `async { ... }`, raw `Async { ... }`, and `Async::Task#async` create additional deterministic workflow fibers when they are called from workflow orchestration code. Code without async fanout runs as the root fiber only. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes. Durable steps called from any workflow fiber emit ordered workflow commands before their side-effecting implementation runs. The default executor is process-local, but step bodies run outside the deterministic workflow scheduler so orchestration fibers can schedule and await concurrent work. Durababble must integrate with Async's task lifecycle so workflow execution context propagates to non-transient child tasks; workflow authors must not be forced to use Durababble-specific async helpers to call durable steps from ordinary Async task trees.
+- **Workflow execution model.** All workflow orchestration code runs on a Durababble-managed deterministic scheduler. Raw `Async { ... }` and `Async::Task#async` create additional deterministic workflow fibers when they are called from workflow orchestration code. Code without async fanout runs as the root fiber only. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes. Durable steps called from any workflow fiber emit ordered workflow commands before their side-effecting implementation runs. The default executor is process-local, but step bodies run outside the deterministic workflow scheduler so orchestration fibers can schedule and wait for concurrent work. Durababble must integrate with Async's task lifecycle so workflow execution context propagates to non-transient child tasks; workflow authors must not be forced to use Durababble-specific async helpers to call durable steps from ordinary Async task trees.
 - **Workflow command history.** Replay requires an append-only per-workflow command/event history. Step scheduling, step execution starts, and step completions are distinct facts. A scheduled step command records the deterministic command id plus the full replay-relevant command shape before any local or remote executor starts the side effect: step method name, serialized args/kwargs or a stable payload digest, retry/executor attributes, and any semantic key if one is present. A start event records that an executor began a concrete attempt. A completion/failure/wait event resolves the command's workflow future. Replay must validate scheduled command shape even when no completion exists, so a step that started before a crash cannot disappear silently.
-- **Deterministic workflow activations.** Workflow replay needs deterministic delivery of future resolutions. Step completions, step failures, timer fires, signal deliveries, and child-workflow completions are external events that make workflow tasks runnable; they must be appended to history and delivered to the deterministic workflow scheduler in history order. This matters even without `await_any`: two branches may each schedule a second step after their first step resolves, and the second-step command order must be driven by recorded completion order rather than by wall-clock timing or a local scheduler's ready-queue accident.
+- **Deterministic workflow activations.** Workflow replay needs deterministic delivery of future resolutions. Step completions, step failures, timer fires, signal deliveries, and child-workflow completions are external events that make workflow tasks runnable; they must be appended to history and delivered to the deterministic workflow scheduler in history order. This matters even without racing tasks: two branches may each schedule a second step after their first step resolves, and the second-step command order must be driven by recorded completion order rather than by wall-clock timing or a local scheduler's ready-queue accident.
 - **Concurrent history writes.** Process-local step execution may run multiple step attempts concurrently, but those attempts must not concurrently mutate workflow history through one non-threadsafe store connection. History mutations are serialized per workflow or protected by executor-local connections/transactions with durable command ids and optimistic checks. Sharing the workflow executor's live connection across Async child tasks is not a valid implementation strategy.
 - **Wait suspension and in-flight work.** A step wait is a terminal command-resolution event, but releasing the workflow lease to `waiting` happens only after the workflow activation has reached a safe suspension point. If one branch records a wait while sibling workflow fibers have already scheduled process-local steps, those sibling steps may finish and commit before the workflow row is released. An activation with only the root fiber is the single-fiber degenerate case, so it can usually persist the wait and suspend the workflow in one activation.
 - **Append-only attempts.** Step attempts are append-only, including waits that transition to completed attempts. Retries and stale attempts remain inspectable.
@@ -101,7 +101,7 @@ end
 
 `step_context` is available only while a workflow step is executing. It contains `workflow_id`, `step_index`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and are stable across retries of the same logical step.
 
-The workflow runtime supports deterministic workflow fibers through raw Async programming and Durababble workflow-task convenience APIs. The following raw Async scatter/gather workflow must be valid:
+The workflow runtime supports deterministic workflow fibers through raw Async programming. Workflow authors use the documented `Async` API directly; Durababble does not expose its own workflow `async`, `await`, or `await_all` helpers. The following raw Async scatter/gather workflow must be valid:
 
 ```ruby
 class FanoutProfiles < Durababble::Workflow
@@ -110,21 +110,6 @@ class FanoutProfiles < Durababble::Workflow
       tasks = user_ids.map { |id| task.async { fetch_profile(id) } }
       tasks.map(&:wait)
     end.wait
-  end
-
-  step def fetch_profile(user_id)
-    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
-  end
-end
-```
-
-The equivalent helper-based workflow must also be valid:
-
-```ruby
-class FanoutProfiles < Durababble::Workflow
-  def execute(user_ids)
-    tasks = user_ids.map { |id| async { fetch_profile(id) } }
-    await_all(tasks)
   end
 
   step def fetch_profile(user_id)
@@ -150,31 +135,6 @@ class EnrichProfiles < Durababble::Workflow
 
       tasks.map(&:wait)
     end.wait
-  end
-
-  step def fetch_profile(user_id)
-    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
-  end
-
-  step def score_profile(profile)
-    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
-  end
-end
-```
-
-The same continuation fanout may be written with Durababble helpers:
-
-```ruby
-class EnrichProfiles < Durababble::Workflow
-  def execute(user_ids)
-    tasks = user_ids.map do |id|
-      async do
-        profile = fetch_profile(id)
-        score_profile(profile)
-      end
-    end
-
-    await_all(tasks)
   end
 
   step def fetch_profile(user_id)
@@ -215,11 +175,11 @@ The workflow surface is:
 - `Durababble::Workflow.wait_condition(timeout: nil) { ... }` blocks a workflow fiber until the condition is true or a durable timeout fires.
 - `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are durable workflow sleeps.
 - Raw `Async { ... }` and `Async::Task#async` are supported workflow authoring APIs. Non-transient child tasks created inside workflow orchestration inherit the active workflow execution context and may call durable steps. `transient: true` Async tasks do not inherit workflow execution context and must not call durable steps.
-- `async { ... }` starts a Durababble-managed workflow fiber and returns a workflow task/future. It is a convenience wrapper over the same task context propagation used for raw Async. `await_all(*tasks)` waits for all supplied tasks, returns their results in argument order, and observes every task failure before raising the first failure. Bounded fanout is expressed as a higher-level helper over the same primitive.
+- Durababble must not require, document, or expose library-specific async helpers for workflow authors. Context propagation and deterministic replay are provided by integrating with Async task creation and waiting.
 - Workflow-local futures must preserve ordered command replay. Task creation and first execution order must be deterministic, and a durable step command is assigned when the workflow fiber reaches the step call, not when the local step implementation happens to finish. The scheduled command shape must include enough data to reject same-method input reordering during replay.
 - Awaiting a durable command parks only the workflow fiber. The step implementation runs on a local process executor by default, and later on a remote executor for remote steps. The workflow scheduler resumes fibers only from deterministic history activations.
 - A wait returned by one workflow fiber must not invalidate the lease for sibling fibers that are still committing already-started local step results. The executor finalizes workflow suspension after the activation quiesces or when no sibling workflow fibers can still schedule/commit work.
-- Workflow-visible races such as `await_any`/`race` are not just scheduler operations. The winning resolution order must be recorded in workflow history, because real completion order is external input to deterministic replay.
+- Workflow-visible races over Async tasks are not just scheduler operations. The winning resolution order must be recorded in workflow history, because real completion order is external input to deterministic replay.
 - Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, waits, signals, child workflows, and deterministic local computation. Step implementations may perform process-local side effects using the local executor and are expected to pass `step_context.idempotency_key` to external systems that support idempotency.
 - `patched(patch_id)` is the API for cross-deploy workflow control-flow compatibility. It records/checks a durable patch marker before the new branch emits steps, waits, or signals.
 - `deprecate_patch(patch_id)` is the cleanup API after no live workflows still need the old branch. It keeps replay compatibility while allowing the old branch to be removed before final marker removal.

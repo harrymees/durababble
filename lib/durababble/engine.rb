@@ -100,21 +100,6 @@ module Durababble
 
   Async::Task.prepend(AsyncTaskWorkflowContextPatch) unless Async::Task < AsyncTaskWorkflowContextPatch
 
-  class WorkflowTask
-    #: (untyped) -> void
-    def initialize(future)
-      @future = future
-    end
-
-    #: () -> untyped
-    def await
-      execution = WorkflowExecutionContext.current
-      return @future.await unless execution
-
-      execution.block_current_workflow_task { @future.await }
-    end
-  end
-
   class CommandFuture
     #: (untyped) -> void
     def initialize(command_id)
@@ -123,12 +108,6 @@ module Durababble
       @done = false
       @result = nil
       @error = nil
-    end
-
-    #: () -> untyped
-    def await
-      @condition.wait until @done
-      value
     end
 
     #: () -> bool
@@ -240,40 +219,6 @@ module Durababble
       @futures.each_value(&:wake) if task
     end
 
-    #: () { -> untyped } -> untyped
-    def async(&block)
-      assert_workflow_task!("async")
-      future = CommandFuture.new(nil)
-      @root_task.async do
-        future.resolve(block.call)
-      rescue StandardError => e
-        future.reject(e)
-      end
-      WorkflowTask.new(future)
-    end
-
-    #: (*untyped) -> untyped
-    def await_all(*tasks)
-      assert_workflow_task!("await_all")
-      tasks = tasks.flatten
-      results = []
-      first_error = nil #: StandardError?
-      tasks.each_with_index do |task, index|
-        results[index] = await(task)
-      rescue StandardError => e
-        first_error = preferred_error(first_error, e)
-      end
-      raise first_error if first_error
-
-      results
-    end
-
-    #: (untyped) -> untyped
-    def await(task)
-      assert_workflow_task!("await")
-      task.respond_to?(:await) ? task.await : task.wait
-    end
-
     #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
     def call_step(instance, method_name:, args:, kwargs:, &block)
       assert_workflow_task!("durable step #{method_name}")
@@ -318,26 +263,6 @@ module Durababble
       return unless cancellation
 
       raise cancellation_error_from(cancellation)
-    end
-
-    #: (untyped, untyped) -> untyped
-    def preferred_error(current, candidate)
-      return candidate unless current
-      return candidate if error_rank(candidate) > error_rank(current)
-
-      current
-    end
-
-    #: (untyped) -> untyped
-    def error_rank(error)
-      case error
-      when WorkflowSuspended
-        0
-      when StepRetryScheduled
-        1
-      else
-        2
-      end
     end
 
     #: (untyped) -> void
