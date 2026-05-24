@@ -4,6 +4,9 @@
 require_relative "../test_helper"
 
 class DurababbleRpcTransportTest < DurababbleTestCase
+  FakeTransientResponse = Struct.new(:result, :ok, :err, :moved, keyword_init: true)
+  FakeRemoteError = Struct.new(:klass, :message, keyword_init: true)
+
   class RpcTransportFakeStore
     attr_reader :workflow_id
 
@@ -231,6 +234,113 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     )
   ensure
     server&.stop
+  end
+
+  test "decodes transport payloads and typed transient response branches" do
+    assert_nil Durababble::Rpc.load(nil)
+    assert_nil Durababble::Rpc.load("")
+    assert_equal({ "ok" => true }, Durababble::Rpc.load(Durababble::Rpc.dump({ "ok" => true })))
+    assert_nil Durababble::Rpc::Client.decode_transient_response(FakeTransientResponse.new(result: :unknown))
+    assert_raises(Durababble::RpcClient::RemoteError) do
+      Durababble::Rpc::Client.decode_transient_response(
+        FakeTransientResponse.new(result: :err, err: FakeRemoteError.new(klass: "UnknownRemote", message: "bad")),
+      )
+    end
+  end
+
+  test "drops stale workflow deliveries and returns local transient responses" do
+    stale_store = Object.new
+    def stale_store.current_workflow_lease(_id) = nil
+
+    delivered = []
+    service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store: stale_store,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: ->(request:, args:) { ["custom", request["method"], args] },
+      node_directory: Durababble::Rpc::NodeDirectory.new("node-b" => "127.0.0.1:6000"),
+      authorize: ->(_call) { true },
+      awaken_batch: ->(**kwargs) { delivered << [:awaken, kwargs] },
+      evict_lease: ->(**kwargs) { delivered << [:evict, kwargs] },
+      deliver_message: ->(**kwargs) { delivered << [:deliver, kwargs] },
+    )
+
+    service.awaken_batch(Durababble::Rpc::Proto::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: ["wf"]), :call)
+    service.evict_lease(Durababble::Rpc::Proto::EvictLeaseRequest.new(worker_pool: "default", target_kind: "workflow", target_class: "", target_id: "wf"), :call)
+    service.deliver_message(Durababble::Rpc::Proto::DeliverMessageRequest.new(worker_pool: "default", target_kind: "workflow", target_class: "", target_id: "wf"), :call)
+    assert_equal [:awaken, :evict], delivered.map(&:first)
+
+    response = service.call_transient(
+      Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", method: "ping", args: Durababble::Rpc.dump({ "x" => 1 })),
+      :call,
+    )
+    assert_equal ["custom", "ping", { "x" => 1 }], Durababble::Rpc.load(response.ok)
+  end
+
+  test "rejects unauthorized service calls before dispatch" do
+    stale_store = Object.new
+    def stale_store.current_workflow_lease(_id) = nil
+
+    unauthorized = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store: stale_store,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: ->(_call) { false },
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: nil,
+    )
+    assert_raises(GRPC::Unauthenticated) do
+      unauthorized.awaken_batch(Durababble::Rpc::Proto::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: []), :call)
+    end
+  end
+
+  test "returns moved and local workflow transient errors from service dispatch" do
+    moved_store = Object.new
+    def moved_store.current_workflow_lease(_id) = { "worker_id" => "node-b" }
+
+    moved_service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store: moved_store,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new("node-b" => "127.0.0.1:6000"),
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: nil,
+    )
+    moved = moved_service.call_transient(
+      Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", workflow_id: "wf", method: "status", args: Durababble::Rpc.dump({})),
+      :call,
+    )
+    assert_equal "node-b", moved.moved.new_node_id
+
+    same_node_store = Object.new
+    def same_node_store.current_workflow_lease(_id) = { "worker_id" => "node-a" }
+
+    same_node_service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store: same_node_store,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: nil,
+    )
+    remote_error = same_node_service.call_transient(
+      Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", workflow_id: "wf", method: "status", args: Durababble::Rpc.dump({})),
+      :call,
+    )
+    assert_equal "Durababble::WorkflowRpc::UnknownCommand", remote_error.err.klass
   end
 
   private

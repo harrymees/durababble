@@ -669,12 +669,12 @@ The test suite must keep correctness claims evidence-backed:
 
 SimpleCov thresholds required by the CI coverage gate:
 
-- global line coverage: 88.3% minimum
+- global line coverage: 90% minimum
 - global branch coverage: 85% minimum
 - per-file line coverage: 59% minimum
 - per-file branch coverage: 41% minimum
 
-These ratchet thresholds are based on the current CI MySQL suite. They remain below the target of 95% line coverage and 90% branch coverage, but the global branch ratchet now enforces the 85% milestone; meaningful tests should raise the configured minimums as coverage improves, and the minimums must not be lowered without an explicit spec update. The gate is `mise exec -- bundle exec rake test:coverage`. It enables branch coverage, measures library files under `lib/**/*.rb`, excludes tests and non-library support surfaces from the metric, excludes `lib/durababble/version.rb` because Bundler loads that gem metadata before SimpleCov starts, prints the SimpleCov summary in CI logs, and writes the HTML report plus SimpleCov result JSON to `coverage/` for CI artifact upload.
+These ratchet thresholds are based on the current CI MySQL suite. They remain below the target of 95% line coverage and 90% branch coverage, but the global line ratchet now enforces the 90% milestone and the global branch ratchet enforces the 85% milestone; meaningful tests should raise the configured minimums as coverage improves, and the minimums must not be lowered without an explicit spec update. The gate is `mise exec -- bundle exec rake test:coverage`. It enables branch coverage, measures library files under `lib/**/*.rb`, excludes tests and non-library support surfaces from the metric, excludes `lib/durababble/version.rb` because Bundler loads that gem metadata before SimpleCov starts, prints the SimpleCov summary in CI logs, and writes the HTML report plus SimpleCov result JSON to `coverage/` for CI artifact upload.
 
 ## Prototype boundaries and anti-goals
 
