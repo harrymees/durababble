@@ -249,9 +249,15 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, failures.length
     messages = failures.first.last.join("\n")
     assert_includes messages, "running workflow"
+    assert_includes messages, "unknown status"
+    assert_includes messages, "partial lease"
+    assert_includes messages, "inconsistent identity"
+    assert_includes messages, "duplicate completed step positions"
     assert_includes messages, "no attempt history"
+    assert_includes messages, "multiple live attempts"
     assert_includes messages, "references missing step"
     assert_includes messages, "references missing workflow"
+    assert_includes messages, "non-completed step"
     assert_includes messages, "processing outbox"
   end
 
