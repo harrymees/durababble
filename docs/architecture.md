@@ -108,6 +108,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
+- Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths. Only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.

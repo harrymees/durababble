@@ -331,8 +331,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       SELECT 'pending-' || i, 'demo', 'pending', decode('#{serialized_empty}', 'hex'), NULL, NULL, now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 2000) AS i;
 
-      INSERT INTO #{quoted_schema}.workflows (id, name, status, input, locked_by, locked_until, created_at, updated_at)
-      SELECT 'failed-' || i, 'demo', 'failed', decode('#{serialized_empty}', 'hex'), NULL, NULL, now() - (i || ' seconds')::interval, now()
+      INSERT INTO #{quoted_schema}.workflows (id, name, status, input, locked_by, locked_until, next_run_at, created_at, updated_at)
+      SELECT 'failed-' || i, 'demo', 'failed', decode('#{serialized_empty}', 'hex'), NULL, NULL, now() - interval '1 minute', now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 2000) AS i;
 
       INSERT INTO #{quoted_schema}.workflows (id, name, status, input, locked_by, locked_until, created_at, updated_at)
