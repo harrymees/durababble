@@ -175,6 +175,21 @@ module Durababble
       __durababble_execution__.step_context
     end
 
+    #: () { -> untyped } -> untyped
+    def async(&block)
+      __durababble_execution__.async(&block)
+    end
+
+    #: (*untyped) -> untyped
+    def await_all(*tasks)
+      __durababble_execution__.await_all(*tasks)
+    end
+
+    #: (untyped) -> untyped
+    def await(task)
+      __durababble_execution__.await(task)
+    end
+
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
       Durababble.wait_until(time, context)
