@@ -27,6 +27,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "store_fault_after_outbox_enqueue",
     "duplicate_delivery_signal_and_outbox",
     "workflow_rpc_owner_state_matrix",
+    "cooperative_cancellation_cleanup",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -187,6 +188,18 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:completed_workflows)
   end
 
+  test "models cooperative cancellation cleanup" do
+    result = Durababble::Deterministic.prove("cooperative_cancellation_cleanup", seed: 59)
+
+    assert_empty result.violations
+    assert_includes result.trace, "workflow_cancel_requested"
+    assert_includes result.trace, "workflow_cancel_delivered"
+    assert_includes result.trace, "step_heartbeat"
+    assert_includes result.trace, "advance by=5"
+    assert_includes result.trace, "cleanup_ran"
+    assert_equal 1, result.summary.fetch(:canceled_workflows)
+  end
+
   test "models durable store faults after writes and recovers from the persisted state" do
     step = Durababble::Deterministic.prove("store_fault_after_step_completed", seed: 47)
     wait = Durababble::Deterministic.prove("store_fault_after_wait_recorded", seed: 48)
@@ -227,6 +240,19 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 2, failures.length
     assert_includes failures.first.last.join, "running attempt"
+    assert_includes failures.first.last.join, "live step"
+  end
+
+  test "reports deterministic store shape invariant violations" do
+    failures = Durababble::Deterministic.search("bug_invalid_store_shape", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "running workflow"
+    assert_includes messages, "no attempt history"
+    assert_includes messages, "references missing step"
+    assert_includes messages, "references missing workflow"
+    assert_includes messages, "processing outbox"
   end
 
   test "fuzzes each unique scenario target across many deterministic seeds" do
