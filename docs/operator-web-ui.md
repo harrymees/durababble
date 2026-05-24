@@ -83,11 +83,7 @@ authorization check.
 The current read-only Rack prototype was smoke-tested locally against a real
 Durababble store and mounted at `/durababble/operator`.
 
-![Workflow list](assets/operator-ui-workflows.png)
-
-![Workflow detail](assets/operator-ui-workflow-detail.png)
-
-![Durable object detail](assets/operator-ui-object-detail.png)
+Screenshot evidence is kept in the implementation PR description instead of committed repository assets.
 
 ## Core information architecture
 
