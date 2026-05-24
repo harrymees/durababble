@@ -2,6 +2,9 @@
 
 Durababble includes a local deterministic simulation harness inspired by `gadget-inc/silo`'s `tests/turmoil_runner` setup. Silo uses Rust `turmoil` plus `mad-turmoil` to virtualize networking, time, and randomness, then proves determinism by running each scenario twice with the same `DST_SEED` and comparing deterministic trace output byte-for-byte.
 
+See `docs/dst-effectiveness-report.md` for the current effectiveness review,
+bug-injection probe results, and recommended suite improvements.
+
 Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc randomness/time and sockets for arbitrary Ruby code, so Durababble ships a small purpose-built harness in `lib/durababble/deterministic.rb`.
 
 ## What is virtualized
