@@ -1,6 +1,13 @@
 # typed: true
 # frozen_string_literal: true
 
+require "async"
+require "async/condition"
+require "thread"
+
+Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?(:durababble_workflow_execution)
+Fiber.attr_accessor(:durababble_step_context) unless Fiber.method_defined?(:durababble_step_context)
+
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
 
@@ -13,123 +20,239 @@ module Durababble
     alias_method :heartbeat, :record
   end
 
-  class WorkflowExecution
-    #: untyped
-    attr_reader :step_context
+  module WorkflowExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_workflow_execution
+      end
 
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, completed_steps: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, completed_steps:, crash_after: nil)
+      #: (untyped) { (?) -> untyped } -> untyped
+      def with_current(execution, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_workflow_execution
+        fiber.durababble_workflow_execution = execution
+        block.call
+      ensure
+        fiber.durababble_workflow_execution = previous
+      end
+    end
+  end
+
+  module StepExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_step_context
+      end
+
+      #: (untyped) { (?) -> untyped } -> untyped
+      def with_current(context, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_step_context
+        fiber.durababble_step_context = context
+        block.call
+      ensure
+        fiber.durababble_step_context = previous
+      end
+    end
+  end
+
+  module AsyncTaskWorkflowContextPatch
+    #: () { (?) -> untyped } -> untyped
+    def schedule(&block)
+      task = self #: as untyped
+      step_context = StepExecutionContext.current
+      if task.transient?
+        execution = WorkflowExecutionContext.current
+        return super(&block) unless execution || step_context
+
+        return super do
+          WorkflowExecutionContext.with_current(nil) do
+            StepExecutionContext.with_current(step_context) { block.call }
+          end
+        end
+      end
+
+      execution = WorkflowExecutionContext.current
+      return super(&block) unless execution || step_context
+
+      execution&.register_workflow_task(self)
+      super do
+        WorkflowExecutionContext.with_current(execution) do
+          StepExecutionContext.with_current(step_context) { block.call }
+        end
+      ensure
+        execution&.unregister_workflow_task(self)
+      end
+    end
+
+    #: () -> untyped
+    def wait
+      execution = WorkflowExecutionContext.current
+      return super() unless execution
+
+      execution.block_current_workflow_task { super() }
+    end
+  end
+
+  Async::Task.prepend(AsyncTaskWorkflowContextPatch) unless Async::Task < AsyncTaskWorkflowContextPatch
+
+  class CommandFuture
+    #: (untyped) -> void
+    def initialize(command_id)
+      @command_id = command_id
+      @condition = Async::Condition.new
+      @done = false
+      @result = nil
+      @error = nil
+    end
+
+    #: () -> bool
+    def done?
+      @done
+    end
+
+    #: () -> void
+    def wait
+      @condition.wait unless @done
+    end
+
+    #: () -> void
+    def wake
+      @condition.signal
+    end
+
+    #: () -> untyped
+    def value
+      raise @error if @error
+
+      @result
+    end
+
+    #: (untyped) -> void
+    def resolve(result)
+      return if @done
+
+      @done = true
+      @result = result
+      @condition.signal
+    end
+
+    #: (untyped) -> void
+    def reject(error)
+      return if @done
+
+      @done = true
+      @error = error
+      @condition.signal
+    end
+  end
+
+  class WorkflowExecution
+    TERMINAL_HISTORY_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
+
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
-      @completed_steps = completed_steps
+      @root_task = root_task
       @crash_after = crash_after
-      @position = 0
-      @step_context = nil
+      @next_command_id = 0
+      @futures = {}
+      @workflow_tasks = {}
+      @blocked_workflow_tasks = {}
+      @workflow_task_count = 0
+      @step_contexts = {}
+      @store_mutex = Mutex.new
+      @resolution_index = 0
+      @scheduled_history = {}
+      @terminal_history = {}
+      @terminal_events = []
       @cancellation_delivered = false
+      history.each { |event| index_history_event(event) }
+      @terminal_events = @terminal_history.values.sort_by { |event| event.fetch("event_index").to_i }
+      register_workflow_task(root_task)
     end
 
-    #: () -> untyped
+    #: () -> bool
     def cancellation_delivered?
       @cancellation_delivered
     end
 
+    #: () -> untyped
+    def step_context
+      StepExecutionContext.current || @step_contexts[Async::Task.current]
+    end
+
+    #: (untyped) -> void
+    def register_workflow_task(task)
+      return if @workflow_tasks.key?(task)
+
+      @workflow_tasks[task] = true
+      @workflow_task_count += 1
+    end
+
+    #: (untyped) -> void
+    def unregister_workflow_task(task)
+      return unless @workflow_tasks.delete(task)
+
+      @blocked_workflow_tasks.delete(task)
+      @workflow_task_count -= 1
+      @futures.each_value(&:wake)
+    end
+
+    #: () { (?) -> untyped } -> untyped
+    def block_current_workflow_task(&block)
+      task = Async::Task.current
+      return block.call unless @workflow_tasks.key?(task)
+
+      @blocked_workflow_tasks[task] = true
+      @futures.each_value(&:wake)
+      block.call
+    ensure
+      @blocked_workflow_tasks.delete(task) if task
+      @futures.each_value(&:wake) if task
+    end
+
     #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
     def call_step(instance, method_name:, args:, kwargs:, &block)
-      base_attributes = {}
-      position = @position
-      @position += 1
+      assert_workflow_task!("durable step #{method_name}")
       step = instance.class.step_definition(method_name)
-      base_attributes = {
-        "durababble.workflow.id" => @workflow_id,
-        "durababble.workflow.name" => instance.class.workflow_name,
-        "durababble.step.name" => step.name,
-        "durababble.step.index" => position,
-        "durababble.worker.id" => @worker_id,
-      }
-
-      if @completed_steps.key?(position)
-        completed_step = @completed_steps.fetch(position)
-        validate_completed_step_shape!(completed_step, step:, position:)
-        Observability.count("durababble.workflow.replay.steps", base_attributes)
-        result = completed_step.fetch("result")
-        raise_if_cancel_requested!
-        return result
+      shape = command_shape(step:, args:, kwargs:)
+      raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
+      command_id, future = synchronize_store do
+        command_id = @next_command_id
+        @next_command_id += 1
+        future = CommandFuture.new(command_id)
+        @futures[command_id] = future
+        schedule_command!(command_id, step:, shape:)
+        [command_id, future]
       end
+      attributes = step_attributes(instance, step:, command_id:)
+      Observability.count("durababble.workflow.replay.steps", attributes) if @terminal_history.key?(command_id)
 
+      dispatch_command!(command_id, step:, shape:, attributes:, &block) unless @terminal_history.key?(command_id)
+      deliver_recorded_resolutions!
+      result = await_command_future(future, command_id)
       raise_if_cancel_requested!
-      @store.record_step_started(workflow_id: @workflow_id, position:, name: step.name)
-      crash!(:step_started)
-      heartbeat = build_heartbeat(position)
-      attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
-      @step_context = StepContext.new(
-        workflow_id: @workflow_id,
-        step_index: position,
-        attempt_number:,
-        idempotency_key: "durababble:v1:workflow:#{@workflow_id}:step:#{position}",
-        heartbeat:,
-      )
-      attributes = base_attributes.merge("durababble.step.attempt" => attempt_number)
-      Observability.count("durababble.workflow.step.attempts", attributes)
-
-      Observability.trace("durababble.workflow.step", attributes) do
-        output = block.call
-        if output.is_a?(WaitRequest)
-          assert_workflow_lease!
-          @store.record_wait(workflow_id: @workflow_id, position:, name: step.name, wait_request: output)
-          crash!(:wait_recorded)
-          raise WorkflowSuspended
-        end
-
-        assert_workflow_lease!
-        @store.record_step_completed(workflow_id: @workflow_id, position:, result: output)
-        Observability.count("durababble.workflow.step.successes", attributes)
-        crash!(:step_completed)
-        raise_if_cancel_requested!
-        output
-      end
-    rescue CancellationError => e
-      assert_workflow_lease!
-      @store.record_step_canceled(workflow_id: @workflow_id, position:, error: "#{e.class}: #{e.message}")
-      raise
-    rescue StandardError => e
-      raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict) || e.is_a?(WorkflowSuspended) || e.is_a?(NonDeterminismError)
-
-      message = "#{e.class}: #{e.message}"
-      assert_workflow_lease!
-      @store.record_step_failed(workflow_id: @workflow_id, position:, error: message)
-      attempt_number = @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == position }
-      failure_attributes = (base_attributes || {}).merge(
-        "durababble.step.attempt" => attempt_number,
-        "error.type" => e.class.name,
-      )
-      Observability.count("durababble.workflow.step.failures", failure_attributes)
-      if step.retry_policy.retryable?(e, attempt_number:)
-        delay = step.retry_policy.delay_for_attempt(attempt_number)
-        Observability.count(
-          "durababble.workflow.step.retries",
-          failure_attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
-        )
-        @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: retry_run_at(delay))
-        raise StepRetryScheduled
-      end
-      raise
-    ensure
-      @step_context = nil
+      result
     end
 
     #: () -> void
     def validate_replay_complete!
-      extra_steps = @completed_steps
-        .select { |position, _step| position >= @position }
-        .sort_by { |position, _step| position }
-      return if extra_steps.empty?
+      extra = @scheduled_history
+        .keys
+        .select { |command_id| command_id >= @next_command_id }
+        .sort
+      return if extra.empty?
 
-      rendered = extra_steps
-        .map { |position, step| "#{position}:#{step.fetch("name")}" }
-        .join(", ")
-      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable step history: #{rendered}"
+      rendered = extra.map { |command_id| "#{command_id}:#{@scheduled_history.fetch(command_id).fetch("name")}" }.join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable command history: #{rendered}"
     end
 
     private
@@ -138,37 +261,303 @@ module Durababble
     def raise_if_cancel_requested!
       return if @cancellation_delivered
 
-      cancellation = @store.workflow_cancellation(@workflow_id)
+      cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
       return unless cancellation
 
-      @cancellation_delivered = true
-      @store.mark_workflow_cancellation_delivered(workflow_id: @workflow_id)
-      reason = cancellation["reason"]
-      raise CancellationError.new(reason, workflow_id: @workflow_id)
+      raise cancellation_error_from(cancellation)
     end
 
-    #: (untyped, step: untyped, position: untyped) -> void
-    def validate_completed_step_shape!(completed_step, step:, position:)
-      persisted_name = completed_step.fetch("name")
-      return if persisted_name == step.name
+    #: (untyped) -> void
+    def index_history_event(event)
+      command_id = event["command_id"]&.to_i
+      return unless command_id
 
-      message = "workflow #{@workflow_id} replay reached step #{position} named #{step.name.inspect}, " \
-        "but durable history already completed #{persisted_name.inspect}"
-      raise NonDeterminismError, message
+      case event.fetch("kind")
+      when "step_scheduled"
+        @scheduled_history[command_id] = event
+      when *TERMINAL_HISTORY_KINDS
+        @terminal_history[command_id] = event
+      end
+    end
+
+    #: (untyped) -> void
+    def assert_workflow_task!(operation)
+      return if @workflow_tasks.key?(Async::Task.current)
+
+      raise Error, "#{operation} must run inside a Durababble-managed workflow task"
+    end
+
+    #: (?untyped, step: untyped, command_id: untyped) -> untyped
+    def step_attributes(instance = nil, step:, command_id:)
+      attributes = {
+        "durababble.workflow.id" => @workflow_id,
+        "durababble.step.name" => step.name,
+        "durababble.step.index" => command_id,
+        "durababble.worker.id" => @worker_id,
+      }
+      attributes["durababble.workflow.name"] = instance.class.workflow_name if instance
+      attributes
+    end
+
+    #: (step: untyped, args: untyped, kwargs: untyped) -> untyped
+    def command_shape(step:, args:, kwargs:)
+      {
+        "name" => step.name,
+        "args" => args,
+        "kwargs" => kwargs,
+        "retry" => retry_shape(step.retry_policy),
+      }
     end
 
     #: (untyped) -> untyped
-    def build_heartbeat(position)
+    def retry_shape(retry_policy)
+      {
+        "initial_interval" => retry_policy.initial_interval,
+        "backoff_coefficient" => retry_policy.backoff_coefficient,
+        "maximum_interval" => retry_policy.maximum_interval,
+        "maximum_attempts" => retry_policy.maximum_attempts,
+        "schedule" => retry_policy.schedule,
+        "non_retryable_errors" => retry_policy.non_retryable_errors.map(&:to_s),
+      }
+    end
+
+    #: (untyped, step: untyped, shape: untyped) -> void
+    def schedule_command!(command_id, step:, shape:)
+      scheduled = @scheduled_history[command_id]
+      if scheduled
+        validate_scheduled_shape!(scheduled, shape:, command_id:)
+        return
+      end
+
+      @store.record_step_scheduled(
+        workflow_id: @workflow_id,
+        command_id:,
+        name: step.name,
+        args: shape.fetch("args"),
+        kwargs: shape.fetch("kwargs"),
+        metadata: { "retry" => shape.fetch("retry") },
+      )
+      crash!(:step_scheduled)
+      @scheduled_history[command_id] = {
+        "kind" => "step_scheduled",
+        "command_id" => command_id,
+        "name" => step.name,
+        "payload" => shape,
+      }
+    end
+
+    #: (untyped, shape: untyped, command_id: untyped) -> void
+    def validate_scheduled_shape!(scheduled, shape:, command_id:)
+      payload = scheduled.fetch("payload")
+      return if payload == shape
+
+      message = "workflow #{@workflow_id} replay reached command #{command_id} #{shape.fetch("name").inspect} " \
+        "with a different durable command shape than recorded history"
+      raise NonDeterminismError, message
+    end
+
+    #: (untyped, step: untyped, shape: untyped, attributes: untyped) { -> untyped } -> void
+    def dispatch_command!(command_id, step:, shape:, attributes:, &block)
+      @root_task.async(transient: true) do |task|
+        raise_if_cancel_requested!
+        synchronize_store do
+          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name)
+        end
+        crash!(:step_started)
+        attempt_number = synchronize_store do
+          @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
+        end
+        attempt_attributes = attributes.merge("durababble.step.attempt" => attempt_number)
+        Observability.count("durababble.workflow.step.attempts", attempt_attributes)
+        step_context = StepContext.new(
+          workflow_id: @workflow_id,
+          step_index: command_id,
+          attempt_number:,
+          idempotency_key: "durababble:v1:workflow:#{@workflow_id}:step:#{command_id}",
+          heartbeat: build_heartbeat(command_id),
+        )
+        @step_contexts[task] = step_context
+
+        Observability.trace("durababble.workflow.step", attempt_attributes) do
+          output = StepExecutionContext.with_current(step_context) { block.call }
+          if output.is_a?(WaitRequest)
+            assert_workflow_lease!
+            suspend_workflow = suspend_workflow_immediately?
+            synchronize_store do
+              @store.record_wait(
+                workflow_id: @workflow_id,
+                command_id:,
+                name: step.name,
+                wait_request: output,
+                suspend_workflow:,
+              )
+            end
+            crash!(:wait_recorded)
+            error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
+            @futures.fetch(command_id).reject(error)
+            next
+          end
+
+          assert_workflow_lease!
+          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output) }
+          Observability.count("durababble.workflow.step.successes", attempt_attributes)
+          crash!(:step_completed)
+          raise_if_cancel_requested!
+          @futures.fetch(command_id).resolve(output)
+        end
+      rescue StandardError => e
+        if e.is_a?(CancellationError)
+          assert_workflow_lease!
+          synchronize_store do
+            @store.record_step_canceled(
+              workflow_id: @workflow_id,
+              command_id:,
+              error: "#{e.class}: #{e.message}",
+            )
+          end
+          @futures.fetch(command_id).reject(e)
+          next
+        end
+        if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
+          @futures.fetch(command_id).reject(e)
+          next
+        end
+        if e.is_a?(WorkflowSuspended) || e.is_a?(StepRetryScheduled) || e.is_a?(NonDeterminismError)
+          @futures.fetch(command_id).reject(e)
+          next
+        end
+
+        error = handle_step_error(e, command_id:, step:, attributes:)
+        @futures.fetch(command_id).reject(error)
+      ensure
+        @step_contexts.delete(task)
+      end
+    end
+
+    #: () -> bool
+    def suspend_workflow_immediately?
+      @workflow_task_count <= 1
+    end
+
+    #: (untyped, command_id: untyped, step: untyped, attributes: untyped) -> untyped
+    def handle_step_error(error, command_id:, step:, attributes:)
+      message = "#{error.class}: #{error.message}"
+      assert_workflow_lease!
+      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message) }
+      attempt_number = synchronize_store do
+        @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
+      end
+      attributes = attributes.merge(
+        "durababble.step.attempt" => attempt_number,
+        "error.type" => error.class.name,
+      )
+      Observability.count("durababble.workflow.step.failures", attributes)
+      return error unless step.retry_policy.retryable?(error, attempt_number:)
+
+      delay = step.retry_policy.delay_for_attempt(attempt_number)
+      Observability.count(
+        "durababble.workflow.step.retries",
+        attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
+      )
+      synchronize_store do
+        @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: retry_run_at(delay))
+      end
+      StepRetryScheduled.new(message)
+    end
+
+    #: (untyped, untyped) -> untyped
+    def await_command_future(future, command_id)
+      loop do
+        deliver_recorded_resolutions!
+        return future.value if future.done?
+
+        missing_command_id = next_undeliverable_resolution_command_id
+        if missing_command_id && !other_workflow_task_can_schedule?(Async::Task.current)
+          message = "workflow #{@workflow_id} history resolved command #{missing_command_id} before command #{command_id}, " \
+            "but current replay has not scheduled command #{missing_command_id}"
+          raise NonDeterminismError, message
+        end
+
+        block_current_workflow_task { future.wait }
+      end
+    end
+
+    #: () -> void
+    def deliver_recorded_resolutions!
+      while @resolution_index < @terminal_events.length
+        event = @terminal_events.fetch(@resolution_index)
+        command_id = event.fetch("command_id").to_i
+        future = @futures[command_id]
+        break unless future
+
+        @resolution_index += 1
+        case event.fetch("kind")
+        when "step_completed"
+          future.resolve(event.fetch("payload"))
+        when "step_waiting"
+          cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
+          if cancellation
+            future.reject(cancellation_error_from(cancellation))
+          else
+            future.reject(WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}"))
+          end
+        when "step_canceled"
+          cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
+          future.reject(cancellation_error_from(cancellation, fallback_reason: event.fetch("error")))
+        when "step_failed"
+          future.reject(Error.new(event.fetch("error")))
+        end
+      end
+    end
+
+    #: (untyped, ?fallback_reason: untyped) -> untyped
+    def cancellation_error_from(cancellation, fallback_reason: nil)
+      @cancellation_delivered = true
+      synchronize_store { @store.mark_workflow_cancellation_delivered(workflow_id: @workflow_id) } if cancellation
+      reason = cancellation&.fetch("reason", fallback_reason)
+      CancellationError.new(reason, workflow_id: @workflow_id)
+    end
+
+    #: () -> untyped
+    def next_undeliverable_resolution_command_id
+      return if @resolution_index >= @terminal_events.length
+
+      command_id = @terminal_events.fetch(@resolution_index).fetch("command_id").to_i
+      command_id unless @futures[command_id]
+    end
+
+    #: (untyped) -> bool
+    def other_workflow_task_can_schedule?(current_task)
+      @workflow_tasks.any? do |task, _registered|
+        task != current_task && !@blocked_workflow_tasks.key?(task)
+      end
+    end
+
+    #: (untyped) -> bool
+    def deliver_cancellation_before_command?(shape)
+      return false if @cancellation_delivered
+      return false unless synchronize_store { @store.workflow_cancellation(@workflow_id) }
+
+      scheduled = @scheduled_history[@next_command_id]
+      return true unless scheduled
+
+      scheduled.fetch("payload") != shape
+    end
+
+    #: (untyped) -> untyped
+    def build_heartbeat(command_id)
       Heartbeat.new(
-        cursor: @store.step_heartbeat_cursor(workflow_id: @workflow_id, position:),
+        cursor: synchronize_store { @store.step_heartbeat_cursor(workflow_id: @workflow_id, command_id:) },
         recorder: lambda do |cursor|
-          renewed = @store.heartbeat_step(workflow_id: @workflow_id, position:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
           attributes = {
             "durababble.workflow.id" => @workflow_id,
-            "durababble.step.index" => position,
+            "durababble.step.index" => command_id,
             "durababble.worker.id" => @worker_id,
             "durababble.lease.owner" => @worker_id,
           }
+          renewed = synchronize_store do
+            @store.heartbeat_step(workflow_id: @workflow_id, command_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
+          end
           unless renewed
             Observability.count("durababble.leases.conflicts", attributes)
             raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before heartbeat"
@@ -184,7 +573,7 @@ module Durababble
     #: () -> untyped
     def assert_workflow_lease!
       return unless @store.respond_to?(:workflow_owned?)
-      return if @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id)
+      return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
 
       raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
     end
@@ -193,6 +582,11 @@ module Durababble
     def retry_run_at(delay)
       base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
       base + delay
+    end
+
+    #: () { -> untyped } -> untyped
+    def synchronize_store(&block)
+      @store_mutex.synchronize(&block)
     end
 
     #: (untyped) -> untyped
@@ -251,41 +645,61 @@ module Durababble
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
-      attributes = {}
-      completed_steps = @store.steps_for(workflow_id)
-        .select { |step| step.fetch("status") == "completed" }
-        .to_h { |step| [step.fetch("position").to_i, step] }
       attributes = {
         "durababble.workflow.id" => workflow_id,
         "durababble.workflow.name" => workflow_class.workflow_name,
         "durababble.worker.id" => @worker_id,
       }
-      Observability.record("durababble.workflow.history.steps", completed_steps.length, attributes)
-      execution = WorkflowExecution.new(
-        store: @store,
-        workflow_id:,
-        worker_id: @worker_id,
-        lease_seconds: @lease_seconds,
-        completed_steps:,
-        crash_after: @crash_after,
-      )
-      workflow = workflow_class.new
-      workflow.__durababble_execution__ = execution
       Observability.trace("durababble.workflow.execute", attributes) do
-        result = workflow.execute(initial_input || initial_context(workflow_id))
-        execution.validate_replay_complete!
-        assert_workflow_lease!(workflow_id)
-        if execution.cancellation_delivered?
-          @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
-          Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
-        else
-          @store.complete_workflow(workflow_id, result:)
-          Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+        workflow = nil #: untyped
+        root_error = nil #: StandardError?
+        root = Async do |root_task|
+          history = @store.workflow_history_for(workflow_id)
+          Observability.record(
+            "durababble.workflow.history.steps",
+            history.count { |event| event.fetch("kind") == "step_completed" },
+            attributes,
+          )
+          execution = WorkflowExecution.new(
+            store: @store,
+            workflow_id:,
+            worker_id: @worker_id,
+            lease_seconds: @lease_seconds,
+            history:,
+            root_task:,
+            crash_after: @crash_after,
+          )
+          workflow = workflow_class.new
+          workflow.__durababble_execution__ = execution
+          result = WorkflowExecutionContext.with_current(execution) do
+            workflow.execute(initial_input || initial_context(workflow_id))
+          end
+          WorkflowExecutionContext.with_current(execution) do
+            execution.validate_replay_complete!
+            assert_workflow_lease!(workflow_id)
+            if execution.cancellation_delivered?
+              @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
+              Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+            else
+              @store.complete_workflow(workflow_id, result:)
+              Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+            end
+          end
+          crash!(:workflow_completed)
+        rescue StandardError => e
+          root_error = e
         end
-        crash!(:workflow_completed)
+        root.wait
+        raise root_error if root_error
+
         snapshot(workflow_id)
+      ensure
+        workflow.__durababble_execution__ = nil if workflow
       end
-    rescue WorkflowSuspended, StepRetryScheduled
+    rescue WorkflowSuspended
+      @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+      snapshot(workflow_id)
+    rescue StepRetryScheduled
       snapshot(workflow_id)
     rescue CancellationError => e
       assert_workflow_lease!(workflow_id)
@@ -300,8 +714,6 @@ module Durababble
       @store.fail_workflow(workflow_id, error: message)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)
-    ensure
-      workflow.__durababble_execution__ = nil if workflow
     end
 
     #: (untyped) -> untyped

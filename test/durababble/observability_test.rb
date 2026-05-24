@@ -100,13 +100,14 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class RuntimeStore
-    attr_reader :workflows, :steps, :attempts
+    attr_reader :workflows, :steps, :attempts, :history
 
     def initialize
       @next_id = 0
       @workflows = {}
       @steps = Hash.new { |hash, key| hash[key] = [] }
       @attempts = Hash.new { |hash, key| hash[key] = [] }
+      @history = Hash.new { |hash, key| hash[key] = [] }
     end
 
     def migrate! = self
@@ -142,27 +143,37 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def workflow_cancellation(_workflow_id) = nil
 
-    def steps_for(workflow_id) = steps[workflow_id]
     def step_attempts_for(workflow_id) = attempts[workflow_id]
-    def step_heartbeat_cursor(workflow_id:, position:) = nil
+    def workflow_history_for(workflow_id) = history[workflow_id]
+    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
-    def record_step_started(workflow_id:, position:, name:)
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+      append_history(workflow_id, "kind" => "step_scheduled", "command_id" => command_id, "name" => name, "payload" => { "name" => name, "args" => args, "kwargs" => kwargs, "retry" => metadata.fetch("retry") })
+    end
+
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+      position = command_id || position
       step = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running" }
       steps[workflow_id].delete_if { |row| row.fetch("position") == position }
       steps[workflow_id] << step
       attempts[workflow_id] << step.merge("id" => "attempt-#{attempts[workflow_id].length + 1}")
+      append_history(workflow_id, "kind" => "step_started", "command_id" => position, "name" => name, "attempt_id" => attempts[workflow_id].last.fetch("id"))
     end
 
-    def record_step_completed(workflow_id:, position:, result:)
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+      position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "completed", "result" => result)
       attempts[workflow_id].last.merge!("status" => "completed", "result" => result)
+      append_history(workflow_id, "kind" => "step_completed", "command_id" => position, "payload" => result)
     end
 
-    def record_step_failed(workflow_id:, position:, error:)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+      position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "failed", "error" => error)
       attempts[workflow_id].last.merge!("status" => "failed", "error" => error)
+      append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "error" => error)
     end
 
     def complete_workflow(workflow_id, result:)
@@ -171,6 +182,12 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def fail_workflow(workflow_id, error:)
       workflows.fetch(workflow_id).merge!("status" => "failed", "error" => error, "locked_by" => nil)
+    end
+
+    private
+
+    def append_history(workflow_id, event)
+      history[workflow_id] << event.merge("event_index" => history[workflow_id].length)
     end
   end
 

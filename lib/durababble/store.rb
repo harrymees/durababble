@@ -68,6 +68,20 @@ module Durababble
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_delivered_at timestamptz")
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("workflow_history")} (
+          workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          event_index integer NOT NULL,
+          kind text NOT NULL,
+          command_id integer,
+          name text,
+          attempt_id text,
+          payload bytea,
+          error text,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (workflow_id, event_index)
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           position integer NOT NULL,
@@ -223,7 +237,7 @@ module Durababble
             WHERE status = 'pending'
               AND (next_run_at IS NULL OR next_run_at <= now())
               #{name_filter}
-            ORDER BY status, created_at
+            ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -233,7 +247,7 @@ module Durababble
               AND next_run_at IS NOT NULL
               AND next_run_at <= now()
               #{name_filter}
-            ORDER BY status, created_at
+            ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -242,7 +256,7 @@ module Durababble
             WHERE status = 'canceling'
               AND (next_run_at IS NULL OR next_run_at <= now())
               #{name_filter}
-            ORDER BY status, created_at
+            ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
@@ -354,6 +368,31 @@ module Durababble
       SQL
     end
 
+    #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
+    def suspend_workflow(workflow_id:, worker_id: nil)
+      params = [workflow_id]
+      owner_filter = ""
+      if worker_id
+        params << worker_id
+        owner_filter = "AND locked_by = $2"
+      end
+      result = execute_params(<<~SQL, params)
+        UPDATE #{table("workflows")}
+        SET status = CASE
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+              WHEN EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending') THEN 'waiting'
+              ELSE 'pending'
+            END,
+            locked_by = NULL,
+            locked_until = NULL,
+            updated_at = now()
+        WHERE id = $1 AND status = 'running' #{owner_filter}
+      SQL
+      return true if result.cmd_tuples == 1
+
+      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+    end
+
     #: (untyped, ?now: untyped) -> untyped
     def make_workflow_due!(workflow_id, now: Time.now)
       execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = $2::timestamptz WHERE id = $1", [workflow_id, timestamp(now)])
@@ -410,8 +449,9 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
-    def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
+    def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
       renewed = transaction do
         workflow = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
           UPDATE #{table("workflows")}
@@ -422,7 +462,7 @@ module Durababble
         next nil unless workflow
 
         serialized_cursor = dump_serialized(cursor)
-        step = execute_params(<<~SQL, [workflow_id, position, serialized_cursor]).first
+        step = execute_params(<<~SQL, [workflow_id, command_id, serialized_cursor]).first
           UPDATE #{table("steps")}
           SET heartbeat_cursor = $3::bytea, updated_at = now()
           WHERE workflow_id = $1 AND position = $2 AND status = 'running'
@@ -430,7 +470,7 @@ module Durababble
         SQL
         next nil unless step
 
-        execute_params(<<~SQL, [workflow_id, position, serialized_cursor])
+        execute_params(<<~SQL, [workflow_id, command_id, serialized_cursor])
           UPDATE #{table("step_attempts")}
           SET heartbeat_cursor = $3::bytea
           WHERE id = (
@@ -445,9 +485,10 @@ module Durababble
       renewed&.fetch("locked_until")
     end
 
-    #: (workflow_id: untyped, position: untyped) -> untyped
-    def step_heartbeat_cursor(workflow_id:, position:)
-      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = $1 AND position = $2", [workflow_id, position]).first
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
+    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = $1 AND position = $2", [workflow_id, command_id]).first
       decode_row(row).fetch("heartbeat_cursor") if row
     end
 
@@ -466,10 +507,10 @@ module Durababble
       result = execute_params(<<~SQL, [timestamp(now)])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-            ELSE 'pending'
-          END,
-          locked_by = NULL, locked_until = NULL, updated_at = now()
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+              ELSE 'pending'
+            END,
+            locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_until < $1::timestamptz
       SQL
       Observability.count("durababble.leases.expired_recovery", by: result.cmd_tuples.to_i)
@@ -513,74 +554,102 @@ module Durababble
       )
     end
 
-    #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
-    def record_step_started(workflow_id:, position:, name:)
+    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+      payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       transaction do
-        execute_params(<<~SQL, [workflow_id, position])
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
+        execute_params(<<~SQL, [workflow_id, command_id, name])
+          INSERT INTO #{table("steps")} (workflow_id, position, name, status, updated_at)
+          VALUES ($1, $2, $3, 'scheduled', now())
+          ON CONFLICT (workflow_id, position) DO NOTHING
+        SQL
+      end
+    end
+
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        execute_params(<<~SQL, [workflow_id, command_id])
           UPDATE #{table("step_attempts")}
           SET status = 'failed', error = 'superseded by retry', completed_at = now()
           WHERE workflow_id = $1 AND position = $2 AND status = 'running'
         SQL
-        execute_params(<<~SQL, [workflow_id, position, name])
+        execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, started_at, updated_at)
           VALUES ($1, $2, $3, 'running', now(), now())
           ON CONFLICT (workflow_id, position) DO UPDATE
             SET status = 'running', error = NULL, started_at = COALESCE(#{table("steps")}.started_at, now()), updated_at = now()
         SQL
         attempt_id = SecureRandom.uuid
-        execute_params(<<~SQL, [attempt_id, workflow_id, position, name])
+        execute_params(<<~SQL, [attempt_id, workflow_id, command_id, name])
           INSERT INTO #{table("step_attempts")} (id, workflow_id, position, name, status)
           VALUES ($1, $2, $3, $4, 'running')
         SQL
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
       end
     end
 
-    #: (workflow_id: untyped, position: untyped, result: untyped) -> untyped
-    def record_step_completed(workflow_id:, position:, result:)
-      record_step_completed_without_transaction(workflow_id:, position:, result:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction { record_step_completed_without_transaction(workflow_id:, command_id:, result:) }
     end
 
-    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-    def record_step_failed(workflow_id:, position:, error:)
-      record_step_failed_without_transaction(workflow_id:, position:, error:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction { record_step_failed_without_transaction(workflow_id:, command_id:, error:) }
     end
 
-    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-    def record_step_canceled(workflow_id:, position:, error:)
-      execute_params(
-        "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting')",
-        [workflow_id, position, error],
-      )
-      update_latest_attempt_serialized(workflow_id:, position:, status: "canceled", serialized_result: dump_serialized(nil), error:)
-    end
-
-    #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
-    def record_wait(workflow_id:, position:, name:, wait_request:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
       transaction do
-        execute_params(<<~SQL, [workflow_id, position, name, dump_serialized(wait_request.context)])
+        execute_params(
+          "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('scheduled', 'running', 'waiting')",
+          [workflow_id, command_id, error],
+        )
+        update_latest_attempt_serialized(workflow_id:, command_id:, status: "canceled", serialized_result: dump_serialized(nil), error:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_canceled", command_id:, error:)
+      end
+    end
+
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        execute_params(<<~SQL, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
           VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
           ON CONFLICT (workflow_id, position) DO UPDATE
             SET status = 'waiting', result = $4::bytea, error = NULL, updated_at = now()
         SQL
         wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
+        execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
           INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
           VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::bytea, 'pending')
         SQL
-        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
-        update_latest_attempt(workflow_id:, position:, status: "waiting", result: wait_request.context, error: nil)
+        update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
+        suspend_workflow(workflow_id:) if suspend_workflow
         Observability.count(
           "durababble.waits.started",
           "durababble.workflow.id" => workflow_id,
-          "durababble.step.index" => position,
+          "durababble.step.index" => command_id,
           "durababble.step.name" => name,
           "durababble.wait.kind" => wait_request.kind,
           "durababble.wait.event_key" => wait_request.event_key,
         )
         wait_id
       end
+    end
+
+    #: (untyped) -> untyped
+    def workflow_history_for(workflow_id)
+      execute_params("SELECT * FROM #{table("workflow_history")} WHERE workflow_id = $1 ORDER BY event_index", [workflow_id]).map { |row| decode_row(row) }
     end
 
     #: (?now: untyped) -> untyped
@@ -715,12 +784,12 @@ module Durababble
 
     #: (untyped) -> untyped
     def steps_for(workflow_id)
-      execute_params("SELECT * FROM #{table("steps")} WHERE workflow_id = $1 ORDER BY position", [workflow_id]).map { |row| decode_row(row) }
+      execute_params("SELECT * FROM #{table("steps")} WHERE workflow_id = $1 ORDER BY position", [workflow_id]).map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (untyped) -> untyped
     def step_attempts_for(workflow_id)
-      execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = $1 ORDER BY started_at, position", [workflow_id]).map { |row| decode_row(row) }
+      execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = $1 ORDER BY started_at, position", [workflow_id]).map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (object_type: untyped, object_id: untyped) -> untyped
@@ -792,7 +861,7 @@ module Durababble
 
     private
 
-    #: (untyped) -> untyped
+    #: (untyped) -> bool
     def terminal_for_cancellation?(row)
       return true if ["completed", "canceled"].include?(row.fetch("status"))
 
@@ -841,7 +910,7 @@ module Durababble
             SELECT w.id FROM #{table("waits")} AS w
             JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
             WHERE w.status = 'pending'
-              AND wf.status = 'waiting'
+              AND wf.status IN ('waiting', 'running')
               AND #{where_sql}
             FOR UPDATE OF w, wf SKIP LOCKED
           )
@@ -851,7 +920,7 @@ module Durababble
         rows.each do |wait|
           record_wait_latency(wait)
           context = wait.fetch("context").merge(payload)
-          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
+          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         Observability.count("durababble.waits.completed", by: rows.length)
@@ -859,33 +928,35 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, position: untyped, result: untyped) -> untyped
-    def record_step_completed_without_transaction(workflow_id:, position:, result:)
+    #: (workflow_id: untyped, command_id: untyped, result: untyped) -> untyped
+    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
       serialized = dump_serialized(result)
       execute_params(
         "UPDATE #{table("steps")} SET status = 'completed', result = $3::bytea, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2",
-        [workflow_id, position, serialized],
+        [workflow_id, command_id, serialized],
       )
-      update_latest_attempt_serialized(workflow_id:, position:, status: "completed", serialized_result: serialized, error: nil)
+      update_latest_attempt_serialized(workflow_id:, command_id:, status: "completed", serialized_result: serialized, error: nil)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-    def record_step_failed_without_transaction(workflow_id:, position:, error:)
+    #: (workflow_id: untyped, command_id: untyped, error: untyped) -> untyped
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
       execute_params(
         "UPDATE #{table("steps")} SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2",
-        [workflow_id, position, error],
+        [workflow_id, command_id, error],
       )
-      update_latest_attempt_serialized(workflow_id:, position:, status: "failed", serialized_result: dump_serialized(nil), error:)
+      update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
     end
 
-    #: (workflow_id: untyped, position: untyped, status: untyped, result: untyped, error: untyped) -> untyped
-    def update_latest_attempt(workflow_id:, position:, status:, result:, error:)
-      update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result: dump_serialized(result), error:)
+    #: (workflow_id: untyped, command_id: untyped, status: untyped, result: untyped, error: untyped) -> untyped
+    def update_latest_attempt(workflow_id:, command_id:, status:, result:, error:)
+      update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result: dump_serialized(result), error:)
     end
 
-    #: (workflow_id: untyped, position: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped
-    def update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result:, error:)
-      execute_params(<<~SQL, [workflow_id, position, status, serialized_result, error])
+    #: (workflow_id: untyped, command_id: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped
+    def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
+      execute_params(<<~SQL, [workflow_id, command_id, status, serialized_result, error])
         UPDATE #{table("step_attempts")}
         SET status = $3, result = $4::bytea, error = $5, completed_at = now()
         WHERE id = (
@@ -895,6 +966,28 @@ module Durababble
           LIMIT 1
         )
       SQL
+    end
+
+    #: (workflow_id: untyped, kind: untyped, ?command_id: untyped, ?name: untyped, ?attempt_id: untyped, ?payload: untyped, ?error: untyped) -> untyped
+    def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
+      execute_params("SELECT id FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id])
+      event_index = execute_params(
+        "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table("workflow_history")} WHERE workflow_id = $1",
+        [workflow_id],
+      ).first.fetch("event_index").to_i
+      execute_params(<<~SQL, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
+        INSERT INTO #{table("workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+      SQL
+      event_index
+    end
+
+    #: (untyped, untyped) -> untyped
+    def normalize_command_id(command_id, position)
+      id = command_id.nil? ? position : command_id
+      raise ArgumentError, "command_id is required" if id.nil?
+
+      id
     end
 
     #: (?max_attempts: untyped) { (?) -> untyped } -> untyped
@@ -1025,10 +1118,17 @@ module Durababble
       end
     end
 
+    #: (untyped) -> untyped
+    def with_command_id(row)
+      row["command_id"] = row["position"] if row.key?("position") && !row.key?("command_id")
+      row
+    end
+
     #: () -> untyped
     def migrate_serialized_columns!
       migrate_serialized_column!("workflows", "input", not_null: true)
       migrate_serialized_column!("workflows", "result")
+      migrate_serialized_column!("workflow_history", "payload")
       migrate_serialized_column!("steps", "result")
       migrate_serialized_column!("steps", "heartbeat_cursor")
       migrate_serialized_column!("step_attempts", "result")
@@ -1048,6 +1148,7 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
       execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
       execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
+      execute("CREATE INDEX IF NOT EXISTS workflow_history_command_idx ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
       execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, kind, event_key, created_at)")
       execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, kind, wake_at, created_at)")
       execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
@@ -1172,6 +1273,22 @@ module Durababble
       add_column_if_missing("workflows", "cancel_requested_at", "DATETIME(6)")
       add_column_if_missing("workflows", "cancel_delivered_at", "DATETIME(6)")
       execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("workflow_history")} (
+          workflow_id VARCHAR(191) NOT NULL,
+          event_index INT NOT NULL,
+          kind VARCHAR(64) NOT NULL,
+          command_id INT,
+          name VARCHAR(191),
+          attempt_id VARCHAR(191),
+          payload LONGBLOB,
+          error TEXT,
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          PRIMARY KEY (workflow_id, event_index),
+          INDEX #{quote_ident(index_name("workflow_history", "command"))} (workflow_id, command_id, event_index),
+          FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
+        )
+      SQL
+      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("steps")} (
           workflow_id VARCHAR(191) NOT NULL,
           position INT NOT NULL,
@@ -1291,7 +1408,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1340,7 +1457,7 @@ module Durababble
           WHERE status = 'pending'
             AND (next_run_at IS NULL OR next_run_at <= NOW(6))
             #{name_sql}
-          ORDER BY status, created_at
+          ORDER BY created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1350,7 +1467,7 @@ module Durababble
             AND next_run_at IS NOT NULL
             AND next_run_at <= NOW(6)
             #{name_sql}
-          ORDER BY status, created_at
+          ORDER BY created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1359,7 +1476,7 @@ module Durababble
           WHERE status = 'canceling'
             AND (next_run_at IS NULL OR next_run_at <= NOW(6))
             #{name_sql}
-          ORDER BY status, created_at
+          ORDER BY created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         SQL
@@ -1487,6 +1604,32 @@ module Durababble
       SQL
     end
 
+    #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
+    def suspend_workflow(workflow_id:, worker_id: nil)
+      params = [workflow_id]
+      owner_filter = ""
+      if worker_id
+        owner_filter = "AND locked_by = ?"
+        params << worker_id
+      end
+      params << workflow_id
+      result = execute_params(<<~SQL, params)
+        UPDATE #{table("workflows")}
+        SET status = CASE
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+              WHEN EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
+              ELSE 'pending'
+            END,
+            locked_by = NULL,
+            locked_until = NULL,
+            updated_at = NOW(6)
+        WHERE status = 'running' #{owner_filter} AND id = ?
+      SQL
+      return true if result.cmd_tuples == 1
+
+      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+    end
+
     #: (untyped, ?now: untyped) -> untyped
     def make_workflow_due!(workflow_id, now: Time.now)
       execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = ? WHERE id = ?", [now, workflow_id])
@@ -1542,8 +1685,9 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
-    def heartbeat_step(workflow_id:, position:, worker_id:, lease_seconds:, cursor:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
+    def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
       renewed = transaction do
         next nil unless workflow_owned?(workflow_id:, worker_id:)
 
@@ -1554,16 +1698,16 @@ module Durababble
         SQL
 
         serialized_cursor = dump_serialized(cursor)
-        step = execute_params("SELECT 1 FROM #{table("steps")} WHERE workflow_id = ? AND position = ? AND status = 'running'", [workflow_id, position]).first
+        step = execute_params("SELECT 1 FROM #{table("steps")} WHERE workflow_id = ? AND position = ? AND status = 'running'", [workflow_id, command_id]).first
         next nil unless step
 
-        execute_params(<<~SQL, [serialized_cursor, workflow_id, position])
+        execute_params(<<~SQL, [serialized_cursor, workflow_id, command_id])
           UPDATE #{table("steps")}
           SET heartbeat_cursor = ?, updated_at = NOW(6)
           WHERE workflow_id = ? AND position = ? AND status = 'running'
         SQL
 
-        execute_params(<<~SQL, [serialized_cursor, workflow_id, position])
+        execute_params(<<~SQL, [serialized_cursor, workflow_id, command_id])
           UPDATE #{table("step_attempts")}
           SET heartbeat_cursor = ?
           WHERE workflow_id = ? AND position = ? AND status = 'running'
@@ -1575,9 +1719,10 @@ module Durababble
       renewed&.fetch("locked_until")
     end
 
-    #: (workflow_id: untyped, position: untyped) -> untyped
-    def step_heartbeat_cursor(workflow_id:, position:)
-      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = ? AND position = ?", [workflow_id, position]).first
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
+    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = ? AND position = ?", [workflow_id, command_id]).first
       decode_row(row).fetch("heartbeat_cursor") if row
     end
 
@@ -1600,47 +1745,68 @@ module Durababble
       execute_params(<<~SQL, [now])
         UPDATE #{table("workflows")}
         SET status = CASE
-            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-            ELSE 'pending'
-          END,
-          locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+              ELSE 'pending'
+            END,
+            locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE status = 'running' AND locked_until < ?
       SQL
       Observability.count("durababble.leases.expired_recovery", by: expired)
       expired
     end
 
-    #: (workflow_id: untyped, position: untyped, name: untyped) -> untyped
-    def record_step_started(workflow_id:, position:, name:)
+    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+      payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       transaction do
-        execute_params(<<~SQL, [workflow_id, position])
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
+        execute_params(<<~SQL, [workflow_id, command_id, name])
+          INSERT IGNORE INTO #{table("steps")} (workflow_id, position, name, status, updated_at)
+          VALUES (?, ?, ?, 'scheduled', NOW(6))
+        SQL
+      end
+    end
+
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        execute_params(<<~SQL, [workflow_id, command_id])
           UPDATE #{table("step_attempts")}
           SET status = 'failed', error = 'superseded by retry', completed_at = NOW(6)
           WHERE workflow_id = ? AND position = ? AND status = 'running'
         SQL
-        execute_params(<<~SQL, [workflow_id, position, name])
+        execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, started_at, updated_at)
           VALUES (?, ?, ?, 'running', NOW(6), NOW(6))
           ON DUPLICATE KEY UPDATE status = 'running', error = NULL, updated_at = NOW(6)
         SQL
         attempt_id = SecureRandom.uuid
-        execute_params(<<~SQL, [attempt_id, workflow_id, position, name])
+        execute_params(<<~SQL, [attempt_id, workflow_id, command_id, name])
           INSERT INTO #{table("step_attempts")} (id, workflow_id, position, name, status)
           VALUES (?, ?, ?, ?, 'running')
         SQL
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
       end
     end
 
-    #: (workflow_id: untyped, position: untyped, result: untyped) -> untyped
-    def record_step_completed(workflow_id:, position:, result:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction { record_step_completed_without_transaction(workflow_id:, command_id:, result:) }
+    end
+
+    #: (workflow_id: untyped, command_id: untyped, result: untyped) -> untyped
+    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
       serialized = dump_serialized(result)
-      execute_params(<<~SQL, [serialized, workflow_id, position])
+      execute_params(<<~SQL, [serialized, workflow_id, command_id])
         UPDATE #{table("steps")}
         SET status = 'completed', result = ?, error = NULL, completed_at = NOW(6), updated_at = NOW(6)
         WHERE workflow_id = ? AND position = ?
       SQL
-      update_latest_attempt_serialized(workflow_id:, position:, status: "completed", serialized_result: serialized, error: nil)
+      update_latest_attempt_serialized(workflow_id:, command_id:, status: "completed", serialized_result: serialized, error: nil)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
     #: (untyped, result: untyped) -> untyped
@@ -1672,24 +1838,35 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-    def record_step_failed(workflow_id:, position:, error:)
-      execute_params(<<~SQL, [error, workflow_id, position])
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction { record_step_failed_without_transaction(workflow_id:, command_id:, error:) }
+    end
+
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
+    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        execute_params(<<~SQL, [error, workflow_id, command_id])
+          UPDATE #{table("steps")}
+          SET status = 'canceled', error = ?, updated_at = NOW(6)
+          WHERE workflow_id = ? AND position = ? AND status IN ('scheduled', 'running', 'waiting')
+        SQL
+        update_latest_attempt_serialized(workflow_id:, command_id:, status: "canceled", serialized_result: dump_serialized(nil), error:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_canceled", command_id:, error:)
+      end
+    end
+
+    #: (workflow_id: untyped, command_id: untyped, error: untyped) -> untyped
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+      execute_params(<<~SQL, [error, workflow_id, command_id])
         UPDATE #{table("steps")}
         SET status = 'failed', error = ?, updated_at = NOW(6)
         WHERE workflow_id = ? AND position = ?
       SQL
-      update_latest_attempt_serialized(workflow_id:, position:, status: "failed", serialized_result: dump_serialized(nil), error:)
-    end
-
-    #: (workflow_id: untyped, position: untyped, error: untyped) -> untyped
-    def record_step_canceled(workflow_id:, position:, error:)
-      execute_params(<<~SQL, [error, workflow_id, position])
-        UPDATE #{table("steps")}
-        SET status = 'canceled', error = ?, updated_at = NOW(6)
-        WHERE workflow_id = ? AND position = ? AND status IN ('running', 'waiting')
-      SQL
-      update_latest_attempt_serialized(workflow_id:, position:, status: "canceled", serialized_result: dump_serialized(nil), error:)
+      update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
     end
 
     #: (untyped) -> untyped
@@ -1702,7 +1879,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def steps_for(workflow_id)
-      execute_params("SELECT * FROM #{table("steps")} WHERE workflow_id = ? ORDER BY position", [workflow_id]).map { |row| decode_row(row) }
+      execute_params("SELECT * FROM #{table("steps")} WHERE workflow_id = ? ORDER BY position", [workflow_id]).map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (workflow_id: untyped, topic: untyped, payload: untyped, key: untyped) -> untyped
@@ -1763,38 +1940,45 @@ module Durababble
       decode_row(execute_params("SELECT * FROM #{table("outbox")} WHERE id = ?", [outbox_id]).first)
     end
 
-    #: (workflow_id: untyped, position: untyped, name: untyped, wait_request: untyped) -> untyped
-    def record_wait(workflow_id:, position:, name:, wait_request:)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+      command_id = normalize_command_id(command_id, position)
       transaction do
         serialized_context = dump_serialized(wait_request.context)
-        execute_params(<<~SQL, [workflow_id, position, name, serialized_context])
+        execute_params(<<~SQL, [workflow_id, command_id, name, serialized_context])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
           VALUES (?, ?, ?, 'waiting', ?, NOW(6), NOW(6))
           ON DUPLICATE KEY UPDATE status = 'waiting', result = VALUES(result), error = NULL, updated_at = NOW(6)
         SQL
         wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
+        execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
           INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
         SQL
-        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
         update_latest_attempt_serialized(
           workflow_id:,
-          position:,
+          command_id:,
           status: "waiting",
           serialized_result: serialized_context,
           error: nil,
         )
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
+        suspend_workflow(workflow_id:) if suspend_workflow
         Observability.count(
           "durababble.waits.started",
           "durababble.workflow.id" => workflow_id,
-          "durababble.step.index" => position,
+          "durababble.step.index" => command_id,
           "durababble.step.name" => name,
           "durababble.wait.kind" => wait_request.kind,
           "durababble.wait.event_key" => wait_request.event_key,
         )
         wait_id
       end
+    end
+
+    #: (untyped) -> untyped
+    def workflow_history_for(workflow_id)
+      execute_params("SELECT * FROM #{table("workflow_history")} WHERE workflow_id = ? ORDER BY event_index", [workflow_id]).map { |row| decode_row(row) }
     end
 
     #: (untyped) -> untyped
@@ -1857,7 +2041,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def step_attempts_for(workflow_id)
-      execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = ? ORDER BY started_at, position", [workflow_id]).map { |row| decode_row(row) }
+      execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = ? ORDER BY started_at, position", [workflow_id]).map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (object_type: untyped, object_id: untyped) -> untyped
@@ -1938,22 +2122,6 @@ module Durababble
 
     private
 
-    #: (untyped, untyped, untyped) -> untyped
-    def add_column_if_missing(table_name, column_name, definition)
-      return if mysql_column_exists?(table_name, column_name)
-
-      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_ident(column_name)} #{definition}")
-    end
-
-    #: (untyped, untyped) -> untyped
-    def mysql_column_exists?(table_name, column_name)
-      !!execute_params(<<~SQL, [raw_table_name(table_name), column_name]).first
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?
-      SQL
-    end
-
     #: (untyped) -> untyped
     def cancel_pending_waits_for_workflow(workflow_id)
       execute_params(<<~SQL, [workflow_id])
@@ -1973,6 +2141,21 @@ module Durababble
       SQL
     end
 
+    #: (untyped, untyped, untyped) -> untyped
+    def add_column_if_missing(table_name, column_name, column_type)
+      exists = execute_params(<<~SQL, ["#{table_prefix}_#{table_name}", column_name]).first
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND column_name = ?
+        LIMIT 1
+      SQL
+      return if exists
+
+      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_ident(column_name)} #{column_type}")
+    end
+
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
@@ -1986,15 +2169,37 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, position: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped
-    def update_latest_attempt_serialized(workflow_id:, position:, status:, serialized_result:, error:)
-      execute_params(<<~SQL, [status, serialized_result, error, workflow_id, position])
+    #: (workflow_id: untyped, command_id: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped
+    def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
+      execute_params(<<~SQL, [status, serialized_result, error, workflow_id, command_id])
         UPDATE #{table("step_attempts")}
         SET status = ?, result = ?, error = ?, completed_at = NOW(6)
         WHERE workflow_id = ? AND position = ? AND status IN ('running', 'waiting')
         ORDER BY started_at DESC
         LIMIT 1
       SQL
+    end
+
+    #: (workflow_id: untyped, kind: untyped, ?command_id: untyped, ?name: untyped, ?attempt_id: untyped, ?payload: untyped, ?error: untyped) -> untyped
+    def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
+      execute_params("SELECT id FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id])
+      event_index = execute_params(
+        "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table("workflow_history")} WHERE workflow_id = ?",
+        [workflow_id],
+      ).first.fetch("event_index").to_i
+      execute_params(<<~SQL, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
+        INSERT INTO #{table("workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      SQL
+      event_index
+    end
+
+    #: (untyped, untyped) -> untyped
+    def normalize_command_id(command_id, position)
+      id = command_id.nil? ? position : command_id
+      raise ArgumentError, "command_id is required" if id.nil?
+
+      id
     end
 
     #: (untyped, untyped, untyped) -> untyped
@@ -2004,7 +2209,7 @@ module Durababble
           SELECT w.* FROM #{table("waits")} AS w
           JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
           WHERE w.status = 'pending'
-            AND wf.status = 'waiting'
+            AND wf.status IN ('waiting', 'running')
             AND #{where_sql}
           FOR UPDATE SKIP LOCKED
         SQL
@@ -2012,7 +2217,7 @@ module Durababble
           execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
           record_wait_latency(wait)
           context = wait.fetch("context").merge(payload)
-          record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position").to_i, result: context)
+          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         Observability.count("durababble.waits.completed", by: waits.length)
@@ -2059,7 +2264,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def table(name)
-      quote_ident(raw_table_name(name))
+      quote_ident("#{table_prefix}_#{name}")
     end
 
     #: (untyped) -> untyped

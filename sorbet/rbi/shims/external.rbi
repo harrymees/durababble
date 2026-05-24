@@ -6,6 +6,24 @@ module Concurrent
   end
 end
 
+module Async
+  class Condition
+    def initialize; end
+    def wait; end
+    def signal; end
+  end
+
+  class Task
+    def self.current; end
+    def async(&blk); end
+    def wait; end
+  end
+end
+
+module Kernel
+  def Async(&blk); end
+end
+
 module Google
   module Protobuf
     class DescriptorPool
