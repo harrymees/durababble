@@ -36,6 +36,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_worker_lifecycle_test_#{Process.pid}_#{SecureRandom.hex(4)}"
     @durababble_store = Durababble::Store.connect(database_url:, schema:)
+    @durababble_store.migrate!
   end
 
   def teardown
@@ -115,7 +116,6 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   end
 
   test "starts a background worker and gracefully completes in-flight work during shutdown" do
-    store.migrate!
     completed = Queue.new
     workflow = durababble_test_workflow("runtime-graceful") do
       test_step("finish") do |ctx|
@@ -150,7 +150,6 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   end
 
   test "stops claiming work on shutdown timeout, revokes owned leases, and lets another worker retry incomplete steps" do
-    store.migrate!
     entered = Queue.new
     release_zombie = Queue.new
     attempts = Queue.new
@@ -201,7 +200,6 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   end
 
   test "only claims workflow names served by this runtime's worker pool" do
-    store.migrate!
     pool_workflow = durababble_test_workflow("pool-a-work") do
       test_step("finish") { |ctx| ctx.merge("pool" => "a") }
     end

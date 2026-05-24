@@ -164,7 +164,6 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
     test "persists exposed workflow commands as durable event waits with #{backend.name}" do
       with_durababble_store(backend, "workflow_commands") do |store|
-        store.migrate!
         worker = Durababble::Worker.new(
           store:,
           workflows: { ApiTestApprovalWorkflow.workflow_name => ApiTestApprovalWorkflow },

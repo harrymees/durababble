@@ -7,7 +7,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "cancels before start and runs cleanup durably with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         work_runs = 0
         cleanup_runs = 0
         workflow = cancelable_workflow(
@@ -37,7 +36,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "cancels while waiting and ignores later signals with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         cleanup_runs = 0
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "cancel-waiting"
@@ -72,7 +70,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "cancels during retry backoff without waiting for the retry due time with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         work_runs = 0
         cleanup_runs = 0
         workflow = cancelable_workflow(
@@ -105,7 +102,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "cancels a running heartbeating step at the heartbeat yield point with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         work_runs = 0
         cleanup_runs = 0
         workflow = nil
@@ -136,7 +132,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "keeps the workflow lease through long-running cancellation cleanup with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         observations = []
         workflow = nil
         workflow = Class.new(Durababble::Workflow) do
@@ -201,7 +196,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "does not repeat completed cleanup after crash and recovery with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         cleanup_runs = 0
         workflow = cancelable_workflow(
           "cancel-cleanup-crash",
@@ -230,7 +224,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "resumes cancellation cleanup after a crash before cleanup body runs with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         cleanup_runs = 0
         workflow = cancelable_workflow(
           "cancel-cleanup-start-crash",
@@ -261,7 +254,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "marks cleanup failure as workflow failure with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         workflow = cancelable_workflow(
           "cancel-cleanup-fails",
           work: ->(input, _heartbeat) {
@@ -283,7 +275,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "retries cleanup steps durably before canceling with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         cleanup_runs = 0
         workflow = cancelable_workflow(
           "cancel-cleanup-retry",
@@ -318,7 +309,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "duplicate cancellation requests preserve the first durable reason with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         workflow = cancelable_workflow("cancel-duplicate", work: ->(input, _heartbeat) { input }, cleanup: ->(input) { input })
         workflow_id = workflow.enqueue({}, store:)
 
@@ -333,7 +323,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "stores cancellation metadata on the workflow row with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_storage_test") do |store|
-        store.migrate!
         workflow = cancelable_workflow("cancel-storage", work: ->(input, _heartbeat) { input }, cleanup: ->(input) { input })
         workflow_id = workflow.enqueue({}, store:)
 
@@ -354,7 +343,6 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
 
     test "terminal workflow cancellation is a no-op unless already canceled with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
-        store.migrate!
         completed_workflow = durababble_test_workflow("terminal-completed") do
           test_step("done") { |ctx| ctx.merge("done" => true) }
         end

@@ -22,8 +22,6 @@ class DurababblePublicWorkflowApiTest < DurababbleTestCase
   test "runs simple-looking workflow code and records method-derived durable steps" do
     backend = durababble_store_backends.first
     with_durababble_store(backend, "public_workflow_api") do |store|
-      store.migrate!
-
       run = Durababble::Engine.new(store:).run(PublicApiCounterWorkflow, input: { "count" => 2 })
 
       assert_equal "completed", run.status

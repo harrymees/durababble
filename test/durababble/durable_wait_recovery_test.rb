@@ -7,7 +7,6 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "does not recreate a timer wait after crashing immediately after persistence with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
-        store.migrate!
         wake_at = Time.utc(2026, 2, 1, 12, 0, 0)
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "durable-timer-checkpoint"
@@ -48,7 +47,6 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
 
     test "keeps repeated durable workflow waits distinct by workflow position with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
-        store.migrate!
         first_wake = Time.utc(2026, 3, 1, 0, 0, 0)
         second_wake = Time.utc(2026, 3, 2, 0, 0, 0)
         workflow = Class.new(Durababble::Workflow) do
