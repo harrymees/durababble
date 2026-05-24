@@ -152,6 +152,7 @@ module Durababble
     def ack_outbox: (String outbox_id, worker_id: String) -> bool
     def outbox_message: (String outbox_id) -> workflow_row?
     def enqueue_inbox_message: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: serialized_payload, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?) -> String
+    def enqueue_workflow_command: (workflow_id: String, workflow_name: String, method_name: String, payload: serialized_payload, ?idempotency_key: String?) -> String
     def claim_target_activation: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time) -> workflow_row?
     def complete_target_activation: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time) -> Object?
     def target_activation: (target_kind: String, target_type: String, target_id: String) -> workflow_row?

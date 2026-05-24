@@ -217,6 +217,36 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not claim an earlier object command when asked for a later one with #{backend.name}" do
+      with_durababble_store(backend, "object_command_fifo_claim") do |store|
+        first = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [1],
+          kwargs: {},
+        )
+        second = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [2],
+          kwargs: {},
+        )
+
+        assert_nil store.claim_object_command(command_id: second, worker_id: "object-worker", lease_seconds: 30)
+        assert_hash_includes store.inbox_message(first), "status" => "pending", "locked_by" => nil
+        assert_hash_includes store.inbox_message(second), "status" => "pending", "locked_by" => nil
+
+        assert_hash_includes(
+          store.claim_object_command(command_id: first, worker_id: "object-worker", lease_seconds: 30),
+          "id" => first,
+          "status" => "running",
+          "locked_by" => "object-worker",
+        )
+      end
+    end
+
     test "allocates inbox sequences transactionally and drains only a contiguous ready prefix with #{backend.name}" do
       with_durababble_store(backend, "inbox_sequence") do |store|
         store.migrate!
@@ -334,6 +364,18 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal first, duplicate
         assert_equal [1], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: "wf-1").map { |message| message.fetch("sequence").to_i }
 
+        same_key_other_target = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-2",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+
+        refute_equal first, same_key_other_target
+        assert_equal [1], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: "wf-2").map { |message| message.fetch("sequence").to_i }
+
         assert_raises(Durababble::IdempotencyKeyConflict) do
           store.enqueue_inbox_message(
             target_kind: "workflow",
@@ -344,6 +386,50 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
             idempotency_key: "signal:approval:wf-1",
           )
         end
+      end
+    end
+
+    test "atomically enqueues workflow commands and rejects terminal workflows with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_enqueue") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        first = store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+          idempotency_key: "approve:1",
+        )
+        duplicate = store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+          idempotency_key: "approve:1",
+        )
+
+        assert_equal first, duplicate
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "different" } },
+            idempotency_key: "approve:1",
+          )
+        end
+
+        store.complete_workflow(workflow_id, result: { "done" => true })
+        assert_raises_matching(Durababble::Error, /terminal/) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "late" } },
+            idempotency_key: "approve:2",
+          )
+        end
+        assert_equal [first], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id).map { |message| message.fetch("id") }
       end
     end
 

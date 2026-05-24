@@ -55,6 +55,33 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  class TerminalRaceCommandStore
+    attr_reader :enqueued
+
+    def initialize
+      @enqueued = false
+    end
+
+    def migrate!; end
+
+    def workflow(workflow_id)
+      { "id" => workflow_id, "status" => "running", "next_run_at" => nil }
+    end
+
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key:)
+      raise Durababble::Error, "workflow #{workflow_id} is terminal"
+    end
+
+    def enqueue_inbox_message(**)
+      @enqueued = true
+      "raced-command"
+    end
+
+    def wait_for_inbox_message(message_id)
+      raise Durababble::CommandTimeout, "timed out waiting for inbox message #{message_id}"
+    end
+  end
+
   test "registers class-oriented workflow steps and public exposed methods" do
     assert_equal "api_test_order_workflow", ApiTestOrderWorkflow.workflow_name
     assert_equal [:charge, :finish], ApiTestOrderWorkflow.step_order
@@ -94,6 +121,16 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
 
     assert_equal "wf:wf-1", positional_query.ref("wf-1", store: Object.new).describe("wf")
+  end
+
+  test "uses the store's atomic workflow command enqueue path" do
+    store = TerminalRaceCommandStore.new
+    error = assert_raises(Durababble::Error) do
+      ApiTestApprovalWorkflow.ref("wf-race", store:).approve(reason: "late")
+    end
+
+    assert_match(/terminal/, error.message)
+    refute store.enqueued
   end
 
   durababble_store_backends.each do |backend|

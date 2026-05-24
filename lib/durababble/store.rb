@@ -816,7 +816,7 @@ module Durababble
       shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       retry_serialization_failures do
         transaction do
-          existing = existing_inbox_message_for_idempotency(idempotency_key)
+          existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
           if existing
             raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
@@ -840,6 +840,46 @@ module Durababble
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
           SQL
           upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+          id
+        end
+      end
+    end
+
+    #: (workflow_id: untyped, workflow_name: untyped, method_name: untyped, payload: untyped, ?idempotency_key: untyped) -> untyped
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
+      target_kind = "workflow"
+      message_kind = "workflow_command"
+      shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
+      retry_serialization_failures do
+        transaction do
+          existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id)
+          if existing
+            raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
+
+            upsert_target_activation_without_transaction(
+              target_kind: existing.fetch("target_kind"),
+              target_type: existing.fetch("target_type"),
+              target_id: existing.fetch("target_id"),
+              ready_at: existing["ready_at"],
+            ) if activatable_inbox_status?(existing.fetch("status"))
+            next existing.fetch("id")
+          end
+
+          workflow = execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
+          raise KeyError, "workflow not found: #{workflow_id}" unless workflow
+
+          raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decode_row(workflow))
+
+          sequence = allocate_mailbox_sequence(target_kind:, target_type: workflow_name, target_id: workflow_id)
+          id = SecureRandom.uuid
+          execute_params(<<~SQL, [id, target_kind, workflow_name, workflow_id, sequence, message_kind, method_name, id, idempotency_key, shape_hash, dump_serialized(payload)])
+            INSERT INTO #{table("inbox")} (
+              id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+              operation_id, idempotency_key, shape_hash, payload, status
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending')
+          SQL
+          upsert_target_activation_without_transaction(target_kind:, target_type: workflow_name, target_id: workflow_id)
           id
         end
       end
@@ -990,14 +1030,15 @@ module Durababble
       return unless object_command_message?(row)
       return object_command_row(row) unless row.key?("target_kind")
 
-      claimed = claim_inbox_messages(
+      claimed = claim_inbox_message_by_id(
+        message_id: command_id,
         target_kind: row.fetch("target_kind"),
         target_type: row.fetch("target_type"),
         target_id: row.fetch("target_id"),
         worker_id:,
         lease_seconds:,
-      ).first
-      return unless claimed&.fetch("id") == command_id
+      )
+      return unless claimed
 
       object_command_row(claimed)
     end
@@ -1236,11 +1277,44 @@ module Durababble
       sequence
     end
 
-    #: (untyped) -> untyped
-    def existing_inbox_message_for_idempotency(idempotency_key)
+    #: (untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       return unless idempotency_key
 
-      execute_params("SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash FROM #{table("inbox")} WHERE idempotency_key = $1 FOR UPDATE", [idempotency_key]).first
+      execute_params(<<~SQL, [target_kind, target_type, target_id, idempotency_key]).first
+        SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
+        FROM #{table("inbox")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3 AND idempotency_key = $4
+        FOR UPDATE
+      SQL
+    end
+
+    #: (message_id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, ?now: untyped) -> untyped
+    def claim_inbox_message_by_id(message_id:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
+      transaction do
+        head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+          SELECT *
+          FROM #{table("inbox")}
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+          ORDER BY sequence
+          LIMIT 1
+          FOR UPDATE
+        SQL
+        next unless head&.fetch("id") == message_id
+        next unless inbox_row_claimable?(head, now:)
+
+        execute_params(<<~SQL, [message_id, worker_id, lease_seconds])
+          UPDATE #{table("inbox")}
+          SET status = 'running',
+              attempts = attempts + 1,
+              locked_by = $2,
+              locked_until = now() + ($3::int * interval '1 second'),
+              updated_at = now()
+          WHERE id = $1
+        SQL
+        decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first)
+      end
     end
 
     #: (untyped) -> bool
@@ -1539,7 +1613,7 @@ module Durababble
           message_kind text NOT NULL,
           method_name text,
           operation_id text NOT NULL,
-          idempotency_key text UNIQUE,
+          idempotency_key text,
           shape_hash text NOT NULL,
           payload bytea NOT NULL,
           status text NOT NULL,
@@ -1586,6 +1660,8 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
       execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
       execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
+      execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
+      execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_target_idempotency_idx ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
       execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
       execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
       execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
@@ -2508,7 +2584,7 @@ module Durababble
     def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil)
       shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       transaction do
-        existing = existing_inbox_message_for_idempotency(idempotency_key)
+        existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
         if existing
           raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
@@ -2532,6 +2608,44 @@ module Durababble
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         SQL
         upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+        id
+      end
+    end
+
+    #: (workflow_id: untyped, workflow_name: untyped, method_name: untyped, payload: untyped, ?idempotency_key: untyped) -> untyped
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
+      target_kind = "workflow"
+      message_kind = "workflow_command"
+      shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
+      transaction do
+        existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        if existing
+          raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
+
+          upsert_target_activation_without_transaction(
+            target_kind: existing.fetch("target_kind"),
+            target_type: existing.fetch("target_type"),
+            target_id: existing.fetch("target_id"),
+            ready_at: existing["ready_at"],
+          ) if activatable_inbox_status?(existing.fetch("status"))
+          next existing.fetch("id")
+        end
+
+        workflow = execute_params("SELECT * FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id]).first
+        raise KeyError, "workflow not found: #{workflow_id}" unless workflow
+
+        raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decode_row(workflow))
+
+        sequence = allocate_mailbox_sequence(target_kind:, target_type: workflow_name, target_id: workflow_id)
+        id = SecureRandom.uuid
+        execute_params(<<~SQL, [id, target_kind, workflow_name, workflow_id, sequence, message_kind, method_name, id, idempotency_key, shape_hash, dump_serialized(payload)])
+          INSERT INTO #{table("inbox")} (
+            id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+            operation_id, idempotency_key, shape_hash, payload, status
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        SQL
+        upsert_target_activation_without_transaction(target_kind:, target_type: workflow_name, target_id: workflow_id)
         id
       end
     end
@@ -2658,14 +2772,15 @@ module Durababble
       row = inbox_message(command_id)
       return unless object_command_message?(row)
 
-      claimed = claim_inbox_messages(
+      claimed = claim_inbox_message_by_id(
+        message_id: command_id,
         target_kind: row.fetch("target_kind"),
         target_type: row.fetch("target_type"),
         target_id: row.fetch("target_id"),
         worker_id:,
         lease_seconds:,
-      ).first
-      return unless claimed&.fetch("id") == command_id
+      )
+      return unless claimed
 
       object_command_row(claimed)
     end
@@ -2802,7 +2917,7 @@ module Durababble
           message_kind VARCHAR(32) NOT NULL,
           method_name VARCHAR(191),
           operation_id VARCHAR(191) NOT NULL,
-          idempotency_key VARCHAR(191) UNIQUE,
+          idempotency_key VARCHAR(191),
           shape_hash VARCHAR(64) NOT NULL,
           payload LONGBLOB NOT NULL,
           status VARCHAR(32) NOT NULL,
@@ -2818,6 +2933,7 @@ module Durababble
           completed_at DATETIME(6),
           dead_lettered_at DATETIME(6),
           UNIQUE KEY #{quote_ident(index_name("inbox", "target_sequence_unique"))} (target_kind, target_type, target_id, sequence),
+          UNIQUE KEY #{quote_ident(index_name("inbox", "target_idempotency_unique"))} (target_kind, target_type, target_id, idempotency_key),
           INDEX #{quote_ident(index_name("inbox", "target_status_sequence"))} (target_kind, target_type, target_id, status, sequence),
           INDEX #{quote_ident(index_name("inbox", "target_sequence"))} (target_kind, target_type, target_id, sequence),
           INDEX #{quote_ident(index_name("inbox", "ready"))} (status, ready_at, created_at)
@@ -2839,6 +2955,8 @@ module Durababble
           INDEX #{quote_ident(index_name("target_activations", "expired"))} (status, locked_until, created_at)
         )
       SQL
+      drop_index_if_present("inbox", "idempotency_key")
+      add_index_if_missing("inbox", index_name("inbox", "target_idempotency_unique"), "UNIQUE KEY #{quote_ident(index_name("inbox", "target_idempotency_unique"))} (target_kind, target_type, target_id, idempotency_key)")
     end
 
     #: (command_id: untyped, worker_id: untyped) -> untyped
@@ -2955,11 +3073,74 @@ module Durababble
       sequence
     end
 
-    #: (untyped) -> untyped
-    def existing_inbox_message_for_idempotency(idempotency_key)
+    #: (untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       return unless idempotency_key
 
-      execute_params("SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash FROM #{table("inbox")} WHERE idempotency_key = ? FOR UPDATE", [idempotency_key]).first
+      execute_params(<<~SQL, [target_kind, target_type, target_id, idempotency_key]).first
+        SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
+        FROM #{table("inbox")}
+        WHERE target_kind = ? AND target_type = ? AND target_id = ? AND idempotency_key = ?
+        FOR UPDATE
+      SQL
+    end
+
+    #: (message_id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, ?now: untyped) -> untyped
+    def claim_inbox_message_by_id(message_id:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
+      transaction do
+        head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+          SELECT *
+          FROM #{table("inbox")}
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+          ORDER BY sequence
+          LIMIT 1
+          FOR UPDATE
+        SQL
+        next unless head&.fetch("id") == message_id
+        next unless inbox_row_claimable?(head, now:)
+
+        execute_params(<<~SQL, [worker_id, lease_seconds, message_id])
+          UPDATE #{table("inbox")}
+          SET status = 'running',
+              attempts = attempts + 1,
+              locked_by = ?,
+              locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND),
+              updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+        decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [message_id]).first)
+      end
+    end
+
+    #: (untyped, untyped, untyped) -> untyped
+    def add_index_if_missing(table_name, index_name, index_definition)
+      exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
+        SELECT 1
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND index_name = ?
+        LIMIT 1
+      SQL
+      return if exists
+
+      execute("ALTER TABLE #{table(table_name)} ADD #{index_definition}")
+    end
+
+    #: (untyped, untyped) -> untyped
+    def drop_index_if_present(table_name, index_name)
+      exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
+        SELECT 1
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND index_name = ?
+        LIMIT 1
+      SQL
+      return unless exists
+
+      execute("DROP INDEX #{quote_ident(index_name)} ON #{table(table_name)}")
     end
 
     #: (untyped) -> bool

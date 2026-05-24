@@ -103,6 +103,19 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       "inbox-1"
     end
 
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key:)
+      @events << [:inbox, {
+        target_kind: "workflow",
+        target_type: workflow_name,
+        target_id: workflow_id,
+        message_kind: "workflow_command",
+        method_name:,
+        payload:,
+        idempotency_key:,
+      },]
+      "inbox-1"
+    end
+
     def wait_for_inbox_message(message_id)
       "result:#{message_id}"
     end

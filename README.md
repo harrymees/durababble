@@ -256,7 +256,7 @@ There's two kinds of RPCs you can expose: simple RPCs, and command RPCs.
 
 Simple RPCs are run in parallel and are not expected to ever mutate state on the workflow -- they aren't recorded durably, and so they can be lost. Use simple RPCs for reads, for things you need to be really cheap, or for situations where the workflow is the "owner" of another resource under the hood that doesn't record durable state in the workflow itself.
 
-Commands can mutate state on the workflow, and are thusly processed in serial and recorded and redelivered durably. Use commands for RPCs that *need* to make it to the workflow, and that change the way the workflow will behave moving forward, like editing local state. Command calls are stored in the durable inbox for the workflow target, coalesced into a target activation, and completed by storing a result or error on the ask row; callers do not need to arrange a matching `wait_event` in workflow code.
+Commands can mutate state on the workflow, and are thusly processed in serial and recorded and redelivered durably. Use commands for RPCs that *need* to make it to the workflow, and that change the way the workflow will behave moving forward, like editing local state.
 
 Workflows can declare simple RPC methods with `expose` on the class, and commands RPC methods with `expose_command`.
 

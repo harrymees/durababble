@@ -447,6 +447,84 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  test "handles postgres workflow command enqueue branches" do
+    store = pg_store
+    payload = { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } }
+    shape_hash = store.send(
+      :inbox_shape_hash,
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_command",
+      method_name: "approve",
+      payload:,
+    )
+    new_connection = ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new([{ "id" => "wf-1", "status" => "running", "next_run_at" => nil }]),
+      PgResult.new,
+      PgResult.new([{ "last_sequence" => "0" }]),
+      PgResult.new,
+      PgResult.new,
+      PgResult.new,
+    ])
+    new_id = pg_store(new_connection).enqueue_workflow_command(
+      workflow_id: "wf-1",
+      workflow_name: "approval",
+      method_name: "approve",
+      payload:,
+      idempotency_key: "approve:1",
+    )
+
+    assert_match(/\A[0-9a-f-]{36}\z/, new_id)
+    assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
+
+    duplicate = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+    ])).enqueue_workflow_command(
+      workflow_id: "wf-1",
+      workflow_name: "approval",
+      method_name: "approve",
+      payload:,
+      idempotency_key: "approve:1",
+    )
+    assert_equal "existing-command", duplicate
+
+    pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "pending-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      PgResult.new,
+    ])).enqueue_workflow_command(
+      workflow_id: "wf-1",
+      workflow_name: "approval",
+      method_name: "approve",
+      payload:,
+      idempotency_key: "approve:1",
+    )
+    assert_equal "pending-command", pending_duplicate
+
+    assert_raises(Durababble::IdempotencyKeyConflict) do
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+      ])).enqueue_workflow_command(
+        workflow_id: "wf-1",
+        workflow_name: "approval",
+        method_name: "approve",
+        payload:,
+        idempotency_key: "approve:1",
+      )
+    end
+
+    assert_raises(KeyError) do
+      pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+        .enqueue_workflow_command(workflow_id: "missing", workflow_name: "approval", method_name: "approve", payload:)
+    end
+    assert_raises_matching(Durababble::Error, /terminal/) do
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "id" => "wf-1", "status" => "completed", "next_run_at" => nil }]),
+      ])).enqueue_workflow_command(workflow_id: "wf-1", workflow_name: "approval", method_name: "approve", payload:)
+    end
+  end
+
   test "handles mysql inbox idempotency branches" do
     store = mysql_store
     shape_hash = store.send(
@@ -478,7 +556,7 @@ class DurababbleStoreTest < DurababbleTestCase
     refute_includes inbox_insert, "retained_until"
 
     duplicate = mysql_store(ScriptedMysqlConnection.new do |sql|
-      if sql.include?("WHERE idempotency_key =")
+      if sql.include?("idempotency_key =")
         MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end).enqueue_inbox_message(
@@ -492,7 +570,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("WHERE idempotency_key =")
+      if sql.include?("idempotency_key =")
         MysqlResultLike.new([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end
@@ -509,7 +587,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       mysql_store(ScriptedMysqlConnection.new do |sql|
-        if sql.include?("WHERE idempotency_key =")
+        if sql.include?("idempotency_key =")
           MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
         end
       end).enqueue_inbox_message(
@@ -574,7 +652,7 @@ class DurababbleStoreTest < DurababbleTestCase
     )
 
     helper = pg_store
-    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil)
+    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert helper.send(:activatable_inbox_status?, "pending")
     refute helper.send(:activatable_inbox_status?, "completed")
     assert_equal "", helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)
@@ -796,6 +874,17 @@ class DurababbleStoreTest < DurababbleTestCase
     }
     assert_includes connection.queries, "ROLLBACK"
     assert_includes connection.queries, "COMMIT"
+
+    index_connection = ScriptedMysqlConnection.new do |sql|
+      if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")
+        MysqlResultLike.new([{ "exists" => 1 }])
+      end
+    end
+    index_store = mysql_store(index_connection)
+    index_store.send(:add_index_if_missing, "inbox", "missing_idx", "INDEX `missing_idx` (status)")
+    index_store.send(:drop_index_if_present, "inbox", "present_idx")
+    assert index_connection.queries.any? { |sql| sql.include?("ADD INDEX `missing_idx`") }
+    assert index_connection.queries.any? { |sql| sql.include?("DROP INDEX `present_idx`") }
   end
 
   private
