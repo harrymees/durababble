@@ -364,7 +364,7 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: records an inbox row and persists state changes
+account.credit(1_000) # durable command: this call is written to the database and eventually processed even in the face of crashes
 account.balance       # query: reads latest persisted state
 ```
 

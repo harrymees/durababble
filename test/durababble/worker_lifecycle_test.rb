@@ -30,6 +30,10 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
       result
     end
+
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:)
+      nil
+    end
   end
 
   def setup

@@ -16,17 +16,15 @@ module Durababble
 
     #: () -> untyped
     def tick
-      if @store.respond_to?(:claim_target_activation)
-        activation = @store.claim_target_activation(
-          worker_id: @worker_id,
-          lease_seconds: @lease_seconds,
-          target_kinds: ["workflow"],
-          target_types: @workflows.keys,
-        )
-        if activation
-          process_target_activation(activation)
-          return :worked
-        end
+      activation = @store.claim_target_activation(
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        target_kinds: ["workflow"],
+        target_types: @workflows.keys,
+      )
+      if activation
+        process_target_activation(activation)
+        return :worked
       end
 
       claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)

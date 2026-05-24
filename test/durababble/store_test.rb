@@ -75,6 +75,28 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  class ScriptedMysqlConnection
+    attr_reader :queries
+    attr_accessor :affected_rows
+
+    def initialize(&result_for_query)
+      @result_for_query = result_for_query
+      @queries = []
+      @affected_rows = 0
+    end
+
+    def query(sql)
+      @queries << sql
+      result = @result_for_query&.call(sql) || MysqlResultLike.new([])
+      @affected_rows = result.affected_rows || 0
+      result
+    end
+
+    def escape(value)
+      value.to_s.gsub("'", "''")
+    end
+  end
+
   class MysqlResultLike
     attr_reader :affected_rows
 
@@ -425,6 +447,82 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  test "handles mysql inbox idempotency branches" do
+    store = mysql_store
+    shape_hash = store.send(
+      :inbox_shape_hash,
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      method_name: nil,
+      payload: { "approved" => true },
+    )
+    new_connection = ScriptedMysqlConnection.new do |sql|
+      MysqlResultLike.new([{ "last_sequence" => 0 }]) if sql.include?("SELECT last_sequence")
+    end
+    new_id = mysql_store(new_connection).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+
+    assert_match(/\A[0-9a-f-]{36}\z/, new_id)
+    inbox_insert = new_connection.queries.find do |sql|
+      sql.include?("INSERT INTO") && sql.include?("`branch_schema_inbox`")
+    end
+    assert_includes inbox_insert, "'signal:wf-1'"
+    refute_includes inbox_insert, "retained_until"
+
+    duplicate = mysql_store(ScriptedMysqlConnection.new do |sql|
+      if sql.include?("WHERE idempotency_key =")
+        MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
+      end
+    end).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+    assert_equal "existing-inbox-id", duplicate
+
+    pending_duplicate_connection = ScriptedMysqlConnection.new do |sql|
+      if sql.include?("WHERE idempotency_key =")
+        MysqlResultLike.new([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
+      end
+    end
+    pending_duplicate = mysql_store(pending_duplicate_connection).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+    assert_equal "pending-inbox-id", pending_duplicate
+    assert pending_duplicate_connection.queries.any? { |sql| sql.include?("INSERT INTO `branch_schema_target_activations`") }
+
+    assert_raises(Durababble::IdempotencyKeyConflict) do
+      mysql_store(ScriptedMysqlConnection.new do |sql|
+        if sql.include?("WHERE idempotency_key =")
+          MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
+        end
+      end).enqueue_inbox_message(
+        target_kind: "workflow",
+        target_type: "approval",
+        target_id: "wf-1",
+        message_kind: "workflow_signal",
+        payload: { "approved" => true },
+        idempotency_key: "signal:wf-1",
+      )
+    end
+  end
+
   test "handles postgres target activation and inbox wait branches" do
     assert_nil pg_store.claim_target_activation(worker_id: "w", lease_seconds: 5, target_kinds: [])
     assert_nil pg_store.claim_target_activation(worker_id: "w", lease_seconds: 5, target_types: [])
@@ -704,6 +802,10 @@ class DurababbleStoreTest < DurababbleTestCase
 
   def pg_store(connection = ScriptedPgConnection.new)
     Durababble::Store.new(connection, schema: "branch_schema")
+  end
+
+  def mysql_store(connection = ScriptedMysqlConnection.new)
+    Durababble::MysqlStore.new(connection, schema: "branch_schema")
   end
 
   def pg_dump(value)

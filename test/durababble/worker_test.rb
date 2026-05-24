@@ -23,6 +23,10 @@ class DurababbleWorkerTest < DurababbleTestCase
       claim&.merge("claimed_by" => worker_id, "lease_seconds" => lease_seconds, "workflow_names" => workflow_names)
     end
 
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:)
+      nil
+    end
+
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
       {
         "id" => workflow_id,
