@@ -456,11 +456,24 @@ module Durababble
         command_id = normalize_command_id(command_id, position)
         @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil) }
         wait_id = next_id("wait")
-        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
+        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "scope" => "step", "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
         update_latest_attempt(workflow_id, command_id, "waiting", wait_request.context, nil)
         append_history(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
         suspend_workflow(workflow_id:) if suspend_workflow
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
+        fault_plan.after(:record_wait)
+        wait_id
+      end
+
+      #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
+      def record_workflow_wait(workflow_id:, position:, wait_request:)
+        wait_id = next_id("wait")
+        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => position, "scope" => "workflow", "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
+        row = @workflows.fetch(workflow_id)
+        row["status"] = "waiting"
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        trace("workflow_wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
         wait_id
       end
@@ -479,6 +492,14 @@ module Durababble
       #: (untyped) -> untyped
       def waits_for(workflow_id)
         @waits.values.select { |wait| wait.fetch("workflow_id") == workflow_id }.sort_by { |wait| wait.fetch("id") }.map { |row| deep(row) }
+      end
+
+      #: (untyped) -> untyped
+      def completed_workflow_waits_for(workflow_id)
+        @waits.values
+          .select { |wait| wait.fetch("workflow_id") == workflow_id && wait.fetch("scope", "step") == "workflow" && wait.fetch("status") == "completed" }
+          .sort_by { |wait| wait.fetch("position") }
+          .map { |row| deep(row) }
       end
 
       #: (untyped) -> untyped
@@ -674,7 +695,9 @@ module Durababble
           wait["status"] = "completed"
           wait["payload"] = deep(payload)
           context = wait.fetch("context").merge(payload)
-          record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position"), result: context)
+          unless wait.fetch("scope", "step") == "workflow"
+            record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position"), result: context)
+          end
           if row.fetch("status") == "waiting"
             row["status"] = "pending"
             row["locked_by"] = nil

@@ -135,10 +135,12 @@ module Durababble
     def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> void
     def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool) -> String
+    def record_workflow_wait: (workflow_id: String, position: Integer, wait_request: WaitRequest) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def wake_due_timers: (?now: Time) -> Integer
     def signal_event: (String event_key, ?payload: serialized_payload) -> Integer
     def waits_for: (String workflow_id) -> Array[workflow_row]
+    def completed_workflow_waits_for: (String workflow_id) -> Array[workflow_row]
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload
     def enqueue_outbox: (workflow_id: String, topic: String, payload: serialized_payload, key: String) -> String
     def claim_outbox: (worker_id: String, lease_seconds: Numeric) -> workflow_row?

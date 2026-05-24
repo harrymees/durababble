@@ -154,8 +154,8 @@ module Durababble
   class WorkflowExecution
     TERMINAL_HISTORY_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
 
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, completed_workflow_waits: untyped, root_task: untyped, ?crash_after: untyped) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, completed_workflow_waits:, root_task:, crash_after: nil)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -170,9 +170,11 @@ module Durababble
       @step_contexts = {}
       @store_mutex = Mutex.new
       @resolution_index = 0
+      @workflow_wait_position = 0
       @scheduled_history = {}
       @terminal_history = {}
       @terminal_events = []
+      @completed_workflow_waits = completed_workflow_waits
       @cancellation_delivered = false
       history.each { |event| index_history_event(event) }
       @terminal_events = @terminal_history.values.sort_by { |event| event.fetch("event_index").to_i }
@@ -241,16 +243,47 @@ module Durababble
       result
     end
 
+    #: (untyped) -> untyped
+    def wait(wait_request)
+      assert_workflow_task!("workflow wait")
+      position = @workflow_wait_position
+      @workflow_wait_position += 1
+
+      if @completed_workflow_waits.key?(position)
+        completed_wait = @completed_workflow_waits.fetch(position)
+        validate_completed_workflow_wait_shape!(completed_wait, wait_request:, position:)
+        result = completed_wait.fetch("context").merge(completed_wait.fetch("payload") || {})
+        raise_if_cancel_requested!
+        return result
+      end
+
+      raise_if_cancel_requested!
+      assert_workflow_lease!
+      synchronize_store { @store.record_workflow_wait(workflow_id: @workflow_id, position:, wait_request:) }
+      crash!(:wait_recorded)
+      raise WorkflowSuspended
+    end
+
     #: () -> void
     def validate_replay_complete!
       extra = @scheduled_history
         .keys
         .select { |command_id| command_id >= @next_command_id }
         .sort
-      return if extra.empty?
+      unless extra.empty?
+        rendered = extra.map { |command_id| "#{command_id}:#{@scheduled_history.fetch(command_id).fetch("name")}" }.join(", ")
+        raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable command history: #{rendered}"
+      end
 
-      rendered = extra.map { |command_id| "#{command_id}:#{@scheduled_history.fetch(command_id).fetch("name")}" }.join(", ")
-      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable command history: #{rendered}"
+      extra_waits = @completed_workflow_waits
+        .select { |position, _wait| position >= @workflow_wait_position }
+        .sort_by { |position, _wait| position }
+      return if extra_waits.empty?
+
+      rendered = extra_waits
+        .map { |position, wait| "#{position}:#{wait.fetch("kind")}:#{wait["event_key"] || "timer"}" }
+        .join(", ")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay completed without consuming durable workflow wait history: #{rendered}"
     end
 
     private
@@ -293,6 +326,17 @@ module Durababble
         "kwargs" => kwargs,
         "retry" => retry_shape(step.retry_policy),
       }
+    end
+
+    #: (untyped, wait_request: untyped, position: untyped) -> void
+    def validate_completed_workflow_wait_shape!(completed_wait, wait_request:, position:)
+      same_kind = completed_wait.fetch("kind") == wait_request.kind
+      same_event = wait_request.kind != "event" || completed_wait["event_key"] == wait_request.event_key
+      return if same_kind && same_event
+
+      expected = wait_request.kind == "event" ? "#{wait_request.kind}:#{wait_request.event_key}" : wait_request.kind
+      persisted = completed_wait.fetch("kind") == "event" ? "#{completed_wait.fetch("kind")}:#{completed_wait["event_key"]}" : completed_wait.fetch("kind")
+      raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow wait #{position} #{expected.inspect}, but durable wait history already completed #{persisted.inspect}"
     end
 
     #: (untyped) -> untyped
@@ -594,19 +638,27 @@ module Durababble
       root_error = nil #: StandardError?
       root = Async do |root_task|
         history = @store.workflow_history_for(workflow_id)
+        completed_workflow_waits = if @store.respond_to?(:completed_workflow_waits_for)
+          @store.completed_workflow_waits_for(workflow_id)
+            .to_h { |wait| [wait.fetch("position").to_i, wait] }
+        else
+          {}
+        end
         execution = WorkflowExecution.new(
           store: @store,
           workflow_id:,
           worker_id: @worker_id,
           lease_seconds: @lease_seconds,
           history:,
+          completed_workflow_waits:,
           root_task:,
           crash_after: @crash_after,
         )
         workflow = workflow_class.new
         workflow.__durababble_execution__ = execution
         result = WorkflowExecutionContext.with_current(execution) do
-          workflow.execute(initial_input || initial_context(workflow_id))
+          output = workflow.execute(initial_input || initial_context(workflow_id))
+          output.is_a?(WaitRequest) ? execution.wait(output) : output
         end
         WorkflowExecutionContext.with_current(execution) do
           execution.validate_replay_complete!

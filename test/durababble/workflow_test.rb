@@ -93,6 +93,82 @@ class DurababbleWorkflowTest < DurababbleTestCase
   end
 
   durababble_store_backends.each do |backend|
+    test "parks and resumes workflow-level event waits without step rows with #{backend.name}" do
+      with_durababble_store(backend, "workflow_waits") do |store|
+        store.migrate!
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "direct-event-wait"
+
+          def execute(input)
+            approval = wait_event("approval:#{input.fetch("id")}", input.merge("waiting_for" => "approval"))
+            finish(approval)
+          end
+
+          step def finish(input)
+            input.merge("finished" => true)
+          end
+        end
+        worker = Durababble::Worker.new(store:, workflows: { workflow.workflow_name => workflow }, worker_id: "worker-a")
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "direct" })
+
+        assert_equal :worked, worker.tick
+        assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+        assert_empty store.steps_for(workflow_id)
+        assert_hash_includes(
+          store.waits_for(workflow_id).first,
+          "scope" => "workflow",
+          "kind" => "event",
+          "event_key" => "approval:direct",
+          "status" => "pending",
+        )
+
+        assert_equal 1, store.signal_event("approval:direct", payload: { "approved" => true })
+        assert_equal :worked, worker.tick
+
+        assert_hash_includes(
+          store.workflow(workflow_id),
+          "status" => "completed",
+          "result" => {
+            "id" => "direct",
+            "waiting_for" => "approval",
+            "approved" => true,
+            "finished" => true,
+          },
+        )
+        assert_equal [["finish", "completed"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
+        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+      end
+    end
+
+    test "parks and resumes workflow-level timer waits returned from execute with #{backend.name}" do
+      with_durababble_store(backend, "workflow_waits") do |store|
+        store.migrate!
+        wake_at = Time.now + 3600
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "direct-timer-wait"
+
+          def execute(input)
+            result = Durababble.wait_until(input.fetch("wake_at"), input.merge("slept" => true))
+            result.merge("finished" => true)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "wake_at" => wake_at })
+
+        waiting = Durababble::Engine.new(store:, worker_id: "timer-worker").resume(workflow, workflow_id:)
+        assert_equal "waiting", waiting.status
+        assert_empty store.steps_for(workflow_id)
+        assert_hash_includes store.waits_for(workflow_id).first, "scope" => "workflow", "kind" => "timer", "status" => "pending"
+
+        assert_equal 0, store.wake_due_timers(now: wake_at - 1)
+        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
+        run = Durababble::Engine.new(store:, worker_id: "timer-worker").resume(workflow, workflow_id:)
+
+        assert_equal "completed", run.status
+        assert_hash_includes run.result, "slept" => true, "finished" => true
+        assert_empty store.steps_for(workflow_id)
+      end
+    end
+
     test "persists exposed workflow commands as durable event waits with #{backend.name}" do
       with_durababble_store(backend, "workflow_commands") do |store|
         store.migrate!

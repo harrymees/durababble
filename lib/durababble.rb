@@ -68,15 +68,36 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
-      WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      handle_wait_request(WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:))
     end
 
     #: (untyped, ?untyped) -> untyped
     def wait_event(event_key, context = {})
-      WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
+      handle_wait_request(WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:))
+    end
+
+    #: (untyped) { -> untyped } -> untyped
+    def with_workflow_execution(execution, &block)
+      previous = Thread.current[:durababble_workflow_execution]
+      Thread.current[:durababble_workflow_execution] = execution
+      block.call
+    ensure
+      Thread.current[:durababble_workflow_execution] = previous
     end
 
     private
+
+    #: (untyped) -> untyped
+    def handle_wait_request(wait_request)
+      execution = if const_defined?(:WorkflowExecutionContext, false)
+        WorkflowExecutionContext.current
+      end
+      execution ||= Thread.current[:durababble_workflow_execution]
+      return wait_request unless execution
+      return wait_request if execution.step_context
+
+      execution.wait(wait_request)
+    end
 
     #: (untyped) -> String
     def schema_component(value)

@@ -163,6 +163,73 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
       end
     end
 
+    test "rejects replay when workflow-level wait history is skipped with #{backend.name}" do
+      with_durababble_store(backend, "hatchet_inspired") do |store|
+        store.migrate!
+        first_version = Class.new(Durababble::Workflow) do
+          workflow_name "workflow-wait-shape-check"
+
+          def execute(input)
+            wait_event("release:#{input.fetch("id")}", input.merge("waiting" => true))
+          end
+        end
+        second_version = Class.new(Durababble::Workflow) do
+          workflow_name "workflow-wait-shape-check"
+
+          def execute(input)
+            input.merge("skipped_wait" => true)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: first_version.workflow_name, input: { "id" => "workflow-wait" })
+
+        waiting = Durababble::Engine.new(store:, worker_id: "first-version", migrate: false).resume(first_version, workflow_id:)
+        assert_equal "waiting", waiting.status
+        assert_empty store.steps_for(workflow_id)
+        assert_equal 1, store.signal_event("release:workflow-wait", payload: { "released" => true })
+
+        run = Durababble::Engine.new(store:, worker_id: "second-version", migrate: false).resume(second_version, workflow_id:)
+
+        assert_equal "failed", run.status
+        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/without consuming durable workflow wait history/, run.error)
+        assert_equal(
+          [["0", "workflow", "event", "completed"]],
+          store.waits_for(workflow_id).map { |wait| [wait.fetch("position").to_s, wait.fetch("scope"), wait.fetch("kind"), wait.fetch("status")] },
+        )
+      end
+    end
+
+    test "rejects replay when workflow-level wait shape changes with #{backend.name}" do
+      with_durababble_store(backend, "hatchet_inspired") do |store|
+        store.migrate!
+        first_version = Class.new(Durababble::Workflow) do
+          workflow_name "workflow-wait-key-check"
+
+          def execute(input)
+            wait_event("release:#{input.fetch("id")}", input)
+          end
+        end
+        second_version = Class.new(Durababble::Workflow) do
+          workflow_name "workflow-wait-key-check"
+
+          def execute(input)
+            wait_event("other:#{input.fetch("id")}", input)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: first_version.workflow_name, input: { "id" => "changed" })
+
+        assert_equal "waiting", Durababble::Engine.new(store:, worker_id: "first-version", migrate: false).resume(first_version, workflow_id:).status
+        assert_equal 1, store.signal_event("release:changed", payload: { "released" => true })
+
+        run = Durababble::Engine.new(store:, worker_id: "second-version", migrate: false).resume(second_version, workflow_id:)
+
+        assert_equal "failed", run.status
+        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/other:changed/, run.error)
+        assert_match(/release:changed/, run.error)
+      end
+    end
+
     test "runs a durable timer wait followed by an event wait with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
         store.migrate!

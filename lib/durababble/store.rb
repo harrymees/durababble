@@ -117,6 +117,7 @@ module Durababble
           id text PRIMARY KEY,
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           position integer NOT NULL,
+          scope text NOT NULL DEFAULT 'step',
           kind text NOT NULL,
           event_key text,
           wake_at timestamptz,
@@ -127,6 +128,7 @@ module Durababble
           completed_at timestamptz
         )
       SQL
+      execute("ALTER TABLE #{table("waits")} ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'step'")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("fences")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -619,12 +621,25 @@ module Durababble
         SQL
         wait_id = SecureRandom.uuid
         execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
-          INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
-          VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::bytea, 'pending')
+          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
+          VALUES ($1, $2, $3, 'step', $4, $5, $6::timestamptz, $7::bytea, 'pending')
         SQL
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
         suspend_workflow(workflow_id:) if suspend_workflow
+        wait_id
+      end
+    end
+
+    #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
+    def record_workflow_wait(workflow_id:, position:, wait_request:)
+      transaction do
+        wait_id = SecureRandom.uuid
+        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
+          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
+          VALUES ($1, $2, $3, 'workflow', $4, $5, $6::timestamptz, $7::bytea, 'pending')
+        SQL
+        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1", [workflow_id])
         wait_id
       end
     end
@@ -647,6 +662,11 @@ module Durababble
     #: (untyped) -> untyped
     def waits_for(workflow_id)
       execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = $1 ORDER BY created_at", [workflow_id]).map { |row| decode_row(row) }
+    end
+
+    #: (untyped) -> untyped
+    def completed_workflow_waits_for(workflow_id)
+      execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = $1 AND scope = 'workflow' AND status = 'completed' ORDER BY position", [workflow_id]).map { |row| decode_row(row) }
     end
 
     #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
@@ -897,7 +917,9 @@ module Durababble
         rows = returning.map { |row| decode_row(row) }
         rows.each do |wait|
           context = wait.fetch("context").merge(payload)
-          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
+          unless wait.fetch("scope", "step") == "workflow"
+            record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
+          end
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         rows.length
@@ -1281,6 +1303,7 @@ module Durababble
           id VARCHAR(191) PRIMARY KEY,
           workflow_id VARCHAR(191) NOT NULL,
           position INT NOT NULL,
+          scope VARCHAR(32) NOT NULL DEFAULT 'step',
           kind VARCHAR(32) NOT NULL,
           event_key VARCHAR(191),
           wake_at DATETIME(6),
@@ -1295,6 +1318,7 @@ module Durababble
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
+      add_column_if_missing("waits", "scope", "VARCHAR(32) NOT NULL DEFAULT 'step'")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
           object_type VARCHAR(191) NOT NULL,
@@ -1859,8 +1883,8 @@ module Durababble
         SQL
         wait_id = SecureRandom.uuid
         execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
-          INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
+          VALUES (?, ?, ?, 'step', ?, ?, ?, ?, 'pending')
         SQL
         update_latest_attempt_serialized(
           workflow_id:,
@@ -1875,6 +1899,19 @@ module Durababble
       end
     end
 
+    #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
+    def record_workflow_wait(workflow_id:, position:, wait_request:)
+      transaction do
+        wait_id = SecureRandom.uuid
+        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
+          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
+          VALUES (?, ?, ?, 'workflow', ?, ?, ?, ?, 'pending')
+        SQL
+        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+        wait_id
+      end
+    end
+
     #: (untyped) -> untyped
     def workflow_history_for(workflow_id)
       execute_params("SELECT * FROM #{table("workflow_history")} WHERE workflow_id = ? ORDER BY event_index", [workflow_id]).map { |row| decode_row(row) }
@@ -1883,6 +1920,11 @@ module Durababble
     #: (untyped) -> untyped
     def waits_for(workflow_id)
       execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = ? ORDER BY created_at", [workflow_id]).map { |row| decode_row(row) }
+    end
+
+    #: (untyped) -> untyped
+    def completed_workflow_waits_for(workflow_id)
+      execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = ? AND scope = 'workflow' AND status = 'completed' ORDER BY position", [workflow_id]).map { |row| decode_row(row) }
     end
 
     #: (untyped, ?payload: untyped) -> untyped
@@ -2115,7 +2157,9 @@ module Durababble
         waits.each do |wait|
           execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
           context = wait.fetch("context").merge(payload)
-          record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
+          unless wait.fetch("scope", "step") == "workflow"
+            record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
+          end
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         waits.length
