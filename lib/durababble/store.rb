@@ -226,6 +226,7 @@ module Durababble
           candidates.concat(execute_params(<<~SQL, []).to_a)
             SELECT id, created_at FROM #{table("workflows")}
             WHERE status = 'failed'
+              AND next_run_at IS NOT NULL
               AND next_run_at <= now()
               #{name_filter}
             ORDER BY created_at
@@ -270,7 +271,7 @@ module Durababble
         WHERE id = $1
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= now()))
+            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
             OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
           )
         RETURNING *
@@ -1205,6 +1206,7 @@ module Durababble
         candidates.concat(execute_params(<<~SQL, name_params).to_a)
           SELECT id, created_at FROM #{table("workflows")}
           WHERE status = 'failed'
+            AND next_run_at IS NOT NULL
             AND next_run_at <= NOW(6)
             #{name_sql}
           ORDER BY created_at
@@ -1228,7 +1230,7 @@ module Durababble
           WHERE id = ?
             AND (
               (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
-              OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
               OR (status = 'running' AND locked_until < NOW(6))
             )
         SQL
@@ -1252,7 +1254,7 @@ module Durababble
           WHERE id = ?
             AND (
               (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
-              OR (status = 'failed' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
             )
           FOR UPDATE SKIP LOCKED

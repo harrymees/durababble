@@ -339,7 +339,7 @@ pred claimWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
     workflowStatus[wf, t] = Pending and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
   )
   or (
-    workflowStatus[wf, t] = Failed and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
+    workflowStatus[wf, t] = Failed and some due: workflowNextRun[wf, t] | not gt[due, t]
   )
   no live: LeaseRow | live.lr_workflow = wf and live.lr_time = t and gt[live.lr_expiresAt, t]
   workflowStatus[wf, tnext] = Running
@@ -692,6 +692,9 @@ assert retryBackoffPreventsEarlyClaim {
     implies workflowStatus[wf, t.next] != Running
   all wf: Workflow, due: Time, t: Time - last |
     workflowStatus[wf, t] = Failed and workflowNextRun[wf, t] = due and gt[due, t]
+    implies workflowStatus[wf, t.next] != Running
+  all wf: Workflow, t: Time - last |
+    workflowStatus[wf, t] = Failed and no workflowNextRun[wf, t]
     implies workflowStatus[wf, t.next] != Running
 }
 

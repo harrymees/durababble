@@ -291,7 +291,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         store.fail_workflow(workflow_id, error: "fatal")
         assert_hash_includes store.workflow(workflow_id), "status" => "failed", "error" => "fatal"
         assert_nil store.claim_runnable_workflow(worker_id: "worker-d", lease_seconds: 30)
-        assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-d", lease_seconds: 30), "locked_by" => "worker-d"
+        assert_nil store.claim_workflow(workflow_id:, worker_id: "worker-d", lease_seconds: 30)
         assert_equal 0, store.steal_expired_leases!(now: Time.now)
       end
     end

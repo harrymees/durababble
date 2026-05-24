@@ -43,4 +43,33 @@ class DurababbleWorkflowTest < DurababbleTestCase
   test "does not expose the removed Workflow.define DSL" do
     assert_not_respond_to Durababble::Workflow, :define
   end
+
+  test "derives fallback names for anonymous workflows" do
+    anonymous_workflow = Class.new(Durababble::Workflow)
+
+    assert_match(/\A\d+\z/, anonymous_workflow.workflow_name)
+  end
+
+  test "ignores unknown pending durable macros while preserving method order identity" do
+    odd_workflow = Class.new(Durababble::Workflow)
+    odd_workflow.instance_variable_set(:@pending_durable_macro, [:unknown, {}])
+    odd_workflow.class_eval { def ignored_macro = true }
+    odd_workflow.class_eval do
+      def repeat(input) = input
+      step :repeat
+      step :repeat
+    end
+
+    assert_equal [:repeat], odd_workflow.step_order
+  end
+
+  test "passes positional arguments to workflow ref query methods" do
+    positional_query = Class.new(Durababble::Workflow) do
+      expose def describe(prefix)
+        "#{prefix}:#{@__durababble_ref_workflow_id}"
+      end
+    end
+
+    assert_equal "wf:wf-1", positional_query.ref("wf-1", store: Object.new).describe("wf")
+  end
 end

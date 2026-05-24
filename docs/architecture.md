@@ -109,7 +109,7 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
-- Worker polling skips failed rows with no retry due time. Explicit `Engine#resume` can still manually claim a failed workflow so operators or tests can retry it without making every failed row automatically runnable.
+- Claim paths skip retry rows whose `next_run_at` is still in the future. Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths; only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
 - Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
 - Event/timer completion uses a locked update so concurrent signalers wake a wait once.
@@ -150,6 +150,6 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 ## Coverage gate
 
-GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 88.3%, global branch coverage drops below 70.5%, per-file line coverage drops below 59%, or per-file branch coverage drops below 41%. These are initial ratchet thresholds from the current MySQL-backed CI suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output and result JSON.
+GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 90%, global branch coverage drops below 85%, per-file line coverage drops below 59%, or per-file branch coverage drops below 41%. These ratchet thresholds are based on the current MySQL-backed CI suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output and result JSON.
 
 See `docs/spec.md` for the guarantee and crash matrices implemented by tests.

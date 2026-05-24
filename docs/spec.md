@@ -35,9 +35,9 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Binary runtime payloads.** Runtime values (`input`, `result`, `context`, `payload`, state, arguments, kwargs, and heartbeat cursors) are serialized with Paquito into binary columns, not JSON/JSONB. PostgreSQL/YSQL stores these columns as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. The PostgreSQL/YSQL migration can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
 - **Durable workflow rows and step rows.** Workflows are durable before execution. Step identity is assigned by deterministic method execution order; method names are recorded as metadata and users do not pass step names at call sites.
 - **Append-only attempts.** Step attempts are append-only, including waits that transition to completed attempts. Retries and stale attempts remain inspectable.
-- **Runnable workflow queue.** Runnable workflows are represented by `pending` rows, `failed` rows whose `next_run_at` is due, or expired `running` leases that are recoverable.
+- **Runnable workflow queue.** Runnable workflows are represented by `pending` rows, retryable `failed` rows whose non-null `next_run_at` is due, or expired `running` leases that are recoverable. Terminal `failed` rows with no retry deadline are not claimable.
 - **Distributed workflow leases.** Workflow ownership is represented by `locked_by` and `locked_until` on the current schema's `workflows` table. Lease holders must re-check ownership before mutating durable workflow state.
-- **Lease-aware resume.** `Engine#resume` refuses to execute work owned by another live worker. Explicit resume can manually claim a failed workflow with no retry due time; worker polling still only auto-claims failed rows whose `next_run_at` is due.
+- **Lease-aware resume.** `Engine#resume` refuses to execute work owned by another live worker and honors retry backoff. Terminal failed workflows with no retry deadline remain terminal until a future explicit restart/retry API changes that state.
 - **Heartbeat extension.** Active workflow leases can be extended, including explicit step heartbeats with opaque cursor storage. Long-running steps do not heartbeat automatically; user code must call the provided heartbeat before the lease deadline or choose a long enough lease.
 - **Expired lease stealing.** Crashed workers are recovered by returning expired `running` workflows to `pending`.
 - **Resume semantics.** Completed steps are skipped; incomplete/running/failed/waiting steps are retried or continued according to durable state.
@@ -422,7 +422,7 @@ end
 
 `schedule: [1, 5, 30]` may be supplied for an explicit per-retry schedule; after the explicit array is exhausted, Durababble falls back to capped exponential backoff. Intervals are numeric seconds. `maximum_attempts:` counts the first execution plus retries. `non_retryable_errors:` accepts Ruby exception classes or class-name strings.
 
-On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, so retry delay survives process restarts and lease churn. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` and the error bubbles to workflow state.
+On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, and only treats `failed` rows as retryable when `next_run_at` is non-null and due, so retry delay survives process restarts and terminal failures remain terminal. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` with `next_run_at` cleared and the error bubbles to workflow state.
 
 ### Method/order step identity
 
@@ -671,12 +671,12 @@ The test suite must keep correctness claims evidence-backed:
 
 SimpleCov thresholds required by the CI coverage gate:
 
-- global line coverage: 88.3% minimum
-- global branch coverage: 70.5% minimum
+- global line coverage: 90% minimum
+- global branch coverage: 85% minimum
 - per-file line coverage: 59% minimum
 - per-file branch coverage: 41% minimum
 
-These are initial ratchet thresholds based on the current CI MySQL suite. They are below the target of 95% line coverage and 90% branch coverage because the current measured branch coverage is materially lower; meaningful tests should raise the configured minimums as coverage improves, and the minimums must not be lowered without an explicit spec update. The gate is `mise exec -- bundle exec rake test:coverage`. It enables branch coverage, measures library files under `lib/**/*.rb`, excludes tests and non-library support surfaces from the metric, excludes `lib/durababble/version.rb` because Bundler loads that gem metadata before SimpleCov starts, prints the SimpleCov summary in CI logs, and writes the HTML report plus SimpleCov result JSON to `coverage/` for CI artifact upload.
+These ratchet thresholds are based on the current CI MySQL suite. They remain below the target of 95% line coverage and 90% branch coverage, but the global line ratchet now enforces the 90% milestone and the global branch ratchet enforces the 85% milestone; meaningful tests should raise the configured minimums as coverage improves, and the minimums must not be lowered without an explicit spec update. The gate is `mise exec -- bundle exec rake test:coverage`. It enables branch coverage, measures library files under `lib/**/*.rb`, excludes tests and non-library support surfaces from the metric, excludes `lib/durababble/version.rb` because Bundler loads that gem metadata before SimpleCov starts, prints the SimpleCov summary in CI logs, and writes the HTML report plus SimpleCov result JSON to `coverage/` for CI artifact upload.
 
 ## Prototype boundaries and anti-goals
 

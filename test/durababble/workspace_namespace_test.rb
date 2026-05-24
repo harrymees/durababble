@@ -46,6 +46,12 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     end
   end
 
+  test "derives the default schema from a sanitized workspace root" do
+    with_env("DURABABBLE_SCHEMA" => nil, "DURABABBLE_WORKSPACE_ROOT" => "/tmp/Workspace With Caps") do
+      assert_match(/\Adurababble_/, Durababble.workspace_schema)
+    end
+  end
+
   test "configure and store connection use the selected default schema" do
     store = NamespaceStoreDouble.new
 

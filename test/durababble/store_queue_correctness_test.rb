@@ -13,7 +13,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
           "failed-middle",
           status: "failed",
           created_at: Time.now - 120,
-          next_run_at: Time.now - 120,
+          next_run_at: Time.now - 90,
         )
         expired_oldest = enqueue_workflow_at(
           "expired-oldest",

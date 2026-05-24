@@ -48,6 +48,7 @@ assertions focus on the implemented prototype tables and the high-risk target
 semantics that already have Ruby surface area.
 
 The terminal-state assertions cover completed, cancelled, and terminated
-workflow rows. Failed workflow rows are intentionally modeled as manually
-resumable, while retry backoff assertions still prove that pending or failed
-rows with a future `next_run_at` cannot be claimed early.
+workflow rows. Failed workflow rows are modeled as claimable only when they
+carry a non-null due `next_run_at`; retry backoff assertions prove that pending
+or failed rows with a future deadline cannot be claimed early and terminal
+failed rows with no retry deadline stay out of claim paths.
