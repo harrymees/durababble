@@ -141,6 +141,7 @@ account.balance
 - Worker polling with leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
 - Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Retry due-time claims distinguish retryable failures from terminal failed workflows.
 - Lease-routed workflow RPC helpers.
 - Deterministic simulation tests for workflow safety and crash-recovery scenarios.
 
