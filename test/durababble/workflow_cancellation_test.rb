@@ -39,16 +39,21 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
         store.migrate!
         cleanup_runs = 0
-        workflow = cancelable_workflow(
-          "cancel-waiting",
-          work: ->(input, _heartbeat) {
-            Durababble.wait_event("approval:#{input.fetch("id")}", input)
-          },
-          cleanup: ->(input) {
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "cancel-waiting"
+
+          def execute(input)
+            wait_event("approval:#{input.fetch("id")}", input)
+          rescue Durababble::CancellationError => e
+            cleanup_after_cancel(input.merge("reason" => e.reason))
+          end
+
+          define_method(:cleanup_after_cancel) do |input|
             cleanup_runs += 1
             { "cleaned" => input.fetch("reason") }
-          },
-        )
+          end
+          step :cleanup_after_cancel
+        end
         workflow_id = workflow.enqueue({ "id" => "wait" }, store:)
 
         waiting = Durababble::Engine.new(store:).resume(workflow, workflow_id:)

@@ -200,36 +200,33 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
-  test "virtual store keeps command history coherent for deferred waits and cancellation" do
+  test "virtual store keeps workflow wait history separate from command history and cancellation" do
     trace = Durababble::Deterministic::Trace.new
     scheduler = Durababble::Deterministic::Scheduler.new(seed: 61, trace:)
     store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
 
     workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
-    store.record_step_scheduled(workflow_id:, command_id: 0, name: "wait_for_event", args: ["evt"])
-    store.record_step_started(workflow_id:, command_id: 0, name: "wait_for_event")
-    store.record_wait(
+    store.record_workflow_wait(
       workflow_id:,
-      command_id: 0,
-      name: "wait_for_event",
-      wait_request: Durababble.wait_event("evt", { "started" => true }),
-      suspend_workflow: false,
+      position: 0,
+      wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "evt", context: { "started" => true }),
     )
 
-    assert_equal "running", store.workflow(workflow_id).fetch("status")
+    assert_equal "waiting", store.workflow(workflow_id).fetch("status")
     assert_equal 1, store.signal_event("evt", payload: { "finished" => true })
-    assert_equal "running", store.workflow(workflow_id).fetch("status")
+    assert_equal "pending", store.workflow(workflow_id).fetch("status")
+    store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
 
     store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
     store.record_step_started(workflow_id:, command_id: 1, name: "cancelable")
     store.record_step_canceled(workflow_id:, position: 1, error: "workflow cancellation requested")
 
     assert_equal(
-      ["step_scheduled", "step_started", "step_waiting", "step_completed", "step_scheduled", "step_started", "step_canceled"],
+      ["step_scheduled", "step_started", "step_canceled"],
       store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
     )
-    assert_equal ["completed", "canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+    assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
 
     pending_id = store.enqueue_workflow(name: "cancel-pending", input: {})
     first = store.request_workflow_cancellation(workflow_id: pending_id, reason: "first")
@@ -345,7 +342,6 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes messages, "multiple live attempts"
     assert_includes messages, "references missing step"
     assert_includes messages, "references missing workflow"
-    assert_includes messages, "non-completed step"
     assert_includes messages, "processing outbox"
   end
 

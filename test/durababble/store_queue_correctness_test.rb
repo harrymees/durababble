@@ -194,11 +194,10 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       with_durababble_store(backend, "queue_correctness") do |store|
         store.migrate!
         workflow_id = store.create_workflow(name: "stale-wait", input: {})
-        store.record_wait(
+        store.record_workflow_wait(
           workflow_id:,
           position: 0,
-          name: "wait_for_event",
-          wait_request: Durababble.wait_event("approval:stale", { "before" => true }),
+          wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "approval:stale", context: { "before" => true }),
         )
         store.complete_workflow(workflow_id, result: { "done" => true })
 

@@ -68,12 +68,12 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
-      handle_wait_request(WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:))
+      handle_wait_request("wait_until", WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:))
     end
 
     #: (untyped, ?untyped) -> untyped
     def wait_event(event_key, context = {})
-      handle_wait_request(WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:))
+      handle_wait_request("wait_event", WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:))
     end
 
     #: (untyped) { -> untyped } -> untyped
@@ -87,14 +87,22 @@ module Durababble
 
     private
 
-    #: (untyped) -> untyped
-    def handle_wait_request(wait_request)
+    #: (untyped, untyped) -> untyped
+    def handle_wait_request(operation, wait_request)
+      step_context = if const_defined?(:StepExecutionContext, false)
+        StepExecutionContext.current
+      end
+      if step_context
+        raise Error, "Durababble.#{operation} is workflow-level only and cannot be called from a durable step"
+      end
+
       execution = if const_defined?(:WorkflowExecutionContext, false)
         WorkflowExecutionContext.current
       end
       execution ||= Thread.current[:durababble_workflow_execution]
-      return wait_request unless execution
-      return wait_request if execution.step_context
+      unless execution
+        raise Error, "Durababble.#{operation} must be called from workflow execution"
+      end
 
       execution.wait(wait_request)
     end

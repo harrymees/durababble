@@ -83,7 +83,7 @@ class DurababbleEngineTest < DurababbleTestCase
             input.fetch("iterations").times do
               ctx = accumulate(ctx)
             end
-            finish(wait_for_release(ctx))
+            finish(wait_event("large-history:#{ctx.fetch("id")}", ctx))
           end
 
           define_method(:accumulate) do |ctx|
@@ -91,16 +91,11 @@ class DurababbleEngineTest < DurababbleTestCase
             ctx.merge("count" => ctx.fetch("count") + 1)
           end
 
-          define_method(:wait_for_release) do |ctx|
-            Durababble.wait_event("large-history:#{ctx.fetch("id")}", ctx)
-          end
-
           define_method(:finish) do |ctx|
             ctx.merge("finished" => true)
           end
 
           step :accumulate
-          step :wait_for_release
           step :finish
         end
         worker = Durababble::Worker.new(
@@ -117,7 +112,7 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
         assert_equal 75, side_effect_count
-        assert_equal 76, store.steps_for(workflow_id).length
+        assert_equal 75, store.steps_for(workflow_id).length
         assert_equal(
           75,
           store.steps_for(workflow_id).count do |step|
@@ -140,7 +135,7 @@ class DurababbleEngineTest < DurababbleTestCase
           },
         )
         assert_equal 75, side_effect_count
-        assert_equal 77, store.steps_for(workflow_id).length
+        assert_equal 76, store.steps_for(workflow_id).length
         assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
       end
     end

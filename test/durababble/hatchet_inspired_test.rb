@@ -64,15 +64,11 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
           workflow_name "suffix-shape-check"
 
           def execute(input)
-            wait_for_release(first_step(input))
+            wait_event("release:#{input.fetch("id")}", first_step(input).merge("waiting" => true))
           end
 
           step def first_step(input)
             input.merge("first" => true)
-          end
-
-          step def wait_for_release(input)
-            Durababble.wait_event("release:#{input.fetch("id")}", input.merge("waiting" => true))
           end
         end
         second_version = Class.new(Durababble::Workflow) do
@@ -96,10 +92,9 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         assert_equal "failed", run.status
         assert_match(/NonDeterminismError/, run.error)
-        assert_match(/without consuming durable command history/, run.error)
-        assert_match(/1:wait_for_release/, run.error)
+        assert_match(/without consuming durable workflow wait history/, run.error)
         assert_equal(
-          [["0", "first_step", "completed"], ["1", "wait_for_release", "completed"]],
+          [["0", "first_step", "completed"]],
           store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
       end
@@ -234,16 +229,16 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
       with_durababble_store(backend, "hatchet_inspired") do |store|
         store.migrate!
         wake_at = Time.utc(2026, 1, 1, 0, 0, 0)
-        workflow = durababble_test_workflow("sleep-then-event") do
-          test_step("sleep") do |ctx|
-            Durababble.wait_until(wake_at, ctx.merge("slept" => true))
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "sleep-then-event"
+
+          define_method(:execute) do |input|
+            slept = wait_until(wake_at, input.merge("slept" => true))
+            approved = wait_event("approval:#{slept.fetch("id")}", slept)
+            finish(approved)
           end
 
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx)
-          end
-
-          test_step("finish") do |ctx|
+          step def finish(ctx)
             ctx.merge("done" => true)
           end
         end
@@ -275,7 +270,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         )
         assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal(
-          ["completed", "completed", "completed"],
+          ["completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },
         )
       end
@@ -284,12 +279,14 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
     test "fans out one external event to all matching durable waiters with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
         store.migrate!
-        workflow = durababble_test_workflow("event-fanout") do
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("broadcast:ready", ctx)
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "event-fanout"
+
+          def execute(input)
+            finish(wait_event("broadcast:ready", input))
           end
 
-          test_step("finish") do |ctx|
+          step def finish(ctx)
             ctx.merge("finished" => true)
           end
         end

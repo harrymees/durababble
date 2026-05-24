@@ -209,12 +209,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
         allowed_indexes: ["steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
-      "record_wait" => {
+      "record_workflow_wait" => {
         call: lambda do
-          store.record_wait(
+          store.record_workflow_wait(
             workflow_id: "running-owned",
             position: 2,
-            name: "timer",
             wait_request: Durababble::WaitRequest.new(
               kind: "timer",
               wake_at: Time.now + 60,
@@ -223,18 +222,16 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["workflows_pkey"],
+        allow_post_filter_indexes: ["workflows_pkey"],
       },
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
-        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "workflows_pkey"],
       },
       "signal_event" => {
         call: -> { store.signal_event("target-event", payload: { "seen" => true }) },
-        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey"],
-        allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "workflows_pkey"],
       },
       "waits_for" => {
         call: -> { store.waits_for("running-owned") },
@@ -356,16 +353,16 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       SELECT 'attempt-' || i, 'running-owned', i % 10, 'step-' || (i % 10), CASE WHEN i % 10 = 0 THEN 'running' ELSE 'completed' END, decode('#{serialized_result}', 'hex'), now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 3000) AS i;
 
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'timer-wait-' || i, 'waiting-' || i, 0, 'timer', NULL, now() - interval '1 minute', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
+      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, scope, kind, event_key, wake_at, context, status, created_at)
+      SELECT 'timer-wait-' || i, 'waiting-' || i, 0, 'workflow', 'timer', NULL, now() - interval '1 minute', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
       FROM generate_series(1, 2000) AS i;
 
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'event-wait-' || i, 'waiting-' || i, 0, 'event', CASE WHEN i = 1 THEN 'target-event' ELSE 'other-event' END, NULL, decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
+      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, scope, kind, event_key, wake_at, context, status, created_at)
+      SELECT 'event-wait-' || i, 'waiting-' || i, 0, 'workflow', 'event', CASE WHEN i = 1 THEN 'target-event' ELSE 'other-event' END, NULL, decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
       FROM generate_series(1, 2000) AS i;
 
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'owned-wait-' || i, 'running-owned', i, 'timer', NULL, now() + interval '1 hour', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
+      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, scope, kind, event_key, wake_at, context, status, created_at)
+      SELECT 'owned-wait-' || i, 'running-owned', i, 'workflow', 'timer', NULL, now() + interval '1 hour', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
       FROM generate_series(1, 200) AS i;
 
       INSERT INTO #{quoted_schema}.fences (workflow_id, key, status, result, completed_at)

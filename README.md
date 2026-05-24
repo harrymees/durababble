@@ -161,7 +161,7 @@ handle.cancel(reason: "customer requested cancellation")
 
 ### Sleeping
 
-A workflow can park itself without keeping a worker thread busy. There are two different shapes:
+A workflow can park itself without keeping a worker thread busy. Waits are root workflow-level yield points, not step operations:
 
 - `wait_until(time, context)` is a timer wait. Use it when the workflow should resume at or after a known time.
 - `wait_event(event_key, context)` is an external event wait. Use it when the workflow should resume only after another process records a matching event with `store.signal_event`.
@@ -206,7 +206,7 @@ store.signal_event("approval:ord_123", payload: { "approved" => true })
 
 The `context` you pass to `wait_until` or `wait_event` is the base value Durababble resumes with when the wait completes. For event waits, the signal payload is merged into that resumed value, which is how the approval example receives `"approved" => true`.
 
-Workflow-level waits have their own durable history and do not create side-effect step rows. Step methods can still return wait requests for compatibility, but new workflow code should call `wait_until` or `wait_event` directly from `#execute` where the orchestration naturally needs to pause. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow.
+Workflow-level waits have their own durable history and do not create side-effect step rows. Call `wait_until` or `wait_event` from the root workflow `#execute` path where orchestration naturally needs to pause. Step methods must not wait, sleep, or return `WaitRequest` values; waits inside steps or child Async branches raise because a wait can last forever and would leave side-effecting step work in an unsafe state. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow.
 
 ### Cancellation
 

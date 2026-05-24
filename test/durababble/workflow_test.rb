@@ -36,14 +36,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     workflow_name "api-test-approval-workflow"
 
     def execute(input)
-      wait_for_approval(input)
-    end
-
-    step def wait_for_approval(input)
-      Durababble.wait_event(
-        "workflow:#{step_context.workflow_id}:command:approve",
-        input.merge("waiting_for" => "approve"),
-      )
+      wait_event("workflow:#{workflow_id}:command:approve", input.merge("waiting_for" => "approve"))
     end
 
     expose_command def approve(reason:)
@@ -202,6 +195,31 @@ class DurababbleWorkflowTest < DurababbleTestCase
           },
         )
         assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+      end
+    end
+
+    test "rejects waits from durable steps with #{backend.name}" do
+      with_durababble_store(backend, "workflow_waits") do |store|
+        store.migrate!
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "step-wait-rejected"
+
+          def execute(input)
+            wait_inside_step(input)
+          end
+
+          step def wait_inside_step(input)
+            wait_event("approval:#{input.fetch("id")}", input)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "step" })
+
+        run = Durababble::Engine.new(store:, worker_id: "step-wait-worker").resume(workflow, workflow_id:)
+
+        assert_equal "failed", run.status
+        assert_match(/workflow-level only/, run.error)
+        assert_empty store.waits_for(workflow_id)
+        assert_equal ["failed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
   end

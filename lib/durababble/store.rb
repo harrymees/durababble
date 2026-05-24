@@ -611,24 +611,7 @@ module Durababble
 
     #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
-      command_id = normalize_command_id(command_id, position)
-      transaction do
-        execute_params(<<~SQL, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
-          INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
-          VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
-          ON CONFLICT (workflow_id, position) DO UPDATE
-            SET status = 'waiting', result = $4::bytea, error = NULL, updated_at = now()
-        SQL
-        wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
-          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
-          VALUES ($1, $2, $3, 'step', $4, $5, $6::timestamptz, $7::bytea, 'pending')
-        SQL
-        update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
-        wait_id
-      end
+      raise Error, "step-scoped waits are not supported; record workflow-level waits with record_workflow_wait"
     end
 
     #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
@@ -908,6 +891,7 @@ module Durababble
             SELECT w.id FROM #{table("waits")} AS w
             JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
             WHERE w.status = 'pending'
+              AND w.scope = 'workflow'
               AND wf.status IN ('waiting', 'running')
               AND #{where_sql}
             FOR UPDATE OF w, wf SKIP LOCKED
@@ -916,10 +900,6 @@ module Durababble
         SQL
         rows = returning.map { |row| decode_row(row) }
         rows.each do |wait|
-          context = wait.fetch("context").merge(payload)
-          unless wait.fetch("scope", "step") == "workflow"
-            record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-          end
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         rows.length
@@ -1873,30 +1853,7 @@ module Durababble
 
     #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
-      command_id = normalize_command_id(command_id, position)
-      transaction do
-        serialized_context = dump_serialized(wait_request.context)
-        execute_params(<<~SQL, [workflow_id, command_id, name, serialized_context])
-          INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
-          VALUES (?, ?, ?, 'waiting', ?, NOW(6), NOW(6))
-          ON DUPLICATE KEY UPDATE status = 'waiting', result = VALUES(result), error = NULL, updated_at = NOW(6)
-        SQL
-        wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
-          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
-          VALUES (?, ?, ?, 'step', ?, ?, ?, ?, 'pending')
-        SQL
-        update_latest_attempt_serialized(
-          workflow_id:,
-          command_id:,
-          status: "waiting",
-          serialized_result: serialized_context,
-          error: nil,
-        )
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
-        wait_id
-      end
+      raise Error, "step-scoped waits are not supported; record workflow-level waits with record_workflow_wait"
     end
 
     #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
@@ -2150,16 +2107,13 @@ module Durababble
           SELECT w.* FROM #{table("waits")} AS w
           JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
           WHERE w.status = 'pending'
+            AND w.scope = 'workflow'
             AND wf.status IN ('waiting', 'running')
             AND #{where_sql}
           FOR UPDATE SKIP LOCKED
         SQL
         waits.each do |wait|
           execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
-          context = wait.fetch("context").merge(payload)
-          unless wait.fetch("scope", "step") == "workflow"
-            record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-          end
           execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
         end
         waits.length

@@ -133,9 +133,16 @@ class DurababbleHardeningTest < DurababbleTestCase
 
   test "signals a waiting event once under concurrent signalers" do
     store.migrate!
-    workflow = durababble_test_workflow("waiting") do
-      test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
-      test_step("done") { |ctx| ctx.merge("done" => true) }
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "waiting"
+
+      def execute(input)
+        done(wait_event("approval:#{input.fetch("id")}", input))
+      end
+
+      step def done(ctx)
+        ctx.merge("done" => true)
+      end
     end
     workflow_id = store.enqueue_workflow(name: "waiting", input: { "id" => "x" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
@@ -148,20 +155,27 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
   end
 
-  test "marks waiting step attempts completed when the wait is satisfied" do
+  test "workflow waits do not create waiting step attempts" do
     store.migrate!
-    workflow = durababble_test_workflow("waiting_attempt") do
-      test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-      test_step("done") { |ctx| ctx.merge("done" => true) }
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "waiting_attempt"
+
+      def execute(input)
+        done(wait_event("event:#{input.fetch("id")}", input))
+      end
+
+      step def done(ctx)
+        ctx.merge("done" => true)
+      end
     end
     workflow_id = store.enqueue_workflow(name: "waiting_attempt", input: { "id" => "attempt" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
-    assert_equal "waiting", store.step_attempts_for(workflow_id).first.fetch("status")
+    assert_empty store.step_attempts_for(workflow_id)
 
     store.signal_event("event:attempt", payload: { "ok" => true })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
 
-    assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+    assert_equal ["completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
   end
 
   test "recovers after a subprocess crashes at durable crash points" do

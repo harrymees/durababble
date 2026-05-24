@@ -69,14 +69,18 @@ class DurababbleCompleteTest < DurababbleTestCase
     test "implements timers, external event waits, and worker polling with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
         store.migrate!
-        workflow = durababble_test_workflow("waits") do
-          test_step("wait_for_time") do |ctx|
-            Durababble.wait_until(Time.now + 3600, ctx.merge("after_timer" => true))
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "waits"
+
+          def execute(input)
+            timed = wait_until(Time.now + 3600, input.merge("after_timer" => true))
+            evented = wait_event("approval:#{timed.fetch("request_id")}", timed.merge("after_event_wait" => true))
+            finish(evented)
           end
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("approval:#{ctx.fetch("request_id")}", ctx.merge("after_event_wait" => true))
+
+          step def finish(ctx)
+            ctx.merge("finished" => true)
           end
-          test_step("finish") { |ctx| ctx.merge("finished" => true) }
         end
 
         worker = Durababble::Worker.new(store:, workflows: { "waits" => workflow }, worker_id: "worker-a")
@@ -90,7 +94,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_equal ["completed", "waiting"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+        assert_empty store.step_attempts_for(workflow_id)
         assert_equal "approval:r1", store.waits_for(workflow_id).last.fetch("event_key")
 
         assert_equal 0, store.signal_event("approval:other", payload: {})
@@ -99,7 +103,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal "completed", store.workflow(workflow_id).fetch("status")
         assert_hash_includes store.workflow(workflow_id).fetch("result"), "finished" => true, "approved" => true
         assert_equal(
-          ["completed", "completed", "completed"],
+          ["completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },
         )
       end
@@ -142,9 +146,16 @@ class DurababbleCompleteTest < DurababbleTestCase
         )
         assert_equal 1, events.count("increment")
 
-        waiting = durababble_test_workflow("waiting") do
-          test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
-          test_step("done") { |ctx| ctx.merge("done" => true) }
+        waiting = Class.new(Durababble::Workflow) do
+          workflow_name "waiting"
+
+          def execute(input)
+            done(wait_event("event:#{input.fetch("id")}", input))
+          end
+
+          step def done(ctx)
+            ctx.merge("done" => true)
+          end
         end
         waiting_id = store.enqueue_workflow(name: "waiting", input: { "id" => "w1" })
         assert_raises(Durababble::InjectedCrash) do

@@ -134,7 +134,6 @@ module Durababble
     def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?) -> String
     def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> void
     def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?) -> void
-    def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool) -> String
     def record_workflow_wait: (workflow_id: String, position: Integer, wait_request: WaitRequest) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def wake_due_timers: (?now: Time) -> Integer
@@ -170,9 +169,10 @@ module Durababble
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
     def execute: (Input input) -> Output
+    def workflow_id: () -> String
     def step_context: () -> StepContext
-    def wait_until: (Time time, ?serialized_payload context) -> WaitRequest
-    def wait_event: (String event_key, ?serialized_payload context) -> WaitRequest
+    def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
+    def wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
   end
 
   class WorkflowRef[Input, Output]
@@ -247,6 +247,7 @@ module Durababble
   end
 
   class WorkflowExecution
+    attr_reader workflow_id: String
     attr_reader step_context: StepContext?
     def call_step: (Workflow[serialized_payload, serialized_payload] instance, method_name: Symbol, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) { () -> serialized_payload } -> serialized_payload
     def validate_replay_complete!: () -> void
@@ -400,6 +401,6 @@ module Durababble
   def self.workspace_schema: (?String? workspace_path, ?prefix: String) -> String
   def self.configure: (database_url: String, ?schema: String) -> Store
   def self.store: () -> Store
-  def self.wait_until: (Time time, ?serialized_payload context) -> WaitRequest
-  def self.wait_event: (String event_key, ?serialized_payload context) -> WaitRequest
+  def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
+  def self.wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
 end

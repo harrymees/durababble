@@ -65,15 +65,14 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "persists waits and wakes event waiters once with #{backend.name}" do
+    test "persists workflow waits and wakes event waiters once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         store.migrate!
         workflow_id = store.create_workflow(name: "waiter", input: { "start" => true })
-        wait_id = store.record_wait(
+        wait_id = store.record_workflow_wait(
           workflow_id:,
           position: 0,
-          name: "approval",
-          wait_request: Durababble.wait_event("approval:#{workflow_id}", { "before" => true }),
+          wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "approval:#{workflow_id}", context: { "before" => true }),
         )
 
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
@@ -88,11 +87,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal 0, store.signal_event("approval:#{workflow_id}", payload: { "approved" => false })
 
         assert_hash_includes store.workflow(workflow_id), "status" => "pending"
-        assert_hash_includes(
-          store.steps_for(workflow_id).first,
-          "status" => "completed",
-          "result" => { "before" => true, "approved" => true },
-        )
+        assert_empty store.steps_for(workflow_id)
         assert_hash_includes(
           store.waits_for(workflow_id).first,
           "status" => "completed",
@@ -101,15 +96,14 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "persists waits and wakes due timers once with #{backend.name}" do
+    test "persists workflow waits and wakes due timers once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         store.migrate!
         workflow_id = store.create_workflow(name: "timer", input: {})
-        wait_id = store.record_wait(
+        wait_id = store.record_workflow_wait(
           workflow_id:,
           position: 0,
-          name: "sleep",
-          wait_request: Durababble.wait_until(Time.utc(2026, 1, 1, 0, 0, 0), { "timer" => true }),
+          wait_request: Durababble::WaitRequest.new(kind: "timer", wake_at: Time.utc(2026, 1, 1, 0, 0, 0), event_key: nil, context: { "timer" => true }),
         )
 
         assert_equal 0, store.wake_due_timers(now: Time.utc(2025, 12, 31, 23, 59, 59))
@@ -118,7 +112,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal 1, store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 1))
         assert_equal 0, store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 2))
         assert_hash_includes store.workflow(workflow_id), "status" => "pending"
-        assert_hash_includes store.steps_for(workflow_id).first, "status" => "completed", "result" => { "timer" => true }
+        assert_empty store.steps_for(workflow_id)
       end
     end
 

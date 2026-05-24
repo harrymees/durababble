@@ -447,7 +447,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
       end
     end
 
-    test "raw Async wait loop does not let workflow suspension mask a sibling step failure with #{backend.name}" do
+    test "raw Async branches cannot perform workflow waits with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
         store.migrate!
 
@@ -473,7 +473,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           def wait_for_release(id)
             wait_event("masked-release:#{id}", { "id" => id })
           end
-          step :wait_for_release
 
           def fail_sibling(id)
             sleep(0.01)
@@ -485,12 +484,12 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         run = Durababble::Engine.new(store:, worker_id: "failure-worker").run(workflow, input: { "id" => "masked" })
 
         assert_equal "failed", run.status
-        assert_match(/boom masked/, run.error)
-        assert_equal [["wait_for_release", "waiting"], ["fail_sibling", "failed"]], store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] }
+        assert_match(/workflow waits must run from the root workflow task/, run.error)
+        assert_empty store.waits_for(run.id)
       end
     end
 
-    test "raw Async branch suspension does not prevent already scheduled siblings from completing with #{backend.name}" do
+    test "raw Async branch wait is rejected before it records a durable wait with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
         store.migrate!
 
@@ -508,7 +507,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           def wait_for_release(id)
             wait_event("raw-release:#{id}", { "id" => id })
           end
-          step :wait_for_release
 
           def persist_sibling(id)
             sleep(0.01)
@@ -518,27 +516,15 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         end
 
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "raw-w1" })
-        suspended = Durababble::Engine.new(store:, worker_id: "raw-wait-worker").resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store:, worker_id: "raw-wait-worker").resume(workflow, workflow_id:)
 
-        assert_equal "waiting", suspended.status
-        assert_equal(
-          [["wait_for_release", "waiting"], ["persist_sibling", "completed"]],
-          store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] },
-        )
-
-        assert_equal 1, store.signal_event("raw-release:raw-w1", payload: { "released" => true })
-        completed = Durababble::Engine.new(store:, worker_id: "raw-resume-worker").resume(workflow, workflow_id:)
-
-        assert_equal "completed", completed.status
-        assert_equal [{ "id" => "raw-w1", "released" => true }, { "sibling" => "raw-w1" }], completed.result
-        assert_equal(
-          ["step_scheduled", "step_started", "step_waiting", "step_scheduled", "step_started", "step_completed", "step_completed"],
-          store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
-        )
+        assert_equal "failed", run.status
+        assert_match(/workflow waits must run from the root workflow task/, run.error)
+        assert_empty store.waits_for(workflow_id)
       end
     end
 
-    test "suspended raw Async branch does not release the lease before root work completes with #{backend.name}" do
+    test "raw Async branch waits do not release the workflow lease with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
         store.migrate!
 
@@ -563,7 +549,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           def wait_for_release(id)
             wait_event("raw-root-release:#{id}", { "id" => id })
           end
-          step :wait_for_release
 
           def persist_sibling(id)
             sleep(0.01)
@@ -573,23 +558,15 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         end
 
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "w2" })
-        suspended = Durababble::Engine.new(store:, worker_id: "wait-worker").resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store:, worker_id: "wait-worker").resume(workflow, workflow_id:)
 
-        assert_equal "waiting", suspended.status
-        assert_equal(
-          [["persist_sibling", "completed"], ["wait_for_release", "waiting"]],
-          store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }.sort_by(&:first),
-        )
-
-        assert_equal 1, store.signal_event("raw-root-release:w2", payload: { "released" => true })
-        completed = Durababble::Engine.new(store:, worker_id: "resume-worker").resume(workflow, workflow_id:)
-
-        assert_equal "completed", completed.status
-        assert_equal [{ "id" => "w2", "released" => true }, { "sibling" => "w2" }], completed.result
+        assert_equal "failed", run.status
+        assert_match(/workflow waits must run from the root workflow task/, run.error)
+        assert_empty store.waits_for(workflow_id)
       end
     end
 
-    test "event delivered during deferred suspension is not lost with #{backend.name}" do
+    test "raw Async branch wait rejection wins before sibling signal delivery with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
         store.migrate!
         signal_counts = []
@@ -617,7 +594,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           def wait_for_release(id)
             wait_event("window-release:#{id}", { "id" => id })
           end
-          step :wait_for_release
 
           define_method(:signal_release) do |id|
             sleep(0.01)
@@ -629,15 +605,12 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         end
 
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "window" })
-        first = Durababble::Engine.new(store:, worker_id: "window-worker").resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store:, worker_id: "window-worker").resume(workflow, workflow_id:)
 
-        assert_equal [1], signal_counts
-        assert_equal "pending", first.status
-
-        completed = Durababble::Engine.new(store:, worker_id: "window-resume").resume(workflow, workflow_id:)
-
-        assert_equal "completed", completed.status
-        assert_equal [{ "id" => "window", "released" => true }, { "signals" => 1 }], completed.result
+        assert_equal "failed", run.status
+        assert_match(/workflow waits must run from the root workflow task/, run.error)
+        assert_empty store.waits_for(workflow_id)
+        assert_includes [[], [0]], signal_counts
       end
     end
 

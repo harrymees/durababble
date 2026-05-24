@@ -175,6 +175,11 @@ module Durababble
       __durababble_execution__.step_context
     end
 
+    #: () -> untyped
+    def workflow_id
+      @__durababble_ref_workflow_id || __durababble_execution__.workflow_id
+    end
+
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
       Durababble.wait_until(time, context)

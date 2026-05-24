@@ -152,7 +152,10 @@ module Durababble
   end
 
   class WorkflowExecution
-    TERMINAL_HISTORY_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
+    TERMINAL_HISTORY_KINDS = ["step_completed", "step_canceled"].freeze
+
+    #: untyped
+    attr_reader :workflow_id
 
     #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, completed_workflow_waits: untyped, root_task: untyped, ?crash_after: untyped) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, completed_workflow_waits:, root_task:, crash_after: nil)
@@ -246,6 +249,9 @@ module Durababble
     #: (untyped) -> untyped
     def wait(wait_request)
       assert_workflow_task!("workflow wait")
+      unless Async::Task.current == @root_task
+        raise Error, "workflow waits must run from the root workflow task"
+      end
       position = @workflow_wait_position
       @workflow_wait_position += 1
 
@@ -408,21 +414,7 @@ module Durababble
 
         output = StepExecutionContext.with_current(step_context) { block.call }
         if output.is_a?(WaitRequest)
-          assert_workflow_lease!
-          suspend_workflow = suspend_workflow_immediately?
-          synchronize_store do
-            @store.record_wait(
-              workflow_id: @workflow_id,
-              command_id:,
-              name: step.name,
-              wait_request: output,
-              suspend_workflow:,
-            )
-          end
-          crash!(:wait_recorded)
-          error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-          @futures.fetch(command_id).reject(error)
-          next
+          raise Error, "durable step #{step.name} returned a wait request; waits are workflow-level only"
         end
 
         assert_workflow_lease!
@@ -457,11 +449,6 @@ module Durababble
       ensure
         @step_contexts.delete(task)
       end
-    end
-
-    #: () -> bool
-    def suspend_workflow_immediately?
-      @workflow_task_count <= 1
     end
 
     #: (untyped, command_id: untyped, step: untyped) -> untyped
@@ -510,13 +497,6 @@ module Durababble
         case event.fetch("kind")
         when "step_completed"
           future.resolve(event.fetch("payload"))
-        when "step_waiting"
-          cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
-          if cancellation
-            future.reject(cancellation_error_from(cancellation))
-          else
-            future.reject(WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}"))
-          end
         when "step_canceled"
           cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
           future.reject(cancellation_error_from(cancellation, fallback_reason: event.fetch("error")))
