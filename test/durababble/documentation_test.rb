@@ -50,7 +50,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
       workflow_result = evaluate_readme_example(readme, "workflow-example", binding)
       object_result = evaluate_readme_example(readme, "durable-object-example", binding)
 
-      assert_equal("queryable", workflow_result)
+      assert_equal({ "payment_id" => "pay_card_123", "label_id" => "label_pay_card_123" }, workflow_result)
       assert_equal(1_000, object_result)
     ensure
       remove_readme_example_constants
