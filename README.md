@@ -6,7 +6,7 @@ The current library gives you two primitives:
 
 | Primitive | Use it for | Current API |
 | --- | --- | --- |
-| Durable workflows | One-off processes with durable steps, waits, retries, and results | `Durababble::Workflow`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
+| Durable workflows | One-off processes with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
 | Durable objects | Id-addressed state with durable command rows and explicit state updates | `Durababble::DurableObject`, `DurableObject.ref`, `expose`, `expose_command` |
 
 Durababble is not a production Temporal replacement. It is a correctness-oriented prototype for proving the Ruby API, SQL state machine, recovery behavior, and backend conformance before widening the product surface. Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
@@ -83,7 +83,7 @@ Set `DURABABBLE_YUGABYTE_DATABASE_URL` to include optional Yugabyte-backed tests
 
 ## Current API Examples
 
-Workflow code is deterministic orchestration in `#execute`; side-effecting methods become durable boundaries with `step`.
+Workflow code is deterministic orchestration in `#execute`; side-effecting methods become durable boundaries with `step`. Completed steps replay from persisted results, and replay shape checks fail with `Durababble::NonDeterminismError` if code reaches a different completed step method or returns before consuming completed history. Cancellation is cooperative: `Workflow.handle(run_id).cancel(reason:)` durably records a request and the next deterministic yield point raises `Durababble::CancellationError` inside workflow code. User code can rescue it, run durable cleanup steps, and finish the run as `canceled`; cleanup failures are recorded as workflow failures.
 
 <!-- README:workflow-example:start -->
 ```ruby
@@ -180,7 +180,19 @@ account.balance
 
 The README describes the implemented prototype. The spec also records the intended public direction so reviewers can distinguish current behavior from target behavior.
 
-- `Workflow.start`, `Workflow.handle`, `DurableObject.at`, and `DurableObject.tell` are the preferred future public spellings. The current implementation still uses `Workflow.enqueue`, `Workflow.ref`, `Engine#run`, and `DurableObject.ref`.
+- Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, class-method enqueueing, and current `Workflow.start` / `Workflow.handle` aliases.
+- First-class cooperative workflow cancellation through `Workflow.handle(...).cancel(reason:)`, persisted cancellation requests, `canceling` / `canceled` states, and replay-safe cleanup steps.
+- Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
+- PostgreSQL/YSQL and MySQL/MariaDB store implementations.
+- Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
+- Worker polling with leased workflow claims.
+- Heartbeats, stale lease recovery, and lease-aware resume.
+- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Retry due-time claims distinguish retryable failures from terminal failed workflows.
+- Lease-routed workflow RPC helpers.
+- Deterministic simulation tests for workflow safety and crash-recovery scenarios.
+
+- `DurableObject.at` and `DurableObject.tell` are the preferred future durable-object spellings. The current durable-object implementation still uses `DurableObject.ref`; workflow code supports both `Workflow.start` / `Workflow.handle` and lower-level `Workflow.enqueue` / `Workflow.ref` / `Engine#run`.
 - Workflow command methods currently persist command events; executing command bodies through the workflow owner and returning command results is target runtime work.
 - Full durable workflow signals (`signal def`, `wait_condition`) are target work. Implemented today are lower-level timer waits, event waits, and event signaling.
 - Durable-object commands persist command rows and execute inline in the current prototype. Per-object FIFO mailbox leasing, async `tell`, sleeps, and worker-driven object execution are target work.
