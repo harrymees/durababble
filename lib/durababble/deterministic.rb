@@ -2132,13 +2132,13 @@ module Durababble
         verify_outbox_invariants!(workflows_state, outbox_state)
       end
 
-      WORKFLOW_STATUSES = ["pending", "running", "waiting", "failed", "completed"].freeze
-      STEP_STATUSES = ["running", "waiting", "failed", "completed"].freeze
-      ATTEMPT_STATUSES = ["running", "waiting", "failed", "completed"].freeze
-      WAIT_STATUSES = ["pending", "completed"].freeze
+      WORKFLOW_STATUSES = ["pending", "running", "waiting", "failed", "completed", "canceling", "canceled"].freeze
+      STEP_STATUSES = ["running", "waiting", "failed", "completed", "canceled"].freeze
+      ATTEMPT_STATUSES = ["running", "waiting", "failed", "completed", "canceled"].freeze
+      WAIT_STATUSES = ["pending", "completed", "canceled"].freeze
       OUTBOX_STATUSES = ["pending", "processing", "processed"].freeze
       LIVE_ATTEMPT_STATUSES = ["running", "waiting"].freeze
-      TERMINAL_WORKFLOW_STATUSES = ["completed", "failed"].freeze
+      TERMINAL_WORKFLOW_STATUSES = ["completed", "failed", "canceled"].freeze
 
       #: (untyped) -> untyped
       def verify_workflow_invariants!(workflows_state)
