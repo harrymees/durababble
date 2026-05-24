@@ -107,6 +107,49 @@ class DurababbleWorkerTest < DurababbleTestCase
     end
   end
 
+  class ActivationDeferralStore < WorkerTestStore
+    attr_reader :completed_activations
+
+    def initialize(locked_until:)
+      super([])
+      @locked_until = locked_until
+      @activation_claimed = false
+      @completed_activations = []
+    end
+
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:)
+      return if @activation_claimed
+
+      @activation_claimed = true
+      {
+        "target_kind" => target_kinds.fetch(0),
+        "target_type" => target_types.fetch(0),
+        "target_id" => "wf-activated",
+        "status" => "running",
+        "locked_by" => worker_id,
+        "lease_seconds" => lease_seconds,
+      }
+    end
+
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+      @resumed << [:activation_claim, workflow_id, worker_id, lease_seconds]
+      nil
+    end
+
+    def workflow(workflow_id)
+      super.merge(
+        "id" => workflow_id,
+        "status" => "running",
+        "locked_by" => "other-worker",
+        "locked_until" => @locked_until.utc.iso8601(6),
+      )
+    end
+
+    def complete_target_activation(**kwargs)
+      @completed_activations << kwargs
+    end
+  end
+
   test "migrates by default and returns idle when no workflow is claimable" do
     store = WorkerTestStore.new([])
     worker = Durababble::Worker.new(store:, workflows: { "unit" => workflow }, worker_id: "worker-a")
@@ -151,6 +194,31 @@ class DurababbleWorkerTest < DurababbleTestCase
 
     assert_equal 2, worker.run_until_idle(max_ticks: 2)
     assert_equal 1, store.claims.length
+  end
+
+  test "defers target activation retry to the active workflow lease deadline" do
+    locked_until = Time.now + 45
+    store = ActivationDeferralStore.new(locked_until:)
+    worker = Durababble::Worker.new(
+      store:,
+      workflows: { "unit" => workflow },
+      worker_id: "worker-a",
+      lease_seconds: 17,
+      migrate: false,
+    )
+
+    assert_equal :worked, worker.tick
+    assert_equal [[:activation_claim, "wf-activated", "worker-a", 17]], store.resumed
+    assert_equal 1, store.completed_activations.length
+    completion = store.completed_activations.first
+    assert_hash_includes(
+      completion,
+      target_kind: "workflow",
+      target_type: "unit",
+      target_id: "wf-activated",
+      worker_id: "worker-a",
+    )
+    assert_in_delta locked_until.to_f, completion.fetch(:now).to_f, 0.001
   end
 
   private

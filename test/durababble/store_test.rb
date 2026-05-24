@@ -389,10 +389,13 @@ class DurababbleStoreTest < DurababbleTestCase
     )
 
     assert_match(/\A[0-9a-f-]{36}\z/, new_id)
-    assert_equal "signal:wf-1", new_connection.exec_params_calls.last.fetch(1)[8]
+    inbox_insert = new_connection.exec_params_calls.find do |sql, _params|
+      sql.include?("INSERT INTO") && sql.include?("inbox") && !sql.include?("target_activations")
+    end
+    assert_equal "signal:wf-1", inbox_insert.fetch(1)[8]
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "existing-inbox-id", "shape_hash" => shape_hash }]),
+      PgResult.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_inbox_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -405,7 +408,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "existing-inbox-id", "shape_hash" => "different" }]),
+        PgResult.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_inbox_message(
         target_kind: "workflow",
         target_type: "approval",

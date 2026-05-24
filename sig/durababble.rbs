@@ -58,6 +58,9 @@ module Durababble
   class FenceTimeout < Error
   end
 
+  class CommandTimeout < Error
+  end
+
   class IdempotencyKeyConflict < Error
   end
 
@@ -120,6 +123,7 @@ module Durababble
     def create_workflow: (name: String, input: serialized_payload) -> String
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
+    def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
     def heartbeat: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> bool
     def workflow_owned?: (workflow_id: String, worker_id: String) -> bool
     def release_worker_leases!: (worker_id: String) -> void
@@ -148,8 +152,12 @@ module Durababble
     def ack_outbox: (String outbox_id, worker_id: String) -> bool
     def outbox_message: (String outbox_id) -> workflow_row?
     def enqueue_inbox_message: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: serialized_payload, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?, ?retention_seconds: Numeric) -> String
+    def claim_target_activation: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time) -> workflow_row?
+    def complete_target_activation: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time) -> Object?
+    def target_activation: (target_kind: String, target_type: String, target_id: String) -> workflow_row?
     def claim_inbox_messages: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time) -> Array[workflow_row]
     def inbox_message: (String message_id) -> workflow_row?
+    def wait_for_inbox_message: (String message_id, ?poll_interval: Numeric, ?timeout: Numeric) -> serialized_payload
     def inbox_messages_for: (target_kind: String, target_type: String, target_id: String) -> Array[workflow_row]
     def workflow: (String workflow_id) -> workflow_row
     def steps_for: (String workflow_id) -> Array[workflow_row]
@@ -160,6 +168,8 @@ module Durababble
     def claim_object_command: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
     def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?) -> Object?
+    def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String) -> Object?
+    def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
   end
 
   class Workflow[Input, Output]
@@ -225,6 +235,7 @@ module Durababble
     def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
     def run: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
+    def drain_workflow_inbox: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?, ?limit: Integer) -> Integer
   end
 
   class Worker

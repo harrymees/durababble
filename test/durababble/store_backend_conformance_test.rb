@@ -256,6 +256,69 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "coalesces inbox messages into one target activation with #{backend.name}" do
+      with_durababble_store(backend, "target_activation") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        first = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+        )
+        second = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "second" } },
+        )
+
+        activation = store.claim_target_activation(worker_id: "activation-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        assert_hash_includes(
+          activation,
+          "target_kind" => "workflow",
+          "target_type" => "approval",
+          "target_id" => workflow_id,
+          "status" => "running",
+          "locked_by" => "activation-worker",
+        )
+        assert_nil store.claim_target_activation(worker_id: "other", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
+        assert_equal [first], claimed.map { |message| message.fetch("id") }
+        store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
+        store.complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker")
+
+        rearmed = store.claim_target_activation(worker_id: "activation-worker-2", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        assert_hash_includes rearmed, "target_id" => workflow_id, "locked_by" => "activation-worker-2"
+        remaining = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker-2", lease_seconds: 30, limit: 1)
+        assert_equal [second], remaining.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "does not claim future target activations until ready with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_future") do |store|
+        store.migrate!
+        ready_at = Time.now + 60
+        store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "future",
+          message_kind: "wake",
+          payload: { "wake" => true },
+          ready_at:,
+        )
+
+        assert_nil store.claim_target_activation(worker_id: "early", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], now: Time.now)
+        activation = store.claim_target_activation(worker_id: "late", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], now: ready_at + 1)
+        assert_hash_includes activation, "target_kind" => "object", "target_type" => "counter", "target_id" => "future", "locked_by" => "late"
+      end
+    end
+
     test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
       with_durababble_store(backend, "inbox_idempotency") do |store|
         store.migrate!

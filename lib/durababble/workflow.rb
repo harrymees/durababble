@@ -212,16 +212,22 @@ module Durababble
         kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
         @store.migrate!
+        current = @store.workflow(@workflow_id)
+        terminal_failed = current.fetch("status") == "failed" && current["next_run_at"].nil?
+        raise Error, "workflow #{@workflow_id} is terminal" if ["completed", "canceled"].include?(current.fetch("status")) || terminal_failed
+
+        idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
-        @store.enqueue_inbox_message(
+        message_id = @store.enqueue_inbox_message(
           target_kind: "workflow",
           target_type: @workflow_class.workflow_name,
           target_id: @workflow_id,
           message_kind: "workflow_command",
           method_name: method_name.to_s,
           payload:,
+          idempotency_key:,
         )
-        @store.signal_event("workflow:#{@workflow_id}:command:#{method_name}", payload:)
+        @store.wait_for_inbox_message(message_id)
       else
         super
       end

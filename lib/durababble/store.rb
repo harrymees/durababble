@@ -310,6 +310,29 @@ module Durababble
     end
 
     #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+      already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT * FROM #{table("workflows")}
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+      SQL
+      return decode_row(already_owned) if already_owned
+
+      row = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
+        UPDATE #{table("workflows")}
+        SET status = 'running', error = NULL, locked_by = $2,
+            locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+        WHERE id = $1
+          AND (
+            status IN ('pending', 'waiting', 'canceling')
+            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+            OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
+          )
+        RETURNING *
+      SQL
+      decode_row(row) if row
+    end
+
+    #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
       execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds])
         UPDATE #{table("workflows")}
@@ -798,6 +821,12 @@ module Durababble
           if existing
             raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
+            upsert_target_activation_without_transaction(
+              target_kind: existing.fetch("target_kind"),
+              target_type: existing.fetch("target_type"),
+              target_id: existing.fetch("target_id"),
+              ready_at: existing["ready_at"],
+            ) if activatable_inbox_status?(existing.fetch("status"))
             next existing.fetch("id")
           end
 
@@ -811,9 +840,75 @@ module Durababble
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13, $14::timestamptz)
           SQL
+          upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
           id
         end
       end
+    end
+
+    #: (worker_id: untyped, lease_seconds: untyped, ?target_kinds: untyped, ?target_types: untyped, ?now: untyped) -> untyped
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now)
+      return if target_kinds&.empty? || target_types&.empty?
+
+      filter = target_activation_filter(target_kinds:, target_types:)
+      row = retry_serialization_failures do
+        transaction do
+          candidates = []
+          candidates.concat(execute_params(<<~SQL, [timestamp(now)]).to_a)
+            SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
+            WHERE status = 'pending' AND ready_at <= $1::timestamptz
+              #{filter}
+            ORDER BY ready_at, created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidates.concat(execute_params(<<~SQL, [timestamp(now)]).to_a)
+            SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
+            WHERE status = 'running' AND locked_until < $1::timestamptz
+              #{filter}
+            ORDER BY ready_at, created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          SQL
+          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          next nil unless candidate
+
+          execute_params(<<~SQL, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
+            UPDATE #{table("target_activations")}
+            SET status = 'running',
+                locked_by = $4,
+                locked_until = now() + ($5::int * interval '1 second'),
+                updated_at = now()
+            WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+            RETURNING *
+          SQL
+        end
+      end
+      decode_row(row) if row
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?now: untyped) -> untyped
+    def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now)
+      transaction do
+        activation = execute_params(<<~SQL, [target_kind, target_type, target_id, worker_id]).first
+          SELECT 1 FROM #{table("target_activations")}
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+            AND status = 'running' AND locked_by = $4
+          FOR UPDATE
+        SQL
+        next nil unless activation
+
+        reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:)
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def target_activation(target_kind:, target_type:, target_id:)
+      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT * FROM #{table("target_activations")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+      SQL
+      decode_row(row) if row
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped) -> untyped
@@ -848,6 +943,25 @@ module Durababble
     def inbox_message(message_id)
       row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first
       decode_inbox_row(row) if row
+    end
+
+    #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
+      deadline = Time.now + timeout
+      loop do
+        message = inbox_message(message_id)
+        raise KeyError, "inbox message not found: #{message_id}" unless message
+
+        case message.fetch("status")
+        when "completed"
+          return message["result"]
+        when "failed", "dead_lettered"
+          raise Error, message["error"] || "inbox message #{message_id} failed"
+        end
+        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
+
+        sleep(poll_interval)
+      end
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
@@ -896,25 +1010,84 @@ module Durababble
         next nil unless command
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
-        execute_params(
+        updated = execute_params(
           "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
           [command_id, dump_serialized(result)],
         )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        updated
       end
     end
 
     #: (command_id: untyped, error: untyped, ?worker_id: untyped) -> untyped
     def fail_object_command(command_id:, error:, worker_id: nil)
-      if worker_id
-        execute_params(
-          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
-          [command_id, error, worker_id],
+      transaction do
+        command = lock_inbox_message_for_failure(command_id:, worker_id:)
+        next nil unless command
+
+        updated = execute_params(<<~SQL, [command_id, error])
+          UPDATE #{table("inbox")}
+          SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END,
+              error = $2,
+              locked_by = NULL,
+              locked_until = NULL,
+              dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
+              updated_at = now()
+          WHERE id = $1
+        SQL
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        updated
+      end
+    end
+
+    #: (message_id: untyped, workflow_id: untyped, result: untyped, worker_id: untyped) -> untyped
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+      transaction do
+        command = lock_inbox_message_for_completion(message_id:, worker_id:)
+        next nil unless command
+
+        append_workflow_history_without_transaction(
+          workflow_id:,
+          kind: "workflow_command_completed",
+          name: command["method_name"],
+          attempt_id: message_id,
+          payload: { "message_id" => message_id, "result" => result },
         )
-      else
-        execute_params(
-          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END, updated_at = now() WHERE id = $1",
-          [command_id, error],
+        updated = execute_params(
+          "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
+          [message_id, dump_serialized(result)],
         )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+        updated
+      end
+    end
+
+    #: (message_id: untyped, workflow_id: untyped, error: untyped, worker_id: untyped) -> untyped
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+      transaction do
+        command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
+        next nil unless command
+
+        append_workflow_history_without_transaction(
+          workflow_id:,
+          kind: "workflow_command_failed",
+          name: command["method_name"],
+          attempt_id: message_id,
+          payload: { "message_id" => message_id },
+          error:,
+        )
+        updated = execute_params(<<~SQL, [message_id, error])
+          UPDATE #{table("inbox")}
+          SET status = 'dead_lettered',
+              error = $2,
+              locked_by = NULL,
+              locked_until = NULL,
+              dead_lettered_at = now(),
+              updated_at = now()
+          WHERE id = $1
+        SQL
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+        updated
       end
     end
 
@@ -950,13 +1123,96 @@ module Durababble
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT 1 FROM #{table("inbox")}
+          SELECT * FROM #{table("inbox")}
           WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
           FOR UPDATE
         SQL
       else
-        execute_params("SELECT 1 FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
+        execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
       end
+    end
+
+    #: (message_id: untyped, worker_id: untyped) -> untyped
+    def lock_inbox_message_for_completion(message_id:, worker_id:)
+      execute_params(<<~SQL, [message_id, worker_id]).first
+        SELECT * FROM #{table("inbox")}
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+        FOR UPDATE
+      SQL
+    end
+
+    #: (command_id: untyped, worker_id: untyped) -> untyped
+    def lock_inbox_message_for_failure(command_id:, worker_id:)
+      if worker_id
+        execute_params(<<~SQL, [command_id, worker_id]).first
+          SELECT * FROM #{table("inbox")}
+          WHERE id = $1 AND status = 'running' AND locked_by = $2
+          FOR UPDATE
+        SQL
+      else
+        execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
+      ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
+      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_timestamp])
+        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
+        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+          SET status = CASE
+                WHEN #{table("target_activations")}.status = 'running' THEN #{table("target_activations")}.status
+                ELSE 'pending'
+              END,
+              ready_at = LEAST(#{table("target_activations")}.ready_at, EXCLUDED.ready_at),
+              updated_at = now()
+      SQL
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
+    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
+      head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT *
+        FROM #{table("inbox")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT 1
+        FOR UPDATE
+      SQL
+
+      if head && head.fetch("status") != "dead_lettered"
+        ready_at = target_activation_ready_at_for(head, now:)
+        set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+      else
+        execute_params(<<~SQL, [target_kind, target_type, target_id])
+          DELETE FROM #{table("target_activations")}
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SQL
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+      ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
+      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_timestamp])
+        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
+        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+          SET status = 'pending',
+              ready_at = EXCLUDED.ready_at,
+              locked_by = NULL,
+              locked_until = NULL,
+              updated_at = now()
+      SQL
+    end
+
+    #: (untyped, now: untyped) -> untyped
+    def target_activation_ready_at_for(row, now:)
+      return now if inbox_row_claimable?(row, now:)
+
+      row["ready_at"] || row["locked_until"] || now
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
@@ -985,7 +1241,28 @@ module Durababble
     def existing_inbox_message_for_idempotency(idempotency_key)
       return unless idempotency_key
 
-      execute_params("SELECT id, shape_hash FROM #{table("inbox")} WHERE idempotency_key = $1 FOR UPDATE", [idempotency_key]).first
+      execute_params("SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash FROM #{table("inbox")} WHERE idempotency_key = $1 FOR UPDATE", [idempotency_key]).first
+    end
+
+    #: (untyped) -> bool
+    def activatable_inbox_status?(status)
+      ["pending", "failed", "running"].include?(status)
+    end
+
+    #: (?target_kinds: untyped, ?target_types: untyped) -> untyped
+    def target_activation_filter(target_kinds:, target_types:)
+      filters = []
+      if target_kinds
+        kinds = target_kinds.map { |kind| @connection.escape_literal(kind) }.join(", ")
+        filters << "target_kind IN (#{kinds})"
+      end
+      if target_types
+        types = target_types.map { |type| @connection.escape_literal(type) }.join(", ")
+        filters << "target_type IN (#{types})"
+      end
+      return "" if filters.empty?
+
+      "AND #{filters.join(" AND ")}"
     end
 
     #: (untyped, now: untyped) -> untyped
@@ -1287,6 +1564,20 @@ module Durababble
           UNIQUE (target_kind, target_type, target_id, sequence)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
+          target_kind text NOT NULL,
+          target_type text NOT NULL,
+          target_id text NOT NULL,
+          status text NOT NULL,
+          ready_at timestamptz NOT NULL,
+          locked_by text,
+          locked_until timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (target_kind, target_type, target_id)
+        )
+      SQL
     end
 
     #: () -> untyped
@@ -1305,6 +1596,8 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
       execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
       execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS target_activations_queue_idx ON #{table("target_activations")} (status, ready_at, created_at)")
+      execute("CREATE INDEX IF NOT EXISTS target_activations_expired_idx ON #{table("target_activations")} (status, locked_until, created_at)")
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped
@@ -1354,6 +1647,8 @@ module Durababble
 
     #: (untyped) -> untyped
     def timestamp(time)
+      return time if time.is_a?(String)
+
       time.utc.iso8601(6)
     end
 
@@ -1558,7 +1853,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "inbox", "mailbox_sequences", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "target_activations", "inbox", "mailbox_sequences", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1683,6 +1978,36 @@ module Durababble
         execute_params(<<~SQL, [worker_id, lease_seconds, workflow_id])
           UPDATE #{table("workflows")}
           SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+        workflow(workflow_id)
+      end
+    end
+
+    #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+      already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT * FROM #{table("workflows")}
+        WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+      SQL
+      return decode_row(already_owned) if already_owned
+
+      transaction do
+        row = execute_params(<<~SQL, [workflow_id, worker_id]).first
+          SELECT id FROM #{table("workflows")}
+          WHERE id = ?
+            AND (
+              status IN ('pending', 'waiting', 'canceling')
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
+              OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
+            )
+          FOR UPDATE SKIP LOCKED
+        SQL
+        next unless row
+
+        execute_params(<<~SQL, [worker_id, lease_seconds, workflow_id])
+          UPDATE #{table("workflows")}
+          SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
           WHERE id = ?
         SQL
         workflow(workflow_id)
@@ -2194,6 +2519,12 @@ module Durababble
         if existing
           raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
+          upsert_target_activation_without_transaction(
+            target_kind: existing.fetch("target_kind"),
+            target_type: existing.fetch("target_type"),
+            target_id: existing.fetch("target_id"),
+            ready_at: existing["ready_at"],
+          ) if activatable_inbox_status?(existing.fetch("status"))
           next existing.fetch("id")
         end
 
@@ -2207,8 +2538,71 @@ module Durababble
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         SQL
+        upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
         id
       end
+    end
+
+    #: (worker_id: untyped, lease_seconds: untyped, ?target_kinds: untyped, ?target_types: untyped, ?now: untyped) -> untyped
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now)
+      return if target_kinds&.empty? || target_types&.empty?
+
+      transaction do
+        filter_sql, filter_params = target_activation_filter_sql(target_kinds:, target_types:)
+        candidates = []
+        candidates.concat(execute_params(<<~SQL, [now] + filter_params).to_a)
+          SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
+          WHERE status = 'pending' AND ready_at <= ?
+            #{filter_sql}
+          ORDER BY ready_at, created_at
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        SQL
+        candidates.concat(execute_params(<<~SQL, [now] + filter_params).to_a)
+          SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
+          WHERE status = 'running' AND locked_until < ?
+            #{filter_sql}
+          ORDER BY ready_at, created_at
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        SQL
+        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        next unless candidate
+
+        execute_params(<<~SQL, [worker_id, lease_seconds, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
+          UPDATE #{table("target_activations")}
+          SET status = 'running',
+              locked_by = ?,
+              locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND),
+              updated_at = NOW(6)
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        target_activation(target_kind: candidate.fetch("target_kind"), target_type: candidate.fetch("target_type"), target_id: candidate.fetch("target_id"))
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?now: untyped) -> untyped
+    def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now)
+      transaction do
+        activation = execute_params(<<~SQL, [target_kind, target_type, target_id, worker_id]).first
+          SELECT 1 FROM #{table("target_activations")}
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+            AND status = 'running' AND locked_by = ?
+          FOR UPDATE
+        SQL
+        next nil unless activation
+
+        reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:)
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def target_activation(target_kind:, target_type:, target_id:)
+      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT * FROM #{table("target_activations")}
+        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+      SQL
+      decode_row(row) if row
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped) -> untyped
@@ -2294,22 +2688,66 @@ module Durababble
           "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
           [dump_serialized(result), command_id],
         )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         MysqlResult.new([], 1)
       end
     end
 
     #: (command_id: untyped, error: untyped, ?worker_id: untyped) -> untyped
     def fail_object_command(command_id:, error:, worker_id: nil)
-      if worker_id
-        execute_params(
-          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)",
-          [error, command_id, worker_id],
-        )
-      else
+      transaction do
+        command = lock_inbox_message_for_failure(command_id:, worker_id:)
+        next nil unless command
+
         execute_params(
           "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?",
           [error, command_id],
         )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+      end
+    end
+
+    #: (message_id: untyped, workflow_id: untyped, result: untyped, worker_id: untyped) -> untyped
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+      transaction do
+        command = lock_inbox_message_for_completion(message_id:, worker_id:)
+        next nil unless command
+
+        append_workflow_history_without_transaction(
+          workflow_id:,
+          kind: "workflow_command_completed",
+          name: command["method_name"],
+          attempt_id: message_id,
+          payload: { "message_id" => message_id, "result" => result },
+        )
+        execute_params(
+          "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
+          [dump_serialized(result), message_id],
+        )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+        MysqlResult.new([], 1)
+      end
+    end
+
+    #: (message_id: untyped, workflow_id: untyped, error: untyped, worker_id: untyped) -> untyped
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+      transaction do
+        command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
+        next nil unless command
+
+        append_workflow_history_without_transaction(
+          workflow_id:,
+          kind: "workflow_command_failed",
+          name: command["method_name"],
+          attempt_id: message_id,
+          payload: { "message_id" => message_id },
+          error:,
+        )
+        execute_params(
+          "UPDATE #{table("inbox")} SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
+          [error, message_id],
+        )
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
       end
     end
 
@@ -2393,19 +2831,115 @@ module Durababble
           INDEX #{quote_ident(index_name("inbox", "ready"))} (status, ready_at, created_at)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
+          target_kind VARCHAR(32) NOT NULL,
+          target_type VARCHAR(191) NOT NULL,
+          target_id VARCHAR(191) NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          ready_at DATETIME(6) NOT NULL,
+          locked_by VARCHAR(191),
+          locked_until DATETIME(6),
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          PRIMARY KEY (target_kind, target_type, target_id),
+          INDEX #{quote_ident(index_name("target_activations", "queue"))} (status, ready_at, created_at),
+          INDEX #{quote_ident(index_name("target_activations", "expired"))} (status, locked_until, created_at)
+        )
+      SQL
     end
 
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT 1 FROM #{table("inbox")}
+          SELECT * FROM #{table("inbox")}
           WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
           FOR UPDATE
         SQL
       else
-        execute_params("SELECT 1 FROM #{table("inbox")} WHERE id = ? FOR UPDATE", [command_id]).first
+        execute_params("SELECT * FROM #{table("inbox")} WHERE id = ? FOR UPDATE", [command_id]).first
       end
+    end
+
+    #: (message_id: untyped, worker_id: untyped) -> untyped
+    def lock_inbox_message_for_completion(message_id:, worker_id:)
+      execute_params(<<~SQL, [message_id, worker_id]).first
+        SELECT * FROM #{table("inbox")}
+        WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        FOR UPDATE
+      SQL
+    end
+
+    #: (command_id: untyped, worker_id: untyped) -> untyped
+    def lock_inbox_message_for_failure(command_id:, worker_id:)
+      if worker_id
+        execute_params(<<~SQL, [command_id, worker_id]).first
+          SELECT * FROM #{table("inbox")}
+          WHERE id = ? AND status = 'running' AND locked_by = ?
+          FOR UPDATE
+        SQL
+      else
+        execute_params("SELECT * FROM #{table("inbox")} WHERE id = ? FOR UPDATE", [command_id]).first
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
+      ready_time = ready_at || Time.now.utc
+      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_time])
+        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        ON DUPLICATE KEY UPDATE
+          status = IF(status = 'running', status, 'pending'),
+          ready_at = LEAST(ready_at, VALUES(ready_at)),
+          updated_at = NOW(6)
+      SQL
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
+    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
+      head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT *
+        FROM #{table("inbox")}
+        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT 1
+        FOR UPDATE
+      SQL
+
+      if head && head.fetch("status") != "dead_lettered"
+        ready_at = target_activation_ready_at_for(head, now:)
+        set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+      else
+        execute_params(<<~SQL, [target_kind, target_type, target_id])
+          DELETE FROM #{table("target_activations")}
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+      ready_time = ready_at || Time.now.utc
+      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_time])
+        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        ON DUPLICATE KEY UPDATE
+          status = 'pending',
+          ready_at = VALUES(ready_at),
+          locked_by = NULL,
+          locked_until = NULL,
+          updated_at = NOW(6)
+      SQL
+    end
+
+    #: (untyped, now: untyped) -> untyped
+    def target_activation_ready_at_for(row, now:)
+      return now if inbox_row_claimable?(row, now:)
+
+      row["ready_at"] || row["locked_until"] || now
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
@@ -2433,7 +2967,29 @@ module Durababble
     def existing_inbox_message_for_idempotency(idempotency_key)
       return unless idempotency_key
 
-      execute_params("SELECT id, shape_hash FROM #{table("inbox")} WHERE idempotency_key = ? FOR UPDATE", [idempotency_key]).first
+      execute_params("SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash FROM #{table("inbox")} WHERE idempotency_key = ? FOR UPDATE", [idempotency_key]).first
+    end
+
+    #: (untyped) -> bool
+    def activatable_inbox_status?(status)
+      ["pending", "failed", "running"].include?(status)
+    end
+
+    #: (?target_kinds: untyped, ?target_types: untyped) -> untyped
+    def target_activation_filter_sql(target_kinds:, target_types:)
+      filters = []
+      params = []
+      if target_kinds
+        filters << "target_kind IN (#{target_kinds.map { "?" }.join(", ")})"
+        params.concat(target_kinds)
+      end
+      if target_types
+        filters << "target_type IN (#{target_types.map { "?" }.join(", ")})"
+        params.concat(target_types)
+      end
+      return ["", []] if filters.empty?
+
+      ["AND #{filters.join(" AND ")}", params]
     end
 
     #: (untyped) -> untyped

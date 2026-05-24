@@ -15,6 +15,7 @@ module Durababble
   class LeaseConflict < Error; end
   class NonDeterminismError < Error; end
   class FenceTimeout < Error; end
+  class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
 
   class CancellationError < Error
