@@ -19,7 +19,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           "workflows_queue",
         ],
         "failed workflow claim probe" => [
-          "SELECT id, created_at FROM #{table("workflows")} WHERE status = 'failed' AND (next_run_at IS NULL OR next_run_at <= NOW(6)) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+          "SELECT id, created_at FROM #{table("workflows")} WHERE status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
           "workflows_queue",
         ],
         "expired workflow claim probe" => [
@@ -118,7 +118,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, result, created_at, updated_at) VALUES ('completed-#{i}', 'demo', 'completed', #{empty}, #{result}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, created_at, updated_at) VALUES ('waiting-#{i}', 'demo', 'waiting', #{empty}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, created_at, updated_at) VALUES ('pending-#{i}', 'demo', 'pending', #{empty}, #{created_at}, #{created_at})")
-      execute("INSERT INTO #{table("workflows")} (id, name, status, input, created_at, updated_at) VALUES ('failed-#{i}', 'demo', 'failed', #{empty}, #{created_at}, #{created_at})")
+      execute("INSERT INTO #{table("workflows")} (id, name, status, input, next_run_at, created_at, updated_at) VALUES ('failed-#{i}', 'demo', 'failed', #{empty}, #{mysql_literal(now - 60)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-active-#{i}', 'demo', 'running', #{empty}, 'other', #{mysql_literal(now + 300)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-expired-#{i}', 'demo', 'running', #{empty}, 'stale', #{mysql_literal(now - 300)}, #{created_at}, #{created_at})")
       timer_wake_at = i == 1 ? now - 60 : now + 3600

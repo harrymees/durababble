@@ -35,7 +35,7 @@ The current prototype is not a production Temporal replacement. It is a correctn
 - **Binary runtime payloads.** Runtime values (`input`, `result`, `context`, `payload`, state, arguments, kwargs, and heartbeat cursors) are serialized with Paquito into binary columns, not JSON/JSONB. PostgreSQL/YSQL stores these columns as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. The PostgreSQL/YSQL migration can convert the earlier prototype's JSONB runtime columns into Paquito bytea columns.
 - **Durable workflow rows and step rows.** Workflows are durable before execution. Step identity is assigned by deterministic method execution order; method names are recorded as metadata and users do not pass step names at call sites.
 - **Append-only attempts.** Step attempts are append-only, including waits that transition to completed attempts. Retries and stale attempts remain inspectable.
-- **Runnable workflow queue.** Runnable workflows are represented by `pending` rows, `failed` rows whose `next_run_at` is due, or expired `running` leases that are recoverable.
+- **Runnable workflow queue.** Runnable workflows are represented by `pending` rows, retryable `failed` rows whose non-null `next_run_at` is due, or expired `running` leases that are recoverable. Terminal `failed` rows with no retry deadline are not claimable.
 - **Distributed workflow leases.** Workflow ownership is represented by `locked_by` and `locked_until` on the current schema's `workflows` table. Lease holders must re-check ownership before mutating durable workflow state.
 - **Lease-aware resume.** `Engine#resume` refuses to execute work owned by another live worker.
 - **Heartbeat extension.** Active workflow leases can be extended, including explicit step heartbeats with opaque cursor storage. Long-running steps do not heartbeat automatically; user code must call the provided heartbeat before the lease deadline or choose a long enough lease.
@@ -421,7 +421,7 @@ end
 
 `schedule: [1, 5, 30]` may be supplied for an explicit per-retry schedule; after the explicit array is exhausted, Durababble falls back to capped exponential backoff. Intervals are numeric seconds. `maximum_attempts:` counts the first execution plus retries. `non_retryable_errors:` accepts Ruby exception classes or class-name strings.
 
-On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, so retry delay survives process restarts and lease churn. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` and the error bubbles to workflow state.
+On a retryable failure, `Engine` records the current step attempt as failed, sets the workflow back to `pending`, clears `locked_by`/`locked_until`, and stores `next_run_at`. `claim_runnable_workflow` ignores pending/failed workflows whose `next_run_at` is still in the future, and only treats `failed` rows as retryable when `next_run_at` is non-null and due, so retry delay survives process restarts and terminal failures remain terminal. On the final failure, or for a non-retryable error, the workflow itself is marked `failed` with `next_run_at` cleared and the error bubbles to workflow state.
 
 ### Method/order step identity
 
