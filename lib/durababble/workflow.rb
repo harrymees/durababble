@@ -211,8 +211,16 @@ module Durababble
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
         kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
-        # For now exposed workflow commands are persisted as events; lease-routed RPC can back this later.
+        @store.migrate!
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
+        @store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          message_kind: "workflow_command",
+          method_name: method_name.to_s,
+          payload:,
+        )
         @store.signal_event("workflow:#{@workflow_id}:command:#{method_name}", payload:)
       else
         super

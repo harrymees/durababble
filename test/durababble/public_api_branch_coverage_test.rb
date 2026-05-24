@@ -94,6 +94,10 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       1
     end
 
+    def enqueue_inbox_message(**)
+      "inbox-1"
+    end
+
     def object_state(object_type:, object_id:)
       @state
     end

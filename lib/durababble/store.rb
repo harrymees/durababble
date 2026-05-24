@@ -11,6 +11,7 @@ require "digest"
 module Durababble
   class Store
     SERIALIZED_COLUMNS = ["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
+    DEFAULT_INBOX_RETENTION_SECONDS = 30 * 24 * 60 * 60
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
 
@@ -173,6 +174,7 @@ module Durababble
           PRIMARY KEY (object_type, object_id)
         )
       SQL
+      create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
           id text PRIMARY KEY,
@@ -787,25 +789,104 @@ module Durababble
       state
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped, ?retention_seconds: untyped) -> untyped
+    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, retention_seconds: DEFAULT_INBOX_RETENTION_SECONDS)
+      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+      retry_serialization_failures do
+        transaction do
+          existing = existing_inbox_message_for_idempotency(idempotency_key)
+          if existing
+            raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
+
+            next existing.fetch("id")
+          end
+
+          sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
+          id = SecureRandom.uuid
+          operation_id = id
+          execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts, retained_until(retention_seconds)])
+            INSERT INTO #{table("inbox")} (
+              id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+              operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts, retained_until
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13, $14::timestamptz)
+          SQL
+          id
+        end
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped) -> untyped
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now)
+      transaction do
+        rows = execute_params(<<~SQL, [target_kind, target_type, target_id, limit])
+          SELECT *
+          FROM #{table("inbox")}
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+          ORDER BY sequence
+          LIMIT $4
+          FOR UPDATE
+        SQL
+        claimable = contiguous_claimable_inbox_rows(rows, now:)
+        claimable.each do |row|
+          execute_params(<<~SQL, [row.fetch("id"), worker_id, lease_seconds])
+            UPDATE #{table("inbox")}
+            SET status = 'running',
+                attempts = attempts + 1,
+                locked_by = $2,
+                locked_until = now() + ($3::int * interval '1 second'),
+                updated_at = now()
+            WHERE id = $1
+          SQL
+        end
+        claimable.map { |row| decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [row.fetch("id")]).first) }
+      end
+    end
+
+    #: (untyped) -> untyped
+    def inbox_message(message_id)
+      row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first
+      decode_inbox_row(row) if row
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def inbox_messages_for(target_kind:, target_type:, target_id:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_inbox_row(row) }
+        SELECT * FROM #{table("inbox")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        ORDER BY sequence
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
-      id = SecureRandom.uuid
-      execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
-        INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
-        VALUES ($1, $2, $3, $4, $5::bytea, $6::bytea, 'pending')
-      SQL
-      id
+      enqueue_inbox_message(
+        target_kind: "object",
+        target_type: object_type,
+        target_id: object_id,
+        message_kind: "ask",
+        method_name: method_name.to_s,
+        payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
+      )
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
-      row = execute_params(<<~SQL, [command_id, worker_id, lease_seconds]).first
-        UPDATE #{table("durable_object_commands")}
-        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
-        WHERE id = $1 AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < now()))
-        RETURNING *
-      SQL
-      decode_row(row) if row
+      row = inbox_message(command_id)
+      return unless object_command_message?(row)
+      return object_command_row(row) unless row.key?("target_kind")
+
+      claimed = claim_inbox_messages(
+        target_kind: row.fetch("target_kind"),
+        target_type: row.fetch("target_type"),
+        target_id: row.fetch("target_id"),
+        worker_id:,
+        lease_seconds:,
+      ).first
+      return unless claimed&.fetch("id") == command_id
+
+      object_command_row(claimed)
     end
 
     #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
@@ -816,7 +897,7 @@ module Durababble
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now() WHERE id = $1",
+          "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
           [command_id, dump_serialized(result)],
         )
       end
@@ -826,12 +907,12 @@ module Durababble
     def fail_object_command(command_id:, error:, worker_id: nil)
       if worker_id
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
+          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
           [command_id, error, worker_id],
         )
       else
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL WHERE id = $1",
+          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END, updated_at = now() WHERE id = $1",
           [command_id, error],
         )
       end
@@ -869,13 +950,110 @@ module Durababble
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT 1 FROM #{table("durable_object_commands")}
+          SELECT 1 FROM #{table("inbox")}
           WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
           FOR UPDATE
         SQL
       else
-        execute_params("SELECT 1 FROM #{table("durable_object_commands")} WHERE id = $1 FOR UPDATE", [command_id]).first
+        execute_params("SELECT 1 FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
       end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id])
+        INSERT INTO #{table("mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
+        VALUES ($1, $2, $3, 0)
+        ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
+      SQL
+      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT last_sequence
+        FROM #{table("mailbox_sequences")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        FOR UPDATE
+      SQL
+      sequence = row.fetch("last_sequence").to_i + 1
+      execute_params(<<~SQL, [target_kind, target_type, target_id, sequence])
+        UPDATE #{table("mailbox_sequences")}
+        SET last_sequence = $4, updated_at = now()
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+      SQL
+      sequence
+    end
+
+    #: (untyped) -> untyped
+    def existing_inbox_message_for_idempotency(idempotency_key)
+      return unless idempotency_key
+
+      execute_params("SELECT id, shape_hash FROM #{table("inbox")} WHERE idempotency_key = $1 FOR UPDATE", [idempotency_key]).first
+    end
+
+    #: (untyped, now: untyped) -> untyped
+    def contiguous_claimable_inbox_rows(rows, now:)
+      claimable = []
+      rows.each do |row|
+        break unless inbox_row_claimable?(row, now:)
+
+        claimable << row
+      end
+      claimable
+    end
+
+    #: (untyped, now: untyped) -> bool
+    def inbox_row_claimable?(row, now:)
+      status = row.fetch("status")
+      return false if status == "dead_lettered"
+
+      if status == "running"
+        locked_until = row["locked_until"]
+        return false unless locked_until
+
+        return Time.parse(locked_until.to_s) < now
+      end
+
+      ready_at = row["ready_at"]
+      ready_at.nil? || Time.parse(ready_at.to_s) <= now
+    end
+
+    #: (untyped) -> bool
+    def object_command_message?(row)
+      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && row.fetch("message_kind") == "ask"))
+    end
+
+    #: (untyped) -> untyped
+    def object_command_row(row)
+      return row unless row.key?("payload")
+
+      payload = row.fetch("payload")
+      row.merge(
+        "object_type" => row.fetch("target_type"),
+        "object_id" => row.fetch("target_id"),
+        "method_name" => row["method_name"] || payload.fetch("method_name"),
+        "args" => payload.fetch("args"),
+        "kwargs" => payload.fetch("kwargs"),
+      )
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, method_name: untyped, payload: untyped) -> String
+    def inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+      Digest::SHA256.hexdigest(SERIALIZER.dump({
+        "target_kind" => target_kind,
+        "target_type" => target_type,
+        "target_id" => target_id,
+        "message_kind" => message_kind,
+        "method_name" => method_name,
+        "payload" => payload,
+      }))
+    end
+
+    #: (untyped) -> untyped
+    def retained_until(retention_seconds)
+      timestamp(Time.now + retention_seconds)
+    end
+
+    #: (untyped) -> untyped
+    def decode_inbox_row(row)
+      decode_row(row)
     end
 
     #: (untyped, untyped, untyped) -> untyped
@@ -1064,6 +1242,51 @@ module Durababble
       migrate_serialized_column!("durable_object_commands", "args", not_null: true)
       migrate_serialized_column!("durable_object_commands", "kwargs", not_null: true)
       migrate_serialized_column!("durable_object_commands", "result")
+      migrate_serialized_column!("inbox", "payload", not_null: true)
+      migrate_serialized_column!("inbox", "result")
+    end
+
+    #: () -> untyped
+    def create_inbox_tables!
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
+          target_kind text NOT NULL,
+          target_type text NOT NULL,
+          target_id text NOT NULL,
+          last_sequence bigint NOT NULL DEFAULT 0,
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (target_kind, target_type, target_id)
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("inbox")} (
+          id text PRIMARY KEY,
+          target_kind text NOT NULL,
+          target_type text NOT NULL,
+          target_id text NOT NULL,
+          sequence bigint NOT NULL,
+          message_kind text NOT NULL,
+          method_name text,
+          operation_id text NOT NULL,
+          idempotency_key text UNIQUE,
+          shape_hash text NOT NULL,
+          payload bytea NOT NULL,
+          status text NOT NULL,
+          attempts integer NOT NULL DEFAULT 0,
+          max_attempts integer,
+          ready_at timestamptz,
+          result bytea,
+          error text,
+          locked_by text,
+          locked_until timestamptz,
+          retained_until timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          completed_at timestamptz,
+          dead_lettered_at timestamptz,
+          UNIQUE (target_kind, target_type, target_id, sequence)
+        )
+      SQL
     end
 
     #: () -> untyped
@@ -1079,6 +1302,9 @@ module Durababble
       execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
       execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
       execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
+      execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
+      execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
+      execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped
@@ -1307,6 +1533,7 @@ module Durababble
           PRIMARY KEY (object_type, object_id)
         )
       SQL
+      create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
           id VARCHAR(191) PRIMARY KEY,
@@ -1331,7 +1558,7 @@ module Durababble
 
     #: () -> untyped
     def drop_schema!
-      ["durable_object_commands", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
+      ["durable_object_commands", "inbox", "mailbox_sequences", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
@@ -1959,34 +2186,101 @@ module Durababble
       state
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped, ?retention_seconds: untyped) -> untyped
+    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, retention_seconds: DEFAULT_INBOX_RETENTION_SECONDS)
+      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+      transaction do
+        existing = existing_inbox_message_for_idempotency(idempotency_key)
+        if existing
+          raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
+
+          next existing.fetch("id")
+        end
+
+        sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
+        id = SecureRandom.uuid
+        operation_id = id
+        execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), ready_at, max_attempts, retained_until(retention_seconds)])
+          INSERT INTO #{table("inbox")} (
+            id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+            operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts, retained_until
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        SQL
+        id
+      end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped) -> untyped
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now)
+      transaction do
+        rows = execute_params(<<~SQL, [target_kind, target_type, target_id, limit]).to_a
+          SELECT *
+          FROM #{table("inbox")}
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+          ORDER BY sequence
+          LIMIT ?
+          FOR UPDATE
+        SQL
+        claimable = contiguous_claimable_inbox_rows(rows, now:)
+        claimable.each do |row|
+          execute_params(<<~SQL, [worker_id, lease_seconds, row.fetch("id")])
+            UPDATE #{table("inbox")}
+            SET status = 'running',
+                attempts = attempts + 1,
+                locked_by = ?,
+                locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND),
+                updated_at = NOW(6)
+            WHERE id = ?
+          SQL
+        end
+        claimable.map { |row| decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [row.fetch("id")]).first) }
+      end
+    end
+
+    #: (untyped) -> untyped
+    def inbox_message(message_id)
+      row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [message_id]).first
+      decode_inbox_row(row) if row
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def inbox_messages_for(target_kind:, target_type:, target_id:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_inbox_row(row) }
+        SELECT * FROM #{table("inbox")}
+        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        ORDER BY sequence
+      SQL
+    end
+
     #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
-      id = SecureRandom.uuid
-      execute_params(<<~SQL, [id, object_type, object_id, method_name, dump_serialized(args), dump_serialized(kwargs)])
-        INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-      SQL
-      id
+      enqueue_inbox_message(
+        target_kind: "object",
+        target_type: object_type,
+        target_id: object_id,
+        message_kind: "ask",
+        method_name: method_name.to_s,
+        payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
+      )
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
-      transaction do
-        row = execute_params(<<~SQL, [command_id]).first
-          SELECT id FROM #{table("durable_object_commands")}
-          WHERE id = ? AND (status IN ('pending', 'failed') OR (status = 'running' AND locked_until < NOW(6)))
-          LIMIT 1
-          FOR UPDATE SKIP LOCKED
-        SQL
-        next unless row
+      row = inbox_message(command_id)
+      return unless object_command_message?(row)
 
-        execute_params(<<~SQL, [worker_id, lease_seconds, command_id])
-          UPDATE #{table("durable_object_commands")}
-          SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND)
-          WHERE id = ?
-        SQL
-        decode_row(execute_params("SELECT * FROM #{table("durable_object_commands")} WHERE id = ?", [command_id]).first)
-      end
+      claimed = claim_inbox_messages(
+        target_kind: row.fetch("target_kind"),
+        target_type: row.fetch("target_type"),
+        target_id: row.fetch("target_id"),
+        worker_id:,
+        lease_seconds:,
+      ).first
+      return unless claimed&.fetch("id") == command_id
+
+      object_command_row(claimed)
     end
 
     #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
@@ -1997,7 +2291,7 @@ module Durababble
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6) WHERE id = ?",
+          "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
           [dump_serialized(result), command_id],
         )
         MysqlResult.new([], 1)
@@ -2008,12 +2302,12 @@ module Durababble
     def fail_object_command(command_id:, error:, worker_id: nil)
       if worker_id
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)",
+          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)",
           [error, command_id, worker_id],
         )
       else
         execute_params(
-          "UPDATE #{table("durable_object_commands")} SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL WHERE id = ?",
+          "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?",
           [error, command_id],
         )
       end
@@ -2055,17 +2349,96 @@ module Durababble
       execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_ident(column_name)} #{column_type}")
     end
 
+    #: () -> untyped
+    def create_inbox_tables!
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
+          target_kind VARCHAR(32) NOT NULL,
+          target_type VARCHAR(191) NOT NULL,
+          target_id VARCHAR(191) NOT NULL,
+          last_sequence BIGINT NOT NULL DEFAULT 0,
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          PRIMARY KEY (target_kind, target_type, target_id)
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("inbox")} (
+          id VARCHAR(191) PRIMARY KEY,
+          target_kind VARCHAR(32) NOT NULL,
+          target_type VARCHAR(191) NOT NULL,
+          target_id VARCHAR(191) NOT NULL,
+          sequence BIGINT NOT NULL,
+          message_kind VARCHAR(32) NOT NULL,
+          method_name VARCHAR(191),
+          operation_id VARCHAR(191) NOT NULL,
+          idempotency_key VARCHAR(191) UNIQUE,
+          shape_hash VARCHAR(64) NOT NULL,
+          payload LONGBLOB NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          attempts INT NOT NULL DEFAULT 0,
+          max_attempts INT,
+          ready_at DATETIME(6),
+          result LONGBLOB,
+          error TEXT,
+          locked_by VARCHAR(191),
+          locked_until DATETIME(6),
+          retained_until DATETIME(6),
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          completed_at DATETIME(6),
+          dead_lettered_at DATETIME(6),
+          UNIQUE KEY #{quote_ident(index_name("inbox", "target_sequence_unique"))} (target_kind, target_type, target_id, sequence),
+          INDEX #{quote_ident(index_name("inbox", "target_status_sequence"))} (target_kind, target_type, target_id, status, sequence),
+          INDEX #{quote_ident(index_name("inbox", "target_sequence"))} (target_kind, target_type, target_id, sequence),
+          INDEX #{quote_ident(index_name("inbox", "ready"))} (status, ready_at, created_at)
+        )
+      SQL
+    end
+
     #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT 1 FROM #{table("durable_object_commands")}
+          SELECT 1 FROM #{table("inbox")}
           WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
           FOR UPDATE
         SQL
       else
-        execute_params("SELECT 1 FROM #{table("durable_object_commands")} WHERE id = ? FOR UPDATE", [command_id]).first
+        execute_params("SELECT 1 FROM #{table("inbox")} WHERE id = ? FOR UPDATE", [command_id]).first
       end
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id])
+        INSERT IGNORE INTO #{table("mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
+        VALUES (?, ?, ?, 0)
+      SQL
+      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT last_sequence
+        FROM #{table("mailbox_sequences")}
+        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        FOR UPDATE
+      SQL
+      sequence = row.fetch("last_sequence").to_i + 1
+      execute_params(<<~SQL, [sequence, target_kind, target_type, target_id])
+        UPDATE #{table("mailbox_sequences")}
+        SET last_sequence = ?, updated_at = NOW(6)
+        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+      SQL
+      sequence
+    end
+
+    #: (untyped) -> untyped
+    def existing_inbox_message_for_idempotency(idempotency_key)
+      return unless idempotency_key
+
+      execute_params("SELECT id, shape_hash FROM #{table("inbox")} WHERE idempotency_key = ? FOR UPDATE", [idempotency_key]).first
+    end
+
+    #: (untyped) -> untyped
+    def retained_until(retention_seconds)
+      Time.now.utc + retention_seconds
     end
 
     #: (workflow_id: untyped, command_id: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped

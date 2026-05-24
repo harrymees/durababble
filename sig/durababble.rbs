@@ -58,6 +58,9 @@ module Durababble
   class FenceTimeout < Error
   end
 
+  class IdempotencyKeyConflict < Error
+  end
+
   class CancellationError < Error
     attr_reader workflow_id: String?
     attr_reader reason: serialized_payload
@@ -144,6 +147,10 @@ module Durababble
     def claim_outbox: (worker_id: String, lease_seconds: Numeric) -> workflow_row?
     def ack_outbox: (String outbox_id, worker_id: String) -> bool
     def outbox_message: (String outbox_id) -> workflow_row?
+    def enqueue_inbox_message: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: serialized_payload, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?, ?retention_seconds: Numeric) -> String
+    def claim_inbox_messages: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time) -> Array[workflow_row]
+    def inbox_message: (String message_id) -> workflow_row?
+    def inbox_messages_for: (target_kind: String, target_type: String, target_id: String) -> Array[workflow_row]
     def workflow: (String workflow_id) -> workflow_row
     def steps_for: (String workflow_id) -> Array[workflow_row]
     def step_attempts_for: (String workflow_id) -> Array[workflow_row]

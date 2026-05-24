@@ -361,6 +361,62 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(KeyError) { store.workflow("missing") }
   end
 
+  test "handles postgres inbox idempotency branches" do
+    store = pg_store
+    shape_hash = store.send(
+      :inbox_shape_hash,
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      method_name: nil,
+      payload: { "approved" => true },
+    )
+    new_connection = ScriptedPgConnection.new(params_results: [
+      PgResult.new,
+      PgResult.new,
+      PgResult.new([{ "last_sequence" => "0" }]),
+      PgResult.new,
+      PgResult.new,
+    ])
+    new_id = pg_store(new_connection).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+
+    assert_match(/\A[0-9a-f-]{36}\z/, new_id)
+    assert_equal "signal:wf-1", new_connection.exec_params_calls.last.fetch(1)[8]
+
+    duplicate = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "id" => "existing-inbox-id", "shape_hash" => shape_hash }]),
+    ])).enqueue_inbox_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf-1",
+      message_kind: "workflow_signal",
+      payload: { "approved" => true },
+      idempotency_key: "signal:wf-1",
+    )
+    assert_equal "existing-inbox-id", duplicate
+
+    assert_raises(Durababble::IdempotencyKeyConflict) do
+      pg_store(ScriptedPgConnection.new(params_results: [
+        PgResult.new([{ "id" => "existing-inbox-id", "shape_hash" => "different" }]),
+      ])).enqueue_inbox_message(
+        target_kind: "workflow",
+        target_type: "approval",
+        target_id: "wf-1",
+        message_kind: "workflow_signal",
+        payload: { "approved" => true },
+        idempotency_key: "signal:wf-1",
+      )
+    end
+  end
+
   test "handles postgres fence replay, serialization migration, retry, and helper branches" do
     completed = { "status" => "completed", "result" => pg_dump({ "done" => true }), "error" => nil }
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }

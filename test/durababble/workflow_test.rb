@@ -112,6 +112,18 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
         ref = ApiTestApprovalWorkflow.ref(workflow_id, store:)
         assert_equal 1, ref.approve(reason: "operator")
+        workflow_messages = store.inbox_messages_for(
+          target_kind: "workflow",
+          target_type: ApiTestApprovalWorkflow.workflow_name,
+          target_id: workflow_id,
+        )
+        assert_equal 1, workflow_messages.length
+        assert_hash_includes(
+          workflow_messages.first,
+          "message_kind" => "workflow_command",
+          "method_name" => "approve",
+          "payload" => { "method" => "approve", "args" => [], "kwargs" => { reason: "operator" } },
+        )
         assert_equal :worked, worker.tick
 
         assert_hash_includes(

@@ -256,7 +256,7 @@ There's two kinds of RPCs you can expose: simple RPCs, and command RPCs.
 
 Simple RPCs are run in parallel and are not expected to ever mutate state on the workflow -- they aren't recorded durably, and so they can be lost. Use simple RPCs for reads, for things you need to be really cheap, or for situations where the workflow is the "owner" of another resource under the hood that doesn't record durable state in the workflow itself.
 
-Commands can mutate state on the workflow, and are thusly processed in serial and recorded and redelivered durably. Use commands for RPCs that *need* to make it to the workflow, and that change the way the workflow will behave moving forward, like editing local state.
+Commands can mutate state on the workflow, and are thusly processed in serial and recorded and redelivered durably. Use commands for RPCs that *need* to make it to the workflow, and that change the way the workflow will behave moving forward, like editing local state. Command calls are stored in the durable inbox for the workflow target; the current prototype also wakes the matching event wait compatibility path while the full workflow command executor is being hardened.
 
 Workflows can declare simple RPC methods with `expose` on the class, and commands RPC methods with `expose_command`.
 
@@ -317,7 +317,7 @@ Durababble then helps you RPC to these objects to read or write the state within
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
-Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after.
+Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after. Object commands are inbox messages ordered by a per-object mailbox sequence, so a later command cannot overtake a pending, backoff, or dead-lettered head message for the same object.
 
 <!-- README:durable-object-example:start -->
 
@@ -364,7 +364,7 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: records a command row and persists state changes
+account.credit(1_000) # durable command: records an inbox row and persists state changes
 account.balance       # query: reads latest persisted state
 ```
 

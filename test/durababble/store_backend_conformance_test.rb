@@ -170,6 +170,18 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           args: [1],
           kwargs: { "by" => 2 },
         )
+        assert_hash_includes(
+          store.inbox_message(command_id),
+          "id" => command_id,
+          "target_kind" => "object",
+          "target_type" => "counter",
+          "target_id" => "abc",
+          "message_kind" => "ask",
+          "method_name" => "increment",
+          "status" => "pending",
+        )
+        assert_equal 1, store.inbox_message(command_id).fetch("sequence").to_i
+        assert_equal 0, store.inbox_message(command_id).fetch("attempts").to_i
         claimed = store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
         assert_hash_includes(
           claimed,
@@ -184,6 +196,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
 
         store.complete_object_command(command_id:, result: { "count" => 3 })
+        assert_hash_includes store.inbox_message(command_id), "status" => "completed", "result" => { "count" => 3 }
         assert_nil store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
 
         fenced_command_id = store.enqueue_object_command(
@@ -209,6 +222,127 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           worker_id: "object-owner",
         )
         assert_equal 1, owner.cmd_tuples
+      end
+    end
+
+    test "allocates inbox sequences transactionally and drains only a contiguous ready prefix with #{backend.name}" do
+      with_durababble_store(backend, "inbox_sequence") do |store|
+        store.migrate!
+        blocked = store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "blocked",
+          message_kind: "wake",
+          payload: { "wake" => 1 },
+          ready_at: Time.now + 60,
+        )
+        ready = store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "blocked",
+          message_kind: "tell",
+          payload: { "tell" => 2 },
+        )
+
+        assert_equal [1, 2], store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "blocked").map { |message| message.fetch("sequence").to_i }
+        assert_equal [], store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2)
+        assert_hash_includes store.inbox_message(blocked), "status" => "pending"
+        assert_hash_includes store.inbox_message(ready), "status" => "pending"
+
+        future = Time.now + 120
+        due = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2, now: future)
+        assert_equal [blocked, ready], due.map { |message| message.fetch("id") }
+        assert_equal ["running", "running"], due.map { |message| message.fetch("status") }
+      end
+    end
+
+    test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
+      with_durababble_store(backend, "inbox_idempotency") do |store|
+        store.migrate!
+        first = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-1",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+        duplicate = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-1",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+
+        assert_equal first, duplicate
+        assert_equal [1], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: "wf-1").map { |message| message.fetch("sequence").to_i }
+
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.enqueue_inbox_message(
+            target_kind: "workflow",
+            target_type: "approval",
+            target_id: "wf-1",
+            message_kind: "workflow_signal",
+            payload: { "approved" => false },
+            idempotency_key: "signal:approval:wf-1",
+          )
+        end
+      end
+    end
+
+    test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
+      with_durababble_store(backend, "inbox_crash_after_commit") do |store|
+        store.migrate!
+        message_id = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-2",
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "reason" => "ok" },
+        )
+
+        recovered = Durababble::Store.connect(database_url: backend.database_url, schema:)
+        begin
+          assert_hash_includes(recovered.inbox_message(message_id), "status" => "pending")
+          assert_equal(1, recovered.inbox_message(message_id).fetch("sequence").to_i)
+          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-2", worker_id: "workflow-owner", lease_seconds: 30)
+          assert_equal([message_id], claimed.map { |message| message.fetch("id") })
+        ensure
+          recovered.close
+        end
+      end
+    end
+
+    test "allocates unique contiguous mailbox sequences under concurrent enqueue with #{backend.name}" do
+      with_durababble_store(backend, "inbox_concurrent") do |store|
+        store.migrate!
+        errors = Queue.new
+        threads = 6.times.map do |index|
+          Thread.new do
+            local = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              local.enqueue_inbox_message(
+                target_kind: "object",
+                target_type: "counter",
+                target_id: "concurrent",
+                message_kind: "tell",
+                payload: { "index" => index },
+              )
+            rescue StandardError => e
+              errors << e
+            ensure
+              local&.close
+            end
+          end
+        end
+        threads.each(&:join)
+        raise errors.pop unless errors.empty?
+
+        sequences = store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "concurrent").map { |message| message.fetch("sequence").to_i }.sort
+        assert_equal [1, 2, 3, 4, 5, 6], sequences
       end
     end
 
