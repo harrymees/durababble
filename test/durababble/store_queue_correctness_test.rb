@@ -7,7 +7,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "claims the oldest runnable workflow across pending, failed, and expired running queues with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         pending_newer = enqueue_workflow_at("pending-newer", status: "pending", created_at: Time.now - 60)
         failed_middle = enqueue_workflow_at(
           "failed-middle",
@@ -47,7 +46,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "does not hide the oldest expired workflow behind a newer more-expired lease with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         expired_oldest = enqueue_workflow_at(
           "expired-oldest",
           status: "running",
@@ -76,7 +74,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "does not steal an unexpired workflow lease from another worker via direct claim with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         workflow_id = enqueue_workflow_at(
           "active",
           status: "running",
@@ -94,7 +91,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "claims the oldest available outbox message across pending and expired processing queues with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
         active_processing = enqueue_outbox_at(
           workflow_id:,
@@ -136,7 +132,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "does not hide the oldest expired outbox message behind a newer more-expired lease with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
         expired_oldest = enqueue_outbox_at(
           workflow_id:,
@@ -176,7 +171,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "only acknowledges outbox messages for the worker that owns the lease with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
         outbox_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "ok" => true }, key: "outbox:ack-owner")
         claimed = store.claim_outbox(worker_id: "owner", lease_seconds: 60)
@@ -192,7 +186,6 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
     test "does not requeue a terminal workflow when a stale wait is signaled with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
-        store.migrate!
         workflow_id = store.create_workflow(name: "stale-wait", input: {})
         store.record_wait(
           workflow_id:,

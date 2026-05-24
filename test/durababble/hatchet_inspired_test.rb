@@ -7,7 +7,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "rejects replay when completed step history no longer matches workflow code with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         first_version = Class.new(Durababble::Workflow) do
           workflow_name "shape-check"
 
@@ -59,7 +58,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "rejects replay when current workflow stops before completed history is consumed with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         first_version = Class.new(Durababble::Workflow) do
           workflow_name "suffix-shape-check"
 
@@ -155,7 +153,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "rejects replay when completed steps are reordered by new workflow code with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         first_version = Class.new(Durababble::Workflow) do
           workflow_name "order-shape-check"
 
@@ -213,7 +210,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "runs a durable timer wait followed by an event wait with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         wake_at = Time.utc(2026, 1, 1, 0, 0, 0)
         workflow = durababble_test_workflow("sleep-then-event") do
           test_step("sleep") do |ctx|
@@ -264,7 +260,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "fans out one external event to all matching durable waiters with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         workflow = durababble_test_workflow("event-fanout") do
           test_step("wait_for_event") do |ctx|
             Durababble.wait_event("broadcast:ready", ctx)
@@ -301,7 +296,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "reuses an idempotent outbox child effect across a retried step with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        store.migrate!
         attempts = 0
         outbox_ids = []
         workflow = Class.new(Durababble::Workflow) do

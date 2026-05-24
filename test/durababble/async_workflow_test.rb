@@ -24,8 +24,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "raw Async scatter gather fanout schedules every branch before completions with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         # [DURABABBLE-CONCURRENCY-1] Concurrent workflow fibers schedule ordered durable commands before completions resolve.
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-fanout"
@@ -67,8 +65,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async reports a later branch failure after out-of-order branch completions with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-fanout-late-failure"
 
@@ -117,8 +113,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async continuation fanout replays dependent command order from completion history with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = raw_continuation_workflow("raw-continuation-replay")
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: [1, 2])
         store.claim_workflow(workflow_id:, worker_id: "raw-history-seeder", lease_seconds: 60)
@@ -142,8 +136,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "scheduled command shape is replay checked before a step starts with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         first_version = Class.new(Durababble::Workflow) do
           workflow_name "scheduled-shape"
 
@@ -183,8 +175,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async tasks propagate workflow context to durable steps with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-supported"
 
@@ -209,8 +199,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "step context propagates to raw Async children inside step bodies with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "step-context-raw-async-child"
 
@@ -256,8 +244,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "durable steps remain unavailable in raw Async children inside step bodies with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "step-child-durable-step-rejected"
 
@@ -290,8 +276,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "Sync and raw Async propagate workflow context to durable steps with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "sync-raw-async-supported"
 
@@ -317,8 +301,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "Async::Task#async propagates workflow context to durable steps with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "task-async-supported"
 
@@ -347,8 +329,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "transient raw Async tasks do not inherit workflow context with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "transient-raw-async-rejected"
 
@@ -379,8 +359,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "transient raw Async descendants do not regain workflow context with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "transient-descendant-raw-async-rejected"
 
@@ -413,8 +391,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async wait loop observes every task failure before raising the first failure with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-all-failures"
 
@@ -450,8 +426,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async wait loop does not let workflow suspension mask a sibling step failure with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-suspension-failure"
 
@@ -493,8 +467,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async branch suspension does not prevent already scheduled siblings from completing with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-parallel-wait-sibling"
 
@@ -541,8 +513,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "suspended raw Async branch does not release the lease before root work completes with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-parallel-wait-root-sibling"
 
@@ -592,7 +562,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "event delivered during deferred suspension is not lost with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
         signal_counts = []
 
         workflow = Class.new(Durababble::Workflow) do
@@ -644,8 +613,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "replay fails instead of hanging when history resolves an unscheduled command first with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "completion-before-unscheduled-command"
 
@@ -681,8 +648,6 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
     test "raw Async replay wakes waiters when sibling branch exits without scheduling historical command with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        store.migrate!
-
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-removed-branch-replay"
 

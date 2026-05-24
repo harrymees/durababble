@@ -11,6 +11,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_hardening_test_#{Process.pid}_#{SecureRandom.hex(4)}"
     @durababble_store = Durababble::Store.connect(database_url:, schema:)
+    @durababble_store.migrate!
   end
 
   def teardown
@@ -22,7 +23,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "claims each workflow exactly once across concurrent workers using separate connections" do
-    store.migrate!
     ids = 20.times.map { |i| store.enqueue_workflow(name: "counter", input: { "count" => i }) }
 
     # [DURABABBLE-LEASE-1] Concurrent pollers cannot obtain duplicate live ownership.
@@ -42,7 +42,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "enforces lease ownership before resuming a workflow" do
-    store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     claimed = store.claim_runnable_workflow(worker_id: "owner", lease_seconds: 60)
     assert_equal workflow_id, claimed.fetch("id")
@@ -57,7 +56,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "does not rewrite an unexpired workflow lease already owned by the same worker" do
-    store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     first_claim = store.claim_runnable_workflow(worker_id: "owner", lease_seconds: 60)
 
@@ -68,7 +66,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "does not leave a stale running attempt when retrying a step that crashed after start" do
-    store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 2 })
     workflow = counter_workflow
 
@@ -85,7 +82,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "preserves scalar step results and text columns that look parseable" do
-    store.migrate!
     workflow = durababble_test_workflow("123") do
       test_step("false") { |_ctx| false }
     end
@@ -101,7 +97,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "runs a fenced side effect only once under concurrent callers" do
-    store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     calls = Queue.new
 
@@ -119,7 +114,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "claims an outbox message once concurrently and reclaims it after lease expiry before ack" do
-    store.migrate!
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     outbox_id = store.enqueue_outbox(workflow_id:, topic: "notify", payload: { "n" => 1 }, key: "notify:once")
 
@@ -137,7 +131,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "signals a waiting event once under concurrent signalers" do
-    store.migrate!
     workflow = durababble_test_workflow("waiting") do
       test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
       test_step("done") { |ctx| ctx.merge("done" => true) }
@@ -155,7 +148,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "marks waiting step attempts completed when the wait is satisfied" do
-    store.migrate!
     workflow = durababble_test_workflow("waiting_attempt") do
       test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
       test_step("done") { |ctx| ctx.merge("done" => true) }
@@ -171,7 +163,6 @@ class DurababbleHardeningTest < DurababbleTestCase
   end
 
   test "recovers after a subprocess crashes at durable crash points" do
-    store.migrate!
     script = File.expand_path("../support/crash_runner.rb", __dir__)
 
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 4 })

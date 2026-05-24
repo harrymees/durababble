@@ -150,7 +150,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
-      store.migrate!
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
 
       store.record_step_started(workflow_id:, position: 0, name: "add_one")
@@ -166,7 +165,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "stores runtime values as Paquito bytea payloads instead of JSONB in Yugabyte" do
     with_yugabyte_store do |store|
-      store.migrate!
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
       store.complete_workflow(workflow_id, result: { "count" => 2 })
 
@@ -200,9 +198,7 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "creates queue and recovery indexes for production-sized tables in Yugabyte" do
-    with_yugabyte_store do |store|
-      store.migrate!
-
+    with_yugabyte_store do
       indexes = PG.connect(durababble_yugabyte_database_url) do |connection|
         connection.exec_params(<<~SQL, [schema]).map { |row| row.fetch("indexname") }
           SELECT indexname
@@ -227,7 +223,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "does not claim work when a worker pool has no registered workflow names" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
-      store.migrate!
       workflow_id = store.enqueue_workflow(name: "unserved", input: {})
 
       assert_nil store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 60, workflow_names: [])
@@ -237,8 +232,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "reports missing workflow lease and cursor lookups as absent" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
-      store.migrate!
-
       assert_raises_matching(KeyError, /missing/) { store.workflow("missing") }
       assert_nil store.current_workflow_lease("missing")
       assert_nil store.step_heartbeat_cursor(workflow_id: "missing", position: 0)
@@ -247,7 +240,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "can mark a workflow running under a concrete worker lease" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
-      store.migrate!
       workflow_id = store.enqueue_workflow(name: "demo", input: {})
 
       store.mark_workflow_running(workflow_id, worker_id: "owner", lease_seconds: 60)
@@ -270,7 +262,7 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "migrates legacy JSONB runtime columns into Paquito bytea columns in Yugabyte" do
-    with_yugabyte_store do |store|
+    with_yugabyte_store(migrate: false) do |store|
       connection = PG.connect(durababble_yugabyte_database_url)
       connection.exec("CREATE SCHEMA #{PG::Connection.quote_ident(schema)}")
       connection.exec(<<~SQL)
@@ -552,7 +544,7 @@ class DurababbleStoreTest < DurababbleTestCase
     Durababble::Store::SERIALIZER.dump(value).then { |bytes| "\\x#{bytes.unpack1("H*")}" }
   end
 
-  def with_yugabyte_store(&block)
+  def with_yugabyte_store(migrate: true, &block)
     skip_without_yugabyte!
     require "pg"
 
@@ -561,6 +553,6 @@ class DurababbleStoreTest < DurababbleTestCase
       database_url: durababble_yugabyte_database_url,
       default_schema_prefix: "durababble_yb",
     )
-    with_durababble_store(backend, "store_test", &block)
+    with_durababble_store(backend, "store_test", migrate:, &block)
   end
 end

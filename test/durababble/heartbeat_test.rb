@@ -7,7 +7,6 @@ class DurababbleHeartbeatTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "extends the workflow lease and stores an opaque cursor during a running step with #{backend.name}" do
       with_durababble_store(backend, "heartbeat_test") do |store|
-        store.migrate!
         test_store = store
         parse_lease_time = ->(value) { value.is_a?(Time) ? value : Time.parse(value) }
         observed = {}
@@ -36,7 +35,6 @@ class DurababbleHeartbeatTest < DurababbleTestCase
 
     test "passes the last heartbeat cursor into the next step invocation after lease expiry recovery with #{backend.name}" do
       with_durababble_store(backend, "heartbeat_test") do |store|
-        store.migrate!
         attempts = []
         workflow = durababble_test_workflow("heartbeat-cursor-resume") do
           test_step("download") do |_ctx, heartbeat|
@@ -65,7 +63,6 @@ class DurababbleHeartbeatTest < DurababbleTestCase
 
     test "rejects a zombie heartbeat after the worker misses its lease deadline with #{backend.name}" do
       with_durababble_store(backend, "heartbeat_test") do |store|
-        store.migrate!
         test_store = store
         expire_lease = ->(workflow_id) { expire_workflow_lease(workflow_id, test_store) }
         workflow = durababble_test_workflow("zombie-heartbeat") do
