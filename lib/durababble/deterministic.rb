@@ -852,28 +852,11 @@ module Durababble
           waits_state = h.store.instance_variable_get(:@waits)
           outbox_state = h.store.instance_variable_get(:@outbox)
 
-          workflows_state["bad-status-workflow"] = {
-            "id" => "bad-status-workflow",
-            "name" => "broken",
-            "status" => "mystery",
-            "input" => {},
-            "result" => nil,
-            "error" => nil,
-            "locked_by" => nil,
-            "locked_until" => nil,
-            "next_run_at" => nil,
-          }
-          workflows_state["partial-lease-workflow"] = {
-            "id" => "partial-lease-workflow",
-            "name" => "broken",
-            "status" => "pending",
-            "input" => {},
-            "result" => nil,
-            "error" => nil,
-            "locked_by" => "worker",
-            "locked_until" => nil,
-            "next_run_at" => nil,
-          }
+          workflows_state["bad-status"] = { "id" => "bad-status", "name" => "counter", "status" => "mystery", "input" => {}, "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
+          workflows_state["partial-lease"] = { "id" => "partial-lease", "name" => "counter", "status" => "pending", "input" => {}, "result" => nil, "error" => nil, "locked_by" => "worker-a", "locked_until" => nil, "next_run_at" => nil }
+          workflows_state["locked-terminal"] = { "id" => "locked-terminal", "name" => "counter", "status" => "completed", "input" => {}, "result" => nil, "error" => nil, "locked_by" => "worker-a", "locked_until" => 99, "next_run_at" => nil }
+          workflows_state["completed-live"] = { "id" => "completed-live", "name" => "counter", "status" => "completed", "input" => {}, "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
+
           steps_state[id][0] = {
             "workflow_id" => id,
             "position" => 0,
@@ -883,39 +866,108 @@ module Durababble
             "error" => nil,
             "heartbeat_cursor" => nil,
           }
-          steps_state[id][1] = {
-            "workflow_id" => id,
-            "position" => 9,
-            "name" => "duplicate_completed_a",
-            "status" => "completed",
-            "result" => {},
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          steps_state[id][2] = {
-            "workflow_id" => id,
-            "position" => 9,
-            "name" => "duplicate_completed_b",
-            "status" => "completed",
-            "result" => {},
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          steps_state[id][3] = {
-            "workflow_id" => "wrong-workflow",
-            "position" => 4,
-            "name" => "bad_identity",
-            "status" => "unknown",
+          steps_state["completed-live"][0] = {
+            "workflow_id" => "completed-live",
+            "position" => 0,
+            "name" => "live_after_terminal",
+            "status" => "running",
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
           }
-          steps_state["missing-step-workflow"][0] = {
-            "workflow_id" => "missing-step-workflow",
+          attempts_state["completed-live"] << {
+            "id" => "completed-live-attempt",
+            "workflow_id" => "completed-live",
             "position" => 0,
-            "name" => "missing_workflow",
+            "name" => "live_after_terminal",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          steps_state["shape"][0] = {
+            "workflow_id" => "shape",
+            "position" => 0,
+            "name" => "completed_a",
             "status" => "completed",
             "result" => {},
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          steps_state["shape"][1] = {
+            "workflow_id" => "shape",
+            "position" => 0,
+            "name" => "completed_b",
+            "status" => "completed",
+            "result" => {},
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          steps_state["shape"][2] = {
+            "workflow_id" => "shape",
+            "position" => 2,
+            "name" => "unknown_step",
+            "status" => "mystery",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          steps_state["shape"][3] = {
+            "workflow_id" => "shape",
+            "position" => 3,
+            "name" => "live_twice",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state["shape"] << {
+            "id" => "name-status-mismatch",
+            "workflow_id" => "shape",
+            "position" => 0,
+            "name" => "different",
+            "status" => "failed",
+            "result" => nil,
+            "error" => "different",
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state["shape"] << {
+            "id" => "unknown-attempt",
+            "workflow_id" => "other-shape",
+            "position" => 2,
+            "name" => "unknown_step",
+            "status" => "mystery",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state["shape"] << {
+            "id" => "live-a",
+            "workflow_id" => "shape",
+            "position" => 3,
+            "name" => "live_twice",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state["shape"] << {
+            "id" => "live-b",
+            "workflow_id" => "shape",
+            "position" => 3,
+            "name" => "live_twice",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "heartbeat_cursor" => nil,
+          }
+          attempts_state["missing-workflow"] << {
+            "id" => "missing-workflow-attempt",
+            "workflow_id" => "missing-workflow",
+            "position" => 0,
+            "name" => "missing",
+            "status" => "running",
+            "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
           }
@@ -926,46 +978,6 @@ module Durababble
             "name" => "missing_step",
             "status" => "running",
             "result" => nil,
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
-            "id" => "bad-status-attempt",
-            "workflow_id" => "wrong-workflow",
-            "position" => 3,
-            "name" => "bad_identity",
-            "status" => "unknown",
-            "result" => nil,
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
-            "id" => "duplicate-live-attempt-a",
-            "workflow_id" => id,
-            "position" => 0,
-            "name" => "orphaned_step",
-            "status" => "running",
-            "result" => nil,
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
-            "id" => "duplicate-live-attempt-b",
-            "workflow_id" => id,
-            "position" => 0,
-            "name" => "orphaned_step",
-            "status" => "waiting",
-            "result" => nil,
-            "error" => nil,
-            "heartbeat_cursor" => nil,
-          }
-          attempts_state["missing-attempt-workflow"] << {
-            "id" => "missing-workflow-attempt",
-            "workflow_id" => "missing-attempt-workflow",
-            "position" => 0,
-            "name" => "missing_workflow",
-            "status" => "completed",
-            "result" => {},
             "error" => nil,
             "heartbeat_cursor" => nil,
           }
@@ -980,8 +992,19 @@ module Durababble
             "payload" => nil,
             "status" => "completed",
           }
-          waits_state["bad-status-wait"] = {
-            "id" => "bad-status-wait",
+          waits_state["unknown-wait"] = {
+            "id" => "unknown-wait",
+            "workflow_id" => id,
+            "position" => 0,
+            "kind" => "event",
+            "event_key" => "unknown",
+            "wake_at" => nil,
+            "context" => {},
+            "payload" => nil,
+            "status" => "mystery",
+          }
+          waits_state["missing-workflow-wait"] = {
+            "id" => "missing-workflow-wait",
             "workflow_id" => "missing-workflow",
             "position" => 0,
             "kind" => "event",
@@ -989,17 +1012,17 @@ module Durababble
             "wake_at" => nil,
             "context" => {},
             "payload" => nil,
-            "status" => "unknown",
+            "status" => "pending",
           }
-          waits_state["completed-live-step-wait"] = {
-            "id" => "completed-live-step-wait",
-            "workflow_id" => id,
-            "position" => 0,
+          waits_state["completed-non-completed-step"] = {
+            "id" => "completed-non-completed-step",
+            "workflow_id" => "shape",
+            "position" => 3,
             "kind" => "event",
-            "event_key" => "live-step",
+            "event_key" => "live-twice",
             "wake_at" => nil,
             "context" => {},
-            "payload" => nil,
+            "payload" => {},
             "status" => "completed",
           }
           outbox_state["bad-outbox"] = {
@@ -1012,25 +1035,15 @@ module Durababble
             "locked_by" => nil,
             "locked_until" => nil,
           }
-          outbox_state["bad-status-outbox"] = {
-            "id" => "bad-status-outbox",
+          outbox_state["unknown-outbox"] = {
+            "id" => "unknown-outbox",
             "workflow_id" => id,
             "topic" => "email",
             "payload" => {},
-            "key" => "bad-status-outbox",
-            "status" => "unknown",
+            "key" => "unknown-outbox",
+            "status" => "mystery",
             "locked_by" => nil,
             "locked_until" => nil,
-          }
-          outbox_state["processing-outbox-with-lease"] = {
-            "id" => "processing-outbox-with-lease",
-            "workflow_id" => id,
-            "topic" => "email",
-            "payload" => {},
-            "key" => "processing-outbox-with-lease",
-            "status" => "processing",
-            "locked_by" => "sender",
-            "locked_until" => h.scheduler.time + 10,
           }
         end
       end
@@ -2273,13 +2286,13 @@ module Durababble
         verify_outbox_invariants!(workflows_state, outbox_state)
       end
 
-      WORKFLOW_STATUSES = ["pending", "running", "waiting", "failed", "completed", "canceled"].freeze
-      STEP_STATUSES = ["running", "waiting", "failed", "completed", "canceled"].freeze
-      ATTEMPT_STATUSES = ["running", "waiting", "failed", "completed", "canceled"].freeze
-      WAIT_STATUSES = ["pending", "completed", "canceled"].freeze
+      WORKFLOW_STATUSES = ["pending", "running", "waiting", "canceling", "canceled", "failed", "completed"].freeze
+      STEP_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
+      ATTEMPT_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
+      WAIT_STATUSES = ["pending", "canceled", "completed"].freeze
       OUTBOX_STATUSES = ["pending", "processing", "processed"].freeze
       LIVE_ATTEMPT_STATUSES = ["running", "waiting"].freeze
-      TERMINAL_WORKFLOW_STATUSES = ["completed", "failed", "canceled"].freeze
+      TERMINAL_WORKFLOW_STATUSES = ["completed", "canceled", "failed"].freeze
 
       #: (untyped) -> untyped
       def verify_workflow_invariants!(workflows_state)
