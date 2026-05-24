@@ -53,6 +53,36 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class BranchCommandStore
+    attr_reader :completed, :failed
+
+    def initialize(complete_result: Durababble::MysqlStore::MysqlResult.new([], 1))
+      @complete_result = complete_result
+      @completed = []
+      @failed = []
+    end
+
+    def migrate! = self
+    def object_state(object_type:, object_id:) = { "value" => 1 }
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:) = "cmd-1"
+    def claim_object_command(command_id:, worker_id:) = { "id" => command_id }
+
+    def complete_object_command(command_id:, result:, **_kwargs)
+      @completed << [command_id, result]
+      @complete_result
+    end
+
+    def fail_object_command(command_id:, error:, worker_id:)
+      @failed << [command_id, error, worker_id]
+    end
+  end
+
+  class CleanCommandObject < Durababble::DurableObject
+    expose_command def read_only
+      "unchanged"
+    end
+  end
+
   class RetryStateTestCounter < Durababble::DurableObject
     def initialize_state
       { "count" => 0 }
@@ -85,6 +115,33 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_nil store.state
     assert_nil store.completed
     assert_nil store.failed
+  end
+
+  test "derives fallback object types, ignores unknown macros, and saves state through the store" do
+    anonymous_object = Class.new(Durababble::DurableObject)
+    assert_match(/\A\d+\z/, anonymous_object.object_type)
+
+    odd_object = Class.new(Durababble::DurableObject)
+    odd_object.instance_variable_set(:@pending_durable_macro, [:unknown, {}])
+    odd_object.class_eval { def ignored_macro = true }
+
+    save_store = Object.new
+    saved = []
+    save_store.define_singleton_method(:save_object_state) { |**kwargs| saved << kwargs }
+    object = anonymous_object.new(durable_id: "obj-1", store: save_store)
+    object.update_state({ "saved" => true })
+    assert_equal [{ object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+  end
+
+  test "completes read-only commands and fails them when the completion lease is lost" do
+    clean_command_store = BranchCommandStore.new
+    clean_ref = CleanCommandObject.ref("clean", store: clean_command_store)
+    assert_equal "unchanged", clean_ref.read_only
+    assert_equal 1, clean_command_store.completed.length
+
+    lost_lease_store = BranchCommandStore.new(complete_result: Durababble::MysqlStore::MysqlResult.new([], 0))
+    assert_raises(Durababble::LeaseConflict) { CleanCommandObject.ref("lost", store: lost_lease_store).read_only }
+    assert_equal 1, lost_lease_store.failed.length
   end
 
   durababble_store_backends.each do |backend|
