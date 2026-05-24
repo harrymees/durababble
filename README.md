@@ -1,19 +1,23 @@
 # Durababble
 
-Durababble is a Ruby 4 durable-execution prototype for workflows and durable objects backed by SQL. It is for work that must survive process exits, retries, lease movement, and worker restarts without hiding the recovery model behind process-local state.
+Durababble is a Ruby 4 durable-execution prototype for workflows and durable objects backed by SQL. It is for work that might run for a long time and must survive process exits, retries, deploys, and other changes in which process is actually running the code.
 
-The current library gives you two primitives:
+The library gives you two primitives:
 
 | Primitive | Use it for | Current API |
 | --- | --- | --- |
-| Durable workflows | One-off processes with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
-| Durable objects | Id-addressed state with durable command rows and explicit state updates | `Durababble::DurableObject`, `DurableObject.ref`, `expose`, `expose_command` |
+| Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
+| Durable objects | Long-lived instances with durable state, like Cloudflare's Durable Objects | `Durababble::DurableObject`, `DurableObject.ref`, `expose`, `expose_command` |
 
-Durababble is not a production Temporal replacement. It is a correctness-oriented prototype for proving the Ruby API, SQL state machine, recovery behavior, and backend conformance before widening the product surface. Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
+Durababble is not a production Temporal replacement. It is a correctness-oriented prototype for proving the Ruby API, SQL state machine, recovery behavior, and backend conformance before widening the product surface.
+
+Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
 
 ## Why It Exists
 
-Ruby applications often need orchestration that is stronger than a background job retry loop but smaller than adopting a full external workflow platform. Durababble explores that middle ground:
+Applications often need orchestration that supports more sophisticated patterns than background jobs or non-durable actors, but deploying and running a whole durable workflow system is operationally undesirable. Instead, Durababble reuses robust backend storage for the durable part and orchestrates using this library.
+
+In this middle ground:
 
 - workflow code is ordinary Ruby with explicit durable `step` boundaries;
 - every durable boundary is persisted before and after execution;
