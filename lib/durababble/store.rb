@@ -11,7 +11,6 @@ require "digest"
 module Durababble
   class Store
     SERIALIZED_COLUMNS = ["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
-    DEFAULT_INBOX_RETENTION_SECONDS = 30 * 24 * 60 * 60
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
 
@@ -812,8 +811,8 @@ module Durababble
       state
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped, ?retention_seconds: untyped) -> untyped
-    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, retention_seconds: DEFAULT_INBOX_RETENTION_SECONDS)
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped
+    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil)
       shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       retry_serialization_failures do
         transaction do
@@ -833,12 +832,12 @@ module Durababble
           sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
           id = SecureRandom.uuid
           operation_id = id
-          execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts, retained_until(retention_seconds)])
+          execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts])
             INSERT INTO #{table("inbox")} (
               id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-              operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts, retained_until
+              operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13, $14::timestamptz)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
           SQL
           upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
           id
@@ -1324,11 +1323,6 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def retained_until(retention_seconds)
-      timestamp(Time.now + retention_seconds)
-    end
-
-    #: (untyped) -> untyped
     def decode_inbox_row(row)
       decode_row(row)
     end
@@ -1556,7 +1550,6 @@ module Durababble
           error text,
           locked_by text,
           locked_until timestamptz,
-          retained_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz,
@@ -2511,8 +2504,8 @@ module Durababble
       state
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped, ?retention_seconds: untyped) -> untyped
-    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, retention_seconds: DEFAULT_INBOX_RETENTION_SECONDS)
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped
+    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil)
       shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       transaction do
         existing = existing_inbox_message_for_idempotency(idempotency_key)
@@ -2531,12 +2524,12 @@ module Durababble
         sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
         id = SecureRandom.uuid
         operation_id = id
-        execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), ready_at, max_attempts, retained_until(retention_seconds)])
+        execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), ready_at, max_attempts])
           INSERT INTO #{table("inbox")} (
             id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-            operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts, retained_until
+            operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         SQL
         upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
         id
@@ -2820,7 +2813,6 @@ module Durababble
           error TEXT,
           locked_by VARCHAR(191),
           locked_until DATETIME(6),
-          retained_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
@@ -2990,11 +2982,6 @@ module Durababble
       return ["", []] if filters.empty?
 
       ["AND #{filters.join(" AND ")}", params]
-    end
-
-    #: (untyped) -> untyped
-    def retained_until(retention_seconds)
-      Time.now.utc + retention_seconds
     end
 
     #: (workflow_id: untyped, command_id: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped

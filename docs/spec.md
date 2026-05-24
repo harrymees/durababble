@@ -334,7 +334,6 @@ Durable operations use both library-generated keys and caller-provided keys:
 - Idempotency keys are scoped to worker pool, target, operation kind, method, and argument fingerprint, not just target id.
 - Same key plus same operation shape returns the existing handle/result or re-raises the saved error. Same key plus different operation shape raises `Durababble::IdempotencyKeyConflict`.
 - Caller timeout after a durable command, signal, or message commits does not cancel durable work. Retrying with the same idempotency key reattaches to the same row.
-- Completed idempotency and inbox rows have configurable retention. The default retention is 30 days unless a class or operation specifies a longer retention window.
 - Transient `expose` methods are not durable and must not accept idempotency keys.
 
 ### Fences
