@@ -174,5 +174,43 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal 1, counter.count
       end
     end
+
+    test "keeps a command idempotency key stable across retry with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_api") do |store|
+        store.migrate!
+        seen_keys = []
+        retrying_object = Class.new(Durababble::DurableObject) do
+          object_type "retrying_object"
+
+          def initialize_state
+            { "committed_attempts" => 0 }
+          end
+
+          define_method(:write_with_retry) do |value|
+            seen_keys << command_context.idempotency_key
+            update_state({
+              "committed_attempts" => current_state.fetch("committed_attempts") + 1,
+              "value" => value,
+            })
+            raise "transient command failure" if command_context.attempt_number == 1
+
+            current_state
+          end
+          expose_command :write_with_retry, retry: { maximum_attempts: 2, schedule: [0] }
+
+          expose def snapshot
+            current_state
+          end
+        end
+        object = retrying_object.ref("object-1", store:)
+
+        result = object.write_with_retry("persisted")
+
+        assert_equal({ "committed_attempts" => 1, "value" => "persisted" }, result)
+        assert_equal 2, seen_keys.length
+        assert_equal 1, seen_keys.uniq.length
+        assert_equal result, object.snapshot
+      end
+    end
   end
 end
