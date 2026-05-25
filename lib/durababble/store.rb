@@ -282,6 +282,38 @@ module Durababble
     def update_latest_attempt(workflow_id:, command_id:, status:, result:, error:)
       update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result: dump_serialized(result), error:)
     end
+
+    #: (untyped, untyped) -> untyped
+    def observe_claim_latency(row, queue)
+      return unless row&.key?("created_at")
+
+      created_at = row.fetch("created_at")
+      created_at = Time.parse(created_at.to_s) unless created_at.respond_to?(:to_time)
+      created_time = created_at.respond_to?(:to_time) ? created_at.to_time : created_at
+      Observability.record(
+        "durababble.queue.claim_latency",
+        [((Time.now - created_time) * 1000.0), 0].max,
+        "durababble.queue.name" => queue,
+        "durababble.store.backend" => Observability.store_backend(self),
+      )
+    rescue StandardError
+      nil
+    end
+
+    #: (untyped) -> untyped
+    def record_wait_latency(wait)
+      created_at = wait.fetch("created_at")
+      completed_at = wait["completed_at"] || Time.now
+      created_at = Time.parse(created_at.to_s) unless created_at.respond_to?(:to_time)
+      completed_at = Time.parse(completed_at.to_s) unless completed_at.respond_to?(:to_time)
+      Observability.record(
+        "durababble.wait.latency",
+        [((completed_at.to_time - created_at.to_time) * 1000.0), 0].max,
+        "durababble.wait.kind" => wait["kind"],
+      )
+    rescue StandardError
+      nil
+    end
   end
 end
 

@@ -77,6 +77,7 @@ module Durababble
           SQL
         end
       end
+      observe_claim_latency(row, "workflow") if row
       decode_row(row) if row
     end
 
@@ -129,11 +130,17 @@ module Durababble
 
     #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-      execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds])
+      result = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds])
         UPDATE #{table("workflows")}
         SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
       SQL
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
+      end
+      result
     end
 
     #: (workflow_id: untyped, worker_id: untyped) -> untyped
@@ -162,7 +169,9 @@ module Durababble
           SET status = 'pending', locked_by = NULL, locked_until = NULL
           WHERE status = 'processing' AND locked_by = $1
         SQL
-        { "workflows" => workflows, "outbox" => outbox }
+        released = { "workflows" => workflows, "outbox" => outbox }
+        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: workflows.to_i)
+        released
       end
     end
 
@@ -318,6 +327,7 @@ module Durababble
             locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_until < $1::timestamptz
       SQL
+      Observability.count("durababble.leases.expired_recovery", by: result.affected_rows.to_i)
       result.affected_rows
     end
 
@@ -427,6 +437,14 @@ module Durababble
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
         suspend_workflow(workflow_id:) if suspend_workflow
+        Observability.count(
+          "durababble.waits.started",
+          "durababble.workflow.id" => workflow_id,
+          "durababble.step.index" => command_id,
+          "durababble.step.name" => name,
+          "durababble.wait.kind" => wait_request.kind,
+          "durababble.wait.event_key" => wait_request.event_key,
+        )
         wait_id
       end
     end
@@ -486,6 +504,7 @@ module Durababble
         VALUES ($1, $2, $3, $4::bytea, $5, 'pending')
         ON CONFLICT (key) DO NOTHING
       SQL
+      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
       execute_params("SELECT id FROM #{table("outbox")} WHERE key = $1", [key]).first.fetch("id")
     end
 
@@ -520,12 +539,15 @@ module Durababble
           SQL
         end
       end
+      observe_claim_latency(row, "outbox") if row
       decode_row(row) if row
     end
 
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
-      execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2", [outbox_id, worker_id])
+      result = execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2", [outbox_id, worker_id])
+      Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
+      result
     end
 
     #: (object_type: untyped, object_id: untyped, state: untyped) -> untyped
@@ -900,10 +922,12 @@ module Durababble
     def finish_completed_waits(returning, payload)
       rows = returning.map { |row| decode_row(row) }
       rows.each do |wait|
+        record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
         execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'", [wait.fetch("workflow_id")])
       end
+      Observability.count("durababble.waits.completed", by: rows.length)
       rows.length
     end
 
