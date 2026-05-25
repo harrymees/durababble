@@ -182,6 +182,179 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class CloudflareCounterExample < Durababble::DurableObject
+    object_type "cloudflare_counter_example"
+
+    def initialize_state
+      { "value" => 0 }
+    end
+
+    expose_command def increment(amount = 1)
+      update_state("value" => current_state.fetch("value") + amount)
+    end
+
+    expose_command def decrement(amount = 1)
+      update_state("value" => current_state.fetch("value") - amount)
+    end
+
+    expose def value
+      current_state.fetch("value")
+    end
+  end
+
+  class CloudflareRpcTargetExample < Durababble::DurableObject
+    object_type "cloudflare_rpc_target_example"
+
+    def initialize_state
+      { "sessions" => {} }
+    end
+
+    expose_command def connect(session_id, metadata)
+      update_state(
+        "sessions" => current_state.fetch("sessions").merge(
+          session_id => metadata.merge("operation_id" => command_context.idempotency_key),
+        ),
+      )
+    end
+
+    expose def metadata_for(session_id)
+      current_state.fetch("sessions").fetch(session_id)
+    end
+  end
+
+  class CloudflareBatcherExample < Durababble::DurableObject
+    object_type "cloudflare_batcher_example"
+
+    def initialize_state
+      { "messages" => [], "flushes" => [] }
+    end
+
+    expose_command def add(message)
+      update_state(current_state.merge("messages" => current_state.fetch("messages") + [message]))
+    end
+
+    def on_wake(payload:)
+      messages = current_state.fetch("messages")
+      update_state(
+        "messages" => [],
+        "flushes" => current_state.fetch("flushes") + [
+          {
+            "messages" => messages,
+            "reason" => payload.fetch("reason"),
+          },
+        ],
+      )
+    end
+
+    expose def snapshot
+      current_state
+    end
+  end
+
+  class CloudflareTtlExample < Durababble::DurableObject
+    object_type "cloudflare_ttl_example"
+
+    def initialize_state
+      { "value" => nil, "expires_at" => nil, "expired" => false }
+    end
+
+    expose_command def put(value, expires_at:)
+      update_state("value" => value, "expires_at" => expires_at, "expired" => false)
+    end
+
+    def on_wake(payload:)
+      expires_at = current_state.fetch("expires_at")
+      return current_state unless expires_at && payload.fetch("now") >= expires_at
+
+      update_state("value" => nil, "expires_at" => nil, "expired" => true)
+    end
+
+    expose def snapshot
+      current_state
+    end
+  end
+
+  class CloudflareKvCoordinatorExample < Durababble::DurableObject
+    object_type "cloudflare_kv_coordinator_example"
+
+    def initialize_state
+      { "kv" => {}, "versions" => {} }
+    end
+
+    expose_command def put(key, value)
+      update_state(
+        "kv" => current_state.fetch("kv").merge(key => value),
+        "versions" => current_state.fetch("versions").merge(key => command_context.idempotency_key),
+      )
+    end
+
+    expose def get(key)
+      current_state.fetch("kv").fetch(key)
+    end
+
+    expose def version_for(key)
+      current_state.fetch("versions").fetch(key)
+    end
+  end
+
+  class CloudflareRoomExample < Durababble::DurableObject
+    object_type "cloudflare_room_example"
+
+    def initialize_state
+      { "sessions" => {}, "messages" => [] }
+    end
+
+    expose_command def join(session_id, metadata)
+      update_state(current_state.merge("sessions" => current_state.fetch("sessions").merge(session_id => metadata)))
+    end
+
+    expose_command def broadcast(body, from:)
+      update_state(
+        current_state.merge(
+          "messages" => current_state.fetch("messages") + [
+            {
+              "from" => from,
+              "body" => body,
+              "member_count" => current_state.fetch("sessions").length,
+            },
+          ],
+        ),
+      )
+    end
+
+    expose def members
+      current_state.fetch("sessions")
+    end
+
+    expose def transcript
+      current_state.fetch("messages")
+    end
+  end
+
+  class CloudflareReadableStreamExample < Durababble::DurableObject
+    object_type "cloudflare_readable_stream_example"
+
+    def initialize_state
+      { "chunks" => [], "cursor" => 0 }
+    end
+
+    expose_command def append_chunks(chunks)
+      update_state(current_state.merge("chunks" => current_state.fetch("chunks") + chunks))
+    end
+
+    expose_command def read_next(limit)
+      cursor = current_state.fetch("cursor")
+      next_cursor = [cursor + limit, current_state.fetch("chunks").length].min
+      chunk = current_state.fetch("chunks")[cursor...next_cursor]
+      update_state(current_state.merge("cursor" => next_cursor))
+      chunk
+    end
+
+    expose def cursor
+      current_state.fetch("cursor")
+    end
+  end
+
   test "does not execute a durable object command when no mailbox row can be claimed" do
     store = EmptyMailboxStore.new
     executor = Durababble::DurableObjectExecutor.new(
@@ -537,6 +710,130 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal ["dead_lettered", "pending"], messages.map { |message| message.fetch("status") }
         assert_nil store.object_state(object_type: failing_object.object_type, object_id: "object-1")
         assert_equal :idle, worker.tick
+      end
+    end
+
+    test "ports diverse Cloudflare durable object examples to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_examples") do |store|
+        worker = object_worker(
+          store,
+          CloudflareCounterExample,
+          CloudflareRpcTargetExample,
+          CloudflareBatcherExample,
+          CloudflareTtlExample,
+          CloudflareKvCoordinatorExample,
+          CloudflareRoomExample,
+          CloudflareReadableStreamExample,
+        )
+
+        counter = CloudflareCounterExample.ref("global", store:)
+        assert_equal(0, counter.value)
+
+        CloudflareCounterExample.tell("global", :increment, 3, store:)
+        CloudflareCounterExample.tell("global", :decrement, 1, store:)
+        wait_for_object_activation(CloudflareCounterExample, "global")
+        assert_equal(1, worker.run_until_idle)
+        assert_equal(2, counter.value)
+
+        CloudflareRpcTargetExample.tell(
+          "socket-worker",
+          :connect,
+          "session-1",
+          { "country" => "US", "plan" => "pro" },
+          store:,
+        )
+        wait_for_object_activation(CloudflareRpcTargetExample, "socket-worker")
+        assert_equal(1, worker.run_until_idle)
+        metadata = CloudflareRpcTargetExample.ref("socket-worker", store:).metadata_for("session-1")
+        assert_hash_includes(metadata, "country" => "US", "plan" => "pro")
+        assert_match(/\Adurababble:v1:object:cloudflare_rpc_target_example:socket-worker:command:/, metadata.fetch("operation_id"))
+
+        counter_messages = store.inbox_messages_for(target_kind: "object", target_type: CloudflareCounterExample.object_type, target_id: "global")
+        assert_equal(["increment", "decrement"], counter_messages.map { |message| message.fetch("method_name") })
+        assert_equal(["completed", "completed"], counter_messages.map { |message| message.fetch("status") })
+
+        CloudflareBatcherExample.tell("batcher", :add, "first", store:)
+        CloudflareBatcherExample.tell("batcher", :add, "second", store:)
+        wait_for_object_activation(CloudflareBatcherExample, "batcher")
+        assert_equal(1, worker.run_until_idle)
+        assert_equal({ "messages" => ["first", "second"], "flushes" => [] }, CloudflareBatcherExample.ref("batcher", store:).snapshot)
+
+        store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: CloudflareBatcherExample.object_type,
+          target_id: "batcher",
+          message_kind: "wake",
+          payload: { "reason" => "alarm" },
+        )
+        wait_for_object_activation(CloudflareBatcherExample, "batcher")
+        assert_equal(1, worker.run_until_idle)
+        assert_equal(
+          {
+            "messages" => [],
+            "flushes" => [{ "messages" => ["first", "second"], "reason" => "alarm" }],
+          },
+          CloudflareBatcherExample.ref("batcher", store:).snapshot,
+        )
+
+        CloudflareTtlExample.tell("cache-key", :put, "cached", expires_at: 100, store:)
+        wait_for_object_activation(CloudflareTtlExample, "cache-key")
+        assert_equal(1, worker.run_until_idle)
+        store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: CloudflareTtlExample.object_type,
+          target_id: "cache-key",
+          message_kind: "wake",
+          payload: { "now" => 99 },
+        )
+        wait_for_object_activation(CloudflareTtlExample, "cache-key")
+        assert_equal(1, worker.run_until_idle)
+        assert_equal({ "value" => "cached", "expires_at" => 100, "expired" => false }, CloudflareTtlExample.ref("cache-key", store:).snapshot)
+
+        store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: CloudflareTtlExample.object_type,
+          target_id: "cache-key",
+          message_kind: "wake",
+          payload: { "now" => 101 },
+        )
+        wait_for_object_activation(CloudflareTtlExample, "cache-key")
+        assert_equal(1, worker.run_until_idle)
+        assert_equal({ "value" => nil, "expires_at" => nil, "expired" => true }, CloudflareTtlExample.ref("cache-key", store:).snapshot)
+
+        CloudflareKvCoordinatorExample.tell("namespace", :put, "feature:enabled", true, store:, idempotency_key: "kv-put-1")
+        wait_for_object_activation(CloudflareKvCoordinatorExample, "namespace")
+        assert_equal(1, worker.run_until_idle)
+        reopened = Durababble::Store.connect(database_url: backend.database_url, schema:)
+        begin
+          kv = CloudflareKvCoordinatorExample.ref("namespace", store: reopened)
+          assert_equal(true, kv.get("feature:enabled"))
+          assert_match(/\Adurababble:v1:object:cloudflare_kv_coordinator_example:namespace:command:/, kv.version_for("feature:enabled"))
+        ensure
+          reopened.close
+        end
+
+        CloudflareRoomExample.tell("lobby", :join, "session-a", { "name" => "Ada" }, store:)
+        CloudflareRoomExample.tell("lobby", :join, "session-b", { "name" => "Grace" }, store:)
+        CloudflareRoomExample.tell("lobby", :broadcast, "hello", from: "session-a", store:)
+        wait_for_object_activation(CloudflareRoomExample, "lobby")
+        assert_equal(1, worker.run_until_idle)
+        room = CloudflareRoomExample.ref("lobby", store:)
+        assert_equal(["session-a", "session-b"], room.members.keys)
+        assert_equal([{ "from" => "session-a", "body" => "hello", "member_count" => 2 }], room.transcript)
+
+        CloudflareReadableStreamExample.tell("feed", :append_chunks, ["a", "b", "c"], store:)
+        wait_for_object_activation(CloudflareReadableStreamExample, "feed")
+        assert_equal(1, worker.run_until_idle)
+        reader = call_object_command_async(backend, CloudflareReadableStreamExample, "feed", [:read_next, 2])
+        wait_for_object_activation(CloudflareReadableStreamExample, "feed")
+        run_worker_until_result(worker, reader.fetch(:queue))
+        status, chunk = reader.fetch(:queue).pop
+        reader.fetch(:thread).join
+        assert_equal(:ok, status)
+        assert_equal(["a", "b"], chunk)
+        assert_equal(2, CloudflareReadableStreamExample.ref("feed", store:).cursor)
+      ensure
+        reader&.fetch(:thread)&.kill if reader&.fetch(:thread)&.alive?
       end
     end
   end
