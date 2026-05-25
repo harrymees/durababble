@@ -14,6 +14,7 @@ module Durababble
     class Error < Durababble::Error; end
     class Unavailable < Error; end
     class Unauthenticated < Error; end
+    class RemoteError < Error; end
 
     class << self
       #: (Object?) -> String
@@ -69,7 +70,7 @@ module Durababble
           typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
           raise typed if typed
 
-          raise Durababble::RpcClient::RemoteError, "#{error.klass}: #{error.message}"
+          raise Durababble::Rpc::RemoteError, "#{error.klass}: #{error.message}"
         end
       end
 

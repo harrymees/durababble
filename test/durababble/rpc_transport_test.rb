@@ -236,7 +236,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     assert_nil Durababble::Rpc.load("")
     assert_equal({ "ok" => true }, Durababble::Rpc.load(Durababble::Rpc.dump({ "ok" => true })))
     assert_nil Durababble::Rpc::Client.decode_transient_response(TestTransientResponse.new(result: :unknown))
-    assert_raises(Durababble::RpcClient::RemoteError) do
+    assert_raises(Durababble::Rpc::RemoteError) do
       Durababble::Rpc::Client.decode_transient_response(
         TestTransientResponse.new(result: :err, err: TestRemoteError.new(klass: "UnknownRemote", message: "bad")),
       )
