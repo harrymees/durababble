@@ -146,7 +146,6 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]
-    def completed_workflow_waits_for(_workflow_id) = []
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
@@ -204,10 +203,58 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def migrate! = self
     def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
 
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
       command_id = "cmd-#{@commands.length + 1}"
-      @commands[command_id] = { object_type:, object_id:, method_name:, args:, kwargs:, status: "pending" }
+      @commands[command_id] = {
+        "id" => command_id,
+        "target_kind" => "object",
+        "target_type" => object_type,
+        "target_id" => object_id,
+        "message_kind" => message_kind,
+        "method_name" => method_name,
+        "payload" => { "method_name" => method_name, "args" => args, "kwargs" => kwargs },
+        "status" => "pending",
+        "attempts" => 0,
+        "max_attempts" => max_attempts,
+      }
       command_id
+    end
+
+    def deliver_target_message(**)
+      true
+    end
+
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
+      command = @commands.fetch(message_id)
+      executor = Durababble::DurableObjectExecutor.new(
+        store: self,
+        objects: { ObservedCounter.object_type => ObservedCounter },
+        worker_id: "object-observed",
+        lease_seconds: 30,
+      )
+      executor.drain_object_inbox(command.fetch("target_type"), object_id: command.fetch("target_id"))
+      case command.fetch("status")
+      when "completed"
+        command.fetch("result")
+      when "failed", "dead_lettered"
+        raise Durababble::Error, command.fetch("error")
+      else
+        raise Durababble::CommandTimeout, "timed out waiting for inbox message #{message_id}"
+      end
+    end
+
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+      rows = @commands.values.select do |command|
+        command.fetch("target_kind") == target_kind &&
+          command.fetch("target_type") == target_type &&
+          command.fetch("target_id") == target_id &&
+          ["pending", "failed", "running"].include?(command.fetch("status"))
+      end
+      rows.first(Integer(limit)).each do |command|
+        command["status"] = "running"
+        command["attempts"] += 1
+        command["locked_by"] = worker_id
+      end
     end
 
     def claim_object_command(command_id:, worker_id:)
@@ -215,14 +262,18 @@ class DurababbleObservabilityTest < DurababbleTestCase
       { "id" => command_id }
     end
 
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: nil, worker_id: nil)
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
       @state[[object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
-      @commands.fetch(command_id).merge!(status: "completed", result:, worker_id:)
+      @commands.fetch(command_id).merge!("status" => "completed", "result" => result, "locked_by" => nil, "worker_id" => worker_id)
       Result.new(1)
     end
 
-    def fail_object_command(command_id:, error:, worker_id:)
-      @commands.fetch(command_id).merge!(status: "failed", error:, worker_id:)
+    def fail_object_command(command_id:, error:, worker_id:, terminal: false)
+      @commands.fetch(command_id).merge!("status" => terminal ? "dead_lettered" : "failed", "error" => error, "locked_by" => nil, "worker_id" => worker_id)
+    end
+
+    def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+      @commands.fetch(command_id).merge!("status" => "pending", "error" => error, "locked_by" => nil, "worker_id" => worker_id, "ready_at" => ready_at)
     end
   end
 

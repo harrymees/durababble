@@ -184,17 +184,18 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       end
     end
 
-    test "does not requeue a terminal workflow when a stale wait is signaled with #{backend.name}" do
+    test "does not requeue a terminal workflow when a stale timer is due with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         workflow_id = store.create_workflow(name: "stale-wait", input: {})
-        store.record_workflow_wait(
+        store.record_wait(
           workflow_id:,
           position: 0,
-          wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "approval:stale", context: { "before" => true }),
+          name: "sleep",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "before" => true }),
         )
         store.complete_workflow(workflow_id, result: { "done" => true })
 
-        assert_equal 0, store.signal_event("approval:stale", payload: { "approved" => true })
+        assert_equal 0, store.wake_due_timers(now: Time.now + 3601)
         assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "done" => true }
       end
     end

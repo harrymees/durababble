@@ -117,7 +117,6 @@ module Durababble
           id VARCHAR(191) PRIMARY KEY,
           workflow_id VARCHAR(191) NOT NULL,
           position INT NOT NULL,
-          scope VARCHAR(32) NOT NULL DEFAULT 'step',
           kind VARCHAR(32) NOT NULL,
           event_key VARCHAR(191),
           wake_at DATETIME(6),
@@ -127,12 +126,11 @@ module Durababble
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           INDEX #{@connection.quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
-          INDEX #{@connection.quote_column_name(index_name("waits", "event_pending"))} (status, scope, kind, event_key, created_at),
-          INDEX #{@connection.quote_column_name(index_name("waits", "timer_pending"))} (status, scope, kind, wake_at, created_at),
+          INDEX #{@connection.quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
+          INDEX #{@connection.quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
-      add_column_if_missing("waits", "scope", "VARCHAR(32) NOT NULL DEFAULT 'step'")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
           object_type VARCHAR(191) NOT NULL,

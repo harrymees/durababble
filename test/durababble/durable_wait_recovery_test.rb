@@ -8,14 +8,12 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
     test "does not recreate a timer wait after crashing immediately after persistence with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
         wake_at = Time.utc(2026, 2, 1, 12, 0, 0)
-        workflow = Class.new(Durababble::Workflow) do
-          workflow_name "durable-timer-checkpoint"
-
-          define_method(:execute) do |input|
-            finish(wait_until(wake_at, input.merge("slept" => true)))
+        workflow = durababble_test_workflow("durable-timer-checkpoint") do
+          test_step("sleep") do |ctx|
+            Durababble.wait_until(wake_at, ctx.merge("slept" => true))
           end
 
-          step def finish(ctx)
+          test_step("finish") do |ctx|
             ctx.merge("done" => true)
           end
         end
@@ -41,11 +39,11 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
         assert_equal({ "id" => "timer-crash", "slept" => true, "done" => true }, run.result)
         assert_equal 1, store.waits_for(workflow_id).length
         assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
-        assert_equal ["completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+        assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
 
-    test "keeps repeated durable workflow waits distinct by workflow position with #{backend.name}" do
+    test "keeps repeated durable waits from the same step method distinct by position with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
         first_wake = Time.utc(2026, 3, 1, 0, 0, 0)
         second_wake = Time.utc(2026, 3, 2, 0, 0, 0)
@@ -53,10 +51,16 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           workflow_name "durable-repeated-waits"
 
           define_method(:execute) do |input|
-            first = wait_until(first_wake, input.merge("phase" => "first"))
-            second = wait_until(second_wake, first.merge("phase" => "second"))
+            first = pause_until(input.merge("phase" => "first"), first_wake)
+            second = pause_until(first.merge("phase" => "second"), second_wake)
             second.merge("done" => true)
           end
+
+          define_method(:pause_until) do |ctx, wake_at|
+            Durababble.wait_until(wake_at, ctx)
+          end
+
+          step :pause_until
         end
         worker = Durababble::Worker.new(
           store:,
@@ -71,15 +75,15 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
         # may appear more than once as separate durable positions.
         assert_equal :worked, worker.tick
         assert_equal(
-          [["0", "workflow", "pending"]],
-          store.waits_for(workflow_id).map { |wait| [wait.fetch("position").to_s, wait.fetch("scope"), wait.fetch("status")] },
+          [["0", "pause_until", "waiting"]],
+          store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
 
         assert_equal 1, store.wake_due_timers(now: first_wake + 1)
         assert_equal :worked, worker.tick
         assert_equal(
-          [["0", "workflow", "completed"], ["1", "workflow", "pending"]],
-          store.waits_for(workflow_id).map { |wait| [wait.fetch("position").to_s, wait.fetch("scope"), wait.fetch("status")] },
+          [["0", "pause_until", "completed"], ["1", "pause_until", "waiting"]],
+          store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
 
         assert_equal 1, store.wake_due_timers(now: second_wake + 1)
@@ -90,9 +94,12 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           "status" => "completed",
           "result" => { "id" => "repeat", "phase" => "second", "done" => true },
         )
-        assert_empty store.steps_for(workflow_id)
+        assert_equal(
+          [["0", "pause_until", "completed"], ["1", "pause_until", "completed"]],
+          store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
+        )
         assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
-        assert_empty store.step_attempts_for(workflow_id)
+        assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
   end

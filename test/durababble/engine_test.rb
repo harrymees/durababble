@@ -148,7 +148,7 @@ class DurababbleEngineTest < DurababbleTestCase
             input.fetch("iterations").times do
               ctx = accumulate(ctx)
             end
-            finish(wait_event("large-history:#{ctx.fetch("id")}", ctx))
+            finish(wait_for_release(ctx))
           end
 
           define_method(:accumulate) do |ctx|
@@ -156,11 +156,16 @@ class DurababbleEngineTest < DurababbleTestCase
             ctx.merge("count" => ctx.fetch("count") + 1)
           end
 
+          define_method(:wait_for_release) do |ctx|
+            Durababble.wait_until(Time.now + 3600, ctx.merge("released" => true))
+          end
+
           define_method(:finish) do |ctx|
             ctx.merge("finished" => true)
           end
 
           step :accumulate
+          step :wait_for_release
           step :finish
         end
         worker = Durababble::Worker.new(
@@ -177,7 +182,7 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
         assert_equal 75, side_effect_count
-        assert_equal 75, store.steps_for(workflow_id).length
+        assert_equal 76, store.steps_for(workflow_id).length
         assert_equal(
           75,
           store.steps_for(workflow_id).count do |step|
@@ -185,7 +190,7 @@ class DurababbleEngineTest < DurababbleTestCase
           end,
         )
 
-        assert_equal 1, store.signal_event("large-history:history", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         assert_equal :worked, worker.tick
 
         assert_hash_includes(
@@ -200,7 +205,7 @@ class DurababbleEngineTest < DurababbleTestCase
           },
         )
         assert_equal 75, side_effect_count
-        assert_equal 76, store.steps_for(workflow_id).length
+        assert_equal 77, store.steps_for(workflow_id).length
         assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
       end
     end

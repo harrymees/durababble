@@ -40,7 +40,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.resume", attributes) do
         current = claimed || @store.workflow(workflow_id)
-        return run_from_row(current) if ["completed", "canceled"].include?(current.fetch("status"))
+        return run_from_row(current) if WorkflowStatus.completed?(current)
 
         owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
         unless owned_claim
@@ -86,9 +86,7 @@ module Durababble
 
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
+      WorkflowStatus.terminal?(row)
     end
 
     #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped
@@ -125,8 +123,6 @@ module Durababble
         root_error = nil #: StandardError?
         root = Async do |root_task|
           history = @store.workflow_history_for(workflow_id)
-          completed_workflow_waits = @store.completed_workflow_waits_for(workflow_id)
-            .to_h { |wait| [wait.fetch("position").to_i, wait] }
           Observability.record(
             "durababble.workflow.history.steps",
             history.count { |event| event.fetch("kind") == "step_completed" },
@@ -138,15 +134,13 @@ module Durababble
             worker_id: @worker_id,
             lease_seconds: @lease_seconds,
             history:,
-            completed_workflow_waits:,
             root_task:,
             crash_after: @crash_after,
           )
           workflow = workflow_class.new
           workflow.__durababble_execution__ = execution
           result = WorkflowExecutionContext.with_current(execution) do
-            output = workflow.execute(initial_input || initial_context(workflow_id))
-            output.is_a?(WaitRequest) ? execution.wait(output) : output
+            workflow.execute(initial_input || initial_context(workflow_id))
           end
           WorkflowExecutionContext.with_current(execution) do
             execution.validate_replay_complete!

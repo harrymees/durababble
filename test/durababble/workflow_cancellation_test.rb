@@ -34,24 +34,19 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
       end
     end
 
-    test "cancels while waiting and ignores later signals with #{backend.name}" do
+    test "cancels while waiting and ignores later timer wakeups with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
         cleanup_runs = 0
-        workflow = Class.new(Durababble::Workflow) do
-          workflow_name "cancel-waiting"
-
-          def execute(input)
-            wait_event("approval:#{input.fetch("id")}", input)
-          rescue Durababble::CancellationError => e
-            cleanup_after_cancel(input.merge("reason" => e.reason))
-          end
-
-          define_method(:cleanup_after_cancel) do |input|
+        workflow = cancelable_workflow(
+          "cancel-waiting",
+          work: ->(input, _heartbeat) {
+            Durababble.wait_until(Time.now + 3600, input)
+          },
+          cleanup: ->(input) {
             cleanup_runs += 1
             { "cleaned" => input.fetch("reason") }
-          end
-          step :cleanup_after_cancel
-        end
+          },
+        )
         workflow_id = workflow.enqueue({ "id" => "wait" }, store:)
 
         waiting = Durababble::Engine.new(store:).resume(workflow, workflow_id:)
@@ -60,10 +55,10 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
         workflow.handle(workflow_id, store:).cancel(reason: "no longer needed")
         assert_equal "canceled", store.waits_for(workflow_id).first.fetch("status")
         run = Durababble::Engine.new(store:).resume(workflow, workflow_id:)
-        signaled = store.signal_event("approval:wait", payload: { "approved" => true })
+        woken = store.wake_due_timers(now: Time.now + 3601)
 
         assert_equal "canceled", run.status
-        assert_equal 0, signaled
+        assert_equal 0, woken
         assert_equal 1, cleanup_runs
       end
     end

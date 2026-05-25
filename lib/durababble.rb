@@ -4,6 +4,7 @@
 require "digest"
 
 require_relative "durababble/version"
+require_relative "durababble/statuses"
 require_relative "durababble/observability"
 
 module Durababble
@@ -81,39 +82,34 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
-      handle_wait_request("wait_until", WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:))
+      wait_request = WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_wait(wait_request, name: "wait_until", args: [time, context])
+      end
+
+      wait_request
     end
+
+    alias_method :sleep_until, :wait_until
 
     #: (untyped, ?untyped) -> untyped
-    def wait_event(event_key, context = {})
-      handle_wait_request("wait_event", WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:))
+    def sleep(duration, context = {})
+      execution = WorkflowExecutionContext.current
+      return Kernel.sleep(duration) unless execution
+
+      wait_request = WaitRequest.new(kind: "timer", wake_at: execution.timer_after(duration), event_key: nil, context:)
+      execution.call_wait(wait_request, name: "sleep", args: [duration, context])
     end
 
-    #: (untyped) { -> untyped } -> untyped
-    def with_workflow_execution(execution, &block)
-      previous = Thread.current[:durababble_workflow_execution]
-      Thread.current[:durababble_workflow_execution] = execution
-      block.call
-    ensure
-      Thread.current[:durababble_workflow_execution] = previous
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      execution = WorkflowExecutionContext.current
+      raise Error, "wait_condition must run inside workflow orchestration" unless execution
+
+      execution.wait_condition(timeout:, &block)
     end
 
     private
-
-    #: (untyped, untyped) -> untyped
-    def handle_wait_request(operation, wait_request)
-      step_context = StepExecutionContext.current
-      if step_context
-        raise Error, "Durababble.#{operation} is workflow-level only and cannot be called from a durable step"
-      end
-
-      execution = WorkflowExecutionContext.current || Thread.current[:durababble_workflow_execution]
-      unless execution
-        raise Error, "Durababble.#{operation} must be called from workflow execution"
-      end
-
-      execution.wait(wait_request)
-    end
 
     #: (untyped) -> String
     def schema_component(value)

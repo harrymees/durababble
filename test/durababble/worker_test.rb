@@ -71,10 +71,6 @@ class DurababbleWorkerTest < DurababbleTestCase
       []
     end
 
-    def completed_workflow_waits_for(_workflow_id)
-      []
-    end
-
     def record_step_scheduled(workflow_id:, command_id:, name:, **)
       @resumed << [:scheduled, workflow_id, command_id, name]
     end

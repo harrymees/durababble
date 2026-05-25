@@ -64,20 +64,16 @@ class DurababbleCompleteTest < DurababbleTestCase
       end
     end
 
-    test "implements timers, external event waits, and worker polling with #{backend.name}" do
+    test "implements timer waits and worker polling with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
-        workflow = Class.new(Durababble::Workflow) do
-          workflow_name "waits"
-
-          def execute(input)
-            timed = wait_until(Time.now + 3600, input.merge("after_timer" => true))
-            evented = wait_event("approval:#{timed.fetch("request_id")}", timed.merge("after_event_wait" => true))
-            finish(evented)
+        workflow = durababble_test_workflow("waits") do
+          test_step("wait_for_time") do |ctx|
+            Durababble.wait_until(Time.now + 3600, ctx.merge("after_timer" => true))
           end
-
-          step def finish(ctx)
-            ctx.merge("finished" => true)
+          test_step("wait_for_second_timer") do |ctx|
+            Durababble.wait_until(Time.now + 3600, ctx.merge("after_second_timer" => true, "approved" => true))
           end
+          test_step("finish") { |ctx| ctx.merge("finished" => true) }
         end
 
         worker = Durababble::Worker.new(store:, workflows: { "waits" => workflow }, worker_id: "worker-a")
@@ -91,16 +87,15 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_empty store.step_attempts_for(workflow_id)
-        assert_equal "approval:r1", store.waits_for(workflow_id).last.fetch("event_key")
+        assert_equal ["completed", "waiting"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+        assert_nil store.waits_for(workflow_id).last.fetch("event_key")
 
-        assert_equal 0, store.signal_event("approval:other", payload: {})
-        assert_equal 1, store.signal_event("approval:r1", payload: { "approved" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 7202)
         assert_equal 1, worker.run_until_idle
         assert_equal "completed", store.workflow(workflow_id).fetch("status")
         assert_hash_includes store.workflow(workflow_id).fetch("result"), "finished" => true, "approved" => true
         assert_equal(
-          ["completed"],
+          ["completed", "completed", "completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },
         )
       end
@@ -141,25 +136,18 @@ class DurababbleCompleteTest < DurababbleTestCase
         )
         assert_equal 1, events.count("increment")
 
-        waiting = Class.new(Durababble::Workflow) do
-          workflow_name "waiting"
-
-          def execute(input)
-            done(wait_event("event:#{input.fetch("id")}", input))
-          end
-
-          step def done(ctx)
-            ctx.merge("done" => true)
-          end
+        waiting = durababble_test_workflow("waiting") do
+          test_step("wait") { |ctx| Durababble.wait_until(Time.now + 3600, ctx.merge("slept" => true)) }
+          test_step("done") { |ctx| ctx.merge("done" => true) }
         end
         waiting_id = store.enqueue_workflow(name: "waiting", input: { "id" => "w1" })
         assert_raises(Durababble::InjectedCrash) do
           engine(crash_after: :wait_recorded).resume(waiting, workflow_id: waiting_id)
         end
         assert_equal "waiting", store.workflow(waiting_id).fetch("status")
-        assert_equal 1, store.signal_event("event:w1", payload: { "signal" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         result = engine(worker_id: "recover").resume(waiting, workflow_id: waiting_id).result
-        assert_hash_includes result, "done" => true, "signal" => true
+        assert_hash_includes result, "done" => true, "slept" => true
 
         outbox_workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 5 })
         outbox_id = store.enqueue_outbox(

@@ -133,19 +133,24 @@ module Durababble
       __durababble_execution__.step_context
     end
 
-    #: () -> untyped
-    def workflow_id
-      @__durababble_ref_workflow_id || __durababble_execution__.workflow_id
-    end
-
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
       Durababble.wait_until(time, context)
     end
 
     #: (untyped, ?untyped) -> untyped
-    def wait_event(event_key, context = {})
-      Durababble.wait_event(event_key, context)
+    def sleep_until(time, context = {})
+      Durababble.sleep_until(time, context)
+    end
+
+    #: (untyped, ?untyped) -> untyped
+    def sleep(duration, context = {})
+      Durababble.sleep(duration, context)
+    end
+
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      Durababble.wait_condition(timeout:, &block)
     end
   end
 

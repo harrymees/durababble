@@ -208,8 +208,20 @@ module Durababble
           SET status = 'pending', locked_by = NULL, locked_until = NULL
           WHERE status = 'processing' AND locked_by = ?
         SQL
-        released = { "workflows" => workflows, "outbox" => outbox }
-        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: workflows.to_i)
+        inbox = execute_params("SELECT COUNT(*) AS count FROM #{table("inbox")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
+        execute_params(<<~SQL, [worker_id])
+          UPDATE #{table("inbox")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+          WHERE status = 'running' AND locked_by = ?
+        SQL
+        target_activations = execute_params("SELECT COUNT(*) AS count FROM #{table("target_activations")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
+        execute_params(<<~SQL, [worker_id])
+          UPDATE #{table("target_activations")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+          WHERE status = 'running' AND locked_by = ?
+        SQL
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
     end
@@ -233,7 +245,7 @@ module Durababble
         UPDATE #{table("workflows")}
         SET status = CASE
               WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-              WHEN EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND scope = 'workflow' AND status = 'pending') THEN 'waiting'
+              WHEN EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
               ELSE 'pending'
             END,
             locked_by = NULL,
@@ -243,7 +255,7 @@ module Durababble
       SQL
       return true if result.affected_rows == 1
 
-      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+      WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
     end
 
     #: (untyped, ?now: untyped) -> untyped
@@ -270,7 +282,7 @@ module Durababble
         end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
-        if first_request && decoded.fetch("status") != "running"
+        if first_request && !WorkflowStatus.running?(decoded)
           execute_params(<<~SQL, [workflow_id])
             UPDATE #{table("workflows")}
             SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
@@ -348,6 +360,18 @@ module Durababble
         SELECT id AS workflow_id, locked_by AS worker_id, locked_until
         FROM #{table("workflows")}
         WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+      SQL
+    end
+
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      execute_params(<<~SQL, [object_type, object_id]).first
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table("inbox")}
+        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        ORDER BY sequence
+        LIMIT 1
       SQL
     end
 
@@ -528,22 +552,33 @@ module Durababble
 
     #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
-      raise Error, "step-scoped waits are not supported; record workflow-level waits with record_workflow_wait"
-    end
-
-    #: (workflow_id: untyped, position: untyped, wait_request: untyped) -> untyped
-    def record_workflow_wait(workflow_id:, position:, wait_request:)
+      command_id = normalize_command_id(command_id, position)
       transaction do
-        wait_id = SecureRandom.uuid
-        execute_params(<<~SQL, [wait_id, workflow_id, position, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
-          INSERT INTO #{table("waits")} (id, workflow_id, position, scope, kind, event_key, wake_at, context, status)
-          VALUES (?, ?, ?, 'workflow', ?, ?, ?, ?, 'pending')
+        serialized_context = dump_serialized(wait_request.context)
+        execute_params(<<~SQL, [workflow_id, command_id, name, serialized_context])
+          INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
+          VALUES (?, ?, ?, 'waiting', ?, NOW(6), NOW(6))
+          ON DUPLICATE KEY UPDATE status = 'waiting', result = VALUES(result), error = NULL, updated_at = NOW(6)
         SQL
-        execute_params("UPDATE #{table("workflows")} SET status = 'waiting', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+        wait_id = SecureRandom.uuid
+        execute_params(<<~SQL, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
+          INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        SQL
+        update_latest_attempt_serialized(
+          workflow_id:,
+          command_id:,
+          status: "waiting",
+          serialized_result: serialized_context,
+          error: nil,
+        )
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
+        suspend_workflow(workflow_id:) if suspend_workflow
         Observability.count(
           "durababble.waits.started",
           "durababble.workflow.id" => workflow_id,
-          "durababble.wait.position" => position,
+          "durababble.step.index" => command_id,
+          "durababble.step.name" => name,
           "durababble.wait.kind" => wait_request.kind,
           "durababble.wait.event_key" => wait_request.event_key,
         )
@@ -705,7 +740,7 @@ module Durababble
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
           SELECT * FROM #{table("inbox")}
-          WHERE id = ? AND status = 'running' AND locked_by = ?
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
           FOR UPDATE
         SQL
       else
@@ -738,7 +773,7 @@ module Durababble
         FOR UPDATE
       SQL
 
-      if head && head.fetch("status") != "dead_lettered"
+      if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else
@@ -869,6 +904,14 @@ module Durababble
       )
     end
 
+    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      execute_params(
+        "UPDATE #{table("inbox")} SET status = 'pending', error = ?, ready_at = ?, locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?",
+        [error, ready_at, message_id],
+      )
+    end
+
     #: (message_id: untyped, error: untyped) -> untyped
     def dead_letter_inbox_message_without_transaction(message_id:, error:)
       execute_params(
@@ -927,23 +970,6 @@ module Durababble
       id
     end
 
-    #: (untyped, untyped) -> untyped
-    def complete_event_waits(event_key, payload)
-      transaction do
-        waits = execute_params(<<~SQL, [event_key]).map { |row| decode_row(row) }
-          SELECT w.* FROM #{table("waits")} AS w
-          JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
-          WHERE w.status = 'pending'
-            AND w.scope = 'workflow'
-            AND wf.status IN ('waiting', 'running')
-            AND w.kind = 'event'
-            AND w.event_key = ?
-          FOR UPDATE SKIP LOCKED
-        SQL
-        finish_completed_waits(waits, payload)
-      end
-    end
-
     #: (untyped) -> untyped
     def complete_timer_waits(now)
       transaction do
@@ -951,7 +977,6 @@ module Durababble
           SELECT w.* FROM #{table("waits")} AS w
           JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
           WHERE w.status = 'pending'
-            AND w.scope = 'workflow'
             AND wf.status IN ('waiting', 'running')
             AND w.kind = 'timer'
             AND w.wake_at <= ?
@@ -966,6 +991,8 @@ module Durababble
       waits.each do |wait|
         execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
         record_wait_latency(wait)
+        context = wait.fetch("context").merge(payload)
+        record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
         execute_params("UPDATE #{table("workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'", [wait.fetch("workflow_id")])
       end
       Observability.count("durababble.waits.completed", by: waits.length)

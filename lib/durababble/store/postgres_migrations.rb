@@ -82,7 +82,6 @@ module Durababble
           id text PRIMARY KEY,
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           position integer NOT NULL,
-          scope text NOT NULL DEFAULT 'step',
           kind text NOT NULL,
           event_key text,
           wake_at timestamptz,
@@ -93,7 +92,6 @@ module Durababble
           completed_at timestamptz
         )
       SQL
-      execute("ALTER TABLE #{table("waits")} ADD COLUMN IF NOT EXISTS scope text NOT NULL DEFAULT 'step'")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("fences")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -250,8 +248,8 @@ module Durababble
         execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
         execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
         execute("CREATE INDEX IF NOT EXISTS workflow_history_command_idx ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
-        execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, scope, kind, event_key, created_at)")
-        execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, scope, kind, wake_at, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, kind, event_key, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, kind, wake_at, created_at)")
         execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
         execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
         execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")

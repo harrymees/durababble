@@ -3,7 +3,7 @@
 
 module Durababble
   class WorkflowReplayHistory
-    TERMINAL_KINDS = ["step_completed", "step_canceled"].freeze
+    TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
 
     #: (untyped) -> void
     def initialize(events)
