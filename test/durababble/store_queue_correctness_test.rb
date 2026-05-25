@@ -8,6 +8,21 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
     test "claims the oldest runnable workflow across pending, failed, and expired running queues with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         pending_newer = enqueue_workflow_at("pending-newer", status: "pending", created_at: Time.now - 60)
+        terminal_failed_oldest = enqueue_workflow_at(
+          "terminal-failed-oldest",
+          status: "failed",
+          created_at: Time.now - 360,
+        )
+        canceled_oldest = enqueue_workflow_at(
+          "canceled-oldest",
+          status: "canceled",
+          created_at: Time.now - 300,
+        )
+        waiting_oldest = enqueue_workflow_at(
+          "waiting-oldest",
+          status: "waiting",
+          created_at: Time.now - 240,
+        )
         failed_middle = enqueue_workflow_at(
           "failed-middle",
           status: "failed",
@@ -41,6 +56,9 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
 
         assert_hash_includes store.workflow(active_oldest), "status" => "running", "locked_by" => "live"
         assert_hash_includes store.workflow(expired_oldest), "status" => "running", "locked_by" => "worker-a"
+        assert_hash_includes store.workflow(terminal_failed_oldest), "status" => "failed", "locked_by" => nil, "next_run_at" => nil
+        assert_hash_includes store.workflow(canceled_oldest), "status" => "canceled", "locked_by" => nil, "next_run_at" => nil
+        assert_hash_includes store.workflow(waiting_oldest), "status" => "waiting", "locked_by" => nil, "next_run_at" => nil
       end
     end
 
