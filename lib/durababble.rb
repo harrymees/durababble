@@ -15,7 +15,8 @@ module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
-  class NonDeterminismError < Error; end
+  class DeterminismError < Error; end
+  class NonDeterminismError < DeterminismError; end
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
@@ -40,7 +41,7 @@ module Durababble
     #: (untyped) -> untyped
     def default_store=(store)
       @default_store = store
-      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+      @default_engine = store ? Engine.new(store:) : nil
     end
 
     #: (untyped) -> untyped
@@ -94,7 +95,7 @@ module Durababble
 
     #: () -> untyped
     def engine
-      @default_engine ||= Engine.new(store:, migrate: false)
+      @default_engine ||= Engine.new(store:)
     end
 
     #: (?engine: untyped, ?store: untyped) -> untyped
@@ -102,7 +103,7 @@ module Durababble
       raise ArgumentError, "pass store: or engine:, not both" if store && engine
 
       return engine if engine
-      return Engine.new(store:, migrate: false) if store
+      return Engine.new(store:) if store
 
       self.engine
     end
@@ -160,6 +161,7 @@ require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
+require_relative "durababble/store_queries"
 require_relative "durababble/store"
 require_relative "durababble/engine"
 require_relative "durababble/run"

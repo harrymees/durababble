@@ -179,7 +179,7 @@ end
 
 The `context` you pass to `wait_until` is the value Durababble resumes the workflow with when the timer fires. For workflows that need to resume on an external signal rather than a clock — webhook delivery, human approval, a batch finishing elsewhere — use a workflow command (`expose_command`) from the signaling process instead.
 
-The current implementation records waits through step history, so the example returns the wait from a small step method. That is an implementation limitation, not the ideal public shape; workflow waits should become workflow-level yield points. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow.
+The current implementation records waits through step history, so the example returns the wait from a small step method. That is an implementation limitation, not the ideal public shape; workflow waits should become workflow-level yield points. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow. Direct host wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO calls from workflow orchestration raise `Durababble::DeterminismError`; put those effects in durable steps or outside workflow execution, where ordinary Ruby host semantics still apply.
 
 ## Cancellation
 
@@ -245,7 +245,7 @@ Durababble handles the RPC machinery between your workers automatically, routing
 
 ## Replay
 
-Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble patches sources of non-determinism for workflow code to ensure that randomness, wall clock time, and process local state is the same for each execution of the workflow.
+Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
 
 ```ruby
 def execute(order)

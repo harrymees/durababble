@@ -129,9 +129,9 @@ Workflow orchestration runs on a Durababble-managed deterministic scheduler. Wor
 
 Durababble integrates with Async task creation and waiting so ordinary non-transient Async child tasks inherit workflow execution context and may call durable steps. Workflow authors must not need Durababble-specific async helpers. `transient: true` Async tasks do not inherit workflow execution context and must not call durable steps.
 
-Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
+Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. The runtime rejects unsafe direct host calls such as wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO operations with `Durababble::DeterminismError`. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
 
-The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers. The implementation must not rely on process-wide monkeypatching to create determinism.
+The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers, or reject unsafe host APIs with `Durababble::DeterminismError` until a durable deterministic API exists. The implementation must not rely on process-wide monkeypatching to create determinism.
 
 Durable commands called from any workflow fiber are assigned command ids when the workflow fiber reaches the call, before the side-effecting implementation runs. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes.
 
@@ -386,6 +386,8 @@ Query-shape and transaction requirements:
 - Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
 - Explicit idempotency rows cover workflow starts and any public durable operation not deduped by the inbox itself.
 - Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
+- Worker lease release, cancellation wait cleanup, and durable-object command paths have explicit indexes and query-plan coverage where they can become hot at scale.
+- New production Store SQL must be added to `Durababble::StoreQueries`; each new registered query must be covered by plan assertions, benchmark coverage, backend conformance coverage, or an explicit uncovered-query list entry reviewed in the query-plan suite.
 - High-risk transactional pieces such as `enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, and object state plus message completion may be implemented with database functions to reduce lock-order drift, provided the common backend contract is preserved.
 - Retention and partitioning must be planned for high-volume history, step attempts, inbox, and idempotency rows before production scale.
 - Runtime value decoding only decodes known serialized binary columns.

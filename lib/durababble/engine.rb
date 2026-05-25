@@ -12,8 +12,8 @@ module Durababble
     #: untyped
     attr_reader :store
 
-    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped) -> void
-    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
+    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped) -> void
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil)
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
@@ -147,7 +147,9 @@ module Durababble
           workflow = workflow_class.new
           workflow.__durababble_execution__ = execution
           result = WorkflowExecutionContext.with_current(execution) do
-            workflow.execute(initial_input || initial_context(workflow_id))
+            WorkflowDeterminism.enforce(workflow_id:) do
+              workflow.execute(initial_input || initial_context(workflow_id))
+            end
           end
           WorkflowExecutionContext.with_current(execution) do
             execution.validate_replay_complete!

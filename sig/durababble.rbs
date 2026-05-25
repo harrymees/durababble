@@ -65,7 +65,10 @@ module Durababble
   class LeaseConflict < Error
   end
 
-  class NonDeterminismError < Error
+  class DeterminismError < Error
+  end
+
+  class NonDeterminismError < DeterminismError
   end
 
   class FenceTimeout < Error
@@ -279,7 +282,7 @@ module Durababble
   class Engine
     attr_reader store: Store
 
-    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
+    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?crash_after: Symbol?) -> void
     def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input) -> String
     def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]

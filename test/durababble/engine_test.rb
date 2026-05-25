@@ -116,7 +116,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "still supports requested injected crash points" do
     no_lease_store = Object.new
-    crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
+    crashy_engine = Durababble::Engine.new(store: no_lease_store, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
   end
 
@@ -133,7 +133,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
     store = FencedCompletionStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "owner-a", lease_seconds: 17, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "owner-a", lease_seconds: 17)
 
     run = engine.resume(ImmediateWorkflow, workflow_id: "wf-1")
 
@@ -146,7 +146,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "drains workflow command inbox one message at a time so failed heads block followers" do
     store = CommandDrainStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_equal [1, 1], store.claim_limits
@@ -158,7 +158,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "does not drain workflow command inboxes for terminal workflows" do
     store = CommandDrainStore.new(workflow_status: "completed")
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 0, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.claim_limits
@@ -173,7 +173,7 @@ class DurababbleEngineTest < DurababbleTestCase
         { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
       ],
     )
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.completed
@@ -188,7 +188,7 @@ class DurababbleEngineTest < DurababbleTestCase
         { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
       ],
     )
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.completed
@@ -221,8 +221,12 @@ class DurababbleEngineTest < DurababbleTestCase
 
     test "returns a terminal failed workflow instead of trying to reclaim it with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
+        attempts = 0
         workflow = durababble_test_workflow("terminal-failure") do
-          test_step("explode") { |_ctx| raise "boom" }
+          test_step("explode") do |_ctx|
+            attempts += 1
+            raise "boom"
+          end
         end
         engine = Durababble::Engine.new(store:, worker_id: "owner")
 
@@ -232,6 +236,8 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal "failed", first.status
         assert_equal first.status, second.status
         assert_equal first.error, second.error
+        assert_equal 1, attempts
+        assert_nil store.workflow(first.id).fetch("next_run_at")
       end
     end
 

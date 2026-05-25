@@ -174,6 +174,11 @@ module Durababble
       @connection.transaction(requires_new: true, &block)
     end
 
+    #: (untyped, **untyped) -> untyped
+    def store_query_sql(id, **locals)
+      StoreQueries.sql(id, self, locals)
+    end
+
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def current_target_lease(target_kind:, target_type:, target_id:)
       case target_kind
