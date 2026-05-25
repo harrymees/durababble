@@ -260,7 +260,7 @@ module Durababble
   class DurableObjectRef[Id, State]
     attr_reader durable_id: Id
 
-    def initialize: (singleton(DurableObject) object_class, Id durable_id, store: Store) -> void
+    def initialize: (singleton(DurableObject) object_class, Id durable_id, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end

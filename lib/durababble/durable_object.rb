@@ -30,7 +30,7 @@ module Durababble
 
       #: (Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?) -> DurableObjectRef
       def handle(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
-        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
+        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:), worker_pool:, idempotency_key:)
       end
 
       #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?idempotency_key: String?, **Object?) -> String
@@ -118,11 +118,13 @@ module Durababble
   class DurableObjectRef
     COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
 
-    #: (Object, String, store: Store) -> void
-    def initialize(object_class, durable_id, store:)
+    #: (Object, String, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
+    def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
       @object_class = object_class #: as untyped
       @durable_id = durable_id
       @store = store #: as untyped
+      @worker_pool = worker_pool || "default"
+      @idempotency_key = idempotency_key
     end
 
     #: String
@@ -161,7 +163,7 @@ module Durababble
     def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
-        idempotency_key = kwargs.delete(:idempotency_key)
+        idempotency_key = kwargs.key?(:idempotency_key) ? kwargs.delete(:idempotency_key) : @idempotency_key
         command_id = @store.enqueue_object_command(
           object_type: @object_class.object_type,
           object_id: @durable_id,
@@ -172,7 +174,7 @@ module Durababble
           idempotency_key:,
           max_attempts: inbox_max_attempts(retry_policy),
         )
-        @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id)
+        @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
     end

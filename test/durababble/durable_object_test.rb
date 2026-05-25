@@ -100,11 +100,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   class AskWaitStore
-    attr_reader :enqueued, :waits, :migrations
+    attr_reader :enqueued, :waits, :deliveries, :migrations
 
     def initialize
       @enqueued = []
       @waits = []
+      @deliveries = []
       @migrations = 0
     end
 
@@ -118,7 +119,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       "cmd-#{@enqueued.length}"
     end
 
-    def deliver_target_message(**) = false
+    def deliver_target_message(**kwargs)
+      @deliveries << kwargs
+      false
+    end
 
     def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
       @waits << { message_id:, poll_interval:, timeout: }
@@ -561,6 +565,19 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal "waited:cmd-1", UnboundedAskObject.handle("object-1", store:).eventually
     assert_nil store.enqueued.first.fetch(:max_attempts)
     assert_nil store.waits.first.fetch(:timeout)
+  end
+
+  test "durable object handles use configured worker pool and idempotency defaults" do
+    store = AskWaitStore.new
+    handle = CleanCommandObject.handle("object-1", store:, worker_pool: "priority", idempotency_key: "default-key")
+
+    assert_equal "waited:cmd-1", handle.read_only
+    assert_equal "default-key", store.enqueued.first.fetch(:idempotency_key)
+    assert_equal "priority", store.deliveries.first.fetch(:worker_pool)
+
+    assert_equal "waited:cmd-2", handle.read_only(idempotency_key: "override-key")
+    assert_equal "override-key", store.enqueued.last.fetch(:idempotency_key)
+    assert_equal "priority", store.deliveries.last.fetch(:worker_pool)
   end
 
   durababble_store_backends.each do |backend|
