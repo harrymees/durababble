@@ -48,7 +48,7 @@ Important files read:
 - `lib/durababble/store.rb`
 - `lib/durababble/worker.rb`
 - `lib/durababble/workflow_rpc.rb`
-- `lib/durababble/deterministic.rb`
+- `test/support/deterministic.rb`
 - `durababble.gemspec`
 
 Durababble is a compact engine:
@@ -58,7 +58,7 @@ Durababble is a compact engine:
 - `Durababble::Worker` is intentionally minimal: `tick` claims one runnable workflow and resumes it; `run_until_idle` loops until idle.
 - `Durababble::Store` owns all SQL directly through the `pg` gem. It creates `workflows`, `steps`, `step_attempts`, `waits`, `fences`, and `outbox` tables. Runtime values are serialized via Paquito into `bytea` columns.
 - `Durababble::WorkflowRpc` routes commands to the worker that currently owns a workflow lease, validates the lease at the receiver before and after handling, translates stale/no-owner errors, and can start/await a new lease before retrying.
-- `Durababble::Deterministic` provides a virtual scheduler, network, and Yugabyte-like store for seed-searching distributed schedules and fault timing.
+- Test-only `Durababble::Deterministic` provides a virtual scheduler, network, and Yugabyte-like store for seed-searching distributed schedules and fault timing.
 
 Durababble's strongest architectural choices:
 
