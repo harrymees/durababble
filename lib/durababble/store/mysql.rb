@@ -491,6 +491,7 @@ module Durababble
 
     #: (String, error: String) -> void
     def terminate_workflow_dependents(workflow_id, error:)
+      # Called only while request_workflow_termination holds the workflow row lock inside a transaction.
       execute_store_query(:terminate_workflow_waits, [workflow_id])
       execute_store_query(:terminate_workflow_steps, [error, workflow_id])
       execute_store_query(:terminate_workflow_step_attempts, [error, workflow_id])
