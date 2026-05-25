@@ -118,9 +118,12 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-expired-#{i}', 'demo', 'running', #{empty}, 'stale', #{mysql_literal(now - 300)}, #{created_at}, #{created_at})")
       timer_wake_at = i == 1 ? now - 60 : now + 3600
       execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('timer-wait-#{i}', 'waiting-#{i}', 0, 'timer', NULL, #{mysql_literal(timer_wake_at)}, #{wait_context}, 'pending', #{created_at})")
+      execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('event-wait-#{i}', 'waiting-#{i}', 0, 'event', #{mysql_literal(i == 1 ? "target-event" : "other-event")}, NULL, #{wait_context}, 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, created_at) VALUES ('pending-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'pending-key-#{i}', 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, locked_by, locked_until, created_at) VALUES ('processing-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'processing-key-#{i}', 'processing', 'owner', #{mysql_literal(now - 60)}, #{created_at})")
     end
+    execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
+    execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")
   rescue StandardError
     begin
