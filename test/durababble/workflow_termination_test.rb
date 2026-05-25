@@ -49,15 +49,15 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         release << true
         run = owner.value
 
-        assert_equal "terminated", terminated.status
-        assert_equal "terminated", run.status
-        assert_nil run.result
-        assert_equal "operator hard stop", run.error
-        assert_equal 1, work_runs
-        assert_equal 0, cleanup_runs
-        assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
-        assert_equal ["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
-        assert_equal ["step_scheduled", "step_started", "workflow_terminated"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+        assert_equal("terminated", terminated.status)
+        assert_equal("terminated", run.status)
+        assert_nil(run.result)
+        assert_equal("operator hard stop", run.error)
+        assert_equal(1, work_runs)
+        assert_equal(0, cleanup_runs)
+        assert_equal(["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") })
+        assert_equal(["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+        assert_equal(["step_scheduled", "step_started", "workflow_terminated"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") })
       ensure
         release << true if defined?(release)
         owner&.kill if defined?(owner) && owner&.alive?
@@ -214,6 +214,52 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         assert_raises_matching(Durababble::Error, /terminal/) do
           store.enqueue_workflow_command(workflow_id:, workflow_name: workflow.workflow_name, method_name: "approve", payload:)
         end
+      end
+    end
+
+    test "dead letters late workflow command completion after terminal state with #{backend.name}" do
+      with_durababble_store(backend, "workflow_termination_command_completion_fence") do |store|
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "terminate-command-completion-fence"
+
+          def execute(input)
+            input
+          end
+
+          expose_command def approve
+            { "approved" => true }
+          end
+        end
+        workflow_id = workflow.enqueue({ "id" => "cmd" }, store:)
+        payload = { "method" => "approve", "args" => [], "kwargs" => {} }
+        command_id = store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: workflow.workflow_name,
+          method_name: "approve",
+          payload:,
+        )
+        claimed = store.claim_inbox_messages(
+          target_kind: "workflow",
+          target_type: workflow.workflow_name,
+          target_id: workflow_id,
+          worker_id: "command-worker",
+        )
+
+        assert_equal [command_id], claimed.map { |command| command.fetch("id") }
+
+        store.complete_workflow(workflow_id, result: { "done" => true })
+        store.complete_workflow_command(
+          message_id: command_id,
+          workflow_id:,
+          result: { "approved" => true },
+          worker_id: "command-worker",
+        )
+
+        assert_hash_includes(
+          store.inbox_message(command_id),
+          "status" => "dead_lettered",
+          "error" => "workflow #{workflow_id} is completed",
+        )
       end
     end
 
