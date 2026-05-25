@@ -82,7 +82,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       message ? [message] : []
     end
 
-    def object_state(object_type:, object_id:) = @state
+    def object_state(object_type:, object_id:, worker_pool: "default") = @state
 
     def complete_object_command(command_id:, result:, **kwargs)
       @completed << [command_id, result]
@@ -388,6 +388,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal(
       [
         {
+          worker_pool: "default",
           target_kind: "object",
           target_type: ClaimlessTestObject.object_type,
           target_id: "object-1",
@@ -413,7 +414,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     save_store.define_singleton_method(:save_object_state) { |**kwargs| saved << kwargs }
     object = anonymous_object.new(durable_id: "obj-1", store: save_store)
     object.update_state({ "saved" => true })
-    assert_equal [{ object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+    assert_equal [{ worker_pool: "default", object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
   end
 
   test "memoizes nil initialized durable object state" do

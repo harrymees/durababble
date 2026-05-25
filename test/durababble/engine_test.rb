@@ -35,11 +35,11 @@ class DurababbleEngineTest < DurababbleTestCase
       { "id" => workflow_id, "status" => @workflow_status, "input" => {} }
     end
 
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       { "id" => workflow_id, "status" => "running", "input" => {}, "locked_by" => worker_id, "lease_seconds" => lease_seconds }
     end
 
-    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+    def claim_inbox_messages(worker_pool: "default", target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
       @claim_limits << limit
       return [] unless target_kind == "workflow" && target_type == "command-drain" && target_id == "wf-1"
       return [] unless worker_id == "worker-a" && lease_seconds == 9
@@ -133,17 +133,17 @@ class DurababbleEngineTest < DurababbleTestCase
       @workflows = {}
     end
 
-    def create_workflow(name:, input:, worker_id:, lease_seconds:)
-      @created_workflows << { name:, input:, worker_id:, lease_seconds: }
-      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id }
+    def create_workflow(name:, input:, worker_id:, lease_seconds:, worker_pool: "default")
+      @created_workflows << { name:, input:, worker_id:, lease_seconds:, worker_pool: }
+      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "worker_pool" => worker_pool, "status" => "running", "input" => input, "locked_by" => worker_id }
       "wf-inline"
     end
 
-    def enqueue_workflow(name:, input:)
+    def enqueue_workflow(name:, input:, worker_pool: "default")
       raise "Engine#run should create the leased running workflow directly"
     end
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       raise "Engine#run should not claim a workflow it just created"
     end
 
@@ -183,8 +183,8 @@ class DurababbleEngineTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def enqueue_workflow(name:, input:)
-      @enqueued << { name:, input: }
+    def enqueue_workflow(name:, input:, worker_pool: "default")
+      @enqueued << { name:, input:, worker_pool: }
       "wf-#{@enqueued.length}"
     end
   end
@@ -210,7 +210,7 @@ class DurababbleEngineTest < DurababbleTestCase
       @row.merge("id" => workflow_id)
     end
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       @row = @row.merge("id" => workflow_id, "status" => "running", "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds)
     end
 
@@ -239,7 +239,17 @@ class DurababbleEngineTest < DurababbleTestCase
 
     assert_equal "wf-1", workflow_id
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 } }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "default" }], store.enqueued
+  end
+
+  test "engine enqueue writes workflows into its worker pool" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:, worker_pool: "critical", migrate: false)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
+
+    assert_equal "wf-1", workflow_id
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "critical" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
@@ -375,7 +385,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
     assert_equal "completed", run.status
     assert_equal({ "count" => 2, "done" => true }, run.result)
-    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9 }], store.created_workflows
+    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9, worker_pool: "default" }], store.created_workflows
   end
 
   durababble_store_backends.each do |backend|

@@ -95,7 +95,8 @@ module Durababble
           SELECT id FROM (
             SELECT id, created_at FROM (
               SELECT id, created_at FROM #{workflows}
-              WHERE status = 'pending'
+              WHERE worker_pool = $1
+                AND status = 'pending'
                 AND runnable_immediately
                 #{name_filter}
               ORDER BY status, runnable_immediately, created_at
@@ -105,7 +106,8 @@ module Durababble
             UNION ALL
             SELECT id, created_at FROM (
               SELECT id, created_at FROM #{workflows}
-              WHERE status = 'pending'
+              WHERE worker_pool = $1
+                AND status = 'pending'
                 AND next_run_at <= now()
                 #{name_filter}
               ORDER BY next_run_at, created_at
@@ -115,7 +117,8 @@ module Durababble
             UNION ALL
             SELECT id, created_at FROM (
               SELECT id, created_at FROM #{workflows}
-              WHERE status = 'failed'
+              WHERE worker_pool = $1
+                AND status = 'failed'
                 AND next_run_at IS NOT NULL
                 AND next_run_at <= now()
                 #{name_filter}
@@ -126,7 +129,8 @@ module Durababble
             UNION ALL
             SELECT id, created_at FROM (
               SELECT id, created_at FROM #{workflows}
-              WHERE status = 'canceling'
+              WHERE worker_pool = $1
+                AND status = 'canceling'
                 AND (next_run_at IS NULL OR next_run_at <= now())
                 #{name_filter}
               ORDER BY created_at
@@ -136,7 +140,8 @@ module Durababble
             UNION ALL
             SELECT id, created_at FROM (
               SELECT id, created_at FROM #{workflows}
-              WHERE status = 'running' AND locked_until < now()
+              WHERE worker_pool = $1
+                AND status = 'running' AND locked_until < now()
                 #{name_filter}
               ORDER BY created_at
               LIMIT 1
@@ -147,9 +152,9 @@ module Durababble
           LIMIT 1
         )
         UPDATE #{workflows} AS workflows
-        SET status = 'running', locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
         FROM candidate
-        WHERE workflows.id = candidate.id
+        WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
         RETURNING workflows.*
       SQL
     end
@@ -157,21 +162,21 @@ module Durababble
     define(:pg_claim_workflow_already_owned, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "workflows")}
-        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+        WHERE id = $1 AND worker_pool = $2 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
       SQL
     end
 
     define(:pg_claim_workflow_update, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = $2,
-            locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
-        WHERE id = $1
+        SET status = 'running', error = NULL, locked_by = $3,
+            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        WHERE id = $1 AND worker_pool = $2
           AND (
             status = 'pending'
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
             OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
+            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
           )
         RETURNING *
       SQL
@@ -260,11 +265,11 @@ module Durababble
       SQL
     end
 
-    define(:pg_current_workflow_lease, backend: :postgres) do |store|
+    define(:pg_current_workflow_lease, backend: :postgres) do |store, worker_pool_sql: ""|
       <<~SQL.chomp
-        SELECT id AS workflow_id, locked_by AS worker_id, locked_until
+        SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
         FROM #{table(store, "workflows")}
-        WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+        WHERE id = $1 #{worker_pool_sql} AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
       SQL
     end
 
@@ -424,15 +429,15 @@ module Durababble
     end
 
     define(:pg_object_state, backend: :postgres) do |store|
-      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = $1 AND object_id = $2"
+      "SELECT state FROM #{table(store, "durable_objects")} WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3"
     end
 
     define(:pg_save_object_state, backend: :postgres) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "durable_objects")} (object_type, object_id, state)
-        VALUES ($1, $2, $3::bytea)
-        ON CONFLICT (object_type, object_id) DO UPDATE
-          SET state = $3::bytea, updated_at = now()
+        INSERT INTO #{table(store, "durable_objects")} (worker_pool, object_type, object_id, state)
+        VALUES ($1, $2, $3, $4::bytea)
+        ON CONFLICT (worker_pool, object_type, object_id) DO UPDATE
+          SET state = $4::bytea, updated_at = now()
       SQL
     end
 
@@ -460,7 +465,8 @@ module Durababble
     define(:mysql_claim_pending_workflow, backend: :mysql) do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
-        WHERE status = 'pending'
+        WHERE worker_pool = ?
+          AND status = 'pending'
           AND (next_run_at IS NULL OR next_run_at <= NOW(6))
           #{name_sql}
         ORDER BY created_at
@@ -472,7 +478,8 @@ module Durababble
     define(:mysql_claim_failed_workflow, backend: :mysql) do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
-        WHERE status = 'failed'
+        WHERE worker_pool = ?
+          AND status = 'failed'
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW(6)
           #{name_sql}
@@ -485,7 +492,8 @@ module Durababble
     define(:mysql_claim_canceling_workflow, backend: :mysql) do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
-        WHERE status = 'canceling'
+        WHERE worker_pool = ?
+          AND status = 'canceling'
           AND (next_run_at IS NULL OR next_run_at <= NOW(6))
           #{name_sql}
         ORDER BY created_at
@@ -497,7 +505,8 @@ module Durababble
     define(:mysql_claim_expired_workflow, backend: :mysql) do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")})
-        WHERE status = 'running' AND locked_until < NOW(6)
+        WHERE worker_pool = ?
+          AND status = 'running' AND locked_until < NOW(6)
           #{name_sql}
         ORDER BY created_at
         LIMIT 1
@@ -509,7 +518,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
           AND (
             status = 'pending'
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
@@ -522,14 +531,14 @@ module Durababble
     define(:mysql_claim_workflow_already_owned, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "workflows")}
-        WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
       SQL
     end
 
     define(:mysql_claim_workflow_lock, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT id FROM #{table(store, "workflows")}
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
           AND (
             status = 'pending'
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
@@ -544,7 +553,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
       SQL
     end
 
@@ -598,11 +607,11 @@ module Durababble
       "SELECT locked_until FROM #{table(store, "workflows")} WHERE id = ?"
     end
 
-    define(:mysql_current_workflow_lease, backend: :mysql) do |store|
+    define(:mysql_current_workflow_lease, backend: :mysql) do |store, worker_pool_sql: ""|
       <<~SQL.chomp
-        SELECT id AS workflow_id, locked_by AS worker_id, locked_until
+        SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
         FROM #{table(store, "workflows")}
-        WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        WHERE id = ? #{worker_pool_sql} AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
       SQL
     end
 
@@ -721,7 +730,7 @@ module Durababble
     end
 
     define(:mysql_object_state, backend: :mysql) do |store|
-      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = ? AND object_id = ?"
+      "SELECT state FROM #{table(store, "durable_objects")} WHERE worker_pool = ? AND object_type = ? AND object_id = ?"
     end
 
     define(:pg_drop_schema, backend: :postgres) do |store|
@@ -729,23 +738,23 @@ module Durababble
     end
 
     define(:pg_insert_workflow, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES ($1, $2, $3, $4::bytea)"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input) VALUES ($1, $2, $3, $4, $5::bytea)"
     end
 
     define(:pg_insert_workflow_with_worker, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4::bytea, $5, now() + ($6::int * interval '1 second'))"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))"
     end
 
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = $2,
-            locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
-        WHERE id = $1
+        SET status = 'running', error = NULL, locked_by = $3,
+            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        WHERE id = $1 AND worker_pool = $2
           AND (
             status IN ('pending', 'waiting', 'canceling')
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
+            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
           )
         RETURNING *
       SQL
@@ -820,9 +829,9 @@ module Durababble
 
     define(:pg_current_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
         FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+        WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
           AND locked_by IS NOT NULL AND locked_until >= now()
         ORDER BY sequence
         LIMIT 1
@@ -833,7 +842,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND worker_pool = $2
       SQL
     end
 
@@ -903,8 +912,8 @@ module Durababble
 
     define(:pg_claim_pending_target_activation, backend: :postgres) do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE status = 'pending' AND ready_at <= $1::timestamptz
+        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
+        WHERE worker_pool = $1 AND status = 'pending' AND ready_at <= $2::timestamptz
           #{filter_sql}
         ORDER BY ready_at, created_at
         LIMIT 1
@@ -914,8 +923,8 @@ module Durababble
 
     define(:pg_claim_expired_target_activation, backend: :postgres) do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE status = 'running' AND locked_until < $1::timestamptz
+        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
+        WHERE worker_pool = $1 AND status = 'running' AND locked_until < $2::timestamptz
           #{filter_sql}
         ORDER BY ready_at, created_at
         LIMIT 1
@@ -926,8 +935,8 @@ module Durababble
     define(:pg_claim_selected_target_activation, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
-        SET status = 'running', locked_by = $4, locked_until = now() + ($5::int * interval '1 second'), updated_at = now()
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
         RETURNING *
       SQL
     end
@@ -935,40 +944,40 @@ module Durababble
     define(:pg_lock_target_activation_for_completion, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT 1 FROM #{table(store, "target_activations")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-          AND status = 'running' AND locked_by = $4
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+          AND status = 'running' AND locked_by = $5
         FOR UPDATE
       SQL
     end
 
     define(:pg_upsert_target_activation, backend: :postgres) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
-        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+        INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
+        VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
+        ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO UPDATE
           SET status = CASE WHEN #{table(store, "target_activations")}.status = 'running' THEN #{table(store, "target_activations")}.status ELSE 'pending' END,
           ready_at = LEAST(#{table(store, "target_activations")}.ready_at, EXCLUDED.ready_at), updated_at = now()
       SQL
     end
 
     define(:pg_delete_target_activation, backend: :postgres) do |store|
-      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = $1 AND target_type = $2 AND target_id = $3"
+      "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
 
     define(:pg_set_target_activation_pending, backend: :postgres) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
-        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+        INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
+        VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
+        ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO UPDATE
           SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
       SQL
     end
 
     define(:pg_insert_mailbox_sequence, backend: :postgres) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
-        VALUES ($1, $2, $3, 0)
-        ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
+        INSERT INTO #{table(store, "mailbox_sequences")} (worker_pool, target_kind, target_type, target_id, last_sequence)
+        VALUES ($1, $2, $3, $4, 0)
+        ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO NOTHING
       SQL
     end
 
@@ -976,7 +985,7 @@ module Durababble
       <<~SQL.chomp
         SELECT last_sequence
         FROM #{table(store, "mailbox_sequences")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
         FOR UPDATE
       SQL
     end
@@ -984,16 +993,16 @@ module Durababble
     define(:pg_update_mailbox_sequence, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "mailbox_sequences")}
-        SET last_sequence = $4, updated_at = now()
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SET last_sequence = $5, updated_at = now()
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
       SQL
     end
 
     define(:pg_existing_inbox_message_for_idempotency, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
+        SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
         FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3 AND idempotency_key = $4
+        WHERE idempotency_hash = $1
         FOR UPDATE
       SQL
     end
@@ -1014,10 +1023,10 @@ module Durababble
     define(:pg_insert_inbox_message, backend: :postgres) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "inbox")} (
-        id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-        operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
+        id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name,
+        operation_id, idempotency_key, idempotency_hash, shape_hash, payload, status, ready_at, max_attempts
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::bytea, 'pending', $14::timestamptz, $15)
       SQL
     end
 
@@ -1025,10 +1034,10 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
-        LIMIT $4
+        LIMIT $5
         FOR UPDATE
       SQL
     end
@@ -1037,7 +1046,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT 1
@@ -1145,13 +1154,13 @@ module Durababble
     define(:pg_inbox_messages_for, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
         ORDER BY sequence
       SQL
     end
 
     define(:pg_target_activation, backend: :postgres) do |store|
-      "SELECT * FROM #{table(store, "target_activations")} WHERE target_kind = $1 AND target_type = $2 AND target_id = $3"
+      "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
 
     define(:mysql_drop_table, backend: :mysql) do |store, table_name:|
@@ -1159,29 +1168,29 @@ module Durababble
     end
 
     define(:mysql_insert_workflow, backend: :mysql) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES (?, ?, ?, ?)"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input) VALUES (?, ?, ?, ?, ?)"
     end
 
     define(:mysql_insert_workflow_with_worker, backend: :mysql) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
       SQL
     end
 
     define(:mysql_mark_workflow_running, backend: :mysql) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ?"
+      "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ?"
     end
 
     define(:mysql_claim_workflow_for_activation_lock, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT id FROM #{table(store, "workflows")}
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
           AND (
             status IN ('pending', 'waiting', 'canceling')
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
@@ -1195,7 +1204,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND worker_pool = ?
       SQL
     end
 
@@ -1292,9 +1301,9 @@ module Durababble
 
     define(:mysql_current_object_lease, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
         FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+        WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
           AND locked_by IS NOT NULL AND locked_until >= NOW(6)
         ORDER BY sequence
         LIMIT 1
@@ -1452,16 +1461,16 @@ module Durababble
 
     define(:mysql_save_object_state, backend: :mysql) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "durable_objects")} (object_type, object_id, state)
-        VALUES (?, ?, ?)
+        INSERT INTO #{table(store, "durable_objects")} (worker_pool, object_type, object_id, state)
+        VALUES (?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE state = VALUES(state), updated_at = NOW(6)
       SQL
     end
 
     define(:mysql_claim_pending_target_activation, backend: :mysql) do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE status = 'pending' AND ready_at <= ?
+        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
+        WHERE worker_pool = ? AND status = 'pending' AND ready_at <= ?
           #{filter_sql}
         ORDER BY ready_at, created_at
         LIMIT 1
@@ -1471,8 +1480,8 @@ module Durababble
 
     define(:mysql_claim_expired_target_activation, backend: :mysql) do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "expired")})
-        WHERE status = 'running' AND locked_until < ?
+        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "expired")})
+        WHERE worker_pool = ? AND status = 'running' AND locked_until < ?
           #{filter_sql}
         ORDER BY ready_at, created_at
         LIMIT 1
@@ -1484,14 +1493,14 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
       SQL
     end
 
     define(:mysql_lock_target_activation_for_completion, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT 1 FROM #{table(store, "target_activations")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status = 'running' AND locked_by = ?
         FOR UPDATE
       SQL
@@ -1544,28 +1553,28 @@ module Durababble
 
     define(:mysql_upsert_target_activation, backend: :mysql) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES (?, ?, ?, 'pending', ?)
+        INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
         ON DUPLICATE KEY UPDATE status = IF(status = 'running', status, 'pending'), ready_at = LEAST(ready_at, VALUES(ready_at)), updated_at = NOW(6)
       SQL
     end
 
     define(:mysql_delete_target_activation, backend: :mysql) do |store|
-      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = ? AND target_type = ? AND target_id = ?"
+      "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
     define(:mysql_set_target_activation_pending, backend: :mysql) do |store|
       <<~SQL.chomp
-        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES (?, ?, ?, 'pending', ?)
+        INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
         ON DUPLICATE KEY UPDATE status = 'pending', ready_at = VALUES(ready_at), locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
       SQL
     end
 
     define(:mysql_insert_mailbox_sequence, backend: :mysql) do |store|
       <<~SQL.chomp
-        INSERT IGNORE INTO #{table(store, "mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
-        VALUES (?, ?, ?, 0)
+        INSERT IGNORE INTO #{table(store, "mailbox_sequences")} (worker_pool, target_kind, target_type, target_id, last_sequence)
+        VALUES (?, ?, ?, ?, 0)
       SQL
     end
 
@@ -1573,7 +1582,7 @@ module Durababble
       <<~SQL.chomp
         SELECT last_sequence
         FROM #{table(store, "mailbox_sequences")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
         FOR UPDATE
       SQL
     end
@@ -1582,15 +1591,15 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "mailbox_sequences")}
         SET last_sequence = ?, updated_at = NOW(6)
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
       SQL
     end
 
     define(:mysql_existing_inbox_message_for_idempotency, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
+        SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
         FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ? AND idempotency_key = ?
+        WHERE idempotency_hash = ?
         FOR UPDATE
       SQL
     end
@@ -1602,10 +1611,10 @@ module Durababble
     define(:mysql_insert_inbox_message, backend: :mysql) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "inbox")} (
-        id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-        operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
+        id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name,
+        operation_id, idempotency_key, idempotency_hash, shape_hash, payload, status, ready_at, max_attempts
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
       SQL
     end
 
@@ -1613,7 +1622,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT #{Integer(limit)}
@@ -1625,7 +1634,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT 1
@@ -1723,13 +1732,13 @@ module Durababble
     define(:mysql_inbox_messages_for, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
         ORDER BY sequence
       SQL
     end
 
     define(:mysql_target_activation, backend: :mysql) do |store|
-      "SELECT * FROM #{table(store, "target_activations")} WHERE target_kind = ? AND target_type = ? AND target_id = ?"
+      "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
   end
 end

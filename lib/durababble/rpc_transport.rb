@@ -414,17 +414,17 @@ module Durababble
         request = request #: as untyped
         return false unless request.target_kind == "workflow"
 
-        lease = @store.current_workflow_lease(request.target_id)
+        lease = @store.current_workflow_lease(request.target_id, worker_pool: request.worker_pool)
         !lease || lease.fetch("worker_id") != @node_id
       end
 
       #: (Object) -> Proto::TransientResponse?
       def moved_response(request)
         request = request #: as untyped
-        lease = @store.current_workflow_lease(request.workflow_id)
+        lease = @store.current_workflow_lease(request.workflow_id, worker_pool: request.worker_pool)
         return unless lease
 
-        new_node_id = lease.fetch("worker_id")
+        new_node_id = lease.fetch("worker_id").to_s
         return if new_node_id == @node_id
 
         Proto::TransientResponse.new(
