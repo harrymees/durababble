@@ -1,0 +1,68 @@
+{{/* Build navigation data once and store in page scratch for reuse */}}
+{{ $all := slice }}
+{{ range .Site.AllPages }}
+  {{ if .File }}
+    {{ $all = $all | append . }}
+  {{ end }}
+{{ end }}
+{{ .Scratch.Set "nav_pages" $all }}
+
+{{ $tmp := newScratch }}
+{{ $tmp.Set "ordered" (slice) }}
+
+{{ define "nav_flatten" }}
+  {{- $scratch := .scratch -}}
+  {{- $currentDir := .currentDir -}}
+  {{- $pages := .pages -}}
+  {{- $subdirs := dict -}}
+  {{- $currentPages := slice -}}
+  {{- range $pages -}}
+    {{- $relPath := strings.TrimPrefix $currentDir .File.Path -}}
+    {{- $parts := split $relPath "/" -}}
+    {{- if eq (len $parts) 1 -}}
+      {{- if ne .File.BaseFileName "_index" -}}
+        {{- $currentPages = $currentPages | append . -}}
+      {{- end -}}
+    {{- else -}}
+      {{- $subdir := index $parts 0 -}}
+      {{- $subdirs = merge $subdirs (dict $subdir (dict)) -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- $items := slice -}}
+  {{- range $currentPages -}}
+    {{- $items = $items | append (dict "type" "page" "weight" (.Params.weight | default 999) "page" .) -}}
+  {{- end -}}
+  {{- range $subdir, $_ := $subdirs -}}
+    {{- $subdirPages := slice -}}
+    {{- $subdirIndex := "" -}}
+    {{- range $pages -}}
+      {{- if hasPrefix .File.Path (printf "%s%s/" $currentDir $subdir) -}}
+        {{- $subdirPages = $subdirPages | append . -}}
+        {{- if eq .File.BaseFileName "_index" -}}
+          {{- $subdirIndex = . -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if gt (len $subdirPages) 0 -}}
+      {{- $w := 999 -}}
+      {{- if $subdirIndex -}}
+        {{- $w = $subdirIndex.Params.weight | default 999 -}}
+      {{- end -}}
+      {{- $items = $items | append (dict "type" "directory" "weight" $w "name" $subdir "pages" $subdirPages) -}}
+    {{- end -}}
+  {{- end -}}
+
+  {{- range sort $items "weight" -}}
+    {{- if eq .type "page" -}}
+      {{- $scratch.Set "ordered" ($scratch.Get "ordered" | append .page) -}}
+    {{- else -}}
+      {{- template "nav_flatten" (dict "currentDir" (printf "%s%s/" $currentDir .name) "pages" .pages "scratch" $scratch) -}}
+    {{- end -}}
+  {{- end -}}
+{{ end }}
+
+{{ template "nav_flatten" (dict "currentDir" "" "pages" $all "scratch" $tmp) }}
+{{ .Scratch.Set "nav_ordered" ($tmp.Get "ordered") }}
+
+
