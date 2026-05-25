@@ -72,6 +72,10 @@ class DurababbleWorkflowTest < DurababbleTestCase
       raise Durababble::Error, "workflow #{workflow_id} is terminal"
     end
 
+    def deliver_target_message(**)
+      @enqueued = true
+    end
+
     def enqueue_inbox_message(**)
       @enqueued = true
       "raced-command"

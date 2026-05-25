@@ -16,6 +16,8 @@ module Durababble
 
     #: untyped
     attr_reader :schema
+    #: untyped
+    attr_accessor :rpc_client_factory
 
     class << self
       #: (database_url: untyped, ?schema: untyped) -> untyped
@@ -36,6 +38,7 @@ module Durababble
       @connection = connection
       @schema = schema
       @migrated = false
+      @rpc_client_factory = ->(address) { Durababble::Rpc::Client.new(address:) }
     end
 
     #: () -> untyped
@@ -517,6 +520,19 @@ module Durababble
       row&.transform_values(&:itself)
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped, ?client_factory: untyped) -> bool
+    def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
+      lease = current_target_lease(target_kind:, target_id:)
+      return false unless lease
+
+      factory = client_factory || rpc_client_factory
+      client = factory.call(lease.fetch("worker_id"))
+      deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+      true
+    rescue Durababble::Rpc::Error, Durababble::WorkflowRpc::Error
+      false
+    end
+
     #: (?now: untyped) -> untyped
     def steal_expired_leases!(now: Time.now)
       result = execute_params(<<~SQL, [timestamp(now)])
@@ -941,6 +957,16 @@ module Durababble
       end
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
+    def reconcile_target_activation(target_kind:, target_type:, target_id:, now: Time.now)
+      transaction { reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:) }
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ready_at: untyped) -> untyped
+    def rearm_target_activation(target_kind:, target_type:, target_id:, ready_at:)
+      transaction { set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:) }
+    end
+
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def target_activation(target_kind:, target_type:, target_id:)
       row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
@@ -1191,6 +1217,27 @@ module Durababble
         SQL
       else
         execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
+      end
+    end
+
+    #: (target_kind: untyped, target_id: untyped) -> untyped
+    def current_target_lease(target_kind:, target_id:)
+      case target_kind
+      when "workflow"
+        current_workflow_lease(target_id)
+      end
+    end
+
+    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+      attempts = 0
+      begin
+        client.deliver_message(worker_pool:, target_kind:, target_class: target_type, target_id:)
+      rescue Durababble::Rpc::Unavailable, Durababble::WorkflowRpc::NodeUnavailable
+        attempts += 1
+        retry if attempts < 2
+
+        raise
       end
     end
 
@@ -2269,6 +2316,19 @@ module Durababble
       SQL
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped, ?client_factory: untyped) -> bool
+    def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
+      lease = current_target_lease(target_kind:, target_id:)
+      return false unless lease
+
+      factory = client_factory || rpc_client_factory
+      client = factory.call(lease.fetch("worker_id"))
+      deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+      true
+    rescue Durababble::Rpc::Error, Durababble::WorkflowRpc::Error
+      false
+    end
+
     #: (?now: untyped) -> untyped
     def steal_expired_leases!(now: Time.now)
       expired = execute_params(<<~SQL, [now]).first.fetch("count").to_i
@@ -2703,6 +2763,16 @@ module Durababble
       end
     end
 
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
+    def reconcile_target_activation(target_kind:, target_type:, target_id:, now: Time.now)
+      transaction { reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:) }
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ready_at: untyped) -> untyped
+    def rearm_target_activation(target_kind:, target_type:, target_id:, ready_at:)
+      transaction { set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:) }
+    end
+
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def target_activation(target_kind:, target_type:, target_id:)
       row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
@@ -2991,6 +3061,27 @@ module Durababble
         SQL
       else
         execute_params("SELECT * FROM #{table("inbox")} WHERE id = ? FOR UPDATE", [command_id]).first
+      end
+    end
+
+    #: (target_kind: untyped, target_id: untyped) -> untyped
+    def current_target_lease(target_kind:, target_id:)
+      case target_kind
+      when "workflow"
+        current_workflow_lease(target_id)
+      end
+    end
+
+    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+      attempts = 0
+      begin
+        client.deliver_message(worker_pool:, target_kind:, target_class: target_type, target_id:)
+      rescue Durababble::Rpc::Unavailable, Durababble::WorkflowRpc::NodeUnavailable
+        attempts += 1
+        retry if attempts < 2
+
+        raise
       end
     end
 

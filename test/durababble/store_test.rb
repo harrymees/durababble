@@ -119,6 +119,25 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
+  class FlakyDeliveryClient
+    attr_reader :deliveries
+
+    def initialize(failures:)
+      @failures = failures
+      @deliveries = []
+    end
+
+    def deliver_message(**kwargs)
+      @deliveries << kwargs
+      if @failures.positive?
+        @failures -= 1
+        raise Durababble::Rpc::Unavailable, "temporarily unavailable"
+      end
+
+      true
+    end
+  end
+
   class ObjectWithString
     def initialize(value)
       @value = value
@@ -710,6 +729,65 @@ class DurababbleStoreTest < DurababbleTestCase
       PgResult.new,
       PgResult.new,
     ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+  end
+
+  test "handles advisory target delivery retry and fallback branches" do
+    pg_client = FlakyDeliveryClient.new(failures: 1)
+    pg_delivered = pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
+    ])).deliver_target_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf",
+      client_factory: lambda do |address|
+        assert_equal("127.0.0.1:12345", address)
+        pg_client
+      end,
+    )
+    assert_equal(true, pg_delivered)
+    assert_equal(2, pg_client.deliveries.length)
+
+    assert_equal false, pg_store.deliver_target_message(
+      target_kind: "object",
+      target_type: "account",
+      target_id: "acct-1",
+      client_factory: ->(_address) { raise "no lease should skip client construction" },
+    )
+
+    pg_down_client = FlakyDeliveryClient.new(failures: 2)
+    assert_equal false, pg_store(ScriptedPgConnection.new(params_results: [
+      PgResult.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
+    ])).deliver_target_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf",
+      client_factory: ->(_address) { pg_down_client },
+    )
+    assert_equal 2, pg_down_client.deliveries.length
+
+    mysql_client = FlakyDeliveryClient.new(failures: 1)
+    mysql_connection = ScriptedMysqlConnection.new do |sql|
+      if sql.include?("SELECT id AS workflow_id")
+        MysqlResultLike.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:23456", "locked_until" => Time.now + 60 }])
+      end
+    end
+    mysql_delivered = mysql_store(mysql_connection).deliver_target_message(
+      target_kind: "workflow",
+      target_type: "approval",
+      target_id: "wf",
+      client_factory: lambda do |address|
+        assert_equal("127.0.0.1:23456", address)
+        mysql_client
+      end,
+    )
+    assert_equal(true, mysql_delivered)
+    assert_equal(2, mysql_client.deliveries.length)
+    assert_equal false, mysql_store.deliver_target_message(
+      target_kind: "object",
+      target_type: "account",
+      target_id: "acct-1",
+      client_factory: ->(_address) { raise "no lease should skip client construction" },
+    )
   end
 
   test "handles postgres fence replay, serialization migration, retry, and helper branches" do

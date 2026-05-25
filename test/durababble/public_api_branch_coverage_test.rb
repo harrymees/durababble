@@ -116,6 +116,11 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
       "inbox-1"
     end
 
+    def deliver_target_message(**kwargs)
+      @events << [:deliver, kwargs]
+      true
+    end
+
     def wait_for_inbox_message(message_id)
       "result:#{message_id}"
     end
@@ -194,6 +199,11 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           method_name: "note",
           payload: { "method" => "note", "args" => [], "kwargs" => { message: "hello" } },
           idempotency_key: "note:hello",
+        },],
+        [:deliver, {
+          target_kind: "workflow",
+          target_type: "branch_test_workflow",
+          target_id: "wf-123",
         },],
       ],
       store.events,

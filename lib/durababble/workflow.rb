@@ -221,6 +221,11 @@ module Durababble
           payload:,
           idempotency_key:,
         )
+        @store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+        )
         @store.wait_for_inbox_message(message_id)
       else
         super
