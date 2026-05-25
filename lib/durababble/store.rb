@@ -113,7 +113,7 @@ module Durababble
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped, ?client_factory: untyped) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
-      lease = current_target_lease(target_kind:, target_id:)
+      lease = current_target_lease(target_kind:, target_type:, target_id:)
       return false unless lease
 
       factory = client_factory || rpc_client_factory
@@ -126,7 +126,7 @@ module Durababble
 
     #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
     def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
-      deadline = Time.now + timeout
+      deadline = timeout && Time.now + timeout
       loop do
         message = inbox_message(message_id)
         raise KeyError, "inbox message not found: #{message_id}" unless message
@@ -137,21 +137,23 @@ module Durababble
         when "failed", "dead_lettered"
           raise Error, message["error"] || "inbox message #{message_id} failed"
         end
-        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
+        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if deadline && Time.now >= deadline
 
         sleep(poll_interval)
       end
     end
 
-    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped, ?message_kind: untyped, ?idempotency_key: untyped, ?max_attempts: untyped) -> untyped
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
       enqueue_inbox_message(
         target_kind: "object",
         target_type: object_type,
         target_id: object_id,
-        message_kind: "ask",
+        message_kind:,
         method_name: method_name.to_s,
         payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
+        idempotency_key:,
+        max_attempts:,
       )
     end
 
@@ -172,12 +174,19 @@ module Durababble
       @connection.transaction(requires_new: true, &block)
     end
 
-    #: (target_kind: untyped, target_id: untyped) -> untyped
-    def current_target_lease(target_kind:, target_id:)
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def current_target_lease(target_kind:, target_type:, target_id:)
       case target_kind
       when "workflow"
         current_workflow_lease(target_id)
+      when "object"
+        current_object_lease(target_type, target_id)
       end
+    end
+
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      nil
     end
 
     #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
@@ -229,7 +238,7 @@ module Durababble
 
     #: (untyped) -> bool
     def object_command_message?(row)
-      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && row.fetch("message_kind") == "ask"))
+      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && ["ask", "tell"].include?(row.fetch("message_kind"))))
     end
 
     #: (untyped) -> untyped

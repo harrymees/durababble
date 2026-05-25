@@ -81,7 +81,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
       "raced-command"
     end
 
-    def wait_for_inbox_message(message_id)
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
       raise Durababble::CommandTimeout, "timed out waiting for inbox message #{message_id}"
     end
   end

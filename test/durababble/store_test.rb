@@ -768,6 +768,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(KeyError) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0.01) }
     messages = [{ "status" => "pending" }]
     assert_raises(Durababble::CommandTimeout) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0) }
+    messages = [{ "status" => "pending" }, { "status" => "completed", "result" => { "later" => true } }]
+    assert_equal({ "later" => true }, helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: nil))
 
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),

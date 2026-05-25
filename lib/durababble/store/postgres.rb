@@ -169,8 +169,18 @@ module Durababble
           SET status = 'pending', locked_by = NULL, locked_until = NULL
           WHERE status = 'processing' AND locked_by = $1
         SQL
-        released = { "workflows" => workflows, "outbox" => outbox }
-        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: workflows.to_i)
+        inbox = execute_params(<<~SQL, [worker_id]).affected_rows
+          UPDATE #{table("inbox")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE status = 'running' AND locked_by = $1
+        SQL
+        target_activations = execute_params(<<~SQL, [worker_id]).affected_rows
+          UPDATE #{table("target_activations")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE status = 'running' AND locked_by = $1
+        SQL
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
     end
@@ -312,6 +322,19 @@ module Durababble
         SELECT id AS workflow_id, locked_by AS worker_id, locked_until
         FROM #{table("workflows")}
         WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+      SQL
+      row&.transform_values(&:itself)
+    end
+
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      row = execute_params(<<~SQL, [object_type, object_id]).first
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table("inbox")}
+        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= now()
+        ORDER BY sequence
+        LIMIT 1
       SQL
       row&.transform_values(&:itself)
     end
@@ -672,7 +695,7 @@ module Durababble
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
           SELECT * FROM #{table("inbox")}
-          WHERE id = $1 AND status = 'running' AND locked_by = $2
+          WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
           FOR UPDATE
         SQL
       else
@@ -840,6 +863,20 @@ module Durababble
             locked_by = NULL,
             locked_until = NULL,
             dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
+            updated_at = now()
+        WHERE id = $1
+      SQL
+    end
+
+    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      execute_params(<<~SQL, [message_id, error, timestamp(ready_at)])
+        UPDATE #{table("inbox")}
+        SET status = 'pending',
+            error = $2,
+            ready_at = $3::timestamptz,
+            locked_by = NULL,
+            locked_until = NULL,
             updated_at = now()
         WHERE id = $1
       SQL
