@@ -13,6 +13,13 @@ Because they are durable, durable workflows can sleep for many days, await some 
 
 <!-- DOCS:workflow-example:start -->
 
+<!-- DOCS:workflow-example:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+```
+-->
+
 ```ruby
 # an example workflow
 class FulfillOrder < Durababble::Workflow
@@ -53,22 +60,38 @@ module Shipping
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
 order ||= {
   "card_token" => "card_123",
   "total_cents" => 5_000,
   "address" => { "postal_code" => "10001" },
 }
 
-# enqueue the workflow
-run = engine.run(FulfillOrder, input: order)
-
-# wait for it to finish and get its return value -- will overcome step failures or crashes or whatever strange issues arise by retrying each step, and eventually return!
-run.result
+# enqueue the workflow and keep a typed handle
+fulfillment = FulfillOrder.start(order, store:)
 ```
+
+<!-- DOCS:workflow-example:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [FulfillOrder],
+  worker_id: "orders-worker-1",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+# later, any process can recover the same handle by id
+fulfillment = FulfillOrder.at(fulfillment.workflow_id, store:)
+```
+
+<!-- DOCS:workflow-example:hidden
+```ruby
+store.workflow(fulfillment.workflow_id).fetch("result")
+```
+-->
 
 <!-- DOCS:workflow-example:end -->
 

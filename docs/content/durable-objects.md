@@ -17,6 +17,13 @@ Durable object methods are not workflow steps. Instead, the command is the durab
 
 <!-- DOCS:durable-object-example:start -->
 
+<!-- DOCS:durable-object-example:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+```
+-->
+
 ```ruby
 class Account < Durababble::DurableObject
   object_type "account"
@@ -37,23 +44,44 @@ class Account < Durababble::DurableObject
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-
 account = Account.at("acct_readme", store:)
-Account.tell("acct_readme", :credit, 1_000, store:)
+```
 
+<!-- DOCS:durable-object-example:hidden
+```ruby
+worker_database_url = respond_to?(:backend_descriptor) ? backend_descriptor.database_url : Durababble.default_database_url
+worker_store = Durababble::Store.connect(database_url: worker_database_url, schema: store.schema)
 worker = Durababble::Worker.new(
-  store:,
-  workflows: {},
+  store: worker_store,
+  workflows: [],
   objects: [Account],
   worker_id: "account-worker-1",
   migrate: false,
 )
-worker.run_until_idle
+worker_thread = Thread.new do
+  loop do
+    worker.run_until_idle
+    sleep 0.01
+  end
+end
+```
+-->
+
+```ruby
+account.credit(1_000)
 
 account.balance
 ```
+
+<!-- DOCS:durable-object-example:hidden
+```ruby
+object_result = account.balance
+worker_thread.kill
+worker_thread.join
+worker_store.close
+object_result
+```
+-->
 
 <!-- DOCS:durable-object-example:end -->
 

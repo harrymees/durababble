@@ -55,19 +55,54 @@ class DurababbleDocumentationTest < DurababbleTestCase
     end
   end
 
+  test "docs site examples can hide runnable setup from the presented snippets" do
+    workflows = read("docs/content/workflows.md")
+    durable_objects = read("docs/content/durable-objects.md")
+
+    workflow_visible = visible_marked_ruby_code(workflows, "workflow-example")
+    assert_includes workflow_visible, "FulfillOrder.start(order, store:)"
+    assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id, store:)"
+    refute_includes workflow_visible, "Durababble::Store.connect"
+    refute_includes workflow_visible, "Durababble::Worker.new"
+    refute_includes workflow_visible, "Durababble::Engine.new"
+
+    object_visible = visible_marked_ruby_code(durable_objects, "durable-object-example")
+    assert_includes object_visible, "account = Account.at(\"acct_readme\", store:)"
+    assert_includes object_visible, "account.credit(1_000)"
+    refute_includes object_visible, "Account.tell"
+    refute_includes object_visible, "Durababble::Store.connect"
+    refute_includes object_visible, "Durababble::Worker.new"
+  end
+
   private
 
   def root
     File.expand_path("../..", __dir__)
   end
 
-  def marked_ruby_code(text, marker)
+  def marked_example_content(text, marker)
     pattern = /<!-- DOCS:#{Regexp.escape(marker)}:start -->(.*?)<!-- DOCS:#{Regexp.escape(marker)}:end -->/m
     match = text.match(pattern)
     assert(match, "docs content is missing #{marker} example markers")
-    code = match[1].match(/```ruby\n(.*?)\n```/m)
-    assert(code, "docs content #{marker} marker does not contain a ruby code block")
-    code[1]
+    match[1]
+  end
+
+  def marked_ruby_code(text, marker)
+    code = ruby_blocks(marked_example_content(text, marker))
+    assert(code.any?, "docs content #{marker} marker does not contain a ruby code block")
+    code.join("\n\n")
+  end
+
+  def visible_marked_ruby_code(text, marker)
+    content = marked_example_content(text, marker)
+    visible_content = content.gsub(/<!-- DOCS:#{Regexp.escape(marker)}:hidden\b.*?-->/m, "")
+    code = ruby_blocks(visible_content)
+    assert(code.any?, "docs content #{marker} marker does not contain a visible ruby code block")
+    code.join("\n\n")
+  end
+
+  def ruby_blocks(markdown)
+    markdown.scan(/```ruby\n(.*?)\n```/m).map(&:first)
   end
 
   def evaluate_marked_example(markdown, marker, context)
