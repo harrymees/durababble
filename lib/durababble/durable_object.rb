@@ -1,20 +1,20 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "durable_method_dsl"
+
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
   ObjectSleepChange = Data.define(:action, :wake_at, :payload)
 
   class DurableObject
-    class << self
-      #: untyped
-      attr_reader :exposed_queries, :exposed_commands
+    extend DurableMethodDSL
 
+    class << self
       #: (untyped) -> untyped
       def inherited(subclass)
         super
-        subclass.instance_variable_set(:@exposed_queries, {})
-        subclass.instance_variable_set(:@exposed_commands, {})
+        initialize_durable_method_dsl(subclass)
       end
 
       #: (?untyped) -> untyped
@@ -29,55 +29,22 @@ module Durababble
         DurableObjectRef.new(self, String(durable_id), store:)
       end
 
-      #: (?untyped) -> untyped
-      def expose(method_name = nil)
-        if method_name
-          @exposed_queries[method_name.to_sym] = true
-          method_name
-        else
-          @pending_durable_macro = [:expose, {}]
-          nil
-        end
-      end
-
-      #: (?untyped, **untyped) -> untyped
-      def expose_command(method_name = nil, **options)
-        if method_name
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
-          method_name
-        else
-          @pending_durable_macro = [:expose_command, { retry_policy: options[:retry] }]
-          nil
-        end
-      end
-
       #: (untyped) -> untyped
       def method_added(method_name)
         super
 
         return if @__durababble_wrapping
 
-        pending = @pending_durable_macro
+        pending = consume_pending_durable_macro
         return unless pending
 
-        @pending_durable_macro = nil
         kind, options = pending
         case kind
         when :expose
-          @exposed_queries[method_name.to_sym] = true
+          register_exposed_query(method_name)
         when :expose_command
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
+          register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
         end
-      end
-
-      private
-
-      #: (untyped) -> untyped
-      def underscore(value)
-        value.gsub(/([A-Z]+)([A-Z][a-z])/, "\\1_\\2")
-          .gsub(/([a-z\d])([A-Z])/, "\\1_\\2")
-          .tr("-", "_")
-          .downcase
       end
     end
 
@@ -254,7 +221,7 @@ module Durababble
         }
         completion[:sleep_change] = object.sleep_change if object.sleep_change
         completed = @store.complete_object_command(**completion)
-        unless completed && (!completed.respond_to?(:cmd_tuples) || completed.cmd_tuples.to_i.positive?)
+        unless completed&.affected_rows.to_i.positive?
           raise LeaseConflict, "lost durable object command lease #{command_id}"
         end
 

@@ -27,7 +27,7 @@ The contract specifies behavior, not a mandatory internal isolation technology. 
 
 - **Durable target:** a workflow execution or durable object instance addressed by class/type, id, and worker pool.
 - **Worker pool:** a persisted routing and execution boundary. Workers in a pool may claim, route, wake, and execute only targets assigned to that pool.
-- **Lease:** a persisted ownership record for a durable target, with owner node, RPC address, lease token, and deadline.
+- **Lease:** a persisted ownership record for a durable target, with the owner gRPC address as the routable node identity, a lease token, and a deadline.
 - **Workflow command:** a deterministic workflow operation such as a step schedule, wait, signal delivery, child workflow command, or patch marker.
 - **Command id:** the replay identity assigned by deterministic workflow execution order.
 - **Attempt id:** the execution identity for one concrete try of a command. Retries create new attempts for the same command id.
@@ -72,7 +72,7 @@ Idempotent start scopes caller keys to worker pool, workflow class, operation ki
 
 `expose` declares non-durable transient methods. Transient methods are invoked through owner-local RPC against the live workflow owner, must not mutate durable state, and must not accept `idempotency_key:`.
 
-`expose_command` declares durable workflow command methods. Commands are committed to the workflow inbox/history before returning to the caller. Synchronous command APIs return serialized results or typed remote errors.
+`expose_command` declares durable workflow command methods. A command call commits a durable inbox ask/tell row before returning to the caller, wakes the active workflow owner through `DeliverMessage` or leaves a durable target activation, and executes against the workflow at the next safe deterministic yield point. Workflow authors do not park on a matching `wait_event` or poll an inbox manually. Synchronous command APIs wait for the ask row to store a serialized result or typed error; retrying with the same idempotency key reattaches to the same row.
 
 `signal def handler` declares deterministic workflow signal handlers. `handle.signal(:name, **args, idempotency_key:)` commits a durable signal message before returning and fails for terminal workflows.
 
@@ -107,7 +107,7 @@ end
 
 `expose_command` registers durable mailbox commands. Commands execute through the durable object's identity, receive `command_context`, and update state only through `update_state(new_state)`. `command_context.idempotency_key` is generated from object type, object id, and mailbox message id and is stable for the durable command.
 
-Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`.
+Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`. Enqueuing a ready object command wakes the active owner through `DeliverMessage` or leaves a durable target activation for pool-local recovery. Object authors do not poll for commands; the owner drains the mailbox when woken or claimed.
 
 Lifecycle callbacks are `on_create`, `on_load`, `on_wake(payload: nil)`, and `on_destroy`. They are lifecycle hooks, not remotely callable public methods.
 
@@ -250,6 +250,10 @@ A step wait is a terminal command-resolution event, but releasing the workflow l
 
 Workflow signals are durable inbox/history messages delivered to declared signal handlers at deterministic workflow yield points. Signal acceptance is idempotent by message id and fails for terminal workflows.
 
+Workflow commands are durable workflow inbox messages delivered to the workflow lease owner. A committed command must make the target runnable immediately. If a live owner holds the workflow lease, the runtime sends `DeliverMessage` after commit; if there is no live owner or advisory delivery fails, the durable target activation remains claimable by the worker pool. The command executes before a new durable workflow command starts, after a step completes/fails/waits, when a running step heartbeats or otherwise yields to the workflow engine, or when a sleep/wait activation is interrupted by message work. A non-heartbeating user step body is not preempted mid-Ruby-frame; the command runs when the active owner reaches a safe point or lease expiry/recovery gives the target to another worker.
+
+Synchronous workflow command APIs are durable asks. The caller waits for the inbox row to store a serialized result or typed error, then returns/re-raises it. If the caller times out or loses its connection after the row commits, the durable command is not canceled; retrying with the same idempotency key reattaches to the same inbox row. Command responses do not require the general outbox table because the response is a one-to-one property of the ask row; workflow/object code may still write ordinary outbox messages when a command handler needs durable delivery to an external system.
+
 ### Cooperative cancellation
 
 Cancellation is cooperative execution, not hard termination.
@@ -304,7 +308,7 @@ Admin and observability surfaces expose patch usage by workflow type/id: normal 
 
 Object commands, scheduled wakeups, and other mailbox work acquire an exclusive writer slot for the target. Exposed transient methods acquire shared read access, can run concurrently with each other, and stop entering once mailbox work is waiting.
 
-Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance.
+Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery.
 
 Commands execute one at a time in strict FIFO order per durable target. Target executors drain only the contiguous ready prefix from the mailbox head. `SKIP LOCKED` must not let later messages overtake a blocked head for the same target.
 
@@ -330,7 +334,6 @@ Durable operations use both library-generated keys and caller-provided keys:
 - Idempotency keys are scoped to worker pool, target, operation kind, method, and argument fingerprint, not just target id.
 - Same key plus same operation shape returns the existing handle/result or re-raises the saved error. Same key plus different operation shape raises `Durababble::IdempotencyKeyConflict`.
 - Caller timeout after a durable command, signal, or message commits does not cancel durable work. Retrying with the same idempotency key reattaches to the same row.
-- Completed idempotency and inbox rows have configurable retention. The default retention is 30 days unless a class or operation specifies a longer retention window.
 - Transient `expose` methods are not durable and must not accept idempotency keys.
 
 ### Fences
@@ -356,10 +359,10 @@ Durababble persists the following logical entities. Physical table names may be 
 | `steps` | Latest logical workflow command state for query/result caching | `(workflow_id, command_id)` |
 | `step_attempts` | Append-only attempt history for step execution and waits | Attempt id, workflow id, command id, status |
 | `waits` | Durable timer and external-event waits | Wait id, workflow id, due time/event key/status |
-| `leases` | Pool-scoped ownership for workflow and object targets | `(worker_pool, target_kind, target_class, target_id)` |
-| `nodes` | Worker node registry with RPC address, advertised pools, draining flag, and heartbeat | `(worker_pool, node_id)` and fresh heartbeat lookups |
+| `leases` | Pool-scoped ownership for workflow and object targets, including the owner gRPC address | `(worker_pool, target_kind, target_class, target_id)` |
 | `inbox` | Durable asks, tells, wakes, workflow signals, and workflow command messages | Target identity, sequence, status, message id |
 | `mailbox_sequences` | Per-target monotonic mailbox sequence allocation | Target identity |
+| `target_activations` | Coalesced runnable target wakeups for inbox/scheduler work | Worker pool, ready time, target identity, status |
 | `idempotency_keys` | Public durable operation deduplication and shape conflict detection | Operation scope plus caller key |
 | `fences` | Workflow-local side-effect idempotency fences | `(workflow_id, key)` |
 | `outbox` | Durable outgoing messages with processing leases | Id, unique message key, lease expiry |
@@ -371,12 +374,17 @@ Query-shape and transaction requirements:
 - Claim paths use `FOR UPDATE SKIP LOCKED` where supported.
 - Persist immutable `worker_pool` on durable targets whose routing, claiming, scheduling, listing, or recovery semantics are pool-scoped.
 - Include `worker_pool` in primary keys and indexes when query patterns need to filter, route, claim, recover, or list by worker pool. Do not add it to keys whose query patterns do not care about worker pool.
-- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with `node_id`, `rpc_address`, `lease_token`, and `lease_until`.
-- The node registry is keyed by pool/node identity and records `rpc_address`, advertised pools, draining flag, and heartbeat time.
-- Object asks/tells/wakes and workflow signals/commands use the unified inbox.
-- Sequence allocation and inbox insert commit in one transaction.
+- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with the owner gRPC address as the node identity plus `lease_token` and `lease_until`.
+- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row and dials the gRPC address stored there; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
+- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the gRPC address in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
+- Object asks/tells/wakes and workflow signals/commands use the unified inbox. Inbox rows are durable message/result records, not a second globally polled work queue.
+- Sequence allocation, inbox insert, and ready-target activation upsert commit in one transaction.
 - Per-target mailbox sequence state lets `enqueue_message` allocate a monotonic sequence and lets target executors drain only a contiguous ready prefix from the head.
-- Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload. Replacing or canceling a sleep is committed with object message completion and state persistence; dispatch inserts the wake mailbox message before removing the sleep row in the same transaction.
+- Enqueueing a ready inbox message must atomically upsert a target activation row, or an equivalent scheduler row, keyed by worker pool and durable target identity. Workers globally poll target activations, not the inbox table; one activation can cover many pending inbox rows for the same target.
+- Target activation completion is conditional on the target mailbox/head state: after draining, the executor clears the activation only if no ready inbox row remains, otherwise it keeps or re-arms the activation with the next due time.
+- If a worker claims a target activation but finds the target is still owned by another fresh lease, it must not hot-loop the activation; it relies on advisory `DeliverMessage` for the live owner and re-arms the durable fallback no earlier than the observed lease deadline.
+- Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload.
+- Object sleep replacement/cancellation is committed with object message completion and state persistence; dispatch inserts the wake mailbox message before removing the sleep row in the same transaction.
 - Append-only workflow history rows are ordered per workflow. Required event families include `step_scheduled`, `step_started`, `step_completed`, `step_failed`, `step_waiting`, timer/wait events, signal delivery events, child-workflow events, and patch marker events.
 - Store deterministic command ids and replay-relevant command shape on schedule events. Store concrete attempt ids on start/completion/failure/wait events. The command id is the replay identity; the attempt id is the execution/retry identity.
 - Mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution events; execution recovery uses distinct attempt start/completion events.
@@ -394,7 +402,7 @@ All public durable semantics must work on PostgreSQL/YSQL and MySQL/MariaDB. Sch
 
 ### Worker lifecycle and recovery
 
-A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`. Each tick claims runnable work whose workflow or object class is present in the worker registry, then resumes it through the deterministic workflow executor or durable object mailbox executor.
+A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`. Each tick claims runnable work whose workflow or object class is present in the worker registry, including workflow rows and coalesced target activations, then resumes it through the deterministic workflow executor or durable object mailbox executor.
 
 Runnable workflows are pending rows, retryable failed rows whose non-null `next_run_at` is due, canceling rows with no live lease whose `next_run_at` is null or due, and expired running leases that are recoverable. Terminal failed rows with no retry deadline are not claimable.
 
@@ -409,17 +417,16 @@ Expired leases are reclaimed by claim paths or recovery sweeps. Recovery does no
 - Every durable target whose execution/routing is pool-scoped has an immutable persisted `worker_pool` selected at first materialization.
 - If a class declares a default pool, that pool wins unless the caller overrides while creating a new durable unit. Once the row exists, the persisted pool wins.
 - Worker pools are the routing and multiregion boundary. A pod in another pool cannot claim, route, or wake a target unless the target is explicitly relocated.
-- `nodes` records which pools each pod serves, its RPC address, draining state, and heartbeat.
 - Scheduler scans filter by pools served by the local pod.
-- `AwakenBatch`, `DeliverMessage`, and `CallTransient` are sent only to nodes in the target pool.
+- `DeliverMessage` and `CallTransient` route to the gRPC address in the target's fresh lease row. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
 - Automatic cross-pool stealing is forbidden. Regional failover is explicit `relocate_worker_pool` operator/runtime work that quiesces the target, releases the old lease, updates the row, and wakes it in the new pool.
 
 ### Sticky placement
 
 Routing keeps hot ids on the pod that already has them in memory:
 
-- Every pod loads or generates a stable `node_id` and advertises `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`.
-- Every acquired lease writes `node_id`, `rpc_address`, and a fresh `lease_token` into the lease row.
+- Every pod exposes `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`, and worker runtimes use that address as the lease owner identity.
+- Every acquired lease writes the owner gRPC address and a fresh `lease_token` into the lease row.
 - Lease acquisition uses a hot in-memory cache when the owner has a fresh lease and falls back to atomic SQL acquisition/lookup when cold, near expiry, or routed remotely.
 - A `LeaseRenewer` refreshes in-flight leases every `lease_ttl_ms / 3` and only when the `lease_token` still matches.
 - Cache entries are evicted on near-expiry, `EvictLease`, object CAS conflict, lease-renew failure, idle timeout, or LRU capacity pressure.
@@ -498,10 +505,10 @@ message DeliverMessageResponse {}
 RPC semantics:
 
 - **AwakenBatch** is a latency optimization after workflow starts or matured scheduler rows. It never replaces durable DB state or scheduler correctness.
-- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload; the receiver queries durable inbox rows. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
+- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload; the receiver queries durable inbox rows and schedules an owner-local target activation without blocking the gRPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
 - **CallTransient** is non-durable RPC for exposed methods against the active owner. It returns a Paquito result, a remote error, `not_running`, or `LeaseMoved`.
 - **EvictLease** asks a pod to drop a cached lease it may no longer own.
-- Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, durable inbox/scheduler recovery remains the correctness path.
+- Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, the already-committed target activation remains the correctness path and is eventually claimed by a worker in the target pool.
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
 - gRPC is required for production cross-pod calls because strongly typed protos catch shape drift and mTLS is available. Auxiliary test transports must not be used for production intranode communication.
 
@@ -584,6 +591,9 @@ Observability requirements:
 | Concurrent signalers wake a wait once | Concurrent signal delivery uses locked/idempotent updates. | Event concurrency spec |
 | Side effects can be fenced by key | A fence records `running` before yielding and exposes operator-visible recovery for abandoned owners. | Fence concurrency spec plus owner-crash spec |
 | Outbox delivery is durable and leased | Outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry. | Outbox specs |
+| Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side `wait_event` is required. | Workflow command mailbox specs plus gRPC wakeup specs |
+| Synchronous durable commands return results | Ask rows store serialized result/error and caller retries with the same idempotency key reattach. | Workflow/object ask specs |
+| Inbox is not a second global polling queue | Workers poll coalesced target activations and target owners drain inbox rows for their own target. | Query-plan and mailbox specs |
 | Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus gRPC transport spec plus DST scenarios |
 | Inter-pod RPC uses full four-method gRPC service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` with production credentials/auth callbacks. | gRPC integration/contract tests plus DST response scenarios |
 | Multi-row state transitions are transactional | Step start/finish/failure, wait transitions, inbox enqueue, mailbox advancement, and state/result writes commit atomically where required. | Implementation plus regression suite |
@@ -617,9 +627,10 @@ Observability requirements:
 | After outbox claim, before ack | Expired outbox lease can be reclaimed by another sender. |
 | During lease-routed workflow RPC | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy. |
 | During app shutdown with in-flight step | Runtime stops new claims; timeout releases leases; later worker retries. |
-| Crash after inbox row commits before `DeliverMessage` | Inbox row remains; scheduler safety-net wakes target later. |
+| Crash after inbox row and target activation commit before `DeliverMessage` | Activation remains claimable; a later worker/owner drains the target inbox. |
 | Crash before inbox row commits | No message row exists; caller retry decides whether to enqueue. |
 | Crash while allocating mailbox sequence | Transaction rolls back or commits both sequence advance and inbox row. |
+| `DeliverMessage` reaches a stale owner | Receiver no-ops after lease check; activation/lease re-check routes work to the current owner. |
 | Crash while object command runs before first checkpoint | Inbox head remains unconsumed; new owner reruns command after lease expiry. |
 | Crash after object command checkpoint completion before state/message completion | Checkpoint output is cached; command replays and persists state/result once. |
 | Crash after object state persists before ask result completion | State persist and message completion must be atomic so this split state is impossible. |
