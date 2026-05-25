@@ -173,12 +173,8 @@ Timer waits are useful for reminders, delayed retries that are part of business 
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    after_delay = sleep_until_reminder_time(reminder)
+    after_delay = sleep_until(reminder.fetch("send_at"), reminder)
     send_reminder(after_delay)
-  end
-
-  step def sleep_until_reminder_time(reminder)
-    wait_until(reminder.fetch("send_at"), reminder)
   end
 
   step def send_reminder(reminder)
@@ -196,12 +192,8 @@ Event waits are useful when the workflow cannot know its resume time up front: h
 ```ruby
 class AwaitOrderApproval < Durababble::Workflow
   def execute(order)
-    approval = wait_for_approval(order)
+    approval = wait_event("approval:#{order.fetch("id")}", order)
     apply_approval(order, approval)
-  end
-
-  step def wait_for_approval(order)
-    wait_event("approval:#{order.fetch("id")}", order)
   end
 
   step def apply_approval(order, approval)
@@ -212,9 +204,7 @@ end
 store.signal_event("approval:ord_123", payload: { "approved" => true })
 ```
 
-The `context` you pass to `wait_until` or `wait_event` is the base value Durababble resumes with when the wait completes. For event waits, the signal payload is merged into that resumed value, which is how the approval example receives `"approved" => true`.
-
-The current implementation records waits through step history, so the examples return waits from small step methods. That is an implementation limitation, not the ideal public shape; workflow waits should become workflow-level yield points. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow.
+The `context` you pass to `sleep_until`, `wait_until`, or `wait_event` is the base value Durababble resumes with when the wait completes. For event waits, the signal payload is merged into that resumed value, which is how the approval example receives `"approved" => true`. Direct waits are durable workflow yield points: they schedule replay-checked workflow history, persist a wait row, release the worker lease at a safe suspension point, and resume the waiting workflow fiber when the timer or event completes. Do not use `Thread.sleep` in workflow orchestration code, because that actually blocks the worker thread instead of durably parking the workflow.
 
 ### Cancellation
 

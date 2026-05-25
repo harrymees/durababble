@@ -76,11 +76,11 @@ Idempotent start scopes caller keys to worker pool, workflow class, operation ki
 
 `signal def handler` declares deterministic workflow signal handlers. `handle.signal(:name, **args, idempotency_key:)` commits a durable signal message before returning and fails for terminal workflows.
 
-Workflow code may use durable timer and event waits through workflow helper methods or the module-level helpers: `wait_until(time, context)`, `wait_event(event_key, context)`, `Durababble.wait_until(time, context)`, and `Durababble.wait_event(event_key, context)`. `Store#signal_event(event_key, payload:)` wakes matching event waits.
+Workflow code may use durable timer and event waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `sleep_until(time, context)`, `wait_until(time, context)`, `wait_event(event_key, context)`, `Durababble.sleep(duration)`, `Durababble.sleep_until(time, context)`, `Durababble.wait_until(time, context)`, and `Durababble.wait_event(event_key, context)`. `Store#signal_event(event_key, payload:)` wakes matching event waits.
 
 Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
 
-`Durababble::Workflow.wait_condition(timeout: nil) { ... }` blocks a workflow fiber until the predicate is true or a durable timeout fires. Durable sleeps are implemented as timer waits and must survive process exit.
+`wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, persist wait rows, and resume the waiting workflow fiber when the timer or event completion is recorded. Durable sleeps are implemented as timer waits and must survive process exit.
 
 ### Durable objects
 

@@ -81,12 +81,41 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
-      WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      wait_request = WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_wait(wait_request, name: "wait_until", args: [time, context])
+      end
+
+      wait_request
+    end
+
+    alias_method :sleep_until, :wait_until
+
+    #: (untyped, ?untyped) -> untyped
+    def sleep(duration, context = {})
+      execution = WorkflowExecutionContext.current
+      return Kernel.sleep(duration) unless execution
+
+      wait_request = WaitRequest.new(kind: "timer", wake_at: execution.timer_after(duration), event_key: nil, context:)
+      execution.call_wait(wait_request, name: "sleep", args: [duration, context])
     end
 
     #: (untyped, ?untyped) -> untyped
     def wait_event(event_key, context = {})
-      WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
+      wait_request = WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_wait(wait_request, name: "wait_event", args: [event_key, context])
+      end
+
+      wait_request
+    end
+
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      execution = WorkflowExecutionContext.current
+      raise Error, "wait_condition must run inside workflow orchestration" unless execution
+
+      execution.wait_condition(timeout:, &block)
     end
 
     private

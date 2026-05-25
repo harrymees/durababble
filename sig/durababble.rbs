@@ -212,8 +212,11 @@ module Durababble
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
     def execute: (Input input) -> Output
     def step_context: () -> StepContext
-    def wait_until: (Time time, ?serialized_payload context) -> WaitRequest
-    def wait_event: (String event_key, ?serialized_payload context) -> WaitRequest
+    def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
+    def sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
+    def sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
+    def wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
+    def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
   end
 
   class WorkflowRef[Input, Output]
@@ -293,6 +296,9 @@ module Durababble
   class WorkflowExecution
     attr_reader step_context: StepContext?
     def call_step: (Workflow[serialized_payload, serialized_payload] instance, method_name: Symbol, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) { () -> serialized_payload } -> serialized_payload
+    def call_wait: (WaitRequest wait_request, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
+    def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
+    def timer_after: (Numeric duration) -> Time
     def validate_replay_complete!: () -> void
   end
 
@@ -444,6 +450,9 @@ module Durababble
   def self.workspace_schema: (?String? workspace_path, ?prefix: String) -> String
   def self.configure: (database_url: String, ?schema: String) -> Store
   def self.store: () -> Store
-  def self.wait_until: (Time time, ?serialized_payload context) -> WaitRequest
-  def self.wait_event: (String event_key, ?serialized_payload context) -> WaitRequest
+  def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
+  def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
+  def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
+  def self.wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
+  def self.wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
 end

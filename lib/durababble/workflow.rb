@@ -139,8 +139,23 @@ module Durababble
     end
 
     #: (untyped, ?untyped) -> untyped
+    def sleep_until(time, context = {})
+      Durababble.sleep_until(time, context)
+    end
+
+    #: (untyped, ?untyped) -> untyped
+    def sleep(duration, context = {})
+      Durababble.sleep(duration, context)
+    end
+
+    #: (untyped, ?untyped) -> untyped
     def wait_event(event_key, context = {})
       Durababble.wait_event(event_key, context)
+    end
+
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      Durababble.wait_condition(timeout:, &block)
     end
   end
 
