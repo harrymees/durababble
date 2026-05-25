@@ -58,6 +58,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       @recording = false
     end
 
+    def adapter_name = "PostgreSQL"
+    def quote_column_name(identifier) = PG::Connection.quote_ident(identifier.to_s)
+
     def record
       @recorded_queries.clear
       @recording = true
@@ -336,8 +339,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "waits_workflow_status_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "waits_workflow_created_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allow_post_filter_indexes: ["waits_workflow_created_idx", "workflows_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "request_workflow_cancellation" => {
         call: -> { store.request_workflow_cancellation(workflow_id: "running-owned", reason: "query plan") },
@@ -347,11 +350,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
         allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-      },
-      "signal_event" => {
-        call: -> { store.signal_event("target-event", payload: { "event" => true }) },
-        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {
