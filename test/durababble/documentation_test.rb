@@ -136,7 +136,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
     schema_suffix = "docs_#{marker.tr("-", "_")}"
 
     with_durababble_store(backend, schema_suffix) do |store|
-      defined_before = Object.constants
+      defined_before = Object.constants # rubocop:disable Sorbet/ConstantsFromStrings -- snapshotting constants for cleanup
       begin
         result = eval_example_code(example, store)
         if EXPECTED_RESULTS.key?(marker)
@@ -172,7 +172,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
   end
 
   def cleanup_constants(defined_before)
-    added = Object.constants - defined_before
+    added = Object.constants - defined_before # rubocop:disable Sorbet/ConstantsFromStrings -- diffing constants for cleanup
     added.each do |const_name|
       Object.send(:remove_const, const_name) if Object.const_defined?(const_name, false)
     end
