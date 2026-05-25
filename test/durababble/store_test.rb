@@ -211,28 +211,44 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
   end
 
-  test "covers shared store helper edge cases" do
-    store = Durababble::Store.allocate
-    store.send(:initialize, ScriptedPgConnection.new, schema: "schema")
-
+  test "affected_rows returns integers and falls back to result row count" do
+    store = shared_store
     assert_equal 7, store.send(:affected_rows, 7)
     assert_equal 1, store.send(:affected_rows, MysqlResultLike.new([{ "id" => "row" }]))
-    store.close
+  end
 
+  test "inbox_row_claimable? rejects blocked inbox statuses" do
+    store = shared_store
     now = Time.utc(2024, 1, 1)
     refute store.send(:inbox_row_claimable?, { "status" => "dead_lettered" }, now:)
     refute store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => nil }, now:)
     refute store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2024-01-02T00:00:00Z" }, now:)
-    assert store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2023-12-31T00:00:00Z" }, now:)
     refute store.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => "2024-01-02T00:00:00Z" }, now:)
-    assert store.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => nil }, now:)
+  end
 
+  test "inbox_row_claimable? allows expired running and ready pending rows" do
+    store = shared_store
+    now = Time.utc(2024, 1, 1)
+    assert store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2023-12-31T00:00:00Z" }, now:)
+    assert store.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => nil }, now:)
+  end
+
+  test "object_command_message? recognizes legacy and object ask messages" do
+    store = shared_store
     refute store.send(:object_command_message?, nil)
     assert store.send(:object_command_message?, { "message_kind" => "ask" })
     assert store.send(:object_command_message?, { "target_kind" => "object", "message_kind" => "ask" })
     refute store.send(:object_command_message?, { "target_kind" => "workflow", "message_kind" => "ask" })
+  end
+
+  test "object_command_row returns legacy command rows unchanged" do
+    store = shared_store
     legacy = { "id" => "legacy" }
     assert_same legacy, store.send(:object_command_row, legacy)
+  end
+
+  test "object_command_row maps object payload fields onto command rows" do
+    store = shared_store
     assert_equal(
       {
         "target_kind" => "object",
@@ -252,6 +268,10 @@ class DurababbleStoreTest < DurababbleTestCase
         "payload" => { "method_name" => "checkout", "args" => [1], "kwargs" => { "fast" => true } },
       }),
     )
+  end
+
+  test "with_command_id backfills command_id from legacy position" do
+    store = shared_store
     assert_equal({ "id" => "no-position" }, store.send(:with_command_id, { "id" => "no-position" }))
     assert_equal({ "position" => 3, "command_id" => 9 }, store.send(:with_command_id, { "position" => 3, "command_id" => 9 }))
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
@@ -1034,6 +1054,12 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   private
+
+  def shared_store
+    Durababble::Store.allocate.tap do |store|
+      store.send(:initialize, ScriptedPgConnection.new, schema: "schema")
+    end
+  end
 
   def pg_store(connection = ScriptedPgConnection.new)
     Durababble::Store.new(connection, schema: "branch_schema")
