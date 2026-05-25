@@ -15,7 +15,8 @@ module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
-  class NonDeterminismError < Error; end
+  class DeterminismError < Error; end
+  class NonDeterminismError < DeterminismError; end
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
@@ -160,6 +161,7 @@ require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
+require_relative "durababble/store_queries"
 require_relative "durababble/store"
 require_relative "durababble/engine"
 require_relative "durababble/run"

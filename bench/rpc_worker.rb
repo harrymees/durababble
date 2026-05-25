@@ -63,7 +63,7 @@ $stdin.each_line do |line|
         SET status = 'running', locked_by = $1, locked_until = now() + interval '30 seconds', updated_at = now()
         WHERE id IN (#{id_placeholders})
       SQL
-      { "ids" => ids, "claimed" => updated.cmd_tuples }
+      { "ids" => ids, "claimed" => updated.affected_rows }
     end
   else
     raise ArgumentError, "unknown command #{command}"

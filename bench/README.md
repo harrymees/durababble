@@ -33,8 +33,6 @@ The suite measures realistic durable-execution operations:
 - claiming/dequeueing pending work under leases;
 - lease heartbeat/renewal;
 - lease conflict checks;
-- durable event waits and signaling;
-- event waits that resume the remaining workflow after an external signal;
 - timer waits that wake and resume the remaining workflow;
 - worker `tick` claim + execute behavior;
 - worker `run_until_idle` batch draining;
@@ -45,11 +43,19 @@ The suite measures realistic durable-execution operations:
 - idempotency fence first execution and cached-result replay;
 - outbox enqueue/claim/ack;
 - outbox expired-lease reclaim;
+- durable object state and command enqueue/claim/complete/read;
 - queue claim performance with large historical workflow tables;
 - due-timer wake scans with many unrelated wait rows;
-- event-signal misses with large pending wait sets;
 - JSON-line command RPC to a separate Ruby process;
 - cross-process enqueue + claim command RPC.
+
+## Adding Store Queries
+
+Every new production store SQL query must be defined in `Durababble::StoreQueries`. The query-plan tests record registered query ids from the large-fixture hot-path operations and fail if a required hot query is not exercised by the performance assertions.
+
+If a registered query is intentionally outside the large-fixture EXPLAIN suite, add it to the explicit uncovered-query list in `test/durababble/query_plan_test.rb` so the exemption is reviewed as source.
+
+For hot queue, lease, wait, outbox, durable-object, or future inbox paths, also update `HOT_QUERY_COVERAGE` with the intended index, lock/order/row-bound assertion, and benchmark operation. Add or extend `test/durababble/query_plan_test.rb`, `test/durababble/mysql_query_plan_test.rb`, and `bench/run.rb` in the same change unless the registry documents a narrow conformance-only exemption.
 
 ## Artifacts
 
