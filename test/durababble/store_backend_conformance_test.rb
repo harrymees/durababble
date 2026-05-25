@@ -117,6 +117,39 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "drains due timers across bounded wake batches with #{backend.name}" do
+      with_durababble_store(backend, "timer_batches") do |store|
+        first_workflow = store.create_workflow(name: "timer-batch", input: {})
+        second_workflow = store.create_workflow(name: "timer-batch", input: {})
+        due_at = Time.utc(2026, 1, 1, 0, 0, 0)
+
+        [first_workflow, second_workflow].each_with_index do |workflow_id, index|
+          store.record_wait(
+            workflow_id:,
+            position: 0,
+            name: "sleep",
+            wait_request: Durababble.wait_until(due_at, { "timer" => index }),
+          )
+        end
+
+        assert_equal 2, store.wake_due_timers(now: due_at + 1, batch_size: 1)
+        assert_equal ["completed"], store.waits_for(first_workflow).map { |wait| wait.fetch("status") }
+        assert_equal ["completed"], store.waits_for(second_workflow).map { |wait| wait.fetch("status") }
+      end
+    end
+
+    test "counts step attempts for one command with #{backend.name}" do
+      with_durababble_store(backend, "attempt_count") do |store|
+        workflow_id = store.create_workflow(name: "attempt-count", input: {})
+
+        3.times { store.record_step_started(workflow_id:, command_id: 0, name: "flaky") }
+        2.times { store.record_step_started(workflow_id:, command_id: 1, name: "other") }
+
+        assert_equal 3, store.step_attempt_count_for(workflow_id:, command_id: 0)
+        assert_equal 2, store.step_attempt_count_for(workflow_id:, position: 1)
+      end
+    end
+
     test "deduplicates fenced work and replays completed or failed results with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.create_workflow(name: "fenced", input: {})

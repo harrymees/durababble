@@ -3,6 +3,8 @@
 
 module Durababble
   class SqlStore < Store
+    TIMER_WAKE_BATCH_SIZE = 100
+
     #: (name: String, input: Object?) -> String
     def create_workflow(name:, input:)
       id = enqueue_workflow(name:, input:)
@@ -60,9 +62,19 @@ module Durababble
         .map { |row| decode_row(row) }
     end
 
-    #: (?now: Time) -> Integer
-    def wake_due_timers(now: Time.now)
-      complete_timer_waits(timestamp_or_nil(now) || now)
+    #: (?now: Time, ?batch_size: Integer) -> Integer
+    def wake_due_timers(now: Time.now, batch_size: TIMER_WAKE_BATCH_SIZE)
+      batch_size = Integer(batch_size)
+      raise ArgumentError, "batch_size must be positive" unless batch_size.positive?
+
+      total = 0
+      timestamp = timestamp_or_nil(now) || now
+      loop do
+        completed = complete_timer_waits(timestamp, batch_size)
+        total += completed
+        break if completed < batch_size
+      end
+      total
     end
 
     #: (String) -> Array[Hash[String, Object?]]
@@ -352,8 +364,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (Object?) -> Integer
-    def complete_timer_waits(now)
+    #: (Object?, Integer) -> Integer
+    def complete_timer_waits(now, batch_size)
       raise NotImplementedError
     end
 

@@ -34,7 +34,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           "outbox_queue",
         ],
         "timer wait wake probe" => [
-          "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status = 'waiting' AND kind = 'timer' AND wake_at <= NOW(6) FOR UPDATE SKIP LOCKED",
+          "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status IN ('waiting', 'running') AND w.kind = 'timer' AND w.wake_at <= NOW(6) ORDER BY w.wake_at, w.created_at LIMIT 100 FOR UPDATE OF w SKIP LOCKED",
           "waits_timer_pending",
         ],
       }

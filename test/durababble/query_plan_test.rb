@@ -154,6 +154,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_schedule_workflow_retry,
     :mysql_set_target_activation_pending,
     :mysql_steal_expired_leases,
+    :mysql_step_attempt_count_for,
     :mysql_step_attempts_for,
     :mysql_step_heartbeat_cursor,
     :mysql_steps_for,
@@ -603,6 +604,10 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       "step_attempts_for" => {
         call: -> { store.step_attempts_for("running-owned") },
         allowed_indexes: ["step_attempts_workflow_started_position_idx"],
+      },
+      "step_attempt_count_for" => {
+        call: -> { store.step_attempt_count_for(workflow_id: "running-owned", position: 0) },
+        allowed_indexes: ["step_attempts_workflow_position_status_started_idx"],
       },
       "object_state" => {
         call: -> { store.object_state(object_type: "counter", object_id: "object-1") },

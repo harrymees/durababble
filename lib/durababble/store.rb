@@ -14,6 +14,8 @@ module Durababble
     SERIALIZED_COLUMNS = ["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
+    GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
+    GENERATED_CONNECTION_CLASSES = {}
 
     #: String
     attr_reader :schema
@@ -38,6 +40,9 @@ module Durababble
         active_record_class = active_record_class_for(database_url)
         active_record_class = active_record_class #: as untyped
         from_active_record(connection_pool: active_record_class.connection_pool, schema:, owner: active_record_class)
+      rescue StandardError
+        remove_active_record_class_const(active_record_class) if active_record_class
+        raise
       end
 
       #: (?connection: Object?, ?connection_pool: Object?, ?schema: String, ?owner: Object?) -> Store
@@ -69,9 +74,28 @@ module Durababble
           self.abstract_class = true
           self.connection_class = true
         end
+        connection_class.instance_variable_set(GENERATED_CONNECTION_CONST_IVAR, connection_name)
+        GENERATED_CONNECTION_CLASSES[connection_name] = connection_class
         Durababble.const_set(connection_name, connection_class)
-        connection_class.establish_connection(config)
+        begin
+          connection_class.establish_connection(config)
+        rescue StandardError
+          remove_active_record_class_const(connection_class)
+          raise
+        end
         connection_class
+      end
+
+      #: (Object?) -> void
+      def remove_active_record_class_const(owner)
+        owner = owner #: as untyped
+        const_name = owner&.instance_variable_get(GENERATED_CONNECTION_CONST_IVAR)
+        return unless const_name.is_a?(String)
+        return unless GENERATED_CONNECTION_CLASSES[const_name].equal?(owner)
+        return unless Durababble.const_defined?(const_name, false)
+
+        Durababble.send(:remove_const, const_name)
+        GENERATED_CONNECTION_CLASSES.delete(const_name)
       end
 
       #: (String) -> Hash[Symbol, Object?]
@@ -111,7 +135,11 @@ module Durababble
     #: () -> void
     def close
       owner = @owner #: as untyped
-      owner&.connection_pool&.disconnect!
+      begin
+        owner&.connection_pool&.disconnect!
+      ensure
+        self.class.send(:remove_active_record_class_const, owner)
+      end
     end
 
     #: () -> Time

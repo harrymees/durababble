@@ -104,6 +104,8 @@ account.balance       # query: reads latest persisted state
 
 Use `expose` for simple RPCs such as `balance`, `status`, `members`, or `current_cursor`. Use `expose_command` for changes such as `credit`, `join`, `append_message`, `advance_cursor`, or `close`. Command methods can use `command_context.idempotency_key` when calling external systems, and command retry policy is declared on the method the same way workflow step retry policy is.
 
+`Account.at("acct_123", worker_pool: "orders")` sends command wakeups to that worker pool, and `idempotency_key:` on `at` or `handle` becomes the default idempotency key for commands sent through that handle; passing `idempotency_key:` to an individual command overrides the handle default.
+
 ```ruby
 class Channel < Durababble::DurableObject
   object_type "channel"

@@ -241,6 +241,13 @@ module Durababble
       end
     end
 
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      row = execute_store_query(:step_attempt_count_for, [workflow_id, command_id]).first
+      row.fetch("count").to_i
+    end
+
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
     def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
       serialized = dump_serialized(result)
@@ -597,12 +604,14 @@ module Durababble
       id.to_i
     end
 
-    #: (String) -> Object?
-    def complete_timer_waits(now)
-      transaction do
-        waits = execute_store_query(:complete_timer_waits, [now]).map { |row| decode_row(row) }
+    #: (Time, Integer) -> Integer
+    def complete_timer_waits(now, batch_size)
+      completed = transaction(isolation: :read_committed) do
+        waits = execute_store_query(:complete_timer_waits, [now], limit: batch_size).map { |row| decode_row(row) }
         finish_completed_waits(waits, {})
       end
+      completed = completed #: as Integer
+      completed
     end
 
     #: (Array[Hash[String, Object?]], Hash[String, Object?]) -> Integer
@@ -643,11 +652,11 @@ module Durababble
       execute_store_query_sql(sql, params)
     end
 
-    #: () { () -> Object? } -> Object?
-    def transaction(&block)
+    #: (**Object?) { () -> Object? } -> Object?
+    def transaction(**options, &block)
       attempts = 0
       begin
-        @connection.transaction(requires_new: true, &block)
+        @connection.transaction(requires_new: true, **options, &block)
       rescue StandardError => error
         if retryable_mysql_error?(error) && attempts < 5
           attempts += 1

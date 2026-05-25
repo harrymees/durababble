@@ -60,8 +60,14 @@ module Durababble
       "wait wake scans" => {
         methods: ["Store.record_wait", "Store.complete_waits", "MysqlStore.complete_waits_mysql"],
         indexes: ["waits_timer_pending_idx", "waits_workflow_status_idx"],
-        assertions: ["timer pending index", "workflow join remains indexed"],
-        benchmarks: ["large_table_due_timer_scan"],
+        assertions: ["timer pending index", "workflow join remains indexed", "bounded wake batches"],
+        benchmarks: ["large_table_due_timer_scan", "bulk_due_timer_wake_parallel"],
+      },
+      "step attempt counts" => {
+        methods: ["WorkflowStepRunner.attempt_number_for", "Store.step_attempt_count_for"],
+        indexes: ["step_attempts_workflow_position_status_started_idx"],
+        assertions: ["attempt count remains index-backed"],
+        benchmarks: ["step_attempt_number_lookup"],
       },
       "outbox delivery" => {
         methods: ["Store.enqueue_outbox", "Store.claim_outbox", "Store.ack_outbox", "Store.release_worker_leases!"],
@@ -343,6 +349,10 @@ module Durababble
       "SELECT * FROM #{table(store, "step_attempts")} WHERE workflow_id = $1 ORDER BY started_at, position"
     end
 
+    define(:pg_step_attempt_count_for, backend: :postgres) do |store|
+      "SELECT COUNT(*) AS count FROM #{table(store, "step_attempts")} WHERE workflow_id = $1 AND position = $2"
+    end
+
     define(:pg_object_state, backend: :postgres) do |store|
       "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = $1 AND object_id = $2"
     end
@@ -588,6 +598,10 @@ module Durababble
 
     define(:mysql_step_attempts_for, backend: :mysql) do |store|
       "SELECT * FROM #{table(store, "step_attempts")} WHERE workflow_id = ? ORDER BY started_at, position"
+    end
+
+    define(:mysql_step_attempt_count_for, backend: :mysql) do |store|
+      "SELECT COUNT(*) AS count FROM #{table(store, "step_attempts")} WHERE workflow_id = ? AND position = ?"
     end
 
     define(:mysql_object_state, backend: :mysql) do |store|
@@ -908,7 +922,9 @@ module Durababble
         "AND wf.status IN ('waiting', 'running')\n    " \
         "AND w.kind = 'timer'\n    " \
         "AND w.wake_at <= $1::timestamptz\n  " \
-        "FOR UPDATE OF w, wf SKIP LOCKED\n" \
+        "ORDER BY w.wake_at, w.created_at\n  " \
+        "LIMIT $3\n  " \
+        "FOR UPDATE OF w SKIP LOCKED\n" \
         ")\n" \
         "RETURNING *"
     end
@@ -1353,14 +1369,16 @@ module Durababble
         "LIMIT 1"
     end
 
-    define(:mysql_complete_timer_waits, backend: :mysql) do |store|
+    define(:mysql_complete_timer_waits, backend: :mysql) do |store, limit:|
       "SELECT w.* FROM #{table(store, "waits")} AS w\n" \
         "JOIN #{table(store, "workflows")} AS wf ON wf.id = w.workflow_id\n" \
         "WHERE w.status = 'pending'\n  " \
         "AND wf.status IN ('waiting', 'running')\n  " \
         "AND w.kind = 'timer'\n  " \
         "AND w.wake_at <= ?\n" \
-        "FOR UPDATE SKIP LOCKED"
+        "ORDER BY w.wake_at, w.created_at\n" \
+        "LIMIT #{Integer(limit)}\n" \
+        "FOR UPDATE OF w SKIP LOCKED"
     end
 
     define(:mysql_complete_wait, backend: :mysql) do |store|

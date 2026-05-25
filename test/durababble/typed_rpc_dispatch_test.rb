@@ -50,6 +50,20 @@ class TypedRpcDispatchTest < DurababbleTestCase
     refute_includes(credit_output, "(::String amount_cents")
   end
 
+  def test_store_return_signatures_match_storage_result_shapes
+    heartbeat_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::Store", "heartbeat_step")
+    assert_includes(heartbeat_output, "-> ::Object?")
+    refute_includes(heartbeat_output, "-> bool")
+
+    ack_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::Store", "ack_outbox")
+    assert_includes(ack_output, "-> ::Object")
+    refute_includes(ack_output, "-> bool")
+
+    save_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::Store", "save_object_state")
+    assert_includes(save_output, "-> ::Durababble::serialized_payload")
+    refute_includes(save_output, "-> void")
+  end
+
   private
 
   def assert_rbs_success(*args)

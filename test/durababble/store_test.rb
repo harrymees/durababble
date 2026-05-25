@@ -44,6 +44,25 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
   end
 
+  test "close removes generated active record connection constants" do
+    owner = nil
+    const_name = nil
+    owner = Durababble::Store.send(:active_record_class_for, "mysql://root@example.invalid/durababble_test")
+    const_name = owner.instance_variable_get(:@durababble_store_connection_const_name)
+    assert_kind_of(String, const_name)
+    assert_equal("Durababble::#{const_name}", owner.name)
+    assert(Durababble.const_defined?(const_name, false))
+
+    store = Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema", owner:)
+    store.close
+
+    refute(Durababble.const_defined?(const_name, false))
+    store.close
+  ensure
+    owner&.connection_pool&.disconnect!
+    Durababble.send(:remove_const, const_name) if const_name && Durababble.const_defined?(const_name, false)
+  end
+
   test "inbox_row_claimable? rejects blocked inbox statuses" do
     store = shared_store
     now = Time.utc(2024, 1, 1)
