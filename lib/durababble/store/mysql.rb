@@ -90,11 +90,6 @@ module Durababble
       ActiveRecord::Result.empty(affected_rows: owned ? 1 : 0)
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
-    def workflow_owned?(workflow_id:, worker_id:)
-      !!execute_store_query(:workflow_owned, [workflow_id, worker_id]).first
-    end
-
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do
@@ -163,11 +158,6 @@ module Durababble
       execute_store_query(:workflow_cancellation, [workflow_id]).first
     end
 
-    #: (workflow_id: String) -> Object?
-    def mark_workflow_cancellation_delivered(workflow_id:)
-      execute_store_query(:mark_workflow_cancellation_delivered, [workflow_id])
-    end
-
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
@@ -187,13 +177,6 @@ module Durababble
       end
       renewed = renewed #: as untyped
       renewed&.fetch("locked_until")
-    end
-
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
-    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      row = execute_store_query(:step_heartbeat_cursor, [workflow_id, command_id]).first
-      decode_row(row).fetch("heartbeat_cursor") if row
     end
 
     #: (String) -> Object?
@@ -236,13 +219,6 @@ module Durababble
         append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
       end
-    end
-
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
-    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      row = execute_store_query(:step_attempt_count_for, [workflow_id, command_id]).first
-      row.fetch("count").to_i
     end
 
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
@@ -301,17 +277,6 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
     end
 
-    #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
-    def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-      existing = execute_store_query(:outbox_by_key, [key]).first
-      return existing.fetch("id") if existing
-
-      id = SecureRandom.uuid
-      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
-      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
-      execute_store_query(:outbox_by_key, [key]).first.fetch("id")
-    end
-
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox(worker_id:, lease_seconds:)
       transaction do
@@ -326,13 +291,6 @@ module Durababble
         observe_claim_latency(message, "outbox")
         message
       end
-    end
-
-    #: (String, worker_id: String) -> Object?
-    def ack_outbox(outbox_id, worker_id:)
-      result = execute_store_query(:ack_outbox, [outbox_id, worker_id])
-      Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
-      result
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
@@ -407,12 +365,6 @@ module Durababble
       end
     end
 
-    #: (object_type: String, object_id: String, state: Object?) -> Object?
-    def save_object_state(object_type:, object_id:, state:)
-      execute_store_query(:save_object_state, [object_type, object_id, dump_serialized(state)])
-      state
-    end
-
     #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time) -> Object?
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now)
       return if target_kinds&.empty? || target_types&.empty?
@@ -442,78 +394,10 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
-      id = SecureRandom.uuid
-      if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
-      else
-        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
-      end
-      id
-    end
-
-    #: (workflow_id: String, worker_id: String) -> bool
-    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
-      execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
-    end
-
-    #: (String) -> Object?
-    def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
-    end
-
-    #: (command_id: String, worker_id: String?) -> Object?
-    def lock_object_command_for_completion(command_id:, worker_id:)
-      if worker_id
-        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
-      else
-        execute_store_query(:lock_inbox_message, [command_id]).first
-      end
-    end
-
-    #: (message_id: String, worker_id: String) -> Object?
-    def lock_inbox_message_for_completion(message_id:, worker_id:)
-      execute_store_query(:lock_inbox_message_for_worker, [message_id, worker_id]).first
-    end
-
-    #: (command_id: String, worker_id: String?) -> Object?
-    def lock_inbox_message_for_failure(command_id:, worker_id:)
-      if worker_id
-        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
-      else
-        execute_store_query(:lock_inbox_message, [command_id]).first
-      end
-    end
-
     #: (target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
       ready_time = ready_at || Time.now.utc
       execute_store_query(:upsert_target_activation, [target_kind, target_type, target_id, ready_time])
-    end
-
-    #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
-    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
-      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(target_id))
-        dead_letter_terminal_workflow_inbox_without_transaction(
-          target_type:,
-          target_id:,
-          error: terminal_error,
-        )
-        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-        return
-      end
-
-      head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
-
-      if head && !InboxStatus.dead_lettered?(head)
-        ready_at = target_activation_ready_at_for(head, now:)
-        set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
-      else
-        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-      end
     end
 
     #: (String) -> String?
@@ -537,11 +421,6 @@ module Durababble
       SQL
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
-    end
-
     #: (target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
     def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       ready_time = ready_at || Time.now.utc
@@ -557,18 +436,6 @@ module Durababble
       sequence
     end
 
-    #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
-    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
-      return unless idempotency_key
-
-      execute_store_query(:existing_inbox_message_for_idempotency, [target_kind, target_type, target_id, idempotency_key]).first
-    end
-
-    #: (String) -> Object?
-    def lock_workflow_for_update(workflow_id)
-      execute_store_query(:lock_workflow_for_update, [workflow_id]).first
-    end
-
     #: (id: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       execute_store_query(:insert_inbox_message, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), ready_at, max_attempts])
@@ -578,11 +445,6 @@ module Durababble
     def inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
       # ActiveRecord quotes MySQL sanitized numeric binds, which is invalid in LIMIT.
       execute_store_query(:inbox_claim_rows_for_update, [target_kind, target_type, target_id], limit:).to_a
-    end
-
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def inbox_head_for_update(target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
     end
 
     #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
@@ -632,22 +494,6 @@ module Durababble
       execute_store_query(:update_latest_attempt, [status, serialized_result, error, workflow_id, command_id])
     end
 
-    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: String?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
-    def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-      execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
-      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-      event_index
-    end
-
-    #: (Integer?, Integer?) -> Integer
-    def normalize_command_id(command_id, position)
-      id = command_id.nil? ? position : command_id
-      raise ArgumentError, "command_id is required" if id.nil?
-
-      id.to_i
-    end
-
     #: (Time, Integer) -> Integer
     def complete_timer_waits(now, batch_size)
       completed = transaction(isolation: :read_committed) do
@@ -689,11 +535,6 @@ module Durababble
       else
         @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
       end
-    end
-
-    #: (String, Array[Object?]) -> untyped
-    def execute_params(sql, params)
-      execute_store_query_sql(sql, params)
     end
 
     #: (**Object?) { () -> Object? } -> Object?
