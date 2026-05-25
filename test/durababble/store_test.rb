@@ -749,6 +749,7 @@ class DurababbleStoreTest < DurababbleTestCase
       .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "0" }]),
       sql_result,
@@ -758,6 +759,7 @@ class DurababbleStoreTest < DurababbleTestCase
     ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "1" }]),
       sql_result,

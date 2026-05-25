@@ -113,6 +113,25 @@ module Durababble
       end
     end
 
+    #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
+    def request_workflow_termination(workflow_id:, reason: nil)
+      error = workflow_termination_error(reason)
+      result = @connection.transaction(requires_new: true) do
+        row = execute_store_query(:lock_workflow_for_termination, [workflow_id]).first
+        raise KeyError, "workflow not found: #{workflow_id}" unless row
+
+        decoded = decode_row(row)
+        next decoded if WorkflowStatus.terminal?(decoded)
+
+        execute_store_query(:terminate_workflow, [workflow_id, dump_serialized(nil), error])
+        terminate_workflow_dependents(workflow_id, error:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error })
+
+        workflow(workflow_id)
+      end
+      result #: as Hash[String, Object?]
+    end
+
     #: (String) -> Object?
     def workflow_cancellation(workflow_id)
       row = execute_store_query(:workflow_cancellation, [workflow_id]).first
@@ -408,6 +427,15 @@ module Durababble
       execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
+    end
+
+    #: (String, error: String) -> void
+    def terminate_workflow_dependents(workflow_id, error:)
+      execute_store_query(:terminate_workflow_waits, [workflow_id])
+      execute_store_query(:terminate_workflow_steps, [workflow_id, error])
+      execute_store_query(:terminate_workflow_step_attempts, [workflow_id, error])
+      execute_store_query(:terminate_workflow_inbox, [workflow_id, error])
+      execute_store_query(:terminate_workflow_target_activations, [workflow_id])
     end
 
     #: (command_id: String, worker_id: String?) -> Object?

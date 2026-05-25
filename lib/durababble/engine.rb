@@ -202,6 +202,11 @@ module Durababble
       snapshot(workflow_id)
     rescue StepRetryScheduled
       snapshot(workflow_id)
+    rescue LeaseConflict
+      row = @store.workflow(workflow_id)
+      return run_from_row(row) if WorkflowStatus.terminal?(row)
+
+      raise
     rescue CancellationError => e
       @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
       Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))

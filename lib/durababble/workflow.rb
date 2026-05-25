@@ -197,6 +197,12 @@ module Durababble
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
     end
 
+    #: (?reason: untyped) -> untyped
+    def terminate(reason: nil)
+      row = @store.request_workflow_termination(workflow_id: @workflow_id, reason:)
+      Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
+    end
+
     #: (untyped, *untyped, **untyped) { (?) -> untyped } -> untyped
     def method_missing(method_name, *args, **kwargs, &block)
       if @workflow_class.exposed_queries.key?(method_name)

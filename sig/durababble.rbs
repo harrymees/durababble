@@ -200,6 +200,7 @@ module Durababble
     def outbox_message: (String outbox_id) -> workflow_row?
     def enqueue_inbox_message: (?worker_pool: String, target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: serialized_payload, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?) -> String
     def enqueue_workflow_command: (workflow_id: String, workflow_name: String, method_name: String, payload: serialized_payload, ?idempotency_key: String?) -> String
+    def request_workflow_termination: (workflow_id: String, ?reason: serialized_payload) -> workflow_row
     def claim_target_activation: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> workflow_row?
     def complete_target_activation: (?worker_pool: String, target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time) -> Object?
     def reconcile_target_activation: (?worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
@@ -252,6 +253,7 @@ module Durababble
     def result: () -> Output?
     def error: () -> String?
     def cancel: (?reason: serialized_payload) -> Run[serialized_payload]
+    def terminate: (?reason: serialized_payload) -> Run[serialized_payload]
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end

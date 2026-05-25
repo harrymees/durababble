@@ -65,7 +65,7 @@ module Durababble
       ATTEMPT_STATUSES = AttemptStatus::ALL
       WAIT_STATUSES = WaitStatus::ALL
       OUTBOX_STATUSES = OutboxStatus::ALL
-      TERMINAL_WORKFLOW_STATUSES = [WorkflowStatus::COMPLETED, WorkflowStatus::CANCELED, WorkflowStatus::FAILED].freeze
+      TERMINAL_WORKFLOW_STATUSES = [WorkflowStatus::COMPLETED, WorkflowStatus::CANCELED, WorkflowStatus::TERMINATED, WorkflowStatus::FAILED].freeze
 
       #: (untyped) -> untyped
       def verify_workflow_invariants!(workflows_state)
