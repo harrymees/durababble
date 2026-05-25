@@ -45,7 +45,7 @@ module Durababble
     #: (Store?) -> Engine?
     def default_store=(store)
       @default_store = store
-      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+      @default_engine = store ? Engine.new(store:) : nil
     end
 
     #: (Engine?) -> Store?
@@ -100,7 +100,7 @@ module Durababble
 
     #: () -> Engine
     def engine
-      @default_engine ||= Engine.new(store:, migrate: false)
+      @default_engine ||= Engine.new(store:)
     end
 
     #: (?engine: Engine?, ?store: Store?) -> Engine
@@ -108,7 +108,7 @@ module Durababble
       raise ArgumentError, "pass store: or engine:, not both" if store && engine
 
       return engine if engine
-      return Engine.new(store:, migrate: false) if store
+      return Engine.new(store:) if store
 
       self.engine
     end

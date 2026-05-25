@@ -563,10 +563,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   test "covers object at, unknown tell, and unbounded retry metadata branches" do
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", store: Object.new)
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.handle("clean", store: Object.new)
-    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new, migrate: false))
+    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new))
     assert_not_respond_to CleanCommandObject, :ref
     assert_raises(NoMethodError) { CleanCommandObject.tell("clean", :missing, store: Object.new) }
-    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new, migrate: false)) }
+    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new)) }
 
     unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
     assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
@@ -575,14 +575,14 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
   test "durable object handles and tells use default and explicit engines" do
     explicit_store = AskWaitStore.new
-    explicit_engine = Durababble::Engine.new(store: explicit_store, migrate: false)
+    explicit_engine = Durababble::Engine.new(store: explicit_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-1", engine: explicit_engine).read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-1", :read_only, engine: explicit_engine))
     assert_equal(["ask", "tell"], explicit_store.enqueued.map { |command| command.fetch(:message_kind) })
     assert_equal(0, explicit_store.migrations)
 
     default_store = AskWaitStore.new
-    Durababble.default_engine = Durababble::Engine.new(store: default_store, migrate: false)
+    Durababble.default_engine = Durababble::Engine.new(store: default_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-2").read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-2", :read_only))
     assert_equal(["ask", "tell"], default_store.enqueued.map { |command| command.fetch(:message_kind) })
