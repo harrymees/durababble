@@ -5,13 +5,14 @@ require_relative "../test_helper"
 
 class DurababbleWorkerTest < DurababbleTestCase
   class WorkerTestStore
-    attr_reader :migrations, :claims, :resumed
+    attr_reader :migrations, :claims, :resumed, :deliveries
 
     def initialize(claims)
       @claims = claims.dup
       @migrations = 0
       @resumed = []
       @step_attempts = []
+      @deliveries = []
     end
 
     def migrate!
@@ -47,6 +48,11 @@ class DurababbleWorkerTest < DurababbleTestCase
         "input" => { "value" => 1 },
         "locked_by" => "worker-a",
       }
+    end
+
+    def deliver_target_message(**kwargs)
+      @deliveries << kwargs
+      true
     end
 
     def steps_for(_workflow_id)
@@ -154,6 +160,68 @@ class DurababbleWorkerTest < DurababbleTestCase
     end
   end
 
+  class AdvisoryDeliveryStore < WorkerTestStore
+    attr_reader :completed_commands, :failed_commands, :rearmed, :reconciled
+
+    def initialize(claimed: true)
+      super([])
+      @claimed = claimed
+      @messages = [
+        {
+          "id" => "msg-1",
+          "target_kind" => "workflow",
+          "target_type" => "command-unit",
+          "target_id" => "wf-command",
+          "message_kind" => "workflow_command",
+          "method_name" => "approve",
+          "payload" => { "method" => "approve", "args" => [], "kwargs" => { reason: "operator" } },
+        },
+      ]
+      @completed_commands = []
+      @failed_commands = []
+      @rearmed = []
+      @reconciled = []
+    end
+
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+      @resumed << [:activation_claim, workflow_id, worker_id, lease_seconds]
+      return unless @claimed
+
+      {
+        "id" => workflow_id,
+        "name" => "command-unit",
+        "status" => "running",
+        "input" => {},
+        "locked_by" => worker_id,
+      }
+    end
+
+    def claim_inbox_messages(**)
+      message = @messages.shift
+      message ? [message] : []
+    end
+
+    def complete_workflow_command(**kwargs)
+      @completed_commands << kwargs
+    end
+
+    def fail_workflow_command(**kwargs)
+      @failed_commands << kwargs
+    end
+
+    def suspend_workflow(**kwargs)
+      @resumed << [:suspend, kwargs]
+    end
+
+    def reconcile_target_activation(**kwargs)
+      @reconciled << kwargs
+    end
+
+    def rearm_target_activation(**kwargs)
+      @rearmed << kwargs
+    end
+  end
+
   test "migrates by default and returns idle when no workflow is claimable" do
     store = WorkerTestStore.new([])
     worker = Durababble::Worker.new(store:, workflows: { "unit" => workflow }, worker_id: "worker-a")
@@ -200,7 +268,8 @@ class DurababbleWorkerTest < DurababbleTestCase
     assert_equal 1, store.claims.length
   end
 
-  test "defers target activation retry to the active workflow lease deadline" do
+  test "forwards target activation and retries soon when another worker holds the active lease" do
+    started_at = Time.now
     locked_until = Time.now + 45
     store = ActivationDeferralStore.new(locked_until:)
     worker = Durababble::Worker.new(
@@ -213,6 +282,16 @@ class DurababbleWorkerTest < DurababbleTestCase
 
     assert_equal :worked, worker.tick
     assert_equal [[:activation_claim, "wf-activated", "worker-a", 17]], store.resumed
+    assert_equal(
+      [
+        {
+          target_kind: "workflow",
+          target_type: "unit",
+          target_id: "wf-activated",
+        },
+      ],
+      store.deliveries,
+    )
     assert_equal 1, store.completed_activations.length
     completion = store.completed_activations.first
     assert_hash_includes(
@@ -222,7 +301,106 @@ class DurababbleWorkerTest < DurababbleTestCase
       target_id: "wf-activated",
       worker_id: "worker-a",
     )
-    assert_in_delta locked_until.to_f, completion.fetch(:now).to_f, 0.001
+    assert_in_delta(
+      (started_at + Durababble::Worker::ACTIVATION_FORWARD_RETRY_SECONDS).to_f,
+      completion.fetch(:now).to_f,
+      0.5,
+    )
+    assert_operator completion.fetch(:now), :<, locked_until
+  end
+
+  test "drains a workflow inbox from an advisory delivery without claiming the activation row" do
+    store = AdvisoryDeliveryStore.new
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "command-unit"
+
+      expose_command def approve(reason:)
+        { "approved_by" => reason }
+      end
+    end
+    worker = Durababble::Worker.new(
+      store:,
+      workflows: { workflow.workflow_name => workflow },
+      worker_id: "worker-a",
+      lease_seconds: 17,
+      migrate: false,
+    )
+
+    assert_equal(
+      :worked,
+      worker.deliver_target(target_kind: "workflow", target_type: "command-unit", target_id: "wf-command"),
+    )
+
+    assert_equal(
+      [
+        [:activation_claim, "wf-command", "worker-a", 17],
+        [:suspend, { workflow_id: "wf-command", worker_id: "worker-a" }],
+      ],
+      store.resumed,
+    )
+    assert_equal(
+      [
+        {
+          message_id: "msg-1",
+          workflow_id: "wf-command",
+          result: { "approved_by" => "operator" },
+          worker_id: "worker-a",
+        },
+      ],
+      store.completed_commands,
+    )
+    assert_empty store.failed_commands
+    assert_equal(
+      [
+        {
+          target_kind: "workflow",
+          target_type: "command-unit",
+          target_id: "wf-command",
+        },
+      ],
+      store.reconciled,
+    )
+  end
+
+  test "ignores unsupported advisory deliveries and rearms when another owner holds the workflow lease" do
+    store = AdvisoryDeliveryStore.new(claimed: false)
+    worker = Durababble::Worker.new(
+      store:,
+      workflows: { workflow.workflow_name => workflow },
+      worker_id: "worker-a",
+      lease_seconds: 17,
+      migrate: false,
+    )
+
+    assert_equal :idle, worker.deliver_target(target_kind: "object", target_type: "unit", target_id: "wf-command")
+    assert_equal :idle, worker.deliver_target(target_kind: "workflow", target_type: "missing", target_id: "wf-command")
+    assert_equal :worked, worker.deliver_target(target_kind: "workflow", target_type: "unit", target_id: "wf-command")
+
+    assert_empty store.completed_commands
+    assert_empty store.failed_commands
+    assert_equal(
+      [
+        [:activation_claim, "wf-command", "worker-a", 17],
+      ],
+      store.resumed,
+    )
+    assert_equal 1, store.rearmed.length
+    assert_hash_includes(
+      store.rearmed.first,
+      target_kind: "workflow",
+      target_type: "unit",
+      target_id: "wf-command",
+    )
+    assert_equal(
+      [
+        {
+          target_kind: "workflow",
+          target_type: "unit",
+          target_id: "wf-command",
+        },
+      ],
+      store.deliveries,
+    )
   end
 
   private

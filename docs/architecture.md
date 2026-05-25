@@ -59,7 +59,7 @@ workflow.description
 workflow.cancel(reason: "user request")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target and still signal the legacy event-wait key as a compatibility wake path. A full command executor that drains workflow inbox rows through the current lease owner, executes the method body, and returns command results is future work.
+In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
 
 ### Durable objects
 
@@ -130,7 +130,8 @@ WORKER = Durababble::WorkerRuntime.start(
   database_url: ENV.fetch("DATABASE_URL"),
   workflows: MyApp::DurableWorkflows.for_pool("default"),
   worker_pool: "default",
-  worker_id: "#{Socket.gethostname}-#{Process.pid}"
+  rpc_host: ENV.fetch("POD_IP", "127.0.0.1"),
+  rpc_port: ENV.fetch("DURABABBLE_RPC_PORT", "50051").to_i
 )
 
 at_exit { WORKER.shutdown(timeout: 10) }

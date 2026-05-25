@@ -4,6 +4,19 @@
 require_relative "../test_helper"
 
 class DurababbleStoreBackendConformanceTest < DurababbleTestCase
+  class AdvisoryDeliveryClient
+    attr_reader :deliveries
+
+    def initialize
+      @deliveries = []
+    end
+
+    def deliver_message(**kwargs)
+      @deliveries << kwargs
+      true
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "migrates, enqueues, claims, completes, and decodes serialized workflow state with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
@@ -430,6 +443,48 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           )
         end
         assert_equal [first], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id).map { |message| message.fetch("id") }
+      end
+    end
+
+    test "advisory-delivers committed workflow messages to the active lease address with #{backend.name}" do
+      with_durababble_store(backend, "workflow_advisory_delivery") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "127.0.0.1:12345", lease_seconds: 30)
+
+        client = AdvisoryDeliveryClient.new
+        delivered = store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          client_factory: lambda do |address|
+            assert_equal("127.0.0.1:12345", address)
+            client
+          end,
+        )
+
+        assert_equal(true, delivered)
+        assert_equal(
+          [
+            {
+              worker_pool: "default",
+              target_kind: "workflow",
+              target_class: "approval",
+              target_id: workflow_id,
+            },
+          ],
+          client.deliveries,
+        )
+
+        store.suspend_workflow(workflow_id:, worker_id: "127.0.0.1:12345")
+        assert_equal false, store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          client_factory: lambda do |_address|
+            raise "should not build a client without a live lease"
+          end,
+        )
       end
     end
 
