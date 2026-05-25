@@ -181,9 +181,33 @@ module Durababble
       @connection.transaction(requires_new: true, &block)
     end
 
+    #: (Symbol | String, ?Array[Object?], **Object?) -> untyped
+    def execute_store_query(id, params = [], **locals)
+      execute_store_query_sql(store_query_sql(id, **locals), params)
+    end
+
     #: (Symbol | String, **Object?) -> String
     def store_query_sql(id, **locals)
-      StoreQueries.sql(id, self, locals)
+      StoreQueries.sql(qualified_store_query_id(id), self, locals)
+    end
+
+    #: (Symbol | String) -> Symbol
+    def qualified_store_query_id(id)
+      query_id = id.to_sym
+      query_id_string = query_id.to_s
+      return query_id if query_id_string.start_with?("pg_", "mysql_")
+
+      :"#{store_query_prefix}_#{query_id}"
+    end
+
+    #: () -> Symbol
+    def store_query_prefix
+      raise NotImplementedError
+    end
+
+    #: (String, Array[Object?]) -> untyped
+    def execute_store_query_sql(sql, params)
+      raise NotImplementedError
     end
 
     #: (target_kind: String, target_type: String, target_id: String) -> Hash[String, Object?]?

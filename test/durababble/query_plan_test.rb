@@ -9,44 +9,168 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   # Registered production queries not directly asserted by the large-fixture EXPLAIN suite.
   # Adding a new registered query without plan coverage must create an intentional diff here.
   POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
-    :pg_claim_object_command,
+    :pg_cancel_step,
+    :pg_cancel_workflow,
+    :pg_cancel_workflow_with_worker,
+    :pg_claim_expired_target_activation,
+    :pg_claim_pending_target_activation,
+    :pg_claim_selected_target_activation,
+    :pg_claim_workflow_for_activation_update,
     :pg_complete_fence,
-    :pg_complete_object_command,
-    :pg_enqueue_object_command,
+    :pg_complete_inbox_message,
+    :pg_complete_workflow,
+    :pg_complete_workflow_with_worker,
+    :pg_current_object_lease,
+    :pg_dead_letter_inbox_message,
+    :pg_delete_target_activation,
+    :pg_drop_schema,
+    :pg_enqueue_workflow,
+    :pg_existing_inbox_message_for_idempotency,
     :pg_fail_fence,
-    :pg_insert_fence,
-    :pg_lock_object_command,
-    :pg_lock_object_command_for_worker,
-    :pg_mark_workflow_waiting,
-    :pg_object_state,
-    :pg_outbox_message,
-    :pg_read_fence,
-    :pg_step_attempts_for,
-    :pg_steps_for,
-    :pg_waits_for_workflow,
-    :pg_workflow,
+    :pg_fail_inbox_message,
+    :pg_fail_step,
+    :pg_fail_workflow,
+    :pg_fail_workflow_with_worker,
+    :pg_inbox_claim_rows_for_update,
+    :pg_inbox_head_for_update,
+    :pg_inbox_message,
+    :pg_inbox_messages_for,
+    :pg_insert_inbox_message,
+    :pg_insert_mailbox_sequence,
+    :pg_insert_scheduled_step,
+    :pg_lock_inbox_message,
+    :pg_lock_inbox_message_for_worker,
+    :pg_lock_owned_workflow_for_update,
+    :pg_lock_target_activation_for_completion,
+    :pg_mailbox_sequence_for_update,
+    :pg_make_workflow_due,
+    :pg_mark_inbox_row_running,
+    :pg_mark_workflow_canceling_for_request,
+    :pg_mark_workflow_cancellation_delivered,
+    :pg_mark_workflow_running,
+    :pg_retry_inbox_message,
+    :pg_schedule_workflow_retry,
+    :pg_set_target_activation_pending,
+    :pg_step_heartbeat_cursor,
+    :pg_target_activation,
+    :pg_update_mailbox_sequence,
+    :pg_upsert_target_activation,
+    :pg_workflow_cancellation,
+    :pg_workflow_history_for,
   ].freeze
 
   MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
     :mysql_ack_outbox,
+    :mysql_cancel_pending_waits_for_workflow,
+    :mysql_cancel_step,
+    :mysql_cancel_waiting_step_attempts_for_workflow,
+    :mysql_cancel_waiting_steps_for_workflow,
+    :mysql_cancel_workflow,
+    :mysql_cancel_workflow_with_worker,
+    :mysql_claim_canceling_workflow,
+    :mysql_claim_expired_outbox,
+    :mysql_claim_expired_target_activation,
+    :mysql_claim_expired_workflow,
+    :mysql_claim_failed_workflow,
+    :mysql_claim_pending_outbox,
+    :mysql_claim_pending_target_activation,
+    :mysql_claim_pending_workflow,
     :mysql_claim_selected_outbox,
+    :mysql_claim_selected_target_activation,
     :mysql_claim_selected_workflow,
+    :mysql_claim_workflow_already_owned,
+    :mysql_claim_workflow_for_activation_lock,
+    :mysql_claim_workflow_for_activation_update,
+    :mysql_claim_workflow_lock,
     :mysql_claim_workflow_update,
+    :mysql_complete_fence,
+    :mysql_complete_inbox_message,
+    :mysql_complete_step,
+    :mysql_complete_timer_waits,
+    :mysql_complete_wait,
+    :mysql_complete_workflow,
+    :mysql_complete_workflow_with_worker,
+    :mysql_count_expired_workflow_leases,
+    :mysql_count_inbox_leases,
+    :mysql_count_outbox_leases,
+    :mysql_count_target_activation_leases,
+    :mysql_count_workflow_leases,
+    :mysql_current_object_lease,
     :mysql_current_workflow_lease,
+    :mysql_dead_letter_inbox_message,
+    :mysql_delete_target_activation,
+    :mysql_drop_table,
+    :mysql_enqueue_workflow,
+    :mysql_existing_inbox_message_for_idempotency,
+    :mysql_fail_fence,
+    :mysql_fail_inbox_message,
+    :mysql_fail_step,
+    :mysql_fail_workflow,
+    :mysql_fail_workflow_with_worker,
     :mysql_heartbeat_latest_attempt,
     :mysql_heartbeat_step_row,
     :mysql_heartbeat_step_workflow,
+    :mysql_heartbeat_workflow,
+    :mysql_inbox_claim_rows_for_update,
+    :mysql_inbox_head_for_update,
+    :mysql_inbox_message,
+    :mysql_inbox_messages_for,
+    :mysql_insert_fence,
+    :mysql_insert_inbox_message,
+    :mysql_insert_mailbox_sequence,
     :mysql_insert_outbox,
+    :mysql_insert_scheduled_step,
     :mysql_insert_step_attempt,
+    :mysql_insert_wait,
+    :mysql_insert_workflow_history,
+    :mysql_lock_fence_for_worker,
+    :mysql_lock_inbox_message,
+    :mysql_lock_inbox_message_for_worker,
+    :mysql_lock_owned_workflow_for_update,
+    :mysql_lock_target_activation_for_completion,
+    :mysql_lock_workflow_for_update,
+    :mysql_lock_workflow_history_workflow,
+    :mysql_mailbox_sequence_for_update,
+    :mysql_make_workflow_due,
+    :mysql_mark_inbox_row_running,
+    :mysql_mark_wait_workflow_pending,
+    :mysql_mark_workflow_canceling_for_request,
+    :mysql_mark_workflow_cancellation_delivered,
+    :mysql_mark_workflow_running,
+    :mysql_mark_workflow_running_with_worker,
+    :mysql_next_workflow_history_event_index,
+    :mysql_object_state,
     :mysql_outbox_by_key,
     :mysql_outbox_message,
+    :mysql_read_fence,
+    :mysql_release_inbox_leases,
+    :mysql_release_outbox_leases,
+    :mysql_release_target_activation_leases,
+    :mysql_release_workflow_leases,
+    :mysql_request_workflow_cancellation,
+    :mysql_retry_inbox_message,
     :mysql_running_step_exists,
+    :mysql_save_object_state,
+    :mysql_schedule_workflow_retry,
+    :mysql_set_target_activation_pending,
+    :mysql_steal_expired_leases,
     :mysql_step_attempts_for,
+    :mysql_step_heartbeat_cursor,
     :mysql_steps_for,
     :mysql_supersede_running_step_attempts,
+    :mysql_suspend_workflow,
+    :mysql_target_activation,
+    :mysql_update_latest_attempt,
+    :mysql_update_mailbox_sequence,
     :mysql_upsert_step_running,
+    :mysql_upsert_target_activation,
+    :mysql_upsert_waiting_step,
+    :mysql_waits_for_workflow,
     :mysql_workflow,
+    :mysql_workflow_cancellation,
+    :mysql_workflow_history_for,
     :mysql_workflow_locked_until,
+    :mysql_workflow_owned,
   ].freeze
 
   module StoreQueryIdRecorder
@@ -261,6 +385,41 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     end
   end
 
+  test "store query ids qualify by backend prefix unless already qualified" do
+    store = fake_store_with_prefix(:mysql)
+
+    assert_equal :mysql_workflow, store.send(:qualified_store_query_id, :workflow)
+    assert_equal :mysql_workflow, store.send(:qualified_store_query_id, "workflow")
+    assert_equal :pg_workflow, store.send(:qualified_store_query_id, :pg_workflow)
+    assert_equal :mysql_workflow, store.send(:qualified_store_query_id, :mysql_workflow)
+  end
+
+  test "store query registry rejects duplicate query ids" do
+    error = assert_raises(ArgumentError) do
+      Durababble::StoreQueries.define(:mysql_workflow, backend: :mysql) { "" }
+    end
+
+    assert_match(/duplicate store query id: mysql_workflow/, error.message)
+  end
+
+  test "mysql lease query builders accept explicit force indexes" do
+    store = fake_store_with_prefix(:mysql)
+    indexed_queries = {
+      count_workflow_leases: "workflows_worker_lease_idx",
+      release_workflow_leases: "workflows_worker_lease_idx",
+      count_outbox_leases: "outbox_worker_lease_idx",
+      release_outbox_leases: "outbox_worker_lease_idx",
+      count_inbox_leases: "inbox_worker_lease_idx",
+      release_inbox_leases: "inbox_worker_lease_idx",
+      count_target_activation_leases: "target_activations_worker_lease_idx",
+      release_target_activation_leases: "target_activations_worker_lease_idx",
+    }
+
+    indexed_queries.each do |id, index|
+      assert_includes store.send(:store_query_sql, id, index:), "FORCE INDEX (#{index})"
+    end
+  end
+
   test "uncovered query lists are explicit and reference registered queries" do
     assert_equal POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS.sort, POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS
     assert_equal MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS.sort, MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS
@@ -277,15 +436,40 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     end
   end
 
-  test "store implementation routes hot SQL through the top-level query registry" do
-    store_path = File.join(File.expand_path("../..", __dir__), "lib/durababble/store/postgres.rb")
-    source = File.read(store_path)
-    hot_methods = source.scan(/^    def (claim_runnable_workflow|claim_workflow|heartbeat|workflow_owned\?|release_worker_leases!|heartbeat_step|current_workflow_lease|steal_expired_leases!|record_step_started|record_wait|enqueue_outbox|claim_outbox|ack_outbox|save_object_state|complete_timer_waits|record_step_completed_without_transaction|update_latest_attempt_serialized)\b(.*?)(?=^    def |\n  end\nend\z)/m)
-    refute_empty hot_methods
+  test "runtime store implementations execute SQL only through registry ids" do
+    store_paths = [
+      File.join(File.expand_path("../..", __dir__), "lib/durababble/store/sql_common.rb"),
+      File.join(File.expand_path("../..", __dir__), "lib/durababble/store/postgres.rb"),
+      File.join(File.expand_path("../..", __dir__), "lib/durababble/store/mysql.rb"),
+    ]
 
-    hot_methods.each do |method_name, body|
-      refute_match(/execute_params\(\s*(?:"|<<~SQL)/, body, "#{method_name} SQL must be defined in Durababble::StoreQueries")
+    store_paths.each do |store_path|
+      source = File.read(store_path).gsub(/^\s*#:\s.*\n\s*def execute_params\(.*?^\s*end\n/m, "")
+      refute_match(/execute_params\(/, source, "#{File.basename(store_path)} must call execute_store_query with a registry id")
+      refute_match(/store_query_sql\(/, source, "#{File.basename(store_path)} must not bypass execute_store_query")
+      refute_match(/<<~SQL/, source, "#{File.basename(store_path)} must keep SQL text in Durababble::StoreQueries")
+      refute_match(/\b(?:SELECT|INSERT|UPDATE|DELETE|DROP)\b/, source, "#{File.basename(store_path)} must keep SQL text in Durababble::StoreQueries")
     end
+  end
+
+  test "registered store queries are referenced by production store implementations" do
+    referenced = []
+    store_root = File.join(File.expand_path("../..", __dir__), "lib/durababble/store")
+    [
+      [File.join(store_root, "postgres.rb"), :pg],
+      [File.join(store_root, "mysql.rb"), :mysql],
+    ].each do |store_path, prefix|
+      referenced.concat(File.read(store_path).scan(/execute_store_query\(:([a-zA-Z0-9_]+)/).flatten.map { |id| :"#{prefix}_#{id}" })
+    end
+
+    common_source = File.read(File.join(store_root, "sql_common.rb"))
+    common_source.scan(/execute_store_query\(:([a-zA-Z0-9_]+)/).flatten.each do |id|
+      referenced << :"pg_#{id}"
+      referenced << :"mysql_#{id}"
+    end
+
+    assert_empty Durababble::StoreQueries.query_ids(:postgres) - referenced
+    assert_empty Durababble::StoreQueries.query_ids(:mysql) - referenced
   end
 
   test "accepts index-only scans as valid index scans" do
@@ -460,6 +644,15 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   end
 
   private
+
+  def fake_store_with_prefix(prefix)
+    Class.new(Durababble::Store) do
+      define_method(:initialize) {}
+      define_method(:store_query_prefix) { prefix }
+      define_method(:execute_store_query_sql) { |_sql, _params| raise NotImplementedError }
+      define_method(:table) { |name| "`test_#{name}`" }
+    end.new
+  end
 
   def migrated_recording_connection
     skip_without_yugabyte!

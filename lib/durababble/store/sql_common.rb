@@ -30,7 +30,7 @@ module Durababble
 
     #: (String) -> Hash[String, Object?]
     def workflow(workflow_id)
-      row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = #{placeholder(1)}", [workflow_id]).first
+      row = execute_store_query(:workflow, [workflow_id]).first
       raise KeyError, "workflow not found: #{workflow_id}" unless row
 
       decode_row(row)
@@ -38,28 +38,25 @@ module Durababble
 
     #: (String) -> Array[Hash[String, Object?]]
     def steps_for(workflow_id)
-      execute_params("SELECT * FROM #{table("steps")} WHERE workflow_id = #{placeholder(1)} ORDER BY position", [workflow_id])
+      execute_store_query(:steps_for, [workflow_id])
         .map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (String) -> Array[Hash[String, Object?]]
     def step_attempts_for(workflow_id)
-      execute_params("SELECT * FROM #{table("step_attempts")} WHERE workflow_id = #{placeholder(1)} ORDER BY started_at, position", [workflow_id])
+      execute_store_query(:step_attempts_for, [workflow_id])
         .map { |row| with_command_id(decode_row(row)) }
     end
 
     #: (object_type: String, object_id: String) -> Object?
     def object_state(object_type:, object_id:)
-      row = execute_params(
-        "SELECT state FROM #{table("durable_objects")} WHERE object_type = #{placeholder(1)} AND object_id = #{placeholder(2)}",
-        [object_type, object_id],
-      ).first
+      row = execute_store_query(:object_state, [object_type, object_id]).first
       decode_row(row).fetch("state") if row
     end
 
     #: (String) -> Array[Hash[String, Object?]]
     def workflow_history_for(workflow_id)
-      execute_params("SELECT * FROM #{table("workflow_history")} WHERE workflow_id = #{placeholder(1)} ORDER BY event_index", [workflow_id])
+      execute_store_query(:workflow_history_for, [workflow_id])
         .map { |row| decode_row(row) }
     end
 
@@ -70,13 +67,13 @@ module Durababble
 
     #: (String) -> Array[Hash[String, Object?]]
     def waits_for(workflow_id)
-      execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = #{placeholder(1)} ORDER BY created_at", [workflow_id])
+      execute_store_query(:waits_for_workflow, [workflow_id])
         .map { |row| decode_row(row) }
     end
 
     #: (String) -> Hash[String, Object?]?
     def outbox_message(outbox_id)
-      row = execute_params("SELECT * FROM #{table("outbox")} WHERE id = #{placeholder(1)}", [outbox_id]).first
+      row = execute_store_query(:outbox_message, [outbox_id]).first
       decode_row(row) if row
     end
 
@@ -180,17 +177,13 @@ module Durababble
 
     #: (String) -> Hash[String, Object?]?
     def inbox_message(message_id)
-      row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = #{placeholder(1)}", [message_id]).first
+      row = execute_store_query(:inbox_message, [message_id]).first
       decode_row(row) if row
     end
 
     #: (target_kind: String, target_type: String, target_id: String) -> Array[Hash[String, Object?]]
     def inbox_messages_for(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
-        SELECT * FROM #{table("inbox")}
-        WHERE target_kind = #{placeholder(1)} AND target_type = #{placeholder(2)} AND target_id = #{placeholder(3)}
-        ORDER BY sequence
-      SQL
+      execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
     end
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
@@ -297,10 +290,7 @@ module Durababble
 
     #: (target_kind: Object?, target_type: Object?, target_id: Object?) -> Hash[String, Object?]?
     def target_activation(target_kind:, target_type:, target_id:)
-      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-        SELECT * FROM #{table("target_activations")}
-        WHERE target_kind = #{placeholder(1)} AND target_type = #{placeholder(2)} AND target_id = #{placeholder(3)}
-      SQL
+      row = execute_store_query(:target_activation, [target_kind, target_type, target_id]).first
       decode_row(row) if row
     end
 
@@ -344,11 +334,6 @@ module Durababble
 
     #: (workflow_id: String, command_id: Integer, error: String) -> Object?
     def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
-      raise NotImplementedError
-    end
-
-    #: (String, Array[Object?]) -> Array[Hash[String, Object?]]
-    def execute_params(sql, params)
       raise NotImplementedError
     end
 
