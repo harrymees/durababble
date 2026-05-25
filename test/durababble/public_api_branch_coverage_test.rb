@@ -71,6 +71,13 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  class RetryPolicyAliasObject < Durababble::DurableObject
+    expose_command retry_policy: { maximum_attempts: 2, schedule: [0] }
+    def command_with_retry_policy_alias
+      "ok"
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "covers explicit and pending workflow macros plus keyword step invocation with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_workflow") do |store|
@@ -96,6 +103,13 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     assert_hash_includes BranchTestPendingWorkflow.exposed_queries, query_with_pending_macro: true
     assert_includes BranchTestPendingWorkflow.exposed_commands, :command_with_pending_macro
     assert_includes BranchTestPendingWorkflow.step_order, :step_with_pending_macro
+  end
+
+  test "registers retry_policy option on pending command macros" do
+    retry_policy = RetryPolicyAliasObject.exposed_commands.fetch(:command_with_retry_policy_alias)
+
+    assert_equal 2, retry_policy.maximum_attempts
+    assert_equal [0], retry_policy.schedule
   end
 
   durababble_store_backends.each do |backend|

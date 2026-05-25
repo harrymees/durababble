@@ -217,7 +217,7 @@ module Durababble
     def self.handle: (String workflow_id, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
-    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
+    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
 
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
@@ -247,7 +247,7 @@ module Durababble
     def self.handle: (Id durable_id, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?) -> durable_object_handle[Id, State, Dispatch]
     def self.tell: (Id durable_id, Symbol method_name, *serialized_payload args, ?store: Store, ?engine: Engine, ?idempotency_key: String?, **serialized_payload kwargs) -> String
     def self.expose: (?Symbol method_name) -> Symbol?
-    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
+    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
 
     attr_reader durable_id: Id
     attr_reader command_context: CommandContext?
