@@ -72,35 +72,6 @@ run.result
 
 <!-- DOCS:workflow-example:end -->
 
-## Parallel Steps With Async
-
-Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
-
-```ruby
-class FetchProfiles < Durababble::Workflow
-  def execute(user_ids)
-    Async do |task|
-      user_ids.map do |user_id|
-        task.async do
-          profile = fetch_profile(user_id)
-          score_profile(profile)
-        end
-      end.map(&:wait)
-    end.wait
-  end
-
-  step def fetch_profile(user_id)
-    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
-  end
-
-  step def score_profile(profile)
-    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
-  end
-end
-```
-
-If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
-
 ## Enqueuing And Workflow Handles
 
 `Engine#run` is the small-script path: it creates a workflow row, runs it immediately in the current process, and returns the completed `Durababble::Run`. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases.
@@ -124,6 +95,21 @@ handle = FulfillOrder.start(order, store:)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 ```
+
+## Replay
+
+Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble patches sources of non-determinism for workflow code to ensure that randomness, wall clock time, and process local state is the same for each execution of the workflow.
+
+```ruby
+def execute(order)
+  payment = charge_card(order)      # reused from storage if step 0 completed
+  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
+
+  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
+end
+```
+
+Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
 ## Sleeping
 
@@ -186,6 +172,35 @@ handle.cancel(reason: "user uploaded a replacement file")
 
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
 
+## Parallel Steps With Async
+
+Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
+
+```ruby
+class FetchProfiles < Durababble::Workflow
+  def execute(user_ids)
+    Async do |task|
+      user_ids.map do |user_id|
+        task.async do
+          profile = fetch_profile(user_id)
+          score_profile(profile)
+        end
+      end.map(&:wait)
+    end.wait
+  end
+
+  step def fetch_profile(user_id)
+    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def score_profile(profile)
+    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
+
 ## RPC
 
 Workflows can expose an RPC surface for other members of the Durababble cluster to invoke. RPCs can just return state, mutate it, change how the workflow execution will proceed, or all of the above.
@@ -217,21 +232,6 @@ handle.note(message: "approved by legal")
 ```
 
 Durababble handles the RPC machinery between your workers automatically, routing messages to the right worker that has a workflow active. If a workflow is not active when you send an RPC to it, Durababble will warm it up on a worker and then deliver your message.
-
-## Replay
-
-Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble patches sources of non-determinism for workflow code to ensure that randomness, wall clock time, and process local state is the same for each execution of the workflow.
-
-```ruby
-def execute(order)
-  payment = charge_card(order)      # reused from storage if step 0 completed
-  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
-
-  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
-end
-```
-
-Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
 ## Workflow Event Log Length
 
