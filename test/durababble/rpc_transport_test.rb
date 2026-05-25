@@ -333,16 +333,14 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   private
 
+  attr_reader :workflow_id
+
   def start_rpc_server(**kwargs)
     Durababble::Rpc::Server.new(**kwargs, port: 0, pool_size: 2).start
   end
 
   def database_url
     backend_descriptor.database_url
-  end
-
-  def workflow_id
-    @workflow_id
   end
 
   def claim_as(worker_id, lease_seconds: 60)

@@ -491,12 +491,10 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
 
   private
 
+  attr_reader :workflow_id
+
   def database_url
     backend_descriptor.database_url
-  end
-
-  def workflow_id
-    @workflow_id
   end
 
   def claim_as(worker_id, lease_seconds: 60)

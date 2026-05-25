@@ -127,7 +127,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
     runtime.store.define_singleton_method(:claim_runnable_workflow) do |**|
-      raise RuntimeError, "boom"
+      raise "boom"
     end
     owner = runtime.store.instance_variable_get(:@owner)
 
