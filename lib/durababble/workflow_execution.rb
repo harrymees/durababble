@@ -12,8 +12,8 @@ require_relative "workflow_step_runner"
 
 module Durababble
   class WorkflowExecution
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil, history_warning_logged: false)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -28,6 +28,7 @@ module Durababble
       @step_contexts = {}
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
+      @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
       @step_runner = WorkflowStepRunner.new(
         store: @store,
@@ -276,6 +277,13 @@ module Durababble
     def ensure_history_limit_allows!(additional_events:)
       max_history_events = Durababble.max_workflow_history_events
       projected_events = @replay_history.event_count + additional_events
+      unless @history_warning_logged
+        @history_warning_logged = Durababble.warn_workflow_history_events(
+          workflow_id: @workflow_id,
+          history_events: projected_events,
+          max_history_events:,
+        )
+      end
       return if projected_events <= max_history_events
 
       raise WorkflowHistoryLimitExceeded.new(

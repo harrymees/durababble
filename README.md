@@ -23,7 +23,3 @@ The docs site source starts at [docs/content/README.md](docs/content/README.md).
 - [Benchmarks](bench/README.md)
 
 The Zeitung documentation source lives in `docs/content/`; see [docs/README.md](docs/README.md) for local preview and build commands.
-
-## Workflow Replay Bounds
-
-Durababble bounds workflow replay by counting persisted `workflow_history` rows before loading replay payloads. The limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. When an open workflow exceeds the limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`; completed/canceled/failed workflows are returned as-is. Operationally, treat this as a workflow design or retention signal: split very long workflows into child runs or smaller durable objects, compact completed history through a deliberate retention tool, or raise the limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.

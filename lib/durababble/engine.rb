@@ -96,11 +96,16 @@ module Durababble
       WorkflowStatus.terminal?(row)
     end
 
-    #: (untyped, ?history_count: untyped) -> void
-    def assert_workflow_history_limit!(workflow_id, history_count: nil)
+    #: (untyped, ?history_count: untyped) -> bool
+    def check_workflow_history_limit!(workflow_id, history_count: nil)
       history_count ||= @store.workflow_history_count_for(workflow_id)
       max_history_events = Durababble.max_workflow_history_events
-      return if history_count <= max_history_events
+      warned = Durababble.warn_workflow_history_events(
+        workflow_id:,
+        history_events: history_count,
+        max_history_events:,
+      )
+      return warned if history_count <= max_history_events
 
       raise WorkflowHistoryLimitExceeded.new(
         workflow_id,
@@ -142,9 +147,8 @@ module Durababble
         workflow = nil #: untyped
         root_error = nil #: StandardError?
         root = Async do |root_task|
-          assert_workflow_history_limit!(workflow_id) if @store.respond_to?(:workflow_history_count_for)
+          history_warning_logged = check_workflow_history_limit!(workflow_id)
           history = @store.workflow_history_for(workflow_id)
-          assert_workflow_history_limit!(workflow_id, history_count: history.length) unless @store.respond_to?(:workflow_history_count_for)
           Observability.record(
             "durababble.workflow.history.steps",
             history.count { |event| event.fetch("kind") == "step_completed" },
@@ -158,6 +162,7 @@ module Durababble
             history:,
             root_task:,
             crash_after: @crash_after,
+            history_warning_logged:,
           )
           workflow = workflow_class.new
           workflow.__durababble_execution__ = execution

@@ -153,6 +153,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]
+    def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)

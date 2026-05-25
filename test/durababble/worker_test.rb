@@ -71,6 +71,10 @@ class DurababbleWorkerTest < DurababbleTestCase
       []
     end
 
+    def workflow_history_count_for(_workflow_id)
+      0
+    end
+
     def record_step_scheduled(workflow_id:, command_id:, name:, **)
       @resumed << [:scheduled, workflow_id, command_id, name]
     end

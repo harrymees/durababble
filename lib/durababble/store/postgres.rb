@@ -437,14 +437,55 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
     def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
+      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(target_id))
+        dead_letter_terminal_workflow_inbox_without_transaction(
+          target_type:,
+          target_id:,
+          error: terminal_error,
+        )
+        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
+        return
+      end
+
       head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else
-        execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
+        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
       end
+    end
+
+    #: (String) -> String?
+    def terminal_workflow_target_error(workflow_id)
+      row = execute_params("SELECT status, error FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
+      return unless row && WorkflowStatus.terminal?(row)
+
+      status = row.fetch("status")
+      error = row["error"]
+      suffix = error.to_s.empty? ? "" : ": #{error}"
+      "workflow #{workflow_id} is terminal #{status}#{suffix}"
+    end
+
+    #: (target_type: String, target_id: String, error: String) -> Object?
+    def dead_letter_terminal_workflow_inbox_without_transaction(target_type:, target_id:, error:)
+      execute_params(<<~SQL, [target_type, target_id, error])
+        UPDATE #{table("inbox")}
+        SET status = 'dead_lettered',
+            error = $3,
+            locked_by = NULL,
+            locked_until = NULL,
+            dead_lettered_at = now(),
+            updated_at = now()
+        WHERE target_kind = 'workflow' AND target_type = $1 AND target_id = $2
+          AND status IN ('pending', 'failed', 'running')
+      SQL
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String) -> Object?
+    def delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
+      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
     end
 
     #: (target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?

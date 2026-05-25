@@ -140,6 +140,14 @@ end
 
 Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
+### Replay Bounds
+
+Durababble bounds workflow replay by counting persisted `workflow_history` rows before loading replay payloads. The hard limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. The warning threshold defaults to `8_000` events and can be tuned with `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS` or `Durababble.workflow_history_warning_events = 8_000`; reaching it logs a warning through `Durababble.logger` and does not stop the run.
+
+When an open workflow exceeds the hard limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`. The terminal failure clears workflow leases and retry deadlines, and terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming it, so workers do not repeatedly claim the same oversized run. Completed, canceled, and failed workflows are returned as-is and remain inspectable.
+
+Treat warning logs or `WorkflowHistoryLimitExceeded` as workflow design or retention signals. Split very long workflows into child runs or smaller durable objects, compact completed history through a deliberate retention tool, or raise the hard limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.
+
 ### Workflow Event Log Length
 
 Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, replay will take very long, and system performance will suffer.
