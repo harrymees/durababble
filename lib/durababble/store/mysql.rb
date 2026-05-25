@@ -208,8 +208,20 @@ module Durababble
           SET status = 'pending', locked_by = NULL, locked_until = NULL
           WHERE status = 'processing' AND locked_by = ?
         SQL
-        released = { "workflows" => workflows, "outbox" => outbox }
-        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: workflows.to_i)
+        inbox = execute_params("SELECT COUNT(*) AS count FROM #{table("inbox")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
+        execute_params(<<~SQL, [worker_id])
+          UPDATE #{table("inbox")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+          WHERE status = 'running' AND locked_by = ?
+        SQL
+        target_activations = execute_params("SELECT COUNT(*) AS count FROM #{table("target_activations")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
+        execute_params(<<~SQL, [worker_id])
+          UPDATE #{table("target_activations")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+          WHERE status = 'running' AND locked_by = ?
+        SQL
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
     end
@@ -243,7 +255,7 @@ module Durababble
       SQL
       return true if result.affected_rows == 1
 
-      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+      WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
     end
 
     #: (untyped, ?now: untyped) -> untyped
@@ -270,7 +282,7 @@ module Durababble
         end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
-        if first_request && decoded.fetch("status") != "running"
+        if first_request && !WorkflowStatus.running?(decoded)
           execute_params(<<~SQL, [workflow_id])
             UPDATE #{table("workflows")}
             SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
@@ -348,6 +360,18 @@ module Durababble
         SELECT id AS workflow_id, locked_by AS worker_id, locked_until
         FROM #{table("workflows")}
         WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+      SQL
+    end
+
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      execute_params(<<~SQL, [object_type, object_id]).first
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table("inbox")}
+        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        ORDER BY sequence
+        LIMIT 1
       SQL
     end
 
@@ -716,7 +740,7 @@ module Durababble
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
           SELECT * FROM #{table("inbox")}
-          WHERE id = ? AND status = 'running' AND locked_by = ?
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
           FOR UPDATE
         SQL
       else
@@ -749,7 +773,7 @@ module Durababble
         FOR UPDATE
       SQL
 
-      if head && head.fetch("status") != "dead_lettered"
+      if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else
@@ -877,6 +901,14 @@ module Durababble
       execute_params(
         "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?",
         [error, message_id],
+      )
+    end
+
+    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      execute_params(
+        "UPDATE #{table("inbox")} SET status = 'pending', error = ?, ready_at = ?, locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?",
+        [error, ready_at, message_id],
       )
     end
 

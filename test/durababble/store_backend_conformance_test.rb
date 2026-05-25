@@ -553,6 +553,41 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
         assert_hash_includes store.release_worker_leases!(worker_id: "worker-b"), "workflows" => 1
         assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-c", lease_seconds: 30), "locked_by" => "worker-c"
+
+        object_command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "release",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_target_activation(worker_id: "object-worker", lease_seconds: 60, target_kinds: ["object"], target_types: ["counter"]),
+          "target_kind" => "object",
+          "target_type" => "counter",
+          "target_id" => "release",
+          "locked_by" => "object-worker",
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: object_command_id, worker_id: "object-worker", lease_seconds: 60),
+          "status" => "running",
+          "locked_by" => "object-worker",
+        )
+
+        released = store.release_worker_leases!(worker_id: "object-worker")
+        assert_hash_includes released, "inbox" => 1, "target_activations" => 1
+        assert_hash_includes store.inbox_message(object_command_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil
+        assert_hash_includes(
+          store.claim_target_activation(worker_id: "object-recovery", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"]),
+          "target_id" => "release",
+          "locked_by" => "object-recovery",
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: object_command_id, worker_id: "object-recovery", lease_seconds: 30),
+          "status" => "running",
+          "locked_by" => "object-recovery",
+        )
+
         store.fail_workflow(workflow_id, error: "fatal")
         assert_hash_includes store.workflow(workflow_id), "status" => "failed", "error" => "fatal"
         assert_nil store.claim_runnable_workflow(worker_id: "worker-d", lease_seconds: 30)
@@ -593,6 +628,48 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           store.claim_object_command(command_id:, worker_id: "recovery-object-worker", lease_seconds: 30),
           "id" => command_id,
           "status" => "running",
+          "locked_by" => "recovery-object-worker",
+        )
+      end
+    end
+
+    test "fences stale durable object command failure and retry writes with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        stale_failure = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_failure, worker_id: "expired-object-worker", lease_seconds: -1),
+          "locked_by" => "expired-object-worker",
+        )
+        failed = store.fail_object_command(command_id: stale_failure, error: "stale failure", worker_id: "expired-object-worker", terminal: true)
+        assert(failed.nil? || failed.affected_rows.to_i.zero?)
+        assert_hash_includes store.inbox_message(stale_failure), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_failure, worker_id: "recovery-object-worker", lease_seconds: 30),
+          "locked_by" => "recovery-object-worker",
+        )
+
+        stale_retry = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc-retry",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_retry, worker_id: "expired-object-worker", lease_seconds: -1),
+          "locked_by" => "expired-object-worker",
+        )
+        retried = store.retry_object_command(command_id: stale_retry, error: "stale retry", worker_id: "expired-object-worker", ready_at: Time.now + 60)
+        assert(retried.nil? || retried.affected_rows.to_i.zero?)
+        assert_hash_includes store.inbox_message(stale_retry), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_retry, worker_id: "recovery-object-worker", lease_seconds: 30),
           "locked_by" => "recovery-object-worker",
         )
       end

@@ -137,7 +137,7 @@ module Durababble
       #: (untyped) -> untyped
       def inactive_workflow_error(workflow_id)
         row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if ["completed", "waiting"].include?(row.fetch("status"))
+        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
 
         NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end
@@ -188,7 +188,7 @@ module Durababble
       #: (untyped) -> untyped
       def inactive_workflow_error(workflow_id)
         row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if ["completed", "waiting"].include?(row.fetch("status"))
+        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
 
         NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end

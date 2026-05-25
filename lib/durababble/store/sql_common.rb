@@ -216,13 +216,29 @@ module Durababble
       end
     end
 
-    #: (command_id: untyped, error: untyped, ?worker_id: untyped) -> untyped
-    def fail_object_command(command_id:, error:, worker_id: nil)
+    #: (command_id: untyped, error: untyped, ?worker_id: untyped, ?terminal: untyped) -> untyped
+    def fail_object_command(command_id:, error:, worker_id: nil, terminal: false)
       transaction do
         command = lock_inbox_message_for_failure(command_id:, worker_id:)
         next nil unless command
 
-        updated = fail_inbox_message_without_transaction(message_id: command_id, error:)
+        updated = if terminal
+          dead_letter_inbox_message_without_transaction(message_id: command_id, error:)
+        else
+          fail_inbox_message_without_transaction(message_id: command_id, error:)
+        end
+        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        updated
+      end
+    end
+
+    #: (command_id: untyped, error: untyped, worker_id: untyped, ready_at: untyped) -> untyped
+    def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+      transaction do
+        command = lock_inbox_message_for_failure(command_id:, worker_id:)
+        next nil unless command
+
+        updated = retry_inbox_message_without_transaction(message_id: command_id, error:, ready_at:)
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         updated
       end
@@ -393,6 +409,11 @@ module Durababble
       raise NotImplementedError
     end
 
+    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      raise NotImplementedError
+    end
+
     #: (message_id: untyped, worker_id: untyped) -> untyped
     def lock_inbox_message_for_completion(message_id:, worker_id:)
       raise NotImplementedError
@@ -415,7 +436,7 @@ module Durababble
 
     #: (untyped) -> bool
     def activatable_inbox_status?(status)
-      ["pending", "failed", "running"].include?(status)
+      InboxStatus.activatable?(status)
     end
 
     #: (message_id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, ?now: untyped) -> untyped

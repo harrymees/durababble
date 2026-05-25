@@ -7,10 +7,11 @@ module Durababble
   class Worker
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
 
-    #: (store: untyped, workflows: untyped, worker_id: untyped, ?lease_seconds: untyped, ?migrate: untyped) -> void
-    def initialize(store:, workflows:, worker_id:, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true)
+    #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped) -> void
+    def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true)
       @store = store
       @workflows = normalize_workflows(workflows)
+      @objects = normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @store.migrate! if migrate
@@ -20,12 +21,7 @@ module Durababble
     def tick
       attributes = { "durababble.worker.id" => @worker_id }
       Observability.measure("durababble.worker.tick", attributes) do
-        activation = @store.claim_target_activation(
-          worker_id: @worker_id,
-          lease_seconds: @lease_seconds,
-          target_kinds: ["workflow"],
-          target_types: @workflows.keys,
-        )
+        activation = claim_next_target_activation
         if activation
           process_target_activation(activation)
           Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
@@ -47,8 +43,7 @@ module Durababble
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def deliver_target(target_kind:, target_type:, target_id:)
-      return :idle unless target_kind == "workflow"
-      return :idle unless @workflows.key?(target_type)
+      return :idle unless registered_target?(target_kind:, target_type:)
 
       process_target_activation(
         {
@@ -79,6 +74,16 @@ module Durababble
 
     #: (untyped, ?advisory: untyped) -> untyped
     def process_target_activation(activation, advisory: false)
+      case activation.fetch("target_kind")
+      when "workflow"
+        process_workflow_activation(activation, advisory:)
+      when "object"
+        process_object_activation(activation, advisory:)
+      end
+    end
+
+    #: (untyped, ?advisory: untyped) -> untyped
+    def process_workflow_activation(activation, advisory: false)
       workflow_id = activation.fetch("target_id")
       workflow = @workflows.fetch(activation.fetch("target_type"))
       engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false)
@@ -113,6 +118,41 @@ module Durababble
       )
     end
 
+    #: (untyped, ?advisory: untyped) -> untyped
+    def process_object_activation(activation, advisory: false)
+      object_type = activation.fetch("target_type")
+      object_id = activation.fetch("target_id")
+      executor = DurableObjectExecutor.new(store: @store, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      drained = executor.drain_object_inbox(object_type, object_id:)
+      if advisory
+        if drained.positive?
+          @store.reconcile_target_activation(
+            target_kind: activation.fetch("target_kind"),
+            target_type: object_type,
+            target_id: object_id,
+          )
+        else
+          forward_target_activation(activation)
+          @store.rearm_target_activation(
+            target_kind: activation.fetch("target_kind"),
+            target_type: object_type,
+            target_id: object_id,
+            ready_at: Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
+          )
+        end
+        return
+      end
+
+      forward_target_activation(activation) if drained.zero?
+      @store.complete_target_activation(
+        target_kind: activation.fetch("target_kind"),
+        target_type: object_type,
+        target_id: object_id,
+        worker_id: @worker_id,
+        now: drained.positive? ? Time.now : Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
+      )
+    end
+
     #: (untyped) -> untyped
     def forward_target_activation(activation)
       @store.deliver_target_message(
@@ -144,6 +184,50 @@ module Durababble
         workflows.transform_keys(&:to_s)
       else
         Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
+      end
+    end
+
+    #: (untyped) -> untyped
+    def normalize_objects(objects)
+      case objects
+      when Hash
+        objects.transform_keys(&:to_s)
+      else
+        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
+      end
+    end
+
+    #: () -> untyped
+    def claim_next_target_activation
+      unless @workflows.empty?
+        activation = @store.claim_target_activation(
+          worker_id: @worker_id,
+          lease_seconds: @lease_seconds,
+          target_kinds: ["workflow"],
+          target_types: @workflows.keys,
+        )
+        return activation if activation
+      end
+
+      return if @objects.empty?
+
+      @store.claim_target_activation(
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        target_kinds: ["object"],
+        target_types: @objects.keys,
+      )
+    end
+
+    #: (target_kind: untyped, target_type: untyped) -> bool
+    def registered_target?(target_kind:, target_type:)
+      case target_kind
+      when "workflow"
+        @workflows.key?(target_type)
+      when "object"
+        @objects.key?(target_type)
+      else
+        false
       end
     end
   end
