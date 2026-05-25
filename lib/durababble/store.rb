@@ -8,6 +8,7 @@ require "paquito"
 require "securerandom"
 require "time"
 require "uri"
+require_relative "worker_identity"
 
 module Durababble
   class Store
@@ -185,8 +186,9 @@ module Durababble
 
       factory = client_factory || rpc_client_factory
       factory = factory #: as untyped
-      client = factory.call(lease.fetch("worker_id"))
-      deliver_target_message_with_retry(client, worker_pool: lease.fetch("worker_pool", worker_pool).to_s, target_kind:, target_type:, target_id:)
+      expected_worker_id = lease.fetch("worker_id").to_s
+      client = factory.call(WorkerIdentity.address_for(expected_worker_id))
+      deliver_target_message_with_retry(client, worker_pool: lease.fetch("worker_pool", worker_pool).to_s, target_kind:, target_type:, target_id:, expected_worker_id:)
       true
     rescue Durababble::Rpc::Error, Durababble::WorkflowRpc::Error
       false
@@ -327,12 +329,12 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (Object, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
-    def deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+    #: (Object, worker_pool: String, target_kind: String, target_type: String, target_id: String, expected_worker_id: String) -> Object?
+    def deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:, expected_worker_id:)
       client = client #: as untyped
       attempts = 0
       begin
-        client.deliver_message(worker_pool:, target_kind:, target_class: target_type, target_id:)
+        client.deliver_message(worker_pool:, target_kind:, target_class: target_type, target_id:, expected_worker_id:)
       rescue Durababble::Rpc::Unavailable, Durababble::WorkflowRpc::NodeUnavailable
         attempts += 1
         retry if attempts < 2
