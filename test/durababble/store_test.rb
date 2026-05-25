@@ -1016,7 +1016,9 @@ class DurababbleStoreTest < DurababbleTestCase
     store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
     assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
     assert_equal ["AND name IN (?, ?)", ["x'; DROP TABLE workflows; --", "safe"]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
+    assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))

@@ -42,6 +42,11 @@ module Durababble
       def table(store, name)
         store.send(:table, name)
       end
+
+      #: (untyped, untyped, untyped) -> untyped
+      def index_name(store, table_name, suffix)
+        store.send(:index_name, table_name, suffix)
+      end
     end
 
     HOT_QUERY_COVERAGE = {
@@ -485,7 +490,7 @@ module Durababble
 
     define(:mysql_claim_expired_workflow, backend: :mysql) do |store, name_sql:|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")}
+        SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")})
         WHERE status = 'running' AND locked_until < NOW(6)
           #{name_sql}
         ORDER BY created_at
@@ -618,15 +623,13 @@ module Durababble
       SQL
     end
 
-    define(:mysql_count_workflow_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
-      "SELECT COUNT(*) AS count FROM #{table(store, "workflows")}#{force_index} WHERE status = 'running' AND locked_by = ?"
+    define(:mysql_count_workflow_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "workflows")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
     end
 
-    define(:mysql_release_workflow_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
+    define(:mysql_release_workflow_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}#{force_index}
+        UPDATE #{table(store, "workflows")} FORCE INDEX (#{index})
         SET status = CASE
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
@@ -636,15 +639,13 @@ module Durababble
       SQL
     end
 
-    define(:mysql_count_outbox_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
-      "SELECT COUNT(*) AS count FROM #{table(store, "outbox")}#{force_index} WHERE status = 'processing' AND locked_by = ?"
+    define(:mysql_count_outbox_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "outbox")} FORCE INDEX (#{index}) WHERE status = 'processing' AND locked_by = ?"
     end
 
-    define(:mysql_release_outbox_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
+    define(:mysql_release_outbox_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
-        UPDATE #{table(store, "outbox")}#{force_index}
+        UPDATE #{table(store, "outbox")} FORCE INDEX (#{index})
         SET status = 'pending', locked_by = NULL, locked_until = NULL
         WHERE status = 'processing' AND locked_by = ?
       SQL
@@ -662,7 +663,7 @@ module Durababble
 
     define(:mysql_claim_expired_outbox, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")}
+        SELECT id, created_at FROM #{table(store, "outbox")} FORCE INDEX (#{index_name(store, "outbox", "expired_lease")})
         WHERE status = 'processing' AND locked_until < NOW(6)
         ORDER BY created_at
         LIMIT 1
@@ -1188,29 +1189,25 @@ module Durababble
       SQL
     end
 
-    define(:mysql_count_inbox_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
-      "SELECT COUNT(*) AS count FROM #{table(store, "inbox")}#{force_index} WHERE status = 'running' AND locked_by = ?"
+    define(:mysql_count_inbox_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "inbox")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
     end
 
-    define(:mysql_release_inbox_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
+    define(:mysql_release_inbox_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
-        UPDATE #{table(store, "inbox")}#{force_index}
+        UPDATE #{table(store, "inbox")} FORCE INDEX (#{index})
         SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE status = 'running' AND locked_by = ?
       SQL
     end
 
-    define(:mysql_count_target_activation_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
-      "SELECT COUNT(*) AS count FROM #{table(store, "target_activations")}#{force_index} WHERE status = 'running' AND locked_by = ?"
+    define(:mysql_count_target_activation_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "target_activations")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
     end
 
-    define(:mysql_release_target_activation_leases, backend: :mysql) do |store, index: nil|
-      force_index = " FORCE INDEX (#{index})" if index
+    define(:mysql_release_target_activation_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
-        UPDATE #{table(store, "target_activations")}#{force_index}
+        UPDATE #{table(store, "target_activations")} FORCE INDEX (#{index})
         SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE status = 'running' AND locked_by = ?
       SQL
@@ -1458,7 +1455,7 @@ module Durababble
 
     define(:mysql_claim_expired_target_activation, backend: :mysql) do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
+        SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "expired")})
         WHERE status = 'running' AND locked_until < ?
           #{filter_sql}
         ORDER BY ready_at, created_at
