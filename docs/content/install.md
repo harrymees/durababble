@@ -1,9 +1,9 @@
 ---
-title: "Install Instructions"
+title: "Installation"
 weight: 12
 ---
 
-# Install Instructions
+# Installation
 
 Add Durababble to a Ruby application and connect it to a database. Durababble stores all its durable state in your application's database, so the install step is mostly about pointing the store at the right ActiveRecord connection.
 

@@ -1,9 +1,9 @@
 ---
-title: "Common Workflow Patterns"
+title: "Workflow Patterns"
 weight: 25
 ---
 
-# Common Workflow Patterns
+# Workflow Patterns
 
 Reference patterns for common workflow shapes. Each example is a complete, runnable Durababble script — the same machinery the test suite exercises against the live public API. Copy a section verbatim, swap in your own side effects, and you have the skeleton.
 

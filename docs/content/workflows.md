@@ -48,7 +48,10 @@ class FulfillOrder < Durababble::Workflow
     )
   end
 end
+```
 
+<!-- DOCS:workflow-example:hidden
+```ruby
 module Payments
   def self.charge(card_token, amount:, idempotency_key:)
     { "id" => "pay_#{card_token}", "amount" => amount, "key" => idempotency_key }
@@ -60,15 +63,16 @@ module Shipping
     { "id" => "label_#{payment_id}", "address" => address, "key" => idempotency_key }
   end
 end
+```
+-->
 
-order ||= {
+```ruby
+# enqueue the workflow and keep a typed handle
+fulfillment = FulfillOrder.start({
   "card_token" => "card_123",
   "total_cents" => 5_000,
   "address" => { "postal_code" => "10001" },
-}
-
-# enqueue the workflow and keep a typed handle
-fulfillment = FulfillOrder.start(order)
+})
 ```
 
 <!-- DOCS:workflow-example:hidden
@@ -136,21 +140,41 @@ end
 
 Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
+### Workflow Event Log Length
+
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, replay will take very long, and system performance will suffer.
+
+Prefer durable objects for long-lived identities, and prefer splitting very large jobs into a workflow per bounded batch or phase.
+
+```ruby
+# Prefer this shape for ongoing per-shop state:
+ShopSync.at(shop_id).record_cursor(cursor)
+
+# Prefer this shape for bounded work:
+SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
+```
+
 ## Sleeping
 
-A workflow can park itself without keeping a worker thread busy. `wait_until(time, context)` is a timer wait: the workflow resumes at or after the given time. Under the hood, Durababble stores the wait, releases the worker lease, and wakes the workflow when the timer is due.
+A workflow can park itself without keeping a worker thread busy. `sleep_until(time, context)` and `wait_until(time, context)` are timer waits: the workflow resumes at or after the given time. Under the hood, Durababble stores the wait, releases the worker lease, and wakes the workflow when the timer is due.
 
 Timer waits are useful for reminders, delayed retries that are part of business logic, cooling-off periods, scheduled followups, or "do not continue before this time" gates:
+
+<!-- DOCS:workflow-sleep-example:start -->
+
+<!-- DOCS:workflow-sleep-example:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
 
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    after_delay = sleep_until_reminder_time(reminder)
+    after_delay = sleep_until(reminder.fetch("send_at"), reminder)
     send_reminder(after_delay)
-  end
-
-  step def sleep_until_reminder_time(reminder)
-    wait_until(reminder.fetch("send_at"), reminder)
   end
 
   step def send_reminder(reminder)
@@ -163,15 +187,66 @@ class SendReminderAfterDelay < Durababble::Workflow
 end
 ```
 
-The `context` you pass to `wait_until` is the value Durababble resumes the workflow with when the timer fires. For workflows that need to resume on an external signal rather than a clock — webhook delivery, human approval, a batch finishing elsewhere — use a workflow command (`expose_command`) from the signaling process instead.
+<!-- DOCS:workflow-sleep-example:hidden
+```ruby
+module Reminders
+  def self.send(user_id, message, idempotency_key:)
+    { "sent_to" => user_id, "message" => message, "key" => idempotency_key }
+  end
+end
+```
+-->
 
-The current implementation records waits through step history, so the example returns the wait from a small step method. That is an implementation limitation, not the ideal public shape; workflow waits should become workflow-level yield points. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow. Direct host wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO calls from workflow orchestration raise `Durababble::DeterminismError`; put those effects in durable steps or outside workflow execution, where ordinary Ruby host semantics still apply.
+```ruby
+reminder = SendReminderAfterDelay.start({
+  "user_id" => "user_123",
+  "message" => "renew subscription",
+  "send_at" => Time.now + 3600,
+})
+```
+
+<!-- DOCS:workflow-sleep-example:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [SendReminderAfterDelay],
+  worker_id: "reminder-worker",
+  migrate: false,
+)
+worker.run_until_idle
+send_at = store.workflow(reminder.workflow_id).fetch("input").fetch("send_at")
+store.wake_due_timers(now: send_at + 1)
+worker.run_until_idle
+
+{
+  "status" => reminder.status,
+  "sent_to" => reminder.result.fetch("sent_to"),
+  "message" => reminder.result.fetch("message"),
+}
+```
+-->
+
+<!-- DOCS:workflow-sleep-example:end -->
+
+The `context` you pass to `sleep_until` or `wait_until` is the value Durababble resumes the workflow with when the timer fires. For workflows that need to resume on an external signal rather than a clock — webhook delivery, human approval, a batch finishing elsewhere — use a workflow command (`expose_command`) from the signaling process instead.
+
+Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow. Direct host wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO calls from workflow orchestration raise `Durababble::DeterminismError`; put those effects in durable steps or outside workflow execution, where ordinary Ruby host semantics still apply.
 
 ## Cancellation
 
 Workflows can be cancelled before they finish. `Workflow.handle(run_id).cancel(reason:)` durably records the reason and asks the workflow to cancel. Any outstanding steps will be cancelled and throw a `Durababble::CancellationError` back to your workflow, which will usually then shut the whole workflow down.
 
 Cancellation is a request, not a hard kill, where the workflow has a chance to clean up, depending on how your workflow code handles the cancellation. Workflow code can let `Durababble::CancellationError` bubble, or it can rescue the error and run cleanup as ordinary durable steps. Cleanup steps get the same replay behavior as any other step, so a crash halfway through cancellation recovery does not force completed cleanup to run again.
+
+<!-- DOCS:workflow-cancellation-example:start -->
+
+<!-- DOCS:workflow-cancellation-example:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
 
 ```ruby
 class ImportCustomers < Durababble::Workflow
@@ -190,28 +265,66 @@ class ImportCustomers < Durababble::Workflow
     Importer.mark_canceled(import.fetch("file_id"), reason: import.fetch("reason"))
   end
 end
+```
 
+<!-- DOCS:workflow-cancellation-example:hidden
+```ruby
+module Importer
+  def self.copy(file_id, idempotency_key:)
+    { "file_id" => file_id, "copy_key" => idempotency_key }
+  end
+
+  def self.mark_canceled(file_id, reason:)
+    { "file_id" => file_id, "status" => "canceled", "reason" => reason }
+  end
+end
+```
+-->
+
+```ruby
 handle = ImportCustomers.start({ "file_id" => "file_123" })
 handle.cancel(reason: "user uploaded a replacement file")
 ```
 
+<!-- DOCS:workflow-cancellation-example:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [ImportCustomers],
+  worker_id: "import-worker",
+  migrate: false,
+)
+worker.run_until_idle
+
+{
+  "status" => handle.status,
+  "result" => handle.result,
+  "steps" => store.steps_for(handle.workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] },
+}
+```
+-->
+
+<!-- DOCS:workflow-cancellation-example:end -->
+
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
 
-## Parallel Steps With Async
+## Using `async` for parallelism
 
-Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
+Workflow orchestration can use the normal `async` gem APIs. `Sync` gives the workflow a structured concurrency scope, and child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
 
 ```ruby
 class FetchProfiles < Durababble::Workflow
   def execute(user_ids)
-    Async do |task|
-      user_ids.map do |user_id|
+    Sync do |task|
+      tasks = user_ids.map do |user_id|
         task.async do
           profile = fetch_profile(user_id)
           score_profile(profile)
         end
-      end.map(&:wait)
-    end.wait
+      end
+
+      tasks.map(&:result)
+    end
   end
 
   step def fetch_profile(user_id)
@@ -257,17 +370,3 @@ handle.note(message: "approved by legal")
 ```
 
 Durababble handles the RPC machinery between your workers automatically, routing messages to the right worker that has a workflow active. If a workflow is not active when you send an RPC to it, Durababble will warm it up on a worker and then deliver your message.
-
-## Workflow Event Log Length
-
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, replay will take very long, and system performance will suffer.
-
-Prefer durable objects for long-lived identities, and prefer splitting very large jobs into a workflow per bounded batch or phase.
-
-```ruby
-# Prefer this shape for ongoing per-shop state:
-ShopSync.at(shop_id).record_cursor(cursor)
-
-# Prefer this shape for bounded work:
-SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
-```
