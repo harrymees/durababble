@@ -255,7 +255,7 @@ module Durababble
       SQL
       return true if result.affected_rows == 1
 
-      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+      WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
     end
 
     #: (untyped, ?now: untyped) -> untyped
@@ -282,7 +282,7 @@ module Durababble
         end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
-        if first_request && decoded.fetch("status") != "running"
+        if first_request && !WorkflowStatus.running?(decoded)
           execute_params(<<~SQL, [workflow_id])
             UPDATE #{table("workflows")}
             SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
@@ -773,7 +773,7 @@ module Durababble
         FOR UPDATE
       SQL
 
-      if head && head.fetch("status") != "dead_lettered"
+      if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else

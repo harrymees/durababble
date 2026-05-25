@@ -569,7 +569,7 @@ module Durababble
       #: (workflow_id: untyped, reason: untyped) -> untyped
       def request_workflow_cancellation(workflow_id:, reason:)
         row = @workflows.fetch(workflow_id)
-        return deep(row) if terminal_for_cancellation?(row)
+        return deep(row) if WorkflowStatus.terminal?(row)
 
         first_request = !@cancellations.key?(workflow_id)
         @cancellations[workflow_id] ||= { "workflow_id" => workflow_id, "reason" => reason, "requested_at" => scheduler.time, "delivered_at" => nil }
@@ -671,7 +671,7 @@ module Durababble
         completed = 0
         waits.each do |wait|
           row = @workflows.fetch(wait.fetch("workflow_id"))
-          next unless ["waiting", "running"].include?(row.fetch("status"))
+          next unless [WorkflowStatus::WAITING, WorkflowStatus::RUNNING].include?(row.fetch("status"))
 
           wait["status"] = "completed"
           wait["payload"] = deep(payload)
@@ -686,13 +686,6 @@ module Durababble
           trace("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
         end
         completed
-      end
-
-      #: (untyped) -> untyped
-      def terminal_for_cancellation?(row)
-        return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-        row.fetch("status") == "failed" && row["next_run_at"].nil?
       end
 
       #: (untyped) -> untyped
@@ -2382,13 +2375,12 @@ module Durababble
         verify_outbox_invariants!(workflows_state, outbox_state)
       end
 
-      WORKFLOW_STATUSES = ["pending", "running", "waiting", "canceling", "canceled", "failed", "completed"].freeze
-      STEP_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
-      ATTEMPT_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
-      WAIT_STATUSES = ["pending", "canceled", "completed"].freeze
-      OUTBOX_STATUSES = ["pending", "processing", "processed"].freeze
-      LIVE_ATTEMPT_STATUSES = ["running", "waiting"].freeze
-      TERMINAL_WORKFLOW_STATUSES = ["completed", "canceled", "failed"].freeze
+      WORKFLOW_STATUSES = WorkflowStatus::ALL
+      STEP_STATUSES = StepStatus::ALL
+      ATTEMPT_STATUSES = AttemptStatus::ALL
+      WAIT_STATUSES = WaitStatus::ALL
+      OUTBOX_STATUSES = OutboxStatus::ALL
+      TERMINAL_WORKFLOW_STATUSES = [WorkflowStatus::COMPLETED, WorkflowStatus::CANCELED, WorkflowStatus::FAILED].freeze
 
       #: (untyped) -> untyped
       def verify_workflow_invariants!(workflows_state)
@@ -2425,7 +2417,7 @@ module Durababble
             if attempts.empty?
               violations << "step #{workflow_id}/#{position} has no attempt history"
             end
-            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && LIVE_ATTEMPT_STATUSES.include?(status)
+            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && AttemptStatus.live?(status)
               violations << "#{workflows_state.fetch(workflow_id).fetch("status")} workflow #{workflow_id} has live step #{position}"
             end
 
@@ -2451,7 +2443,7 @@ module Durababble
             if attempt.fetch("workflow_id") != workflow_id
               violations << "attempt #{attempt.fetch("id")} has inconsistent workflow id"
             end
-            live_attempts[position] << attempt if LIVE_ATTEMPT_STATUSES.include?(status)
+            live_attempts[position] << attempt if AttemptStatus.live?(status)
             workflow = workflows_state[workflow_id]
             if workflow&.fetch("status") == "completed" && status == "running"
               violations << "completed workflow #{workflow_id} has running attempt #{attempt.fetch("id")}"

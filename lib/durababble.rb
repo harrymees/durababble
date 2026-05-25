@@ -4,6 +4,7 @@
 require "digest"
 
 require_relative "durababble/version"
+require_relative "durababble/statuses"
 require_relative "durababble/observability"
 
 module Durababble
