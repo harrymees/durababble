@@ -123,6 +123,10 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
+  test "current_target_lease ignores unsupported target kinds" do
+    assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf")
+  end
+
   test "postgres enqueue_workflow inserts the pending row in one statement" do
     connection = ScriptedPgConnection.new
     store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
@@ -1031,6 +1035,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
     assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
+    assert_raises(ArgumentError) { store.send(:normalize_command_id, nil, nil) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))
