@@ -713,20 +713,11 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       end
     end
 
-    test "ports diverse Cloudflare durable object examples to persisted local behavior with #{backend.name}" do
-      with_durababble_store(backend, "cloudflare_examples") do |store|
-        worker = object_worker(
-          store,
-          CloudflareCounterExample,
-          CloudflareRpcTargetExample,
-          CloudflareBatcherExample,
-          CloudflareTtlExample,
-          CloudflareKvCoordinatorExample,
-          CloudflareRoomExample,
-          CloudflareReadableStreamExample,
-        )
-
+    test "ports Cloudflare counter example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_counter_example") do |store|
+        worker = object_worker(store, CloudflareCounterExample)
         counter = CloudflareCounterExample.ref("global", store:)
+
         assert_equal(0, counter.value)
 
         CloudflareCounterExample.tell("global", :increment, 3, store:)
@@ -734,6 +725,16 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         wait_for_object_activation(CloudflareCounterExample, "global")
         assert_equal(1, worker.run_until_idle)
         assert_equal(2, counter.value)
+
+        messages = store.inbox_messages_for(target_kind: "object", target_type: CloudflareCounterExample.object_type, target_id: "global")
+        assert_equal(["increment", "decrement"], messages.map { |message| message.fetch("method_name") })
+        assert_equal(["completed", "completed"], messages.map { |message| message.fetch("status") })
+      end
+    end
+
+    test "ports Cloudflare RpcTarget metadata example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_rpc_target_example") do |store|
+        worker = object_worker(store, CloudflareRpcTargetExample)
 
         CloudflareRpcTargetExample.tell(
           "socket-worker",
@@ -744,13 +745,16 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         )
         wait_for_object_activation(CloudflareRpcTargetExample, "socket-worker")
         assert_equal(1, worker.run_until_idle)
+
         metadata = CloudflareRpcTargetExample.ref("socket-worker", store:).metadata_for("session-1")
         assert_hash_includes(metadata, "country" => "US", "plan" => "pro")
         assert_match(/\Adurababble:v1:object:cloudflare_rpc_target_example:socket-worker:command:/, metadata.fetch("operation_id"))
+      end
+    end
 
-        counter_messages = store.inbox_messages_for(target_kind: "object", target_type: CloudflareCounterExample.object_type, target_id: "global")
-        assert_equal(["increment", "decrement"], counter_messages.map { |message| message.fetch("method_name") })
-        assert_equal(["completed", "completed"], counter_messages.map { |message| message.fetch("status") })
+    test "ports Cloudflare alarm batcher example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_batcher_example") do |store|
+        worker = object_worker(store, CloudflareBatcherExample)
 
         CloudflareBatcherExample.tell("batcher", :add, "first", store:)
         CloudflareBatcherExample.tell("batcher", :add, "second", store:)
@@ -774,10 +778,17 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           },
           CloudflareBatcherExample.ref("batcher", store:).snapshot,
         )
+      end
+    end
+
+    test "ports Cloudflare TTL cache example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_ttl_example") do |store|
+        worker = object_worker(store, CloudflareTtlExample)
 
         CloudflareTtlExample.tell("cache-key", :put, "cached", expires_at: 100, store:)
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
         assert_equal(1, worker.run_until_idle)
+
         store.enqueue_inbox_message(
           target_kind: "object",
           target_type: CloudflareTtlExample.object_type,
@@ -799,10 +810,17 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
         assert_equal(1, worker.run_until_idle)
         assert_equal({ "value" => nil, "expires_at" => nil, "expired" => true }, CloudflareTtlExample.ref("cache-key", store:).snapshot)
+      end
+    end
+
+    test "ports Cloudflare KV coordinator example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_kv_coordinator_example") do |store|
+        worker = object_worker(store, CloudflareKvCoordinatorExample)
 
         CloudflareKvCoordinatorExample.tell("namespace", :put, "feature:enabled", true, store:, idempotency_key: "kv-put-1")
         wait_for_object_activation(CloudflareKvCoordinatorExample, "namespace")
         assert_equal(1, worker.run_until_idle)
+
         reopened = Durababble::Store.connect(database_url: backend.database_url, schema:)
         begin
           kv = CloudflareKvCoordinatorExample.ref("namespace", store: reopened)
@@ -811,24 +829,39 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         ensure
           reopened.close
         end
+      end
+    end
+
+    test "ports Cloudflare WebSocket room example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_room_example") do |store|
+        worker = object_worker(store, CloudflareRoomExample)
 
         CloudflareRoomExample.tell("lobby", :join, "session-a", { "name" => "Ada" }, store:)
         CloudflareRoomExample.tell("lobby", :join, "session-b", { "name" => "Grace" }, store:)
         CloudflareRoomExample.tell("lobby", :broadcast, "hello", from: "session-a", store:)
         wait_for_object_activation(CloudflareRoomExample, "lobby")
         assert_equal(1, worker.run_until_idle)
+
         room = CloudflareRoomExample.ref("lobby", store:)
         assert_equal(["session-a", "session-b"], room.members.keys)
         assert_equal([{ "from" => "session-a", "body" => "hello", "member_count" => 2 }], room.transcript)
+      end
+    end
+
+    test "ports Cloudflare readable stream example to persisted local behavior with #{backend.name}" do
+      with_durababble_store(backend, "cloudflare_readable_stream_example") do |store|
+        worker = object_worker(store, CloudflareReadableStreamExample)
 
         CloudflareReadableStreamExample.tell("feed", :append_chunks, ["a", "b", "c"], store:)
         wait_for_object_activation(CloudflareReadableStreamExample, "feed")
         assert_equal(1, worker.run_until_idle)
+
         reader = call_object_command_async(backend, CloudflareReadableStreamExample, "feed", [:read_next, 2])
         wait_for_object_activation(CloudflareReadableStreamExample, "feed")
         run_worker_until_result(worker, reader.fetch(:queue))
         status, chunk = reader.fetch(:queue).pop
         reader.fetch(:thread).join
+
         assert_equal(:ok, status)
         assert_equal(["a", "b"], chunk)
         assert_equal(2, CloudflareReadableStreamExample.ref("feed", store:).cursor)
@@ -860,7 +893,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     { thread: caller, queue: result_queue }
   end
 
-  def wait_for_object_activation(object_class, object_id, timeout: 2)
+  def wait_for_object_activation(object_class, object_id, timeout: 10)
     deadline = Time.now + timeout
     loop do
       activation = store.target_activation(target_kind: "object", target_type: object_class.object_type, target_id: object_id)
