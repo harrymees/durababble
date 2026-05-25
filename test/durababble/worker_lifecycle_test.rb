@@ -86,7 +86,8 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     )
 
     assert_same runtime, runtime.start
-    assert_equal runtime.rpc_address, runtime.worker_id
+    assert_equal runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id)
+    assert_match(/\Adefault-[0-9a-f]{12}@#{Regexp.escape(runtime.rpc_address)}\z/, runtime.worker_id)
     first_thread = runtime.wait(timeout: 0.05)
     assert(first_thread.is_a?(Thread) || first_thread.nil?, "expected wait to return a thread or nil")
     assert_same runtime, runtime.start
@@ -356,14 +357,14 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_port: 0,
     )
     runtime.start
-    assert_equal(runtime.rpc_address, runtime.worker_id)
+    assert_equal(runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id))
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
-    store.claim_workflow(workflow_id:, worker_id: runtime.rpc_address, lease_seconds: 30)
+    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30)
     assert_hash_includes(
       store.workflow(workflow_id),
       "status" => "running",
-      "locked_by" => runtime.rpc_address,
+      "locked_by" => runtime.worker_id,
     )
 
     caller_store = Durababble::Store.connect(database_url:, schema:)
@@ -405,7 +406,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     runtime.start
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime.rpc_address, lease_seconds: 30, worker_pool: "pool-a")
+    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30, worker_pool: "pool-a")
     message_id = store.enqueue_workflow_command(
       workflow_id:,
       workflow_name: workflow.workflow_name,
@@ -471,7 +472,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     runtime_b.start
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime_a.rpc_address, lease_seconds: 30, worker_pool: "pool-a")
+    store.claim_workflow(workflow_id:, worker_id: runtime_a.worker_id, lease_seconds: 30, worker_pool: "pool-a")
     caller_store = Durababble::Store.connect(database_url:, schema:)
     caller_store.rpc_client_factory = ->(_address) { ForcedUnavailableDeliveryClient.new }
     def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.01, timeout: 3)

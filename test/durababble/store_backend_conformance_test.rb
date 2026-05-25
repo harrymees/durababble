@@ -575,7 +575,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_advisory_delivery") do |store|
         store.migrate!
         workflow_id = store.enqueue_workflow(name: "approval", input: {})
-        store.claim_workflow(workflow_id:, worker_id: "127.0.0.1:12345", lease_seconds: 30)
+        worker_id = "worker-1@127.0.0.1:12345"
+        store.claim_workflow(workflow_id:, worker_id:, lease_seconds: 30)
 
         client = AdvisoryDeliveryClient.new
         delivered = store.deliver_target_message(
@@ -596,12 +597,13 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
               target_kind: "workflow",
               target_class: "approval",
               target_id: workflow_id,
+              expected_worker_id: worker_id,
             },
           ],
           client.deliveries,
         )
 
-        store.suspend_workflow(workflow_id:, worker_id: "127.0.0.1:12345")
+        store.suspend_workflow(workflow_id:, worker_id:)
         assert_equal false, store.deliver_target_message(
           target_kind: "workflow",
           target_type: "approval",

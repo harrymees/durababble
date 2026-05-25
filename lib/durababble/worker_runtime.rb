@@ -46,7 +46,8 @@ module Durababble
       @workflows = workflows
       @objects = objects
       @worker_pool = worker_pool
-      @worker_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
+      @worker_identity_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
+      @worker_id = @worker_identity_id
       @lease_seconds = lease_seconds
       @poll_interval = poll_interval
       @migrate = migrate
@@ -164,6 +165,7 @@ module Durababble
         credentials: @rpc_credentials,
         pool_size: @rpc_pool_size,
         verify_deliver_message_owner: false,
+        identity_id: @worker_identity_id,
         deliver_message: method(:enqueue_delivery),
       ).start
       @rpc_address = @rpc_server.address

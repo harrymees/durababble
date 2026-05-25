@@ -29,7 +29,7 @@ The contract specifies behavior, not a mandatory internal isolation technology. 
 
 - **Durable target:** a workflow execution or durable object instance addressed by class/type, id, and worker pool.
 - **Worker pool:** a persisted routing and execution boundary. Workers in a pool may claim, route, wake, and execute only targets assigned to that pool.
-- **Lease:** a persisted ownership record for a durable target, with the owner gRPC address as the routable node identity, a lease token, and a deadline.
+- **Lease:** a persisted ownership record for a durable target, with the owner worker identity, a lease token, and a deadline. Production `WorkerRuntime` identities are compact parseable strings in the form `worker-id@host:port`, where the random worker id distinguishes a process incarnation and the address suffix is the routable gRPC endpoint.
 - **Workflow command:** a deterministic workflow operation such as a step schedule, timer wait, workflow command delivery, child workflow command, or patch marker.
 - **Command id:** the replay identity assigned by deterministic workflow execution order.
 - **Attempt id:** the execution identity for one concrete try of a command. Retries create new attempts for the same command id.
@@ -367,7 +367,7 @@ Durababble persists the following logical entities. Physical table names may be 
 | `steps` | Latest logical workflow command state for query/result caching | `(workflow_id, command_id)` |
 | `step_attempts` | Append-only attempt history for step execution and waits | Attempt id, workflow id, command id, status |
 | `waits` | Durable timer waits | Wait id, workflow id, due time/status |
-| `leases` | Pool-scoped ownership for workflow and object targets, including the owner gRPC address | `(worker_pool, target_kind, target_class, target_id)` |
+| `leases` | Pool-scoped ownership for workflow and object targets, including the owner worker identity | `(worker_pool, target_kind, target_class, target_id)` |
 | `inbox` | Durable asks, tells, wakes, and workflow command messages | Target identity, sequence, status, message id |
 | `mailbox_sequences` | Per-target monotonic mailbox sequence allocation | Target identity |
 | `target_activations` | Coalesced runnable target wakeups for inbox/scheduler work | Worker pool, ready time, target identity, status |
@@ -382,9 +382,9 @@ Query-shape and transaction requirements:
 - Claim paths use `FOR UPDATE SKIP LOCKED` where supported.
 - Persist immutable `worker_pool` on durable targets whose routing, claiming, scheduling, listing, or recovery semantics are pool-scoped.
 - Include `worker_pool` in primary keys and indexes when query patterns need to filter, route, claim, recover, or list by worker pool. Do not add it to keys whose query patterns do not care about worker pool.
-- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with the owner gRPC address as the node identity plus `lease_token` and `lease_until`.
-- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row and dials the gRPC address stored there; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
-- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the gRPC address in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
+- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with the owner worker identity plus `lease_token` and `lease_until`.
+- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row, dials the gRPC address suffix from the stored worker identity, and sends the full identity as `expected_worker_id`; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
+- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the gRPC address suffix in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
 - Object asks/tells/wakes and workflow commands use the unified inbox. Inbox rows are durable message/result records, not a second globally polled work queue.
 - Sequence allocation, inbox insert, and ready-target activation upsert commit in one transaction.
 - Per-target mailbox sequence state lets `enqueue_message` allocate a monotonic sequence and lets target executors drain only a contiguous ready prefix from the head.
@@ -427,15 +427,15 @@ Expired leases are reclaimed by claim paths or recovery sweeps. Recovery does no
 - If a class declares a default pool, that pool wins unless the caller overrides while creating a new durable unit. Once the row exists, the persisted pool wins.
 - Worker pools are the routing and multiregion boundary. A pod in another pool cannot claim, route, or wake a target unless the target is explicitly relocated.
 - Scheduler scans filter by pools served by the local pod.
-- `DeliverMessage` and `CallTransient` route to the gRPC address in the target's fresh lease row. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
+- `DeliverMessage` and `CallTransient` route to the gRPC address suffix in the target's fresh lease row and include the full lease owner as `expected_worker_id`. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
 - Automatic cross-pool stealing is forbidden. Regional failover is explicit `relocate_worker_pool` operator/runtime work that quiesces the target, releases the old lease, updates the row, and wakes it in the new pool.
 
 ### Sticky placement
 
 Routing keeps hot ids on the pod that already has them in memory:
 
-- Every pod exposes `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`, and worker runtimes use that address as the lease owner identity.
-- Every acquired lease writes the owner gRPC address and a fresh `lease_token` into the lease row.
+- Every pod exposes `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`, and worker runtimes combine a random worker id with that address as `worker-id@rpc_address` for the lease owner identity.
+- Every acquired lease writes the full owner worker identity and a fresh `lease_token` into the lease row.
 - Lease acquisition uses a hot in-memory cache when the owner has a fresh lease and falls back to atomic SQL acquisition/lookup when cold, near expiry, or routed remotely.
 - A `LeaseRenewer` refreshes in-flight leases every `lease_ttl_ms / 3` and only when the `lease_token` still matches.
 - Cache entries are evicted on near-expiry, `EvictLease`, object CAS conflict, lease-renew failure, idle timeout, or LRU capacity pressure.
@@ -480,6 +480,7 @@ message EvictLeaseRequest {
   string target_kind = 2;  // object | workflow
   string target_class = 3; // empty for workflows
   string target_id = 4;
+  string expected_worker_id = 5;
 }
 message EvictLeaseResponse {}
 
@@ -491,6 +492,7 @@ message TransientRequest {
   string method = 5;
   bytes args = 6;          // paquito-encoded
   int64 deadline_ms = 7;
+  string expected_worker_id = 8;
 }
 
 message TransientResponse {
@@ -507,6 +509,7 @@ message DeliverMessageRequest {
   string target_kind = 2;  // object | workflow
   string target_class = 3; // empty for workflows
   string target_id = 4;
+  string expected_worker_id = 5;
 }
 message DeliverMessageResponse {}
 ```
@@ -514,9 +517,9 @@ message DeliverMessageResponse {}
 RPC semantics:
 
 - **AwakenBatch** is a latency optimization after workflow starts or matured scheduler rows. It never replaces durable DB state or scheduler correctness.
-- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload; the receiver queries durable inbox rows and schedules an owner-local target activation without blocking the gRPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
-- **CallTransient** is non-durable RPC for exposed methods against the active owner. It returns a Paquito result, a remote error, `not_running`, or `LeaseMoved`.
-- **EvictLease** asks a pod to drop a cached lease it may no longer own.
+- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload, but it does carry `expected_worker_id` so a fresh worker at a recycled address can ignore a wake intended for the previous process incarnation. The receiver queries durable inbox rows and schedules an owner-local target activation without blocking the gRPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
+- **CallTransient** is non-durable RPC for exposed methods against the active owner. It carries `expected_worker_id`; the receiver rejects the call as stale before invoking user code if its local worker identity does not match. It returns a Paquito result, a remote error, `not_running`, or `LeaseMoved`.
+- **EvictLease** asks a pod to drop a cached lease it may no longer own. It also carries `expected_worker_id` and is ignored by workers whose local identity does not match the intended lease owner.
 - Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, the already-committed target activation remains the correctness path and is eventually claimed by a worker in the target pool.
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
 - gRPC is required for production cross-pod calls because strongly typed protos catch shape drift and mTLS is available. Auxiliary test transports must not be used for production intranode communication.

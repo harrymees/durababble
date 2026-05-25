@@ -119,6 +119,34 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     node_b&.stop
   end
 
+  test "rejects workflow RPCs addressed to a previous worker incarnation at a recycled address" do
+    store = self.store
+    ran = false
+    server = start_rpc_server(
+      node_id: nil,
+      store:,
+      workflow_handlers: { "status" => ->(_payload) { ran = true } },
+    )
+    old_identity = "previous-worker@#{server.address}"
+    store.claim_workflow(workflow_id:, worker_id: old_identity, lease_seconds: 30)
+    client = Durababble::Rpc::Client.new(address: server.address)
+
+    assert_match(/\A[0-9a-f]{12}@#{Regexp.escape(server.address)}\z/, server.node_id)
+    assert_equal(server.address, Durababble::WorkerIdentity.address_for(old_identity))
+    assert_raises(Durababble::WorkflowRpc::StaleLease) do
+      client.call_transient(
+        worker_pool: "default",
+        workflow_id:,
+        method: "status",
+        args: {},
+        expected_worker_id: old_identity,
+      )
+    end
+    assert_equal(false, ran)
+  ensure
+    server&.stop
+  end
+
   test "acknowledges workflow message wakeups without work when the lease moved away" do
     store = self.store
     claim_as("node-b")
@@ -293,6 +321,46 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       [{ worker_pool: "default", target_kind: "workflow", target_class: "", target_id: workflow_id }],
       delivered,
     )
+  end
+
+  test "drops target RPCs addressed to a previous worker incarnation" do
+    store = self.store
+    delivered = []
+    service = Durababble::Rpc::Service.new(
+      node_id: "fresh-worker@127.0.0.1:50051",
+      store:,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: ->(**kwargs) { delivered << [:evict, kwargs] },
+      deliver_message: ->(**kwargs) { delivered << [:deliver, kwargs] },
+    )
+
+    service.evict_lease(
+      Durababble::Rpc::Proto::EvictLeaseRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+        expected_worker_id: "old-worker@127.0.0.1:50051",
+      ),
+      :call,
+    )
+    service.deliver_message(
+      Durababble::Rpc::Proto::DeliverMessageRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+        expected_worker_id: "old-worker@127.0.0.1:50051",
+      ),
+      :call,
+    )
+
+    assert_empty delivered
   end
 
   test "drops stale workflow deliveries and returns local transient responses" do
