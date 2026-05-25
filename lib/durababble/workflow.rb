@@ -36,26 +36,26 @@ module Durababble
         workflow_name
       end
 
-      #: (untyped, ?store: untyped) -> untyped
-      def enqueue(input, store: Durababble.store)
-        store.migrate!
-        store.enqueue_workflow(name: workflow_name, input:)
+      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def enqueue(input, store: nil, engine: nil)
+        Durababble.engine_for(store:, engine:).enqueue(self, input:)
       end
 
-      #: (untyped, ?store: untyped) -> untyped
-      def start(input, store: Durababble.store)
-        workflow_id = enqueue(input, store:)
-        handle(workflow_id, store:)
+      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def start(input, store: nil, engine: nil)
+        resolved_engine = Durababble.engine_for(store:, engine:)
+        workflow_id = resolved_engine.enqueue(self, input:)
+        handle(workflow_id, engine: resolved_engine)
       end
 
-      #: (untyped, ?store: untyped) -> untyped
-      def ref(workflow_id, store: Durababble.store)
-        WorkflowRef.new(self, workflow_id, store:)
+      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def at(workflow_id, store: nil, engine: nil)
+        handle(workflow_id, store:, engine:)
       end
 
-      #: (untyped, ?store: untyped) -> untyped
-      def handle(workflow_id, store: Durababble.store)
-        ref(workflow_id, store:)
+      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def handle(workflow_id, store: nil, engine: nil)
+        WorkflowRef.new(self, workflow_id, store: Durababble.store_for(store:, engine:))
       end
 
       #: (?untyped, **untyped) -> untyped
@@ -165,6 +165,21 @@ module Durababble
     #: untyped
     attr_reader :workflow_id
 
+    #: () -> untyped
+    def status
+      @store.workflow(@workflow_id).fetch("status")
+    end
+
+    #: () -> untyped
+    def result
+      @store.workflow(@workflow_id)["result"]
+    end
+
+    #: () -> untyped
+    def error
+      @store.workflow(@workflow_id)["error"]
+    end
+
     #: (?reason: untyped) -> untyped
     def cancel(reason: nil)
       row = @store.request_workflow_cancellation(workflow_id: @workflow_id, reason:)
@@ -179,7 +194,6 @@ module Durababble
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
         kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
-        @store.migrate!
         idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
         message_id = @store.enqueue_workflow_command(

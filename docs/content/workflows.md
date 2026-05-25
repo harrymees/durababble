@@ -13,6 +13,14 @@ Because they are durable, durable workflows can sleep for many days, await some 
 
 <!-- DOCS:workflow-example:start -->
 
+<!-- DOCS:workflow-example:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
+
 ```ruby
 # an example workflow
 class FulfillOrder < Durababble::Workflow
@@ -53,77 +61,80 @@ module Shipping
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
 order ||= {
   "card_token" => "card_123",
   "total_cents" => 5_000,
   "address" => { "postal_code" => "10001" },
 }
 
-# enqueue the workflow
-run = engine.run(FulfillOrder, input: order)
-
-# wait for it to finish and get its return value -- will overcome step failures or crashes or whatever strange issues arise by retrying each step, and eventually return!
-run.result
+# enqueue the workflow and keep a typed handle
+fulfillment = FulfillOrder.start(order)
 ```
+
+<!-- DOCS:workflow-example:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [FulfillOrder],
+  worker_id: "orders-worker-1",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+# later, any process can recover the same handle by id
+fulfillment = FulfillOrder.at(fulfillment.workflow_id)
+fulfillment.result
+```
+
+<!-- DOCS:workflow-example:hidden
+```ruby
+fulfillment.result
+```
+-->
 
 <!-- DOCS:workflow-example:end -->
 
-## Parallel Steps With Async
-
-Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
-
-```ruby
-class FetchProfiles < Durababble::Workflow
-  def execute(user_ids)
-    Async do |task|
-      user_ids.map do |user_id|
-        task.async do
-          profile = fetch_profile(user_id)
-          score_profile(profile)
-        end
-      end.map(&:wait)
-    end.wait
-  end
-
-  step def fetch_profile(user_id)
-    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
-  end
-
-  step def score_profile(profile)
-    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
-  end
-end
-```
-
-If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
-
 ## Enqueuing And Workflow Handles
 
-`Engine#run` is the small-script path: it creates a workflow row, runs it immediately in the current process, and returns the completed `Durababble::Run`. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases.
+`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
-workflow_id = FulfillOrder.enqueue(order, store:)
+workflow_id = FulfillOrder.enqueue(order)
 
 # in some other long lived process, you'd do:
 worker = Durababble::Worker.new(
-  store:,
+  store: Durababble.store,
   workflows: [FulfillOrder],
   worker_id: "orders-worker-1",
 )
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order, store:)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.handle(workflow_id, store:)` and `FulfillOrder.ref(workflow_id, store:)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
-handle = FulfillOrder.start(order, store:)
+handle = FulfillOrder.start(order)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 ```
+
+## Replay
+
+Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
+
+```ruby
+def execute(order)
+  payment = charge_card(order)      # reused from storage if step 0 completed
+  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
+
+  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
+end
+```
+
+Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
 ## Sleeping
 
@@ -180,11 +191,40 @@ class ImportCustomers < Durababble::Workflow
   end
 end
 
-handle = ImportCustomers.start({ "file_id" => "file_123" }, store:)
+handle = ImportCustomers.start({ "file_id" => "file_123" })
 handle.cancel(reason: "user uploaded a replacement file")
 ```
 
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
+
+## Parallel Steps With Async
+
+Workflow orchestration can use the normal `async` gem APIs. Child tasks inherit the workflow context, so each branch can call durable steps directly. Durababble records every scheduled step, start, completion, failure, and wait in history, which makes scatter/gather and continuation fanout safe even when branches finish in a different order than they were started.
+
+```ruby
+class FetchProfiles < Durababble::Workflow
+  def execute(user_ids)
+    Async do |task|
+      user_ids.map do |user_id|
+        task.async do
+          profile = fetch_profile(user_id)
+          score_profile(profile)
+        end
+      end.map(&:wait)
+    end.wait
+  end
+
+  step def fetch_profile(user_id)
+    Profiles.fetch(user_id, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def score_profile(profile)
+    ProfileScoring.score(profile, idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
 
 ## RPC
 
@@ -211,27 +251,12 @@ class ReviewWorkflow < Durababble::Workflow
   end
 end
 
-handle = ReviewWorkflow.handle(run_id, store:)
+handle = ReviewWorkflow.at(run_id)
 handle.label
 handle.note(message: "approved by legal")
 ```
 
 Durababble handles the RPC machinery between your workers automatically, routing messages to the right worker that has a workflow active. If a workflow is not active when you send an RPC to it, Durababble will warm it up on a worker and then deliver your message.
-
-## Replay
-
-Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
-
-```ruby
-def execute(order)
-  payment = charge_card(order)      # reused from storage if step 0 completed
-  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
-
-  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
-end
-```
-
-Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
 ## Workflow Event Log Length
 
@@ -241,8 +266,8 @@ Prefer durable objects for long-lived identities, and prefer splitting very larg
 
 ```ruby
 # Prefer this shape for ongoing per-shop state:
-ShopSync.ref(shop_id, store:).record_cursor(cursor)
+ShopSync.at(shop_id).record_cursor(cursor)
 
 # Prefer this shape for bounded work:
-SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor }, store:)
+SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
 ```
