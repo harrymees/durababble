@@ -127,77 +127,8 @@ channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```
 
-## More Object Shapes
-
-Counters are a good fit when every caller for the same id should see the same accumulated value and updates must not race each other.
-
-```ruby
-class Counter < Durababble::DurableObject
-  object_type "counter"
-
-  def initialize_state = { "value" => 0 }
-
-  expose_command def increment(amount = 1)
-    update_state("value" => current_state.fetch("value") + amount)
-  end
-
-  expose def value = current_state.fetch("value")
-end
-
-Counter.tell("global", :increment, 3, store:)
-```
-
-Objects can also model one keyed item with its own lifecycle, such as a cache entry that clears itself when a worker delivers a wake message.
-
-```ruby
-class CacheEntry < Durababble::DurableObject
-  object_type "cache_entry"
-
-  def initialize_state
-    { "value" => nil, "expires_at" => nil }
-  end
-
-  expose_command def put(value, expires_at:)
-    update_state("value" => value, "expires_at" => expires_at)
-  end
-
-  def on_wake(payload:)
-    expires_at = current_state.fetch("expires_at")
-    return current_state unless expires_at && payload.fetch("now") >= expires_at
-
-    update_state("value" => nil, "expires_at" => nil)
-  end
-
-  expose def value = current_state.fetch("value")
-end
-```
-
-A room, session, or coordinator object can serialize membership changes and broadcasts through one id while still exposing cheap read methods for the current state.
-
-```ruby
-class Room < Durababble::DurableObject
-  object_type "room"
-
-  def initialize_state
-    { "members" => {}, "messages" => [] }
-  end
-
-  expose_command def join(session_id, metadata)
-    update_state(current_state.merge("members" => current_state.fetch("members").merge(session_id => metadata)))
-  end
-
-  expose_command def broadcast(body, from:)
-    message = { "from" => from, "body" => body, "member_count" => current_state.fetch("members").length }
-    update_state(current_state.merge("messages" => current_state.fetch("messages") + [message]))
-  end
-
-  expose def members = current_state.fetch("members")
-  expose def transcript = current_state.fetch("messages")
-end
-```
-
 ## Choosing Objects Or Workflows
 
 Durable workflows and durable objects share the same durable store, but they fit different shapes of work. Use a workflow when the work is a finite process with a start, a result, ordered durable steps, waits, retries, or cancellation: indexing pipelines, tool sequences, resumable imports, or fulfillment flows. Use a durable object when the work centers on an id that should keep mutable state over time, potentially indefinitely, and accept repeated queries or commands: sessions, carts, conversations, agent contexts, project state, or per-shop workers.
 
-Use a workflow to orchestrate a process; use a durable object to own an entity's state. Compose them when a process needs durable per-entity state, but avoid turning a long-lived entity into one never-ending workflow just to make it addressable, or turning a finite process into ad hoc object state just to make retries durable.
+Use a workflow to orchestrate a process; use a durable object to own an entity's state. Compose them when a process needs durable per-entity state, but avoid turning a long-lived entity into one never-ending workflow just to make it addressable, or turning a finite process into ad hoc object state just to make retries durable. See [Object Patterns](object-patterns.md) for executable examples of common object shapes.

@@ -742,7 +742,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     test "ports Cloudflare counter example to persisted local behavior with #{backend.name}" do
       with_durababble_store(backend, "cloudflare_counter_example") do |store|
         worker = object_worker(store, CloudflareCounterExample)
-        counter = CloudflareCounterExample.ref("global", store:)
+        counter = CloudflareCounterExample.at("global", store:)
 
         assert_equal(0, counter.value)
 
@@ -772,7 +772,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         wait_for_object_activation(CloudflareRpcTargetExample, "socket-worker")
         assert_equal(1, worker.run_until_idle)
 
-        metadata = CloudflareRpcTargetExample.ref("socket-worker", store:).metadata_for("session-1")
+        metadata = CloudflareRpcTargetExample.at("socket-worker", store:).metadata_for("session-1")
         assert_hash_includes(metadata, "country" => "US", "plan" => "pro")
         assert_match(/\Adurababble:v1:object:cloudflare_rpc_target_example:socket-worker:command:/, metadata.fetch("operation_id"))
       end
@@ -786,7 +786,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         CloudflareBatcherExample.tell("batcher", :add, "second", store:)
         wait_for_object_activation(CloudflareBatcherExample, "batcher")
         assert_equal(1, worker.run_until_idle)
-        assert_equal({ "messages" => ["first", "second"], "flushes" => [] }, CloudflareBatcherExample.ref("batcher", store:).snapshot)
+        assert_equal({ "messages" => ["first", "second"], "flushes" => [] }, CloudflareBatcherExample.at("batcher", store:).snapshot)
 
         store.enqueue_inbox_message(
           target_kind: "object",
@@ -802,7 +802,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
             "messages" => [],
             "flushes" => [{ "messages" => ["first", "second"], "reason" => "alarm" }],
           },
-          CloudflareBatcherExample.ref("batcher", store:).snapshot,
+          CloudflareBatcherExample.at("batcher", store:).snapshot,
         )
       end
     end
@@ -824,7 +824,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         )
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
         assert_equal(1, worker.run_until_idle)
-        assert_equal({ "value" => "cached", "expires_at" => 100, "expired" => false }, CloudflareTtlExample.ref("cache-key", store:).snapshot)
+        assert_equal({ "value" => "cached", "expires_at" => 100, "expired" => false }, CloudflareTtlExample.at("cache-key", store:).snapshot)
 
         store.enqueue_inbox_message(
           target_kind: "object",
@@ -835,7 +835,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         )
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
         assert_equal(1, worker.run_until_idle)
-        assert_equal({ "value" => nil, "expires_at" => nil, "expired" => true }, CloudflareTtlExample.ref("cache-key", store:).snapshot)
+        assert_equal({ "value" => nil, "expires_at" => nil, "expired" => true }, CloudflareTtlExample.at("cache-key", store:).snapshot)
       end
     end
 
@@ -849,7 +849,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
         reopened = Durababble::Store.connect(database_url: backend.database_url, schema:)
         begin
-          kv = CloudflareKvCoordinatorExample.ref("namespace", store: reopened)
+          kv = CloudflareKvCoordinatorExample.at("namespace", store: reopened)
           assert_equal(true, kv.get("feature:enabled"))
           assert_match(/\Adurababble:v1:object:cloudflare_kv_coordinator_example:namespace:command:/, kv.version_for("feature:enabled"))
         ensure
@@ -868,7 +868,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         wait_for_object_activation(CloudflareRoomExample, "lobby")
         assert_equal(1, worker.run_until_idle)
 
-        room = CloudflareRoomExample.ref("lobby", store:)
+        room = CloudflareRoomExample.at("lobby", store:)
         assert_equal(["session-a", "session-b"], room.members.keys)
         assert_equal([{ "from" => "session-a", "body" => "hello", "member_count" => 2 }], room.transcript)
       end
@@ -890,7 +890,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
         assert_equal(:ok, status)
         assert_equal(["a", "b"], chunk)
-        assert_equal(2, CloudflareReadableStreamExample.ref("feed", store:).cursor)
+        assert_equal(2, CloudflareReadableStreamExample.at("feed", store:).cursor)
       ensure
         reader&.fetch(:thread)&.kill if reader&.fetch(:thread)&.alive?
       end

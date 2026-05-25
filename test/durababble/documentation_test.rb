@@ -9,7 +9,28 @@ class DurababbleDocumentationTest < DurababbleTestCase
   # markers found on disk that are missing from this map fail the test loudly.
   EXPECTED_RESULTS = {
     "workflow-example" => { "payment_id" => "pay_card_123", "label_id" => "label_pay_card_123" },
+    "workflow-sleep-example" => { "status" => "completed", "sent_to" => "user_123", "message" => "renew subscription" },
+    "workflow-cancellation-example" => {
+      "status" => "canceled",
+      "result" => nil,
+      "steps" => [["mark_import_canceled", "completed"]],
+    },
     "durable-object-example" => 1_000,
+    "object-pattern-counter" => 2,
+    "object-pattern-session-registry" => { "country" => "US", "plan" => "pro", "operation_id_recorded" => true },
+    "object-pattern-batcher" => {
+      "messages" => [],
+      "flushes" => [{ "messages" => ["first", "second"], "reason" => "alarm" }],
+    },
+    "object-pattern-ttl-cache" => { "value" => nil, "expires_at" => nil, "expired" => true },
+    "object-pattern-kv-coordinator" => { "enabled" => true, "version_recorded" => true },
+    "object-pattern-room" => {
+      "members" => ["session-a", "session-b"],
+      "transcript" => [{ "from" => "session-a", "body" => "hello", "member_count" => 2 }],
+    },
+    "object-pattern-stream" => { "chunks" => ["a", "b", "c"], "cursor" => 2, "last_read" => ["a", "b"] },
+    "object-pattern-rate-window" => [true, true, false, true],
+    "object-pattern-document" => { "revision" => 2, "content" => "Hello world" },
     "patterns-sequential" => { "status" => "completed", "row_count" => 2 },
     "patterns-fanout" => [101, 102, 103],
     "patterns-bounded-concurrency" => [1, 2, 3, 4, 5],
@@ -35,6 +56,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
       "docs/content/README.md",
       "docs/content/workflows.md",
       "docs/content/durable-objects.md",
+      "docs/content/object-patterns.md",
       "docs/content/reference.md",
       "docs/spec.md",
       "docs/content/architecture.md",
@@ -78,14 +100,31 @@ class DurababbleDocumentationTest < DurababbleTestCase
   test "docs site examples can hide runnable setup from the presented snippets" do
     workflows = read("docs/content/workflows.md")
     durable_objects = read("docs/content/durable-objects.md")
+    object_patterns = read("docs/content/object-patterns.md")
 
     workflow_visible = visible_marked_ruby_code(workflows, "workflow-example")
-    assert_includes workflow_visible, "FulfillOrder.start(order)"
+    assert_includes workflow_visible, "FulfillOrder.start({"
     assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id)"
     assert_includes workflow_visible, "fulfillment.result"
+    refute_includes workflow_visible, "module Payments"
+    refute_includes workflow_visible, "module Shipping"
+    refute_includes workflow_visible, "order ||="
     refute_includes workflow_visible, "Durababble::Store.connect"
     refute_includes workflow_visible, "Durababble::Worker.new"
     refute_includes workflow_visible, "Durababble::Engine.new"
+
+    sleep_visible = visible_marked_ruby_code(workflows, "workflow-sleep-example")
+    assert_includes sleep_visible, "sleep_until(reminder.fetch(\"send_at\"), reminder)"
+    refute_includes sleep_visible, "step def sleep_until_reminder_time"
+    refute_includes sleep_visible, "Durababble::Store.connect"
+    refute_includes sleep_visible, "Durababble::Worker.new"
+
+    cancellation_visible = visible_marked_ruby_code(workflows, "workflow-cancellation-example")
+    assert_includes cancellation_visible, "rescue Durababble::CancellationError"
+    assert_includes cancellation_visible, "handle.cancel(reason: \"user uploaded a replacement file\")"
+    refute_includes cancellation_visible, "module Importer"
+    refute_includes cancellation_visible, "Durababble::Store.connect"
+    refute_includes cancellation_visible, "Durababble::Worker.new"
 
     object_visible = visible_marked_ruby_code(durable_objects, "durable-object-example")
     assert_includes object_visible, "account = Account.at(\"acct_readme\")"
@@ -93,6 +132,12 @@ class DurababbleDocumentationTest < DurababbleTestCase
     refute_includes object_visible, "Account.tell"
     refute_includes object_visible, "Durababble::Store.connect"
     refute_includes object_visible, "Durababble::Worker.new"
+
+    counter_visible = visible_marked_ruby_code(object_patterns, "object-pattern-counter")
+    assert_includes counter_visible, "Counter.tell(\"global\", :increment, 3)"
+    assert_includes counter_visible, "Counter.at(\"global\").value"
+    refute_includes counter_visible, "Durababble::Store.connect"
+    refute_includes counter_visible, "Durababble::Worker.new"
   end
 
   private
