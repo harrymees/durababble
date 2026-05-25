@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "delegate"
 require "open3"
 require "rbconfig"
 require "thread"
@@ -78,6 +79,50 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_equal ["failed", "completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
   end
 
+  test "does not let a stale owner checkpoint after its lease moves" do
+    attempts = 0
+    workflow = durababble_test_workflow("lease-move-checkpoint") do
+      test_step("work") do |ctx|
+        attempts += 1
+        ctx.merge("attempt" => attempts)
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.name, input: {})
+    stale_store = Class.new(SimpleDelegator) do
+      attr_reader :moved
+
+      def initialize(delegate)
+        super(delegate)
+        @delegate = delegate
+        @armed = true
+        @moved = false
+      end
+
+      def workflow_owned?(workflow_id:, worker_id:)
+        owned = @delegate.workflow_owned?(workflow_id:, worker_id:)
+        if owned && @armed
+          @armed = false
+          @moved = true
+          @delegate.release_worker_leases!(worker_id:)
+          @delegate.claim_workflow(workflow_id:, worker_id: "recovery", lease_seconds: 60)
+        end
+        owned
+      end
+    end.new(store)
+
+    assert_raises_matching(Durababble::LeaseConflict, /expired or moved/) do
+      Durababble::Engine.new(store: stale_store, worker_id: "zombie", migrate: false).resume(workflow, workflow_id:)
+    end
+    assert_equal true, stale_store.moved
+    assert_equal ["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+    refute_includes store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "step_completed"
+
+    recovered = Durababble::Engine.new(store:, worker_id: "recovery", migrate: false).resume(workflow, workflow_id:)
+
+    assert_equal "completed", recovered.status
+    assert_equal({ "attempt" => 2 }, recovered.result)
+  end
+
   test "preserves scalar step results and text columns that look parseable" do
     workflow = durababble_test_workflow("123") do
       test_step("false") { |_ctx| false }
@@ -125,32 +170,32 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_nil store.claim_outbox(worker_id: "late", lease_seconds: 60)
   end
 
-  test "signals a waiting event once under concurrent signalers" do
+  test "wakes a waiting timer once under concurrent callers" do
     workflow = durababble_test_workflow("waiting") do
-      test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
+      test_step("wait") { |ctx| Durababble.wait_until(Time.now + 3600, ctx.merge("woken" => true)) }
       test_step("done") { |ctx| ctx.merge("done" => true) }
     end
     workflow_id = store.enqueue_workflow(name: "waiting", input: { "id" => "x" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
 
-    signaled = run_threads(8) do |index, local|
-      local.signal_event("approval:x", payload: { "signaler" => index })
+    woken = run_threads(8) do |_index, local|
+      local.wake_due_timers(now: Time.now + 3601)
     end
-    assert_equal 1, signaled.sum
+    assert_equal 1, woken.sum
     assert_equal "completed", Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:).status
     assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
   end
 
   test "marks waiting step attempts completed when the wait is satisfied" do
     workflow = durababble_test_workflow("waiting_attempt") do
-      test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+      test_step("wait") { |ctx| Durababble.wait_until(Time.now + 3600, ctx.merge("ok" => true)) }
       test_step("done") { |ctx| ctx.merge("done" => true) }
     end
     workflow_id = store.enqueue_workflow(name: "waiting_attempt", input: { "id" => "attempt" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
     assert_equal "waiting", store.step_attempts_for(workflow_id).first.fetch("status")
 
-    store.signal_event("event:attempt", payload: { "ok" => true })
+    store.wake_due_timers(now: Time.now + 3601)
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
 
     assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }

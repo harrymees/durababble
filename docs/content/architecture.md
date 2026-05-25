@@ -1,16 +1,21 @@
-# Durababble architecture
+---
+title: "Architecture"
+weight: 70
+---
+
+# Architecture
 
 Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durable-object definitions; a SQL store owns durable coordination and recovery state. The primary tested stores are YugabyteDB/YSQL through the PostgreSQL wire protocol and MySQL/MariaDB through Trilogy.
 
 ## Components
 
 - `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
-- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.ref(id, store:)`, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
+- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.at(id, store:)` / `Class.ref(id, store:)` for synchronous asks and `Class.tell(id, :method, store:)` for asynchronous tells, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
 - `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
-- `Durababble::Worker`: polls for one runnable workflow at a time and executes it under a lease. The worker registry contains workflow classes.
-- `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
-- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` currently records durable command events rather than executing through this router.
+- `Durababble::Worker`: polls for one runnable workflow or target activation at a time. Workflow rows execute through the deterministic engine; workflow and object target activations drain the target inbox under the worker's lease identity. The worker registry contains workflow classes and durable object classes.
+- `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, serves RPC wakeups, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
+- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` records durable workflow command inbox rows and wakes or warms the workflow target before execution.
 - `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: protobuf/gRPC transport for cross-node wakeups, evictions, transient calls, and durable-message wakeups. Workflow transient calls use `Durababble::Rpc::WorkflowClient` to bridge `WorkflowRpc::Router` onto the `CallTransient` gRPC method.
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API. Runtime execution does not load or validate RBS.
@@ -39,7 +44,7 @@ class CounterWorkflow < Durababble::Workflow
 end
 ```
 
-When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. Direct orchestration waits (`sleep`, `sleep_until`, `wait_until`, `wait_event`, and `wait_condition`) delegate to the same workflow command scheduler without wrapping the wait in a user step. The execution object:
+When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. Direct orchestration waits (`sleep`, `sleep_until`, `wait_until`, and `wait_condition`) delegate to the same workflow command scheduler without wrapping the wait in a user step. The execution object:
 
 1. assigns the next step position;
 2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
@@ -51,7 +56,7 @@ When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
 If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
 
-Direct waits use the same monotonic command ids and replay validation as steps, but their command names are the wait helpers rather than user step method names. A direct wait records a scheduled command before the wait row is inserted, records a waiting history event when the wait is persisted, and later consumes the completed timer or event payload to resume the blocked workflow fiber.
+Direct waits use the same monotonic command ids and replay validation as steps, but their command names are the wait helpers rather than user step method names. A direct wait records a scheduled command before the wait row is inserted, records a waiting history entry when the wait is persisted, and later consumes the completed timer payload to resume the blocked workflow fiber.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 
@@ -84,19 +89,19 @@ class Account < Durababble::DurableObject
 end
 ```
 
-The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. The current prototype has the class/ref API, inbox-backed inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
+The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. Synchronous asks and asynchronous tells enqueue inbox rows and wake or activate the object target; workers drain the object's contiguous ready mailbox prefix, invoke exposed command methods, and commit state plus message completion in one store transaction. Generated command idempotency keys remain stable across retries because they derive from the durable mailbox row.
 
 ## Storage model
 
 - `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, `next_run_at` for durably scheduled step retries, and first cooperative cancellation request metadata (`cancel_reason`, `cancel_requested_at`, `cancel_delivered_at`).
 - `steps`: one row per workflow step position; stores latest state, result used for resume, and latest opaque heartbeat cursor for incomplete-step recovery.
 - `step_attempts`: append-only attempt history for every started step, including the latest heartbeat cursor observed for each attempt.
-- `waits`: durable timer and external-event waits, including context needed to resume.
+- `waits`: durable timer waits, including context needed to resume.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
 - `mailbox_sequences`: per-target sequence allocation state for workflow and object inbox messages.
-- `inbox`: persisted object asks/tells/wakes plus workflow command/signal messages, including target identity, mailbox sequence, idempotency key, shape hash, retry/dead-letter fields, result/error, and retention deadline.
+- `inbox`: persisted object asks/tells/wakes plus workflow command messages, including target identity, mailbox sequence, idempotency key, shape hash, retry/dead-letter fields, result/error, and retention deadline.
 
 ## Durability semantics
 
@@ -113,11 +118,11 @@ The durable-object contract is actor-like: commands for the same `(object_type, 
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
 - Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths. Only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
-- Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting workflow command.
+- Timer wait requests persist a `waits` row and put the workflow in `waiting` until the timer wake completes the waiting workflow command.
 - Workflow cancellation is cooperative, not termination. `Workflow.handle(id).cancel(reason:)` records durable cancellation metadata on the workflow row. Pending, waiting, and retry-backoff workflows move to `canceling` and become claimable immediately; running workflows keep their current lease and observe the request at the next step boundary, completed-step replay boundary, or step heartbeat. The engine raises `Durababble::CancellationError` into workflow code. Once raised, cleanup steps run as ordinary durable steps; completed cleanup steps are skipped after crash/recovery. If cleanup returns or re-raises the cancellation error, the workflow becomes `canceled`. If cleanup raises an unrelated non-retryable error, the workflow becomes `failed`; retryable cleanup failures keep `next_run_at` and retry under `canceling`.
 - First-class child workflows are still future scope. Cancellation semantics for that future surface must require an explicit durable child-cancellation policy; cooperative parent cancellation must not silently terminate child work or claim that child cleanup completed.
 - Operator termination remains a separate hard-stop concept: it may mark or remove work without running user cleanup and must not report the workflow as cooperatively `canceled`.
-- Event/timer completion uses a locked update so concurrent signalers wake a wait once.
+- Timer completion uses a locked update so concurrent wake attempts resume a wait once.
 - Fences persist a running row before side effects and persist the first completed result for all repeated callers.
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 - Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry stale ownership, no-active-owner, and transport-unavailable failures only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.
@@ -143,9 +148,9 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 ## Observability
 
-`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle events. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle transitions. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
 
-The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level durable-execution signals such as workflow, step, wait, lease, outbox, queue, worker, and RPC telemetry.
+The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level telemetry for workflows, steps, waits, leases, outbox rows, queues, workers, and RPCs.
 
 Primary spans:
 
@@ -173,13 +178,13 @@ Primary metrics:
 
 - `bench/run.rb` is a macro benchmark harness for the storage and coordination operations that dominate durable execution performance.
 - The suite records environment metadata, per-operation latency percentiles, throughput, and allocation counts as JSON/CSV/Markdown.
-- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into the selected SQL backend before measuring queue claims, due-timer scans, and event-signal misses against large tables.
-- The benchmark operation set intentionally covers the main prototype lifecycle: enqueue, claim, heartbeat, lease conflict/recovery, worker tick/drain, end-to-end event and timer waits, resume-with-completed-steps, failed-workflow retry, observability reads, idempotency fences, outbox claim/ack/reclaim, large-table query shapes, and cross-process command RPC.
+- The large-fixture benchmarks load historical workflow, step, wait, and outbox rows into the selected SQL backend before measuring queue claims, due-timer scans, and missed workflow-command wakeups against large tables.
+- The benchmark operation set intentionally covers the main prototype lifecycle: enqueue, claim, heartbeat, lease conflict/recovery, worker tick/drain, end-to-end timer waits, resume-with-completed-steps, failed-workflow retry, observability reads, idempotency fences, outbox claim/ack/reclaim, large-table query shapes, and cross-process command RPC.
 - GitHub Actions runs the benchmark suite on demand and weekly, then stores timestamped benchmark reports as workflow artifacts for longitudinal comparison.
-- Store migrations create queue/recovery indexes for workflow claims, expired leases, pending event waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
+- Store migrations create queue/recovery indexes for workflow claims, expired leases, pending timer waits, due timers, and outbox delivery scans so the benchmark suite exercises production-intended query plans rather than relying on tiny-table behavior.
 
 ## Coverage gate
 
 GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 90%, global branch coverage drops below 85%, per-file line coverage drops below 59%, or per-file branch coverage drops below 41%. These ratchet thresholds are based on the current MySQL-backed CI suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output and result JSON.
 
-See `docs/spec.md` for the guarantee and crash matrices implemented by tests.
+See [the spec](../spec.md) for the guarantee and crash matrices implemented by tests.

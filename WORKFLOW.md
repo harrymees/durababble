@@ -129,16 +129,17 @@ Non-negotiables:
 3. Prefer end-to-end behavioral/regression tests over assertions that only restate metadata or docs.
 4. Preserve the settled API direction in `docs/spec.md`: `Workflow.start` / `Workflow.handle`, `DurableObject.at` / `DurableObject.tell`, method/order step identity, unified inbox, and the full four-method gRPC direction.
 5. Keep payload serialization through Paquito/binary storage unless deliberately changing the spec and implementation together.
-6. Update `docs/spec.md`, `docs/architecture.md`, and `README.md` when behavior, API, storage guarantees, or operational expectations change.
+6. Update `docs/spec.md`, `docs/content/architecture.md`, the relevant `docs/content/` pages, and `README.md` when behavior, API, storage guarantees, or operational expectations change.
 7. Treat the project as a correctness-oriented prototype rather than a production Temporal replacement; do not silently widen scope beyond the ticket.
 
 Required reading order:
 
 1. `AGENTS.md`
-2. `README.md`
-3. `docs/spec.md`
-4. `docs/architecture.md`
-5. `docs/deterministic-testing.md` when touching deterministic simulation or recovery scenarios
+2. `docs/content/README.md`
+3. The relevant concept page under `docs/content/`
+4. `docs/spec.md`
+5. `docs/content/architecture.md`
+6. `docs/deterministic-testing.md` when touching deterministic simulation or recovery scenarios
 
 Implementation guidance:
 

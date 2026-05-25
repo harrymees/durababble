@@ -75,7 +75,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       @resumed << [:scheduled, workflow_id, command_id, name]
     end
 
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
       position ||= command_id
       @step_attempts << { "workflow_id" => workflow_id, "position" => position, "name" => name }
       @resumed << [:started, workflow_id, position, name]
@@ -98,21 +98,21 @@ class DurababbleWorkerTest < DurababbleTestCase
       true
     end
 
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
       position ||= command_id
       @resumed << [:completed, workflow_id, position, result]
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       position ||= command_id
       @resumed << [:failed, workflow_id, position, error]
     end
 
-    def complete_workflow(workflow_id, result:)
+    def complete_workflow(workflow_id, result:, worker_id: nil)
       @resumed << [:workflow_completed, workflow_id, result]
     end
 
-    def fail_workflow(workflow_id, error:)
+    def fail_workflow(workflow_id, error:, worker_id: nil)
       @resumed << [:workflow_failed, workflow_id, error]
     end
   end

@@ -1,0 +1,8 @@
+{{ if and (or .IsPage .IsHome) .TableOfContents }}
+<div class="td-toc">
+  <h4 class="td-toc__title">On this page</h4>
+  <nav>
+    {{ .TableOfContents }}
+  </nav>
+</div>
+{{ end }}

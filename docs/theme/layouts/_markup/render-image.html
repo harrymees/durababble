@@ -1,0 +1,10 @@
+{{- $image := .Destination -}}
+{{- if strings.Contains $image "/static/" -}}
+  {{- $parts := split $image "/static/" -}}
+  {{- if gt (len $parts) 1 -}}
+    {{- $image = printf "/%s" (index $parts 1) | relURL -}}
+  {{- end -}}
+{{- else if strings.HasPrefix $image "/" -}}
+  {{- $image = $image | relURL -}}
+{{- end -}}
+<img src="{{ $image }}" alt="{{ .Text | safeHTML }}"{{ with .Title }} title="{{ . }}"{{ end }} />

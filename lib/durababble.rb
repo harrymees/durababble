@@ -4,6 +4,7 @@
 require "digest"
 
 require_relative "durababble/version"
+require_relative "durababble/statuses"
 require_relative "durababble/observability"
 
 module Durababble
@@ -98,16 +99,6 @@ module Durababble
 
       wait_request = WaitRequest.new(kind: "timer", wake_at: execution.timer_after(duration), event_key: nil, context:)
       execution.call_wait(wait_request, name: "sleep", args: [duration, context])
-    end
-
-    #: (untyped, ?untyped) -> untyped
-    def wait_event(event_key, context = {})
-      wait_request = WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
-      if (execution = WorkflowExecutionContext.current)
-        return execution.call_wait(wait_request, name: "wait_event", args: [event_key, context])
-      end
-
-      wait_request
     end
 
     #: (?timeout: untyped) { -> bool } -> bool
