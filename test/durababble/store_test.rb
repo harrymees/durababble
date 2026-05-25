@@ -63,6 +63,14 @@ class DurababbleStoreTest < DurababbleTestCase
     Durababble.send(:remove_const, const_name) if const_name && Durababble.const_defined?(const_name, false)
   end
 
+  test "generated active record cleanup ignores nil owners" do
+    assert_nil Durababble::Store.send(:remove_active_record_class_const, nil)
+  end
+
+  test "observe_claim_latency ignores missing rows" do
+    assert_nil shared_store.send(:observe_claim_latency, nil, "workflow")
+  end
+
   test "inbox_row_claimable? rejects blocked inbox statuses" do
     store = shared_store
     now = Time.utc(2024, 1, 1)
