@@ -16,37 +16,38 @@ module Durababble
     class Unauthenticated < Error; end
 
     class << self
-      #: (untyped) -> untyped
+      #: (Object?) -> String
       def dump(value) = SERIALIZER.dump(value)
-      #: (untyped) -> untyped
+      #: (String?) -> Object?
       def load(bytes) = bytes.nil? || bytes.empty? ? nil : SERIALIZER.load(bytes)
     end
 
     class NodeDirectory
-      #: (?untyped) -> void
+      #: (?Hash[String, String]) -> void
       def initialize(entries = {})
         @entries = {}
         entries.each { |node_id, rpc_address| register(node_id:, rpc_address:) }
       end
 
-      #: (node_id: untyped, rpc_address: untyped) -> untyped
+      #: (node_id: String, rpc_address: String) -> String
       def register(node_id:, rpc_address:)
         @entries[node_id] = rpc_address
       end
 
-      #: (untyped) -> untyped
+      #: (String) -> String?
       def rpc_address_for(node_id)
         @entries[node_id]
       end
     end
 
     class Client
-      #: untyped
+      #: String
       attr_reader :address
 
       class << self
-        #: (untyped) -> untyped
+        #: (Object) -> Object?
         def decode_transient_response(response)
+          response = response #: as untyped
           case response.result
           when :ok
             Rpc.load(response.ok)
@@ -62,8 +63,9 @@ module Durababble
 
         private
 
-        #: (untyped) -> untyped
+        #: (Object) -> bot
         def raise_remote_error(error)
+          error = error #: as untyped
           typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
           raise typed if typed
 
@@ -71,14 +73,14 @@ module Durababble
         end
       end
 
-      #: (address: untyped, ?credentials: untyped, ?timeout: untyped, ?stub: untyped) -> void
+      #: (address: String, ?credentials: Symbol, ?timeout: Numeric, ?stub: Object?) -> void
       def initialize(address:, credentials: :this_channel_is_insecure, timeout: DEFAULT_TIMEOUT, stub: nil)
         @address = address
         @timeout = timeout
         @stub = stub || Proto::Stub.new(address, credentials)
       end
 
-      #: (worker_pool: untyped, workflow_ids: untyped) -> untyped
+      #: (worker_pool: String, workflow_ids: Array[String]) -> bool
       def awaken_batch(worker_pool:, workflow_ids:)
         Observability.trace("durababble.rpc.client.awaken_batch", "durababble.worker.pool" => worker_pool) do
           with_rpc_errors do
@@ -91,7 +93,7 @@ module Durababble
         true
       end
 
-      #: (worker_pool: untyped, target_kind: untyped, target_id: untyped, ?target_class: untyped) -> untyped
+      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String) -> bool
       def evict_lease(worker_pool:, target_kind:, target_id:, target_class: "")
         Observability.trace("durababble.rpc.client.evict_lease", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
           with_rpc_errors do
@@ -104,7 +106,7 @@ module Durababble
         true
       end
 
-      #: (worker_pool: untyped, target_kind: untyped, target_id: untyped, ?target_class: untyped) -> untyped
+      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String) -> bool
       def deliver_message(worker_pool:, target_kind:, target_id:, target_class: "")
         Observability.trace("durababble.rpc.client.deliver_message", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
           with_rpc_errors do
@@ -117,7 +119,7 @@ module Durababble
         true
       end
 
-      #: (worker_pool: untyped, method: untyped, args: untyped, ?class_name: untyped, ?object_id: untyped, ?workflow_id: untyped, ?deadline_ms: untyped) -> untyped
+      #: (worker_pool: Object?, method: Object?, args: Object?, ?class_name: Object?, ?object_id: Object?, ?workflow_id: Object?, ?deadline_ms: Object?) -> Object
       def call_transient_response(worker_pool:, method:, args:, class_name: "", object_id: "", workflow_id: "", deadline_ms: 0)
         Observability.trace("durababble.rpc.client.call_transient", "durababble.worker.pool" => worker_pool, "durababble.rpc.method" => method, "durababble.workflow.id" => workflow_id, "durababble.object.type" => class_name, "durababble.object.id" => object_id) do
           with_rpc_errors do
@@ -137,7 +139,7 @@ module Durababble
         end
       end
 
-      #: (**untyped) -> untyped
+      #: (**Object?) -> Object?
       def call_transient(**kwargs)
         self.class.decode_transient_response(
           call_transient_response(
@@ -156,12 +158,12 @@ module Durababble
 
       private
 
-      #: () -> untyped
+      #: () -> Time
       def deadline
         Time.now + @timeout
       end
 
-      #: () { (?) -> untyped } -> untyped
+      #: () { () -> Object? } -> Object?
       def with_rpc_errors(&block)
         block.call
       rescue GRPC::Unauthenticated => e
@@ -174,13 +176,13 @@ module Durababble
     end
 
     class WorkflowClient
-      #: (address: untyped, ?worker_pool: untyped, ?credentials: untyped, ?timeout: untyped) -> void
+      #: (address: String, ?worker_pool: String, ?credentials: Symbol, ?timeout: Numeric) -> void
       def initialize(address:, worker_pool: "default", credentials: :this_channel_is_insecure, timeout: DEFAULT_TIMEOUT)
         @client = Client.new(address:, credentials:, timeout:)
         @worker_pool = worker_pool
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (String, Hash[String, Object?]) -> Object?
       def request(command, payload)
         raise WorkflowRpc::UnknownCommand, command unless command == "workflow_rpc"
 
@@ -194,10 +196,14 @@ module Durababble
     end
 
     class Server
-      #: untyped
-      attr_reader :node_id, :host, :port
+      #: String?
+      attr_reader :node_id
+      #: String
+      attr_reader :host
+      #: Integer?
+      attr_reader :port
 
-      #: (node_id: untyped, store: untyped, ?worker_pool: untyped, ?workflow_handlers: untyped, ?transient_handler: untyped, ?node_directory: untyped, ?host: untyped, ?port: untyped, ?credentials: untyped, ?pool_size: untyped, ?authorize: untyped, ?awaken_batch: untyped, ?evict_lease: untyped, ?deliver_message: untyped, ?verify_deliver_message_owner: untyped) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -232,15 +238,16 @@ module Durababble
         @verify_deliver_message_owner = verify_deliver_message_owner
       end
 
-      #: () -> untyped
+      #: () -> Server
       def start
         return self if @server
 
         @server = GRPC::RpcServer.new(pool_size: @pool_size)
         @port = @server.add_http2_port("#{host}:#{@requested_port}", @credentials)
         @node_id ||= address
+        current_node_id = @node_id
         @server.handle(Service.new(
-          node_id:,
+          node_id: current_node_id,
           store: @store,
           worker_pool: @worker_pool,
           workflow_handlers: @workflow_handlers,
@@ -256,7 +263,7 @@ module Durababble
         self
       end
 
-      #: () -> untyped
+      #: () -> void
       def stop
         @server&.stop
         @server_task&.wait
@@ -265,14 +272,14 @@ module Durababble
         @server_task = nil
       end
 
-      #: () -> untyped
+      #: () -> String
       def address
         "#{host}:#{port || @requested_port}"
       end
     end
 
     class Service < Proto::Service
-      #: (node_id: untyped, store: untyped, worker_pool: untyped, workflow_handlers: untyped, transient_handler: untyped, node_directory: untyped, authorize: untyped, awaken_batch: untyped, evict_lease: untyped, deliver_message: untyped, ?verify_deliver_message_owner: untyped) -> void
+      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -301,8 +308,9 @@ module Durababble
         @verify_deliver_message_owner = verify_deliver_message_owner
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (Object, Object) -> Proto::AwakenBatchResponse
       def awaken_batch(request, call)
+        request = request #: as untyped
         Observability.trace("durababble.rpc.server.awaken_batch", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id) do
           authorize!(call)
           @awaken_batch&.call(worker_pool: request.worker_pool, workflow_ids: request.workflow_ids.to_a)
@@ -310,8 +318,9 @@ module Durababble
         end
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (Object, Object) -> Proto::EvictLeaseResponse
       def evict_lease(request, call)
+        request = request #: as untyped
         Observability.trace("durababble.rpc.server.evict_lease", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
           @evict_lease&.call(
@@ -324,8 +333,9 @@ module Durababble
         end
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (Object, Object) -> Proto::DeliverMessageResponse
       def deliver_message(request, call)
+        request = request #: as untyped
         Observability.trace("durababble.rpc.server.deliver_message", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
           unless @verify_deliver_message_owner && stale_workflow_message?(request)
@@ -340,8 +350,9 @@ module Durababble
         end
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (Object, Object) -> Proto::TransientResponse
       def call_transient(request, call)
+        request = request #: as untyped
         Observability.trace("durababble.rpc.server.call_transient", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => request.object_id) do
           authorize!(call)
           result = if request.workflow_id.empty?
@@ -363,7 +374,7 @@ module Durababble
 
       private
 
-      #: (untyped) -> untyped
+      #: (Object) -> void
       def authorize!(call)
         return unless @authorize
         return if @authorize.call(call)
@@ -371,8 +382,9 @@ module Durababble
         raise GRPC::Unauthenticated, "durababble RPC peer is not authorized"
       end
 
-      #: (untyped) -> untyped
+      #: (Object) -> Object?
       def call_workflow_transient(request)
+        request = request #: as untyped
         payload = {
           "workflow_id" => request.workflow_id,
           "expected_worker_id" => @node_id,
@@ -386,8 +398,9 @@ module Durababble
         ).call(payload)
       end
 
-      #: (untyped) -> untyped
+      #: (Object) -> Object?
       def call_custom_transient(request)
+        request = request #: as untyped
         unless @transient_handler
           raise WorkflowRpc::UnknownCommand, "unknown transient RPC method #{request["method"]}"
         end
@@ -395,16 +408,18 @@ module Durababble
         @transient_handler.call(request:, args: Rpc.load(request.args))
       end
 
-      #: (untyped) -> untyped
+      #: (Object) -> bool
       def stale_workflow_message?(request)
+        request = request #: as untyped
         return false unless request.target_kind == "workflow"
 
         lease = @store.current_workflow_lease(request.target_id)
         !lease || lease.fetch("worker_id") != @node_id
       end
 
-      #: (untyped) -> untyped
+      #: (Object) -> Proto::TransientResponse?
       def moved_response(request)
+        request = request #: as untyped
         lease = @store.current_workflow_lease(request.workflow_id)
         return unless lease
 
@@ -419,7 +434,7 @@ module Durababble
         )
       end
 
-      #: (untyped) -> untyped
+      #: (StandardError) -> Proto::TransientResponse
       def remote_error_response(error)
         Proto::TransientResponse.new(
           err: Proto::RemoteError.new(

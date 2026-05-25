@@ -17,41 +17,41 @@ module Durababble
     RPC_NOT_RUNNING = [COMPLETED, WAITING].freeze
 
     class << self
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def completed?(row_or_status)
         COMPLETED_STATUSES.include?(status_of(row_or_status))
       end
 
-      #: (untyped) -> untyped
+      #: (Hash[String, Object?]) -> bool
       def terminal?(row)
         completed?(row) || final_failed?(row)
       end
 
-      #: (untyped) -> untyped
+      #: (Hash[String, Object?]) -> bool
       def final_failed?(row)
         row.fetch("status") == FAILED && row["next_run_at"].nil?
       end
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def suspended_or_runnable?(row_or_status)
         SUSPENDED_OR_RUNNABLE.include?(status_of(row_or_status))
       end
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def rpc_not_running?(row_or_status)
         RPC_NOT_RUNNING.include?(status_of(row_or_status))
       end
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def running?(row_or_status)
         status_of(row_or_status) == RUNNING
       end
 
       private
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> String
       def status_of(row_or_status)
-        row_or_status.respond_to?(:fetch) ? row_or_status.fetch("status") : row_or_status
+        row_or_status.is_a?(Hash) ? row_or_status.fetch("status").to_s : row_or_status
       end
     end
   end
@@ -78,16 +78,16 @@ module Durababble
     LIVE = [RUNNING, WAITING].freeze
 
     class << self
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def live?(row_or_status)
         LIVE.include?(status_of(row_or_status))
       end
 
       private
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> String
       def status_of(row_or_status)
-        row_or_status.respond_to?(:fetch) ? row_or_status.fetch("status") : row_or_status
+        row_or_status.is_a?(Hash) ? row_or_status.fetch("status").to_s : row_or_status
       end
     end
   end
@@ -117,26 +117,26 @@ module Durababble
     ACTIVATABLE = [PENDING, FAILED, RUNNING].freeze
 
     class << self
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def activatable?(row_or_status)
         ACTIVATABLE.include?(status_of(row_or_status))
       end
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def dead_lettered?(row_or_status)
         status_of(row_or_status) == DEAD_LETTERED
       end
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> bool
       def running?(row_or_status)
         status_of(row_or_status) == RUNNING
       end
 
       private
 
-      #: (untyped) -> untyped
+      #: (String | Hash[String, Object?]) -> String
       def status_of(row_or_status)
-        row_or_status.respond_to?(:fetch) ? row_or_status.fetch("status") : row_or_status
+        row_or_status.is_a?(Hash) ? row_or_status.fetch("status").to_s : row_or_status
       end
     end
   end

@@ -5,7 +5,7 @@ require "async/condition"
 
 module Durababble
   class CommandFuture
-    #: (untyped) -> void
+    #: (Integer) -> void
     def initialize(command_id)
       @command_id = command_id
       @condition = Async::Condition.new
@@ -29,14 +29,14 @@ module Durababble
       @condition.signal
     end
 
-    #: () -> untyped
+    #: () -> Object?
     def value
       raise @error if @error
 
       @result
     end
 
-    #: (untyped) -> void
+    #: (Object?) -> void
     def resolve(result)
       return if @done
 
@@ -45,7 +45,7 @@ module Durababble
       @condition.signal
     end
 
-    #: (untyped) -> void
+    #: (Exception) -> void
     def reject(error)
       return if @done
 

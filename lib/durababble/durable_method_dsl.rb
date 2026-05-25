@@ -3,29 +3,31 @@
 
 module Durababble
   module DurableMethodDSL
-    #: untyped
-    attr_reader :exposed_queries, :exposed_commands
+    #: Hash[Symbol, bool]
+    attr_reader :exposed_queries
+    #: Hash[Symbol, RetryPolicy]
+    attr_reader :exposed_commands
 
-    #: (untyped) -> untyped
+    #: (Class) -> void
     def initialize_durable_method_dsl(subclass)
       subclass.instance_variable_set(:@exposed_queries, {})
       subclass.instance_variable_set(:@exposed_commands, {})
     end
 
-    #: (untyped) -> untyped
+    #: (Symbol) -> Object?
     def method_added(method_name)
       super
       apply_pending_durable_macro(method_name)
     end
 
-    #: (?untyped) -> untyped
+    #: (?Symbol?) -> Symbol?
     def expose(method_name = nil)
       return register_exposed_query(method_name) if method_name
 
       set_pending_durable_macro(:expose)
     end
 
-    #: (?untyped, **untyped) -> untyped
+    #: (?Symbol?, **Object?) -> Symbol?
     def expose_command(method_name = nil, **options)
       if method_name
         return register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
@@ -36,25 +38,26 @@ module Durababble
 
     private
 
-    #: (untyped) -> untyped
+    #: (Symbol) -> Symbol
     def register_exposed_query(method_name)
       @exposed_queries[method_name.to_sym] = true
       method_name
     end
 
-    #: (untyped, retry_policy: untyped) -> untyped
+    #: (Symbol, retry_policy: Object?) -> Symbol
     def register_exposed_command(method_name, retry_policy:)
-      @exposed_commands[method_name.to_sym] = RetryPolicy.from(retry_policy)
+      policy = retry_policy #: as untyped
+      @exposed_commands[method_name.to_sym] = RetryPolicy.from(policy)
       method_name
     end
 
-    #: (untyped, **untyped) -> untyped
+    #: (Symbol, **Object?) -> nil
     def set_pending_durable_macro(kind, **options)
       @pending_durable_macro = [kind, options]
       nil
     end
 
-    #: (untyped) -> bool
+    #: (Symbol) -> bool
     def apply_pending_durable_macro(method_name)
       return false if @__durababble_wrapping
 
@@ -66,14 +69,14 @@ module Durababble
       true
     end
 
-    #: () -> untyped
+    #: () -> [Symbol, Hash[Symbol, Object?]]?
     def consume_pending_durable_macro
       pending = @pending_durable_macro
       @pending_durable_macro = nil if pending
       pending
     end
 
-    #: (untyped, untyped, untyped) -> untyped
+    #: (Symbol, Symbol, Hash[Symbol, Object?]) -> Symbol?
     def handle_pending_durable_macro(kind, method_name, options)
       case kind
       when :expose
@@ -83,7 +86,7 @@ module Durababble
       end
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> String
     def underscore(value)
       value.gsub(/([A-Z]+)([A-Z][a-z])/, "\\1_\\2")
         .gsub(/([a-z\d])([A-Z])/, "\\1_\\2")
