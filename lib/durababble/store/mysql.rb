@@ -18,13 +18,6 @@ module Durababble
       @migrated = false
     end
 
-    #: (name: String, input: Object?) -> Object?
-    def enqueue_workflow(name:, input:)
-      id = SecureRandom.uuid
-      execute_store_query(:enqueue_workflow, [id, name, dump_serialized(input)])
-      id
-    end
-
     #: (String, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
       if worker_id
@@ -105,14 +98,18 @@ module Durababble
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do
-        workflows = execute_store_query(:count_workflow_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_workflow_leases, [worker_id])
-        outbox = execute_store_query(:count_outbox_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_outbox_leases, [worker_id])
-        inbox = execute_store_query(:count_inbox_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_inbox_leases, [worker_id])
-        target_activations = execute_store_query(:count_target_activation_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_target_activation_leases, [worker_id])
+        workflow_index = index_name("workflows", "worker_lease")
+        workflows = execute_store_query(:count_workflow_leases, [worker_id], index: workflow_index).first.fetch("count").to_i
+        execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index)
+        outbox_index = index_name("outbox", "worker_lease")
+        outbox = execute_store_query(:count_outbox_leases, [worker_id], index: outbox_index).first.fetch("count").to_i
+        execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index)
+        inbox_index = index_name("inbox", "worker_lease")
+        inbox = execute_store_query(:count_inbox_leases, [worker_id], index: inbox_index).first.fetch("count").to_i
+        execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index)
+        target_activation_index = index_name("target_activations", "worker_lease")
+        target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
+        execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
@@ -448,6 +445,17 @@ module Durababble
 
     private
 
+    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
+      id = SecureRandom.uuid
+      if worker_id
+        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
+      else
+        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
+      end
+      id
+    end
+
     #: (workflow_id: String, worker_id: String) -> bool
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
@@ -491,14 +499,50 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
     def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
+      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(target_id))
+        dead_letter_terminal_workflow_inbox_without_transaction(
+          target_type:,
+          target_id:,
+          error: terminal_error,
+        )
+        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
+        return
+      end
+
       head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else
-        execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
+        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
       end
+    end
+
+    #: (String) -> String?
+    def terminal_workflow_target_error(workflow_id)
+      row = execute_params("SELECT status, error FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id]).first
+      return unless row && WorkflowStatus.terminal?(row)
+
+      status = row.fetch("status")
+      error = row["error"]
+      suffix = error.to_s.empty? ? "" : ": #{error}"
+      "workflow #{workflow_id} is terminal #{status}#{suffix}"
+    end
+
+    #: (target_type: String, target_id: String, error: String) -> Object?
+    def dead_letter_terminal_workflow_inbox_without_transaction(target_type:, target_id:, error:)
+      execute_params(<<~SQL, [error, target_type, target_id])
+        UPDATE #{table("inbox")}
+        SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6)
+        WHERE target_kind = 'workflow' AND target_type = ? AND target_id = ?
+          AND status IN ('pending', 'failed', 'running')
+      SQL
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String) -> Object?
+    def delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
+      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
     end
 
     #: (target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?

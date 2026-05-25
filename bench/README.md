@@ -12,6 +12,7 @@ For Durababble, most meaningful costs are database round trips, leases, queue sc
 
 ```sh
 mise exec -- ruby bench/run.rb --profile smoke
+mise exec -- ruby bench/run.rb --profile history-smoke
 mise exec -- ruby bench/run.rb --profile full --fixture-size 100000
 ```
 
@@ -37,6 +38,7 @@ The suite measures realistic durable-execution operations:
 - worker `tick` claim + execute behavior;
 - worker `run_until_idle` batch draining;
 - resume behavior that skips completed steps and continues remaining steps;
+- bounded replay/resume behavior for small, medium, and intentionally large completed workflow histories;
 - observability reads for workflow/step/attempt/wait state;
 - failed-workflow retry through the runnable queue;
 - expired workflow lease recovery;

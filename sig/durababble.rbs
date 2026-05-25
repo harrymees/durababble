@@ -71,6 +71,13 @@ module Durababble
   class NonDeterminismError < DeterminismError
   end
 
+  class WorkflowHistoryLimitExceeded < Error
+    attr_reader workflow_id: String
+    attr_reader history_events: Integer
+    attr_reader max_history_events: Integer
+    def initialize: (String workflow_id, history_events: Integer, max_history_events: Integer) -> void
+  end
+
   class FenceTimeout < Error
   end
 
@@ -137,6 +144,13 @@ module Durababble
 
   def self.configure_observability: (?enabled: bool, ?attributes: Hash[String | Symbol, serialized_payload]) -> Observability::Configuration
   def self.observability: () -> Observability::Configuration
+  def self.max_workflow_history_events: () -> Integer
+  def self.max_workflow_history_events=: ((Integer | String) value) -> (Integer | String)
+  def self.workflow_history_warning_events: () -> Integer
+  def self.workflow_history_warning_events=: ((Integer | String) value) -> (Integer | String)
+  def self.logger: () -> Object?
+  def self.logger=: (Object? logger) -> Object?
+  def self.warn_workflow_history_events: (workflow_id: String, history_events: Integer, max_history_events: Integer) -> bool
 
   class Store
     attr_reader schema: String
@@ -150,7 +164,7 @@ module Durababble
     def close: () -> void
     def current_time: () -> Time
     def enqueue_workflow: (name: String, input: serialized_payload) -> String
-    def create_workflow: (name: String, input: serialized_payload) -> String
+    def create_workflow: (name: String, input: serialized_payload, ?worker_id: String?, ?lease_seconds: Numeric) -> String
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
     def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
@@ -176,6 +190,7 @@ module Durababble
     def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
+    def workflow_history_count_for: (String workflow_id) -> Integer
     def wake_due_timers: (?now: Time, ?batch_size: Integer) -> Integer
     def waits_for: (String workflow_id) -> Array[workflow_row]
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload

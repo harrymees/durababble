@@ -33,8 +33,8 @@ module Durababble
       }
       Observability.trace("durababble.workflow.start", attributes) do
         Observability.count("durababble.workflow.starts", attributes)
-        workflow_id = enqueue(workflow_class, input:)
-        resume(workflow_class, workflow_id:)
+        workflow_id = @store.create_workflow(name: workflow_class.workflow_name, input:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+        execute(workflow_class, workflow_id:, initial_input: input)
       end
     end
 
@@ -96,6 +96,24 @@ module Durababble
       WorkflowStatus.terminal?(row)
     end
 
+    #: (untyped, ?history_count: untyped) -> bool
+    def check_workflow_history_limit!(workflow_id, history_count: nil)
+      history_count ||= @store.workflow_history_count_for(workflow_id)
+      max_history_events = Durababble.max_workflow_history_events
+      warned = Durababble.warn_workflow_history_events(
+        workflow_id:,
+        history_events: history_count,
+        max_history_events:,
+      )
+      return warned if history_count <= max_history_events
+
+      raise WorkflowHistoryLimitExceeded.new(
+        workflow_id,
+        history_events: history_count,
+        max_history_events: max_history_events,
+      )
+    end
+
     #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped
     def dispatch_workflow_command(workflow_class, workflow, workflow_id:, message:)
       unless message.fetch("message_kind") == "workflow_command"
@@ -129,6 +147,7 @@ module Durababble
         workflow = nil #: untyped
         root_error = nil #: StandardError?
         root = Async do |root_task|
+          history_warning_logged = check_workflow_history_limit!(workflow_id)
           history = @store.workflow_history_for(workflow_id)
           Observability.record(
             "durababble.workflow.history.steps",
@@ -143,6 +162,7 @@ module Durababble
             history:,
             root_task:,
             crash_after: @crash_after,
+            history_warning_logged:,
           )
           workflow = workflow_class.new
           workflow.__durababble_execution__ = execution

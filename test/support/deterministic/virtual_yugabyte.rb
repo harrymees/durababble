@@ -299,6 +299,11 @@ module Durababble
         @history[workflow_id].map { |row| deep(row) }
       end
 
+      #: (untyped) -> untyped
+      def workflow_history_count_for(workflow_id)
+        @history[workflow_id].length
+      end
+
       #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
       def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
         fence_key = [workflow_id, key]

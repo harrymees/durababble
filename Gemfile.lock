@@ -50,6 +50,7 @@ GEM
       fiber-annotation
       fiber-local (~> 1.1)
       json
+    csv (3.3.5)
     docile (1.4.1)
     drb (2.2.3)
     fiber-annotation (0.2.0)
@@ -163,6 +164,7 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
+  csv (~> 3.3)
   durababble!
   minitest (< 6)
   mocha (~> 2.7)

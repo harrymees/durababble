@@ -2,6 +2,7 @@
 # typed: false
 # frozen_string_literal: true
 
+require "csv"
 require "fileutils"
 require "json"
 require "open3"
@@ -18,7 +19,7 @@ module Durababble
   module Benchmarks
     DEFAULT_DATABASE_URL = Durababble.default_database_url
 
-    Operation = Struct.new(:name, :iterations, :warmup, :description, :block, :prepare, keyword_init: true)
+    Operation = Struct.new(:name, :iterations, :warmup, :description, :block, :prepare, :before, keyword_init: true)
 
     class Runner
       def initialize(profile:, database_url:, schema:, output_dir:, fixture_size:, seed:, samples:, keep_schema:, only: nil)
@@ -88,38 +89,44 @@ module Durababble
 
       def operations
         quick = @profile == "smoke"
-        selected = [
-          Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
-          Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
-          Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
-          Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
-          Operation.new(name: "fenced_workflow_completion", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "complete running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_completion)),
-          Operation.new(name: "fenced_workflow_failure", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "fail running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_failure)),
-          Operation.new(name: "fenced_workflow_cancellation", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "cancel running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_cancellation)),
-          Operation.new(name: "timer_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into due timer wait, wake it, and resume remaining workflow steps", block: method(:bench_timer_wait_resume_workflow)),
-          Operation.new(name: "worker_tick_execute_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "worker tick claim + execute a runnable workflow", block: method(:bench_worker_tick_execute_workflow)),
-          Operation.new(name: "worker_run_until_idle_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "worker drains a small batch through run_until_idle", block: method(:bench_worker_run_until_idle_batch)),
-          Operation.new(name: "resume_skips_completed_step", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "resume reconstructs context and skips already-completed steps", block: method(:bench_resume_skips_completed_step)),
-          Operation.new(name: "read_workflow_state", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "inspect workflow, steps, attempts, and waits for observability", block: method(:bench_read_workflow_state)),
-          Operation.new(name: "failed_workflow_retry", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "retry a failed workflow through the runnable queue", block: method(:bench_failed_workflow_retry)),
-          Operation.new(name: "expired_workflow_lease_recovery", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "detect and return expired workflow leases to pending", block: method(:bench_expired_workflow_lease_recovery)),
-          Operation.new(name: "fence_first_execution", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "acquire an idempotency fence, run side effect, and persist result", block: method(:bench_fence_first_execution)),
-          Operation.new(name: "fence_cached_result", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "read cached idempotency fence result without re-running side effect", block: method(:bench_fence_cached_result)),
-          Operation.new(name: "outbox_claim_ack", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "claim and acknowledge outbox messages", block: method(:bench_outbox_claim_ack)),
-          Operation.new(name: "outbox_expired_reclaim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "reclaim an outbox message whose processing lease expired", block: method(:bench_outbox_expired_reclaim)),
-          Operation.new(name: "durable_object_command_claim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "persist, claim, complete, and read durable object command state", block: method(:bench_durable_object_command_claim)),
-          Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
-          Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
-          Operation.new(name: "bulk_due_timer_wake_parallel", iterations: quick ? 3 : 20, warmup: quick ? 1 : 3, description: "wake a large due timer set from two concurrent stores", prepare: method(:prepare_bulk_due_timer_wake), block: method(:bench_bulk_due_timer_wake_parallel)),
-          Operation.new(name: "step_attempt_number_lookup", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "compute a step attempt number with many prior attempts", block: method(:bench_step_attempt_number_lookup)),
-          Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
-          Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
-          Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
-        ]
+        selected = if @profile.start_with?("history")
+          history_replay_operations
+        else
+          [
+            Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
+            Operation.new(name: "inline_run_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "create, lease, and complete an inline workflow run", block: method(:bench_inline_run_workflow)),
+            Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
+            Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
+            Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
+            Operation.new(name: "fenced_workflow_completion", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "complete running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_completion)),
+            Operation.new(name: "fenced_workflow_failure", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "fail running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_failure)),
+            Operation.new(name: "fenced_workflow_cancellation", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "cancel running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_cancellation)),
+            Operation.new(name: "timer_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into due timer wait, wake it, and resume remaining workflow steps", block: method(:bench_timer_wait_resume_workflow)),
+            Operation.new(name: "worker_tick_execute_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "worker tick claim + execute a runnable workflow", block: method(:bench_worker_tick_execute_workflow)),
+            Operation.new(name: "worker_run_until_idle_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "worker drains a small batch through run_until_idle", block: method(:bench_worker_run_until_idle_batch)),
+            Operation.new(name: "resume_skips_completed_step", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "resume reconstructs context and skips already-completed steps", block: method(:bench_resume_skips_completed_step)),
+            Operation.new(name: "read_workflow_state", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "inspect workflow, steps, attempts, and waits for observability", block: method(:bench_read_workflow_state)),
+            Operation.new(name: "failed_workflow_retry", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "retry a failed workflow through the runnable queue", block: method(:bench_failed_workflow_retry)),
+            Operation.new(name: "expired_workflow_lease_recovery", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "detect and return expired workflow leases to pending", block: method(:bench_expired_workflow_lease_recovery)),
+            Operation.new(name: "fence_first_execution", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "acquire an idempotency fence, run side effect, and persist result", block: method(:bench_fence_first_execution)),
+            Operation.new(name: "fence_cached_result", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "read cached idempotency fence result without re-running side effect", block: method(:bench_fence_cached_result)),
+            Operation.new(name: "outbox_claim_ack", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "claim and acknowledge outbox messages", block: method(:bench_outbox_claim_ack)),
+            Operation.new(name: "outbox_expired_reclaim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "reclaim an outbox message whose processing lease expired", block: method(:bench_outbox_expired_reclaim)),
+            Operation.new(name: "durable_object_command_claim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "persist, claim, complete, and read durable object command state", block: method(:bench_durable_object_command_claim)),
+            Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
+            Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
+            Operation.new(name: "bulk_due_timer_wake_parallel", iterations: quick ? 3 : 20, warmup: quick ? 1 : 3, description: "wake a large due timer set from two concurrent stores", prepare: method(:prepare_bulk_due_timer_wake), block: method(:bench_bulk_due_timer_wake_parallel)),
+            Operation.new(name: "step_attempt_number_lookup", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "compute a step attempt number with many prior attempts", block: method(:bench_step_attempt_number_lookup)),
+            Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
+            Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
+            Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
+          ]
+        end
         @only ? selected.select { |operation| operation.name.match?(@only) } : selected
       end
 
       def measure(operation)
+        operation.before&.call(operation)
         operation.warmup.times do |i|
           operation.prepare&.call(i, warmup: true)
           operation.block.call(i, warmup: true)
@@ -211,6 +218,11 @@ module Durababble
         raise "workflow not claimed" unless claimed
       end
 
+      def bench_inline_run_workflow(i, warmup:)
+        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30, migrate: false).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+        raise "inline workflow did not complete" unless run.status == "completed"
+      end
+
       def bench_heartbeat(i, warmup:)
         id = @store.enqueue_workflow(name: "bench_heartbeat", input: { "i" => i })
         @store.claim_workflow(workflow_id: id, worker_id: "heartbeater", lease_seconds: 30)
@@ -274,6 +286,74 @@ module Durababble
         @store.record_step_completed(workflow_id:, position: 0, result: { "i" => i, "value" => 2 })
         run = Durababble::Engine.new(store: @store, worker_id: "resume-prep", lease_seconds: 30).resume(workflow, workflow_id:)
         raise "resume did not complete" unless run.status == "completed" && run.result.fetch("value") == 4
+      end
+
+      def history_replay_operations
+        smoke = @profile == "history-smoke"
+        sizes = smoke ? { small: 10, medium: 50, large: 150 } : { small: 50, medium: 250, large: 1_000 }
+        sizes.map do |label, history_steps|
+          Operation.new(
+            name: "replay_long_history_#{label}",
+            iterations: smoke ? 3 : 20,
+            warmup: smoke ? 1 : 3,
+            description: "resume workflow after #{history_steps} completed steps plus a completed timer wait",
+            before: ->(operation) { prepare_history_replay_fixture(label, history_steps:, count: operation.iterations + operation.warmup) },
+            block: ->(_i, warmup:) { bench_history_replay(label, warmup:) },
+          )
+        end
+      end
+
+      def prepare_history_replay_fixture(label, history_steps:, count:)
+        @history_replay_ids ||= {}
+        @history_replay_offsets ||= {}
+        workflow = long_history_workflow(label, history_steps:)
+        wake_at = long_history_wake_at(label)
+        @history_replay_ids[label] = count.times.map do |i|
+          prepare_history_replay_workflow(workflow, history_steps:, wake_at:, input: { "i" => i, "count" => 0 })
+        end
+        @store.wake_due_timers(now: wake_at + 1)
+        @history_replay_offsets[label] = 0
+      end
+
+      def prepare_history_replay_workflow(workflow, history_steps:, wake_at:, input:)
+        workflow_id = @store.create_workflow(name: workflow.name, input:)
+        ctx = input
+        history_steps.times do |command_id|
+          @store.record_step_scheduled(
+            workflow_id:,
+            command_id:,
+            name: "accumulate",
+            args: [ctx],
+            metadata: default_retry_metadata,
+          )
+          @store.record_step_started(workflow_id:, command_id:, name: "accumulate")
+          ctx = ctx.merge("count" => ctx.fetch("count") + 1)
+          @store.record_step_completed(workflow_id:, command_id:, result: ctx)
+        end
+        wait_context = ctx.merge("released" => true)
+        @store.record_step_scheduled(
+          workflow_id:,
+          command_id: history_steps,
+          name: "wait_until",
+          args: [wake_at, wait_context],
+          metadata: wait_metadata(wake_at, wait_context),
+        )
+        @store.record_wait(
+          workflow_id:,
+          command_id: history_steps,
+          name: "wait_until",
+          wait_request: Durababble.wait_until(wake_at, wait_context),
+        )
+        workflow_id
+      end
+
+      def bench_history_replay(label, warmup:)
+        offset = @history_replay_offsets.fetch(label)
+        workflow_id = @history_replay_ids.fetch(label).fetch(offset)
+        @history_replay_offsets[label] = offset + 1
+        workflow = @history_replay_workflows.fetch(label)
+        run = Durababble::Engine.new(store: @store, worker_id: "history-replay-#{label}-#{warmup}", lease_seconds: 30, migrate: false).resume(workflow, workflow_id:)
+        raise "history replay did not complete" unless run.status == "completed"
       end
 
       def bench_read_workflow_state(i, warmup:)
@@ -467,6 +547,35 @@ module Durababble
         end
       end
 
+      def noop_workflow
+        @noop_workflow ||= Class.new(Durababble::Workflow) do
+          workflow_name "bench_inline_run"
+
+          def execute(input)
+            input
+          end
+        end
+      end
+
+      def event_resume_workflow(event_key)
+        Class.new(Durababble::Workflow) do
+          workflow_name "bench_event_resume"
+
+          define_method(:execute) do |input|
+            finish_after_event(wait_for_event(input))
+          end
+
+          define_method(:wait_for_event) do |ctx|
+            Durababble.wait_event(event_key, context: ctx)
+          end
+          step :wait_for_event
+
+          step def finish_after_event(ctx)
+            ctx.merge("finished" => true)
+          end
+        end
+      end
+
       def timer_resume_workflow
         @timer_resume_workflow ||= Class.new(Durababble::Workflow) do
           workflow_name "bench_timer_resume"
@@ -483,6 +592,55 @@ module Durababble
             ctx.merge("finished" => true)
           end
         end
+      end
+
+      def long_history_workflow(label, history_steps:)
+        @history_replay_workflows ||= {}
+        @history_replay_workflows[label] ||= begin
+          wake_at = long_history_wake_at(label)
+          Class.new(Durababble::Workflow) do
+            workflow_name "bench_history_replay_#{label}"
+
+            define_method(:execute) do |input|
+              ctx = input
+              history_steps.times { ctx = accumulate(ctx) }
+              Durababble.wait_until(wake_at, ctx.merge("released" => true))
+            end
+
+            step def accumulate(ctx)
+              ctx.merge("count" => ctx.fetch("count") + 1)
+            end
+          end
+        end
+      end
+
+      def long_history_wake_at(label)
+        @history_replay_wake_ats ||= {}
+        @history_replay_wake_ats[label] ||= Time.utc(2026, 5, 25, 5, 0, 0) + @history_replay_wake_ats.length
+      end
+
+      def default_retry_metadata
+        {
+          "retry" => {
+            "initial_interval" => 1,
+            "backoff_coefficient" => 2.0,
+            "maximum_interval" => nil,
+            "maximum_attempts" => 1,
+            "schedule" => [],
+            "non_retryable_errors" => [],
+          },
+        }
+      end
+
+      def wait_metadata(wake_at, context)
+        {
+          "wait" => {
+            "kind" => "timer",
+            "event_key" => nil,
+            "wake_at" => wake_at,
+            "context" => context,
+          },
+        }
       end
 
       def state_read_ids
@@ -651,20 +809,12 @@ module Durababble
       end
 
       def csv(report)
-        rows = [
-          ["profile", "started_at", "git_sha", "operation", "iterations", "ops_per_second", "median_ms", "p95_ms", "p99_ms", "avg_allocations", "fixture_size"],
-        ]
-        report.fetch(:operations).each do |op|
-          rows << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
+        CSV.generate do |csv|
+          csv << ["profile", "started_at", "git_sha", "operation", "iterations", "ops_per_second", "median_ms", "p95_ms", "p99_ms", "avg_allocations", "fixture_size"]
+          report.fetch(:operations).each do |op|
+            csv << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
+          end
         end
-        rows.map { |row| row.map { |field| csv_field(field) }.join(",") }.join("\n")
-      end
-
-      def csv_field(value)
-        field = value.to_s
-        return field unless field.match?(/[",\r\n]/)
-
-        "\"#{field.gsub("\"", "\"\"")}\""
       end
     end
   end

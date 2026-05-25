@@ -12,8 +12,8 @@ require_relative "workflow_step_runner"
 
 module Durababble
   class WorkflowExecution
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil, history_warning_logged: false)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -28,6 +28,7 @@ module Durababble
       @step_contexts = {}
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
+      @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
       @step_runner = WorkflowStepRunner.new(
         store: @store,
@@ -93,18 +94,24 @@ module Durababble
       step = instance.class.step_definition(method_name)
       shape = step_command_shape(step:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
-      command_id, future = synchronize_store do
+      command_id, future, scheduled_from_history = synchronize_store do
         command_id = @next_command_id
         @next_command_id += 1
         future = CommandFuture.new(command_id)
         @futures[command_id] = future
-        schedule_command!(command_id, name: step.name, shape:)
-        [command_id, future]
+        scheduled_from_history = schedule_command!(command_id, name: step.name, shape:, event_budget: 3)
+        [command_id, future, scheduled_from_history]
       end
       attributes = step_attributes(instance, step:, command_id:)
       Observability.count("durababble.workflow.replay.steps", attributes) if @replay_history.terminal_recorded?(command_id)
 
-      dispatch_command!(command_id, step:, attributes:, &block) unless @replay_history.terminal_recorded?(command_id)
+      unless @replay_history.terminal_recorded?(command_id)
+        if scheduled_from_history
+          ensure_history_limit_allows!(additional_events: 2)
+          @replay_history.reserve_events!(2)
+        end
+        dispatch_command!(command_id, step:, attributes:, &block)
+      end
       deliver_recorded_resolutions!
       result = await_command_future(future, command_id)
       raise_if_cancel_requested!
@@ -116,16 +123,22 @@ module Durababble
       assert_workflow_task!("durable wait #{name}")
       shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
-      command_id, future = synchronize_store do
+      command_id, future, scheduled_from_history = synchronize_store do
         command_id = @next_command_id
         @next_command_id += 1
         future = CommandFuture.new(command_id)
         @futures[command_id] = future
-        schedule_command!(command_id, name:, shape:)
-        [command_id, future]
+        scheduled_from_history = schedule_command!(command_id, name:, shape:, event_budget: 3)
+        [command_id, future, scheduled_from_history]
       end
 
-      record_wait_command!(command_id, name:, wait_request:) unless @replay_history.terminal_recorded?(command_id)
+      unless @replay_history.terminal_recorded?(command_id)
+        if scheduled_from_history
+          ensure_history_limit_allows!(additional_events: 2)
+          @replay_history.reserve_events!(2)
+        end
+        record_wait_command!(command_id, name:, wait_request:)
+      end
       deliver_recorded_resolutions!
       result = await_command_future(future, command_id)
       raise_if_cancel_requested!
@@ -240,10 +253,11 @@ module Durababble
       }
     end
 
-    #: (untyped, name: untyped, shape: untyped) -> void
-    def schedule_command!(command_id, name:, shape:)
-      return if @replay_history.validate_scheduled_shape!(workflow_id: @workflow_id, command_id:, shape:)
+    #: (untyped, name: untyped, shape: untyped, event_budget: Integer) -> bool
+    def schedule_command!(command_id, name:, shape:, event_budget:)
+      return true if @replay_history.validate_scheduled_shape!(workflow_id: @workflow_id, command_id:, shape:)
 
+      ensure_history_limit_allows!(additional_events: event_budget)
       @store.record_step_scheduled(
         workflow_id: @workflow_id,
         command_id:,
@@ -255,6 +269,28 @@ module Durababble
       )
       crash!(:step_scheduled)
       @replay_history.remember_scheduled(command_id, step_name: name, shape:)
+      @replay_history.reserve_events!(event_budget - 1)
+      false
+    end
+
+    #: (additional_events: Integer) -> void
+    def ensure_history_limit_allows!(additional_events:)
+      max_history_events = Durababble.max_workflow_history_events
+      projected_events = @replay_history.event_count + additional_events
+      unless @history_warning_logged
+        @history_warning_logged = Durababble.warn_workflow_history_events(
+          workflow_id: @workflow_id,
+          history_events: projected_events,
+          max_history_events:,
+        )
+      end
+      return if projected_events <= max_history_events
+
+      raise WorkflowHistoryLimitExceeded.new(
+        @workflow_id,
+        history_events: projected_events,
+        max_history_events: max_history_events,
+      )
     end
 
     #: (untyped, step: untyped, attributes: untyped) { -> untyped } -> void

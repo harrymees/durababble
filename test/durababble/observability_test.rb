@@ -120,6 +120,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
       id
     end
 
+    def create_workflow(name:, input:, worker_id:, lease_seconds:)
+      @next_id += 1
+      id = "wf-#{@next_id}"
+      @workflows[id] = { "id" => id, "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds, "created_at" => Time.now }
+      id
+    end
+
     def workflow(workflow_id) = @workflows.fetch(workflow_id)
 
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
@@ -146,6 +153,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]
+    def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)

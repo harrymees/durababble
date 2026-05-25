@@ -6,10 +6,13 @@ module Durababble
     TIMER_WAKE_BATCH_SIZE = 100
 
     #: (name: String, input: Object?) -> String
-    def create_workflow(name:, input:)
-      id = enqueue_workflow(name:, input:)
-      mark_workflow_running(id)
-      id
+    def enqueue_workflow(name:, input:)
+      insert_workflow(name:, input:, status: "pending")
+    end
+
+    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric) -> String
+    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60)
+      insert_workflow(name:, input:, status: "running", worker_id:, lease_seconds:)
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
@@ -79,6 +82,14 @@ module Durababble
     def workflow_history_for(workflow_id)
       execute_store_query(:workflow_history_for, [workflow_id])
         .map { |row| decode_row(row) }
+    end
+
+    #: (String) -> Integer
+    def workflow_history_count_for(workflow_id)
+      row = execute_store_query(:workflow_history_count_for, [workflow_id]).first
+      return 0 unless row
+
+      row.fetch("count").to_s.to_i
     end
 
     #: (?now: Time, ?batch_size: Integer) -> Integer
@@ -353,8 +364,8 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (name: String, input: Object?) -> String
-    def enqueue_workflow(name:, input:)
+    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
       raise NotImplementedError
     end
 

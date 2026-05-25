@@ -24,7 +24,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_dead_letter_inbox_message,
     :pg_delete_target_activation,
     :pg_drop_schema,
-    :pg_enqueue_workflow,
     :pg_existing_inbox_message_for_idempotency,
     :pg_fail_fence,
     :pg_fail_inbox_message,
@@ -38,6 +37,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_insert_inbox_message,
     :pg_insert_mailbox_sequence,
     :pg_insert_scheduled_step,
+    :pg_insert_workflow,
+    :pg_insert_workflow_with_worker,
     :pg_lock_inbox_message,
     :pg_lock_inbox_message_for_worker,
     :pg_lock_owned_workflow_for_update,
@@ -56,6 +57,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_update_mailbox_sequence,
     :pg_upsert_target_activation,
     :pg_workflow_cancellation,
+    :pg_workflow_history_count_for,
     :pg_workflow_history_for,
   ].freeze
 
@@ -100,7 +102,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_dead_letter_inbox_message,
     :mysql_delete_target_activation,
     :mysql_drop_table,
-    :mysql_enqueue_workflow,
     :mysql_existing_inbox_message_for_idempotency,
     :mysql_fail_fence,
     :mysql_fail_inbox_message,
@@ -122,7 +123,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_insert_scheduled_step,
     :mysql_insert_step_attempt,
     :mysql_insert_wait,
+    :mysql_insert_workflow,
     :mysql_insert_workflow_history,
+    :mysql_insert_workflow_with_worker,
     :mysql_lock_fence_for_worker,
     :mysql_lock_inbox_message,
     :mysql_lock_inbox_message_for_worker,
@@ -169,6 +172,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_waits_for_workflow,
     :mysql_workflow,
     :mysql_workflow_cancellation,
+    :mysql_workflow_history_count_for,
     :mysql_workflow_history_for,
     :mysql_workflow_locked_until,
     :mysql_workflow_owned,
@@ -249,7 +253,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       return unless @recording
 
       normalized = sql.strip
-      return unless normalized.match?(/\A(?:SELECT|INSERT|UPDATE|DELETE)\b/i)
+      return unless normalized.match?(/\A(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i)
 
       @recorded_queries << [normalized, params]
     end

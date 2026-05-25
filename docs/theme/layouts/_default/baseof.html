@@ -68,7 +68,30 @@
     {{ if .Store.Get "hasMermaid" }}
       <script type="module">
         import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.esm.min.mjs';
-        mermaid.initialize({ startOnLoad: true });
+        const themeFor = () =>
+          document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default';
+        mermaid.initialize({ startOnLoad: false, theme: themeFor() });
+        await mermaid.run();
+
+        // Re-render when the user toggles the page theme.
+        const rerender = async () => {
+          const blocks = document.querySelectorAll('pre.mermaid');
+          blocks.forEach((el) => {
+            if (el.dataset.source) {
+              el.removeAttribute('data-processed');
+              el.innerHTML = el.dataset.source;
+            } else {
+              el.dataset.source = el.textContent;
+            }
+          });
+          mermaid.initialize({ startOnLoad: false, theme: themeFor() });
+          await mermaid.run();
+        };
+        new MutationObserver((muts) => {
+          for (const m of muts) {
+            if (m.attributeName === 'data-theme') rerender();
+          }
+        }).observe(document.documentElement, { attributes: true });
       </script>
     {{ end }}
   </body>
