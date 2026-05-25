@@ -235,15 +235,21 @@ module Durababble
         fault_plan.after(:record_step_completed)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped, ?terminal: untyped, ?error_class: untyped, ?error_message: untyped) -> untyped
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
         assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "failed"
         step["error"] = error
         update_latest_attempt(workflow_id, command_id, "failed", nil, error)
-        append_history(workflow_id:, kind: "step_failed", command_id:, error:)
+        payload = nil
+        if terminal
+          payload = { "terminal" => true }
+          payload["error_class"] = error_class if error_class
+          payload["error_message"] = error_message if error_message
+        end
+        append_history(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
         trace("step_failed", id: workflow_id, command_id:, error:)
       end
 

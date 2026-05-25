@@ -278,8 +278,10 @@ module Durababble
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
       token = SecureRandom.uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
+      claimed = inserted.affected_rows == 1
+      claimed ||= execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
 
-      if inserted.affected_rows == 1
+      if claimed
         begin
           result = block.call
           execute_store_query(:complete_fence, [workflow_id, key, token, dump_serialized(result)])
@@ -607,11 +609,12 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
       execute_store_query(:fail_step, [workflow_id, command_id, error])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
     #: (workflow_id: String, command_id: Integer, status: String, result: Object?, error: String?) -> Object?

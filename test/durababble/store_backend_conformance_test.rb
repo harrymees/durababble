@@ -182,6 +182,28 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "reclaims expired running fences with #{backend.name}" do
+      with_durababble_store(backend, "fence_reclaim") do |store|
+        workflow_id = store.create_workflow(name: "stale-fence", input: {})
+        fence_key = "charge:stale"
+        calls = 0
+
+        store.send(:execute_store_query, :insert_fence, [workflow_id, fence_key, "abandoned-worker", -1])
+
+        result = store.with_fence(workflow_id:, key: fence_key, poll_interval: 0.001, timeout: 1) do
+          calls += 1
+          { "charged_by" => "reclaimer" }
+        end
+
+        assert_equal({ "charged_by" => "reclaimer" }, result)
+        assert_equal 1, calls
+        replayed = store.with_fence(workflow_id:, key: fence_key, poll_interval: 0.001, timeout: 1) do
+          raise "completed fence should replay without running the block"
+        end
+        assert_equal result, replayed
+      end
+    end
+
     test "persists durable object state and command lifecycle payloads with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         assert_nil store.object_state(object_type: "counter", object_id: "abc")

@@ -332,6 +332,12 @@ module Durababble
       SQL
     end
 
+    define(:pg_claim_expired_fence, backend: :postgres) do |store|
+      "UPDATE #{table(store, "fences")}\n" \
+        "SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), result = NULL, error = NULL, completed_at = NULL\n" \
+        "WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < now()"
+    end
+
     define(:pg_complete_fence, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "fences")}
@@ -1412,6 +1418,12 @@ module Durababble
         INSERT IGNORE INTO #{table(store, "fences")} (workflow_id, `key`, status, locked_by, locked_until)
         VALUES (?, ?, 'running', ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))
       SQL
+    end
+
+    define(:mysql_claim_expired_fence, backend: :mysql) do |store|
+      "UPDATE #{table(store, "fences")}\n" \
+        "SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), result = NULL, error = NULL, completed_at = NULL\n" \
+        "WHERE workflow_id = ? AND `key` = ? AND status = 'running' AND locked_until < NOW(6)"
     end
 
     define(:mysql_lock_fence_for_worker, backend: :mysql) do |store|

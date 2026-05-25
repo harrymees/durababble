@@ -17,6 +17,34 @@ module Durababble
     GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
     GENERATED_CONNECTION_CLASSES = {}
 
+    class PooledConnections
+      #: (Store) -> void
+      def initialize(template)
+        @template = template
+      end
+
+      #: () -> void
+      def close
+      end
+
+      #: () -> bool
+      def pooled_connections?
+        true
+      end
+
+      #: (Symbol, *untyped, **untyped) ?{ (*untyped) -> untyped } -> untyped
+      def method_missing(name, *args, **kwargs, &block)
+        @template.send(:with_connection_store) do |store|
+          store.public_send(name, *args, **kwargs, &block)
+        end
+      end
+
+      #: (Symbol, ?bool) -> bool
+      def respond_to_missing?(name, include_private = false)
+        @template.respond_to?(name, include_private)
+      end
+    end
+
     #: String
     attr_reader :schema
     #: Object
@@ -145,6 +173,11 @@ module Durababble
     #: () -> Time
     def current_time = Time.now
 
+    #: () -> PooledConnections
+    def pooled_connections
+      PooledConnections.new(self)
+    end
+
     #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: Object?) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
       lease = current_target_lease(target_kind:, target_type:, target_id:)
@@ -203,6 +236,26 @@ module Durababble
     end
 
     private
+
+    #: () -> Object?
+    def active_record_connection_pool
+      owner = @owner #: as untyped
+      return owner.connection_pool if owner&.respond_to?(:connection_pool)
+      return @connection.pool if @connection.respond_to?(:pool)
+
+      nil
+    end
+
+    #: () { (?) -> Object? } -> Object?
+    def with_connection_store(&block)
+      pool = active_record_connection_pool
+      raise Error, "Durababble store cannot checkout an isolated connection without an ActiveRecord connection pool" unless pool
+
+      pool = pool #: as untyped
+      pool.with_connection do |connection|
+        block.call(self.class.from_active_record(connection:, schema: @schema))
+      end
+    end
 
     #: () { () -> Object? } -> Object?
     def transaction(&block)

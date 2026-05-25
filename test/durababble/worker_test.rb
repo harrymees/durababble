@@ -107,7 +107,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       @resumed << [:completed, workflow_id, position, result]
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       position ||= command_id
       @resumed << [:failed, workflow_id, position, error]
     end

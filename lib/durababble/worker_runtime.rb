@@ -62,6 +62,8 @@ module Durababble
       @last_error = nil
       @rpc_server = nil
       @rpc_address = nil
+      @worker_store = nil
+      @rpc_store = nil
     end
 
     #: () -> untyped
@@ -79,9 +81,10 @@ module Durababble
         )
         start_rpc_server
         worker = begin
-          Worker.new(store: @store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
+          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
         rescue StandardError
           stop_rpc_server
+          close_isolated_stores
           raise
         end
         @thread = Thread.new { run_loop(worker) }
@@ -134,16 +137,27 @@ module Durababble
     #: () -> untyped
     def close
       shutdown
+      close_isolated_stores
       @store.close if @owns_store
     end
 
     private
 
     #: () -> untyped
+    def worker_store
+      @worker_store ||= isolated_store
+    end
+
+    #: () -> untyped
+    def rpc_store
+      @rpc_store ||= isolated_store
+    end
+
+    #: () -> untyped
     def start_rpc_server
       @rpc_server = Rpc::Server.new(
         node_id: nil,
-        store: @store,
+        store: rpc_store,
         worker_pool: @worker_pool,
         host: @rpc_host,
         port: @rpc_port,
@@ -164,6 +178,25 @@ module Durababble
       @rpc_server = nil
       @rpc_address = nil
       server.stop
+    end
+
+    #: () -> untyped
+    def isolated_store
+      return @store unless @store.respond_to?(:pooled_connections)
+
+      @store.pooled_connections
+    end
+
+    #: () -> void
+    def close_isolated_stores
+      [@worker_store, @rpc_store].compact.uniq.each do |isolated_store|
+        next if isolated_store.equal?(@store)
+        next unless isolated_store.respond_to?(:close)
+
+        isolated_store.close
+      end
+      @worker_store = nil
+      @rpc_store = nil
     end
 
     #: (**untyped) -> untyped

@@ -186,7 +186,7 @@ module Durababble
     def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
     def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
     def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
-    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> void
     def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
@@ -232,7 +232,7 @@ module Durababble
     def self.handle: (String workflow_id, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
-    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
+    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
 
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
@@ -262,7 +262,7 @@ module Durababble
     def self.handle: (Id durable_id, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?) -> durable_object_handle[Id, State, Dispatch]
     def self.tell: (Id durable_id, Symbol method_name, *serialized_payload args, ?store: Store, ?engine: Engine, ?idempotency_key: String?, **serialized_payload kwargs) -> String
     def self.expose: (?Symbol method_name) -> Symbol?
-    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
+    def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
 
     attr_reader durable_id: Id
     attr_reader command_context: CommandContext?
@@ -298,7 +298,7 @@ module Durababble
   class Engine
     attr_reader store: Store
 
-    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
+    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?crash_after: Symbol?) -> void
     def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input) -> String
     def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]

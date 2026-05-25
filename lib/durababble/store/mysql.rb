@@ -294,11 +294,12 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
       execute_store_query(:fail_step, [error, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
@@ -372,8 +373,10 @@ module Durababble
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
       token = SecureRandom.uuid
       execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
+      claimed = execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first
+      claimed ||= execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
 
-      if execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first
+      if claimed
         begin
           result = block.call
           execute_store_query(:complete_fence, [dump_serialized(result), workflow_id, key, token])

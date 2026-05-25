@@ -24,12 +24,25 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal:, error_class:, error_message:)
+      end
+    end
+
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Time) -> Object?
+    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:)
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false)
+        scheduled = schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+
+        scheduled
       end
     end
 
@@ -55,8 +68,14 @@ module Durababble
 
     #: (object_type: String, object_id: String) -> Object?
     def object_state(object_type:, object_id:)
+      state = object_state_entry(object_type:, object_id:)
+      state.equal?(Store::NO_OBJECT_STATE) ? nil : state
+    end
+
+    #: (object_type: String, object_id: String) -> Object?
+    def object_state_entry(object_type:, object_id:)
       row = execute_store_query(:object_state, [object_type, object_id]).first
-      decode_row(row).fetch("state") if row
+      row ? decode_row(row).fetch("state") : Store::NO_OBJECT_STATE
     end
 
     #: (String) -> Array[Hash[String, Object?]]
@@ -328,6 +347,16 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
     end
 
+    #: (terminal: bool, error_class: String?, error_message: String?) -> Hash[String, Object?]?
+    def step_failure_payload(terminal:, error_class:, error_message:)
+      return unless terminal
+
+      payload = { "terminal" => true }
+      payload["error_class"] = error_class if error_class
+      payload["error_message"] = error_message if error_message
+      payload
+    end
+
     #: (workflow_id: String, worker_id: String) -> void
     def assert_workflow_lease_for_update!(workflow_id:, worker_id:)
       return if lock_owned_workflow_for_update(workflow_id:, worker_id:)
@@ -345,6 +374,16 @@ module Durababble
       raise NotImplementedError
     end
 
+    #: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
+    def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+      raise NotImplementedError
+    end
+
+    #: (String, error: String, ?worker_id: String?) -> Object?
+    def fail_workflow(workflow_id, error:, worker_id: nil)
+      raise NotImplementedError
+    end
+
     #: (Integer?, Integer?) -> Integer
     def normalize_command_id(command_id, position)
       raise NotImplementedError
@@ -355,8 +394,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
       raise NotImplementedError
     end
 
