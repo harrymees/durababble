@@ -19,6 +19,31 @@ module Durababble
         @workflows = {}
         @violations = []
         @checks = []
+        @expect_settled = false
+        @expected_side_effects = nil
+        @expected_processed_outbox = nil
+      end
+
+      # Declare that, once the scheduler drains, every workflow must be either
+      # terminal or *legitimately* parked (a pending event wait, or a timer /
+      # retry scheduled beyond the simulation horizon). Opt-in because some
+      # scenarios intentionally leave runnable work behind. Enables the
+      # liveness/termination checker.
+      #: () -> void
+      def expect_settled!
+        @expect_settled = true
+      end
+
+      # Declare the exact number of fenced side effects expected by end of run.
+      #: (untyped) -> void
+      def expect_side_effects(count)
+        @expected_side_effects = count
+      end
+
+      # Declare the exact number of processed outbox messages expected by end of run.
+      #: (untyped) -> void
+      def expect_processed_outbox(count)
+        @expected_processed_outbox = count
       end
 
       #: (untyped, ticks: untyped, ?crash_percent: untyped) -> untyped
@@ -48,16 +73,96 @@ module Durababble
 
       #: () -> untyped
       def verify_store_invariants!
-        workflows_state = store.instance_variable_get(:@workflows)
-        steps_state = store.instance_variable_get(:@steps)
-        attempts_state = store.instance_variable_get(:@attempts)
-        waits_state = store.instance_variable_get(:@waits)
-        outbox_state = store.instance_variable_get(:@outbox)
+        workflows_state = store.all_workflows
+        steps_state = store.all_steps
+        attempts_state = store.all_attempts
+        waits_state = store.all_waits
+        outbox_state = store.all_outbox
+        fences_state = store.all_fences
 
         verify_workflow_invariants!(workflows_state)
         verify_step_invariants!(workflows_state, steps_state, attempts_state)
         verify_wait_invariants!(workflows_state, steps_state, waits_state)
         verify_outbox_invariants!(workflows_state, outbox_state)
+        verify_fence_invariants!(fences_state)
+        verify_liveness!(workflows_state, waits_state) if @expect_settled
+        verify_effect_expectations!
+      end
+
+      # A fence still `running` at end of run whose lease has expired and was
+      # never reclaimed is a stuck fence — the crashed-holder-never-reclaimed
+      # bug class. Only judged when the backend models a lease (`locked_until`);
+      # the legacy in-memory store does not and is skipped.
+      #: (untyped) -> untyped
+      def verify_fence_invariants!(fences_state)
+        final_time = scheduler.time
+        fences_state.each do |fence|
+          next unless fence.fetch("status") == "running"
+
+          locked_until = fence["locked_until"]
+          next if locked_until.nil?
+
+          if locked_until < final_time
+            violations << "stuck fence #{fence.fetch("workflow_id")}/#{fence.fetch("key")} held by #{fence["locked_by"].inspect} with expired lease never reclaimed"
+          end
+        end
+      end
+
+      # Liveness/termination: once the scheduler drains, every workflow must be
+      # terminal or legitimately parked. Flags abandoned-but-runnable work and
+      # workflows wedged mid-flight (running/canceling at end of run).
+      #: (untyped, untyped) -> untyped
+      def verify_liveness!(workflows_state, waits_state)
+        final_time = scheduler.time
+        workflows_state.each do |id, row|
+          status = row.fetch("status")
+          next if status == WorkflowStatus::COMPLETED || status == WorkflowStatus::CANCELED
+
+          case status
+          when "running"
+            violations << "workflow #{id} left running at end of run (abandoned lease, no path forward)"
+          when "canceling"
+            violations << "workflow #{id} stuck canceling at end of run"
+          when "pending"
+            if due?(row.fetch("next_run_at"), final_time)
+              violations << "workflow #{id} left pending and runnable at end of run (abandoned work)"
+            end
+          when "failed"
+            next_run_at = row.fetch("next_run_at")
+            if !next_run_at.nil? && next_run_at <= final_time
+              violations << "workflow #{id} left failed with a due retry at end of run (abandoned retry)"
+            end
+          when "waiting"
+            pending = waits_state.values.select { |wait| wait.fetch("workflow_id") == id && wait.fetch("status") == "pending" }
+            if pending.empty?
+              violations << "workflow #{id} waiting with no pending wait at end of run"
+            elsif pending.any? { |wait| wait.fetch("kind") == "timer" && !wait.fetch("wake_at").nil? && wait.fetch("wake_at") <= final_time }
+              violations << "workflow #{id} waiting on a timer past its wake_at at end of run (timer never fired)"
+            end
+          end
+        end
+      end
+
+      # Exactly-once effects: when a scenario declares an expected count, enforce
+      # it as a shared invariant rather than a per-scenario `check`.
+      #: () -> untyped
+      def verify_effect_expectations!
+        return if @expected_side_effects.nil? && @expected_processed_outbox.nil?
+
+        summary = store.summary
+        unless @expected_side_effects.nil?
+          actual = summary.fetch(:side_effects)
+          violations << "expected #{@expected_side_effects} side effect(s) but observed #{actual}" if actual != @expected_side_effects
+        end
+        return if @expected_processed_outbox.nil?
+
+        actual = summary.fetch(:processed_outbox)
+        violations << "expected #{@expected_processed_outbox} processed outbox message(s) but observed #{actual}" if actual != @expected_processed_outbox
+      end
+
+      #: (untyped, untyped) -> untyped
+      def due?(next_run_at, final_time)
+        next_run_at.nil? || next_run_at <= final_time
       end
 
       WORKFLOW_STATUSES = WorkflowStatus::ALL

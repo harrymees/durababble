@@ -345,6 +345,45 @@ module Durababble
       end
 
       #: (untyped) -> untyped
+      def bug_stuck_fence(seed)
+        run(seed, "bug_stuck_fence") do |h|
+          id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          h.store.mark_workflow_running(id)
+          fences = h.store.instance_variable_get(:@fences)
+          fences[[id, "charge"]] = {
+            "workflow_id" => id,
+            "key" => "charge",
+            "status" => "running",
+            "result" => nil,
+            "error" => nil,
+            "locked_by" => "crashed-worker",
+            "locked_until" => h.scheduler.time - 1,
+          }
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_abandoned_runnable_workflow(seed)
+        run(seed, "bug_abandoned_runnable_workflow") do |h|
+          h.expect_settled!
+          h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          # No workers ever run: the workflow is left pending and immediately
+          # runnable, which the liveness checker must flag.
+        end
+      end
+
+      #: (untyped) -> untyped
+      def bug_unmet_effect_expectation(seed)
+        run(seed, "bug_unmet_effect_expectation") do |h|
+          h.expect_side_effects(1)
+          h.expect_processed_outbox(1)
+          h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
+          # No fence is ever acquired and no outbox message is processed, so the
+          # declared exactly-once expectations are violated.
+        end
+      end
+
+      #: (untyped) -> untyped
       def rpc_fault_injection(seed)
         run(seed, "rpc_fault_injection") do |h|
           outcomes = ["success", "timeout", "connection_error", "eof", "remote_error", "idle_disconnect_reconnect"]

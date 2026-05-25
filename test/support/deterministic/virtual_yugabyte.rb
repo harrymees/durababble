@@ -2,10 +2,13 @@
 # frozen_string_literal: true
 
 require_relative "core"
+require_relative "store_inspection"
 
 module Durababble
   module Deterministic
     class VirtualYugabyte
+      include StoreInspection
+
       #: untyped
       attr_reader :scheduler, :fault_plan
 
@@ -420,6 +423,34 @@ module Durababble
       def steps_for(workflow_id) = @steps[workflow_id].values.sort_by { |row| row.fetch("position") }.map { |row| deep(row) }
       #: (untyped) -> untyped
       def step_attempts_for(workflow_id) = @attempts[workflow_id].map { |row| deep(row) }
+
+      # --- StoreInspection ---------------------------------------------------
+
+      #: () -> untyped
+      def all_workflows = @workflows
+
+      #: () -> untyped
+      def all_steps
+        steps = Hash.new { |_hash, _key| {} }
+        @steps.each { |workflow_id, by_position| steps[workflow_id] = by_position }
+        steps
+      end
+
+      #: () -> untyped
+      def all_attempts
+        attempts = Hash.new { |_hash, _key| [] }
+        @attempts.each { |workflow_id, list| attempts[workflow_id] = list }
+        attempts
+      end
+
+      #: () -> untyped
+      def all_waits = @waits
+
+      #: () -> untyped
+      def all_outbox = @outbox
+
+      #: () -> untyped
+      def all_fences = @fences.values
 
       #: () -> untyped
       def summary

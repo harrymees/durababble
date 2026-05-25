@@ -351,6 +351,29 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes messages, "processing outbox"
   end
 
+  test "flags a stuck fence whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_fence", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck fence"
+  end
+
+  test "flags abandoned-but-runnable workflows under an expect_settled scenario" do
+    failures = Durababble::Deterministic.search("bug_abandoned_runnable_workflow", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "pending and runnable"
+  end
+
+  test "flags unmet exactly-once effect expectations" do
+    failures = Durababble::Deterministic.search("bug_unmet_effect_expectation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "expected 1 side effect"
+    assert_includes messages, "expected 1 processed outbox"
+  end
+
   test "fuzzes each unique scenario target across many deterministic seeds" do
     assert_scenarios_hold(FUZZ_SCENARIOS, seeds: 1..100)
   end
