@@ -7,11 +7,11 @@ require "pg"
 
 class DurababbleStoreTest < DurababbleTestCase
   class PgResult < Array
-    attr_reader :cmd_tuples
+    attr_reader :affected_rows
 
     def initialize(rows = [], cmd_tuples: rows.length)
       super(rows)
-      @cmd_tuples = cmd_tuples
+      @affected_rows = cmd_tuples
     end
   end
 
@@ -27,73 +27,100 @@ class DurababbleStoreTest < DurababbleTestCase
       @closed = false
     end
 
-    def exec_params(sql, params)
-      @exec_params_calls << [sql, params]
-      result = @params_results.shift || PgResult.new
-      result.respond_to?(:call) ? result.call(sql, params) : result
+    def adapter_name = "PostgreSQL"
+
+    def exec_query(sql, name = nil, binds = [], prepare: false)
+      params = binds.map { |bind| bind.respond_to?(:value_before_type_cast) ? bind.value_before_type_cast : bind.value }
+      if name == "Durababble SQL"
+        @exec_params_calls << [sql, params]
+        result = @params_results.shift || PgResult.new
+        result.respond_to?(:call) ? result.call(sql, params) : result
+      else
+        @exec_calls << sql
+        result = @exec_results.shift || PgResult.new
+        result.respond_to?(:call) ? result.call(sql) : result
+      end
     end
 
-    def exec(sql)
-      @exec_calls << sql
-      result = @exec_results.shift || PgResult.new
-      result.respond_to?(:call) ? result.call(sql) : result
-    end
-
-    def transaction
+    def transaction(requires_new: true)
       yield
     end
 
-    def finished?
-      @finished
+    def quote(value)
+      case value
+      when nil
+        "NULL"
+      when true
+        "TRUE"
+      when false
+        "FALSE"
+      when Numeric
+        value.to_s
+      else
+        "'#{value.to_s.gsub("'", "''")}'"
+      end
+    end
+
+    def quote_column_name(identifier)
+      %("#{identifier.to_s.gsub("\"", "\"\"")}")
     end
 
     def close
       @closed = true
     end
-
-    def escape_literal(value)
-      "'#{value.to_s.gsub("'", "''")}'"
-    end
-  end
-
-  class FakeMysqlConnection
-    attr_reader :queries
-    attr_accessor :affected_rows
-
-    def initialize
-      @queries = []
-      @affected_rows = 0
-    end
-
-    def query(sql)
-      @queries << sql
-      MysqlResultLike.new([])
-    end
-
-    def escape(value)
-      value.to_s.gsub("'", "''")
-    end
   end
 
   class ScriptedMysqlConnection
     attr_reader :queries
-    attr_accessor :affected_rows
 
     def initialize(&result_for_query)
       @result_for_query = result_for_query
       @queries = []
-      @affected_rows = 0
     end
 
-    def query(sql)
+    def adapter_name = "Trilogy"
+
+    def exec_query(sql, name = nil, binds = [], prepare: false)
       @queries << sql
-      result = @result_for_query&.call(sql) || MysqlResultLike.new([])
-      @affected_rows = result.affected_rows || 0
-      result
+      @result_for_query&.call(sql) || MysqlResultLike.new([])
     end
 
-    def escape(value)
-      value.to_s.gsub("'", "''")
+    def transaction(requires_new: true)
+      yield
+    end
+
+    def quote(value)
+      case value
+      when nil
+        "NULL"
+      when true
+        "TRUE"
+      when false
+        "FALSE"
+      when Numeric
+        value.to_s
+      when Time
+        "'#{value.utc.strftime("%Y-%m-%d %H:%M:%S.%6N")}'"
+      else
+        "'#{value.to_s.gsub("'", "''")}'"
+      end
+    end
+
+    def quote_column_name(identifier)
+      "`#{identifier.to_s.gsub("`", "``")}`"
+    end
+
+    def cast_bound_value(value)
+      case value
+      when true
+        "1"
+      when false
+        "0"
+      when Numeric
+        value.to_s
+      else
+        value
+      end
     end
   end
 
@@ -105,17 +132,8 @@ class DurababbleStoreTest < DurababbleTestCase
       @affected_rows = affected_rows
     end
 
-    def each_hash
-      @rows.each
-    end
-  end
-
-  class MysqlRetryableError < StandardError
-    attr_reader :error_code
-
-    def initialize(error_code)
-      @error_code = error_code
-      super("mysql #{error_code}")
+    def to_a
+      @rows
     end
   end
 
@@ -138,21 +156,11 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  class ObjectWithString
-    def initialize(value)
-      @value = value
-    end
-
-    def to_s
-      @value
-    end
-  end
-
   class MysqlMigrationProbeStore < Durababble::MysqlStore
     attr_reader :executed
 
     def initialize(schema:, columns: {})
-      super(nil, schema:)
+      super(ScriptedMysqlConnection.new, schema:)
       @columns = columns
       @executed = []
     end
@@ -175,18 +183,14 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  test "routes configured database URLs through mysql and postgres adapters" do
-    mysql = Object.new
-    pg = ScriptedPgConnection.new
+  test "routes active record connections through mysql and postgres adapters" do
+    assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection: ScriptedPgConnection.new, schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.new(ScriptedPgConnection.new, schema: "schema")
 
-    Durababble::MysqlStore.expects(:connect).with do |uri:, schema:|
-      uri.scheme == "mysql" && schema == "schema"
-    end.returns(mysql)
-    assert_same mysql, Durababble::Store.connect(database_url: "mysql://user@127.0.0.1/db", schema: "schema")
-
-    PG.expects(:connect).with("postgresql://127.0.0.1/db").returns(pg)
-    store = Durababble::Store.connect(database_url: "postgresql://127.0.0.1/db", schema: "schema")
-    assert_kind_of Durababble::Store, store
+    unsupported = Object.new
+    unsupported.define_singleton_method(:adapter_name) { "SQLite" }
+    assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection: unsupported, schema: "schema") }
   end
 
   test "migrates and persists workflow plus step state" do
@@ -674,9 +678,10 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert helper.send(:activatable_inbox_status?, "pending")
     refute helper.send(:activatable_inbox_status?, "completed")
-    assert_equal "", helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)
-    assert_includes helper.send(:target_activation_filter, target_kinds: ["workflow"], target_types: nil), "target_kind IN"
-    assert_includes helper.send(:target_activation_filter, target_kinds: nil, target_types: ["approval"]), "target_type IN"
+    assert_equal ["", []], helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)
+    malicious_kind = "workflow'); DROP TABLE inbox; --"
+    assert_equal ["AND target_kind IN ($2)", [malicious_kind]], helper.send(:target_activation_filter, target_kinds: [malicious_kind], target_types: nil, offset: 2)
+    assert_equal ["AND target_type IN ($2)", ["approval"]], helper.send(:target_activation_filter, target_kinds: nil, target_types: ["approval"], offset: 2)
     assert_equal Time.utc(2024, 1, 1), helper.send(:target_activation_ready_at_for, { "status" => "pending", "ready_at" => nil }, now: Time.utc(2024, 1, 1))
     assert_equal "2024-01-02T00:00:00Z", helper.send(:target_activation_ready_at_for, { "status" => "pending", "ready_at" => "2024-01-02T00:00:00Z" }, now: Time.utc(2024, 1, 1))
     assert_equal "2024-01-02T00:00:00Z", helper.send(:target_activation_ready_at_for, { "status" => "running", "locked_until" => "2024-01-02T00:00:00Z" }, now: Time.utc(2024, 1, 1))
@@ -828,16 +833,17 @@ class DurababbleStoreTest < DurababbleTestCase
     attempts = 0
     result = store.send(:retry_serialization_failures) do
       attempts += 1
-      raise PG::TRSerializationFailure if attempts == 1
+      raise ActiveRecord::SerializationFailure if attempts == 1
 
       :retried
     end
     assert_equal :retried, result
-    assert_raises(PG::TRSerializationFailure) do
-      store.send(:retry_serialization_failures, max_attempts: 1) { raise PG::TRSerializationFailure }
+    assert_raises(ActiveRecord::SerializationFailure) do
+      store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::SerializationFailure }
     end
-    assert_equal "", store.send(:workflow_name_filter, nil)
-    assert_includes store.send(:workflow_name_filter, ["a", "b"]), "name IN"
+    assert_equal ["", []], store.send(:workflow_name_filter, nil)
+    malicious_name = "a'); DROP TABLE workflows; --"
+    assert_equal ["AND name IN ($1, $2)", [malicious_name, "b"]], store.send(:workflow_name_filter, [malicious_name, "b"])
     assert_nil store.send(:timestamp_or_nil, nil)
   end
 
@@ -845,13 +851,6 @@ class DurababbleStoreTest < DurababbleTestCase
     migrated = pg_store
     migrated.instance_variable_set(:@migrated, true)
     assert_same migrated, migrated.migrate!
-
-    open_connection = ScriptedPgConnection.new(finished: false)
-    closed_connection = ScriptedPgConnection.new(finished: true)
-    pg_store(open_connection).close
-    pg_store(closed_connection).close
-    assert open_connection.closed
-    refute closed_connection.closed
 
     assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new, PgResult.new]))
       .claim_runnable_workflow(worker_id: "w", lease_seconds: 5)
@@ -901,12 +900,12 @@ class DurababbleStoreTest < DurababbleTestCase
     ])).complete_object_command(command_id: "cmd", result: "ok")
 
     retry_connection = ScriptedPgConnection.new(exec_results: [
-      ->(_sql) { raise PG::TRDeadlockDetected },
+      ->(_sql) { raise ActiveRecord::Deadlocked },
       PgResult.new,
     ])
     pg_store(retry_connection).send(:execute, "SELECT 1")
-    assert_raises(PG::TRDeadlockDetected) do
-      pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise PG::TRDeadlockDetected } }))
+    assert_raises(ActiveRecord::Deadlocked) do
+      pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise ActiveRecord::Deadlocked } }))
         .send(:execute, "SELECT 1")
     end
 
@@ -925,33 +924,33 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_store(migration_connection).send(:migrate_serialized_column!, "outbox", "payload")
   end
 
-  test "binds mysql literals, rows, identifiers, and retries transient transactions" do
-    connection = FakeMysqlConnection.new
+  test "uses active record mysql quoting, sanitization, and transaction retry" do
+    connection = ScriptedMysqlConnection.new
     store = Durababble::MysqlStore.new(connection, schema: "branch-schema-with-a-very-long-name-that-will-be-hashed")
 
     assert_match(/\Adura_[0-9a-f]{10}\z/, store.send(:table_prefix))
-    assert_equal "`has``tick`", store.send(:quote_ident, "has`tick")
-    assert_equal("SELECT NULL, TRUE, FALSE, 4", store.send(:bind_params, "SELECT ?, ?, ?, ?", [nil, true, false, 4]))
-    assert_equal "x'616263'", store.send(:mysql_literal, "abc".b)
-    assert_equal "'O''Reilly'", store.send(:mysql_literal, "O'Reilly")
-    assert_equal("'2024-01-01 00:00:00.123456'", store.send(:mysql_literal, Time.utc(2024, 1, 1, 0, 0, 0, 123_456)))
-    assert_equal "'object-value'", store.send(:mysql_literal, ObjectWithString.new("object-value"))
-    assert_raises(ArgumentError) { store.send(:bind_params, "SELECT ?, ?", [1]) }
-    assert_raises(ArgumentError) { store.send(:bind_params, "SELECT ?", [1, 2]) }
-    assert_equal([], store.send(:mysql_rows, Object.new))
-    assert_equal([{ "id" => 1 }], store.send(:mysql_rows, MysqlResultLike.new([{ id: 1 }])))
-    assert store.send(:retryable_mysql_error?, MysqlRetryableError.new(1213))
-    refute store.send(:retryable_mysql_error?, MysqlRetryableError.new(9999))
+    assert_equal "`dura_#{Digest::SHA1.hexdigest("branch_schema_with_a_very_long_name_that_will_be_hashed")[0, 10]}_workflows`", store.send(:table, "workflows")
+    store.send(:execute_params, "SELECT ?, ?, ?, ?", [nil, true, false, 4])
+    assert_equal "SELECT NULL, '1', '0', '4'", connection.queries.last
+    store.send(:execute_params, "SELECT ?", ["x'; DROP TABLE workflows; --"])
+    assert_equal "SELECT 'x''; DROP TABLE workflows; --'", connection.queries.last
+    store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
+    assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
+    assert_equal ["AND name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["AND target_kind IN (?)", [["workflow'); DROP TABLE inbox; --"]]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
+    assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
+    assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
+    assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))
+    refute store.send(:retryable_mysql_error?, RuntimeError.new("boom"))
 
     attempts = 0
     assert_equal :ok, store.send(:transaction) {
       attempts += 1
-      raise MysqlRetryableError, 1213 if attempts == 1
+      raise ActiveRecord::Deadlocked, "deadlocked" if attempts == 1
 
       :ok
     }
-    assert_includes connection.queries, "ROLLBACK"
-    assert_includes connection.queries, "COMMIT"
+    assert_equal 2, attempts
 
     index_connection = ScriptedMysqlConnection.new do |sql|
       if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")

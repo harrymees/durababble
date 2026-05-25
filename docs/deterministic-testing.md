@@ -68,7 +68,7 @@ The original prototype spec covered distributed workflow leases and lease-aware 
 Use this to search a scenario over many deterministic schedules:
 
 ```sh
-mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
+mise exec -- ruby -Ilib -e 'require "durababble/deterministic"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
 ```
 
 An empty array means no invariant violation was found for that seed range.
