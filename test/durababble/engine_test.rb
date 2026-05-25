@@ -227,7 +227,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "still supports requested injected crash points" do
     no_lease_store = Object.new
-    crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
+    crashy_engine = Durababble::Engine.new(store: no_lease_store, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
   end
 
@@ -369,7 +369,7 @@ class DurababbleEngineTest < DurababbleTestCase
       end
     end
     store = InlineRunStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9)
 
     run = engine.run(workflow, input: { "count" => 2 })
 
@@ -545,7 +545,7 @@ class DurababbleEngineTest < DurababbleTestCase
           store.record_step_started(workflow_id:, command_id: 0, name: "first")
           store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-          run = Durababble::Engine.new(store:, worker_id: "history-at-max", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-at-max").resume(workflow, workflow_id:)
 
           assert_equal "completed", run.status
           assert_equal({ "count" => 2 }, run.result)
@@ -569,7 +569,7 @@ class DurababbleEngineTest < DurababbleTestCase
             raise "history should not be fetched once the count is over the configured limit"
           end
 
-          run = Durababble::Engine.new(store:, worker_id: "history-prefetch", migrate: false).resume(ImmediateWorkflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-prefetch").resume(ImmediateWorkflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/Durababble::WorkflowHistoryLimitExceeded: workflow #{workflow_id} has 4 history events, exceeding max 3/, run.error)
@@ -595,8 +595,8 @@ class DurababbleEngineTest < DurababbleTestCase
           store.record_step_started(workflow_id:, command_id: 0, name: "first")
           store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-          run = Durababble::Engine.new(store:, worker_id: "history-over", migrate: false).resume(workflow, workflow_id:)
-          replay = Durababble::Engine.new(store:, worker_id: "history-over-again", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-over").resume(workflow, workflow_id:)
+          replay = Durababble::Engine.new(store:, worker_id: "history-over-again").resume(workflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/WorkflowHistoryLimitExceeded/, run.error)
@@ -623,7 +623,7 @@ class DurababbleEngineTest < DurababbleTestCase
               store.record_step_started(workflow_id:, command_id: 0, name: "first")
               store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-              run = Durababble::Engine.new(store:, worker_id: "history-warning", migrate: false).resume(workflow, workflow_id:)
+              run = Durababble::Engine.new(store:, worker_id: "history-warning").resume(workflow, workflow_id:)
 
               assert_equal "completed", run.status
               assert logger.warnings.any? { |message| message.include?("workflow #{workflow_id} has 3 workflow history events") }
@@ -664,7 +664,7 @@ class DurababbleEngineTest < DurababbleTestCase
             "status" => "pending",
           )
 
-          failed = Durababble::Engine.new(store:, worker_id: "history-terminal", migrate: false).resume(workflow, workflow_id:)
+          failed = Durababble::Engine.new(store:, worker_id: "history-terminal").resume(workflow, workflow_id:)
           worker = Durababble::Worker.new(store:, workflows: [workflow], worker_id: "activation-cleanup", migrate: false)
           assert_equal :worked, worker.tick
           assert_equal :idle, worker.tick
@@ -692,7 +692,7 @@ class DurababbleEngineTest < DurababbleTestCase
           workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
           store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
 
-          run = Durababble::Engine.new(store:, worker_id: "history-attempt", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-attempt").resume(workflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/WorkflowHistoryLimitExceeded/, run.error)
@@ -715,12 +715,12 @@ class DurababbleEngineTest < DurababbleTestCase
           end
           workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wait" })
 
-          waiting = Durababble::Engine.new(store:, worker_id: "history-wait", migrate: false).resume(workflow, workflow_id:)
+          waiting = Durababble::Engine.new(store:, worker_id: "history-wait").resume(workflow, workflow_id:)
           assert_equal "waiting", waiting.status
           assert_equal 2, store.workflow_history_count_for(workflow_id)
 
           assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-          completed = Durababble::Engine.new(store:, worker_id: "history-wait-recover", migrate: false).resume(workflow, workflow_id:)
+          completed = Durababble::Engine.new(store:, worker_id: "history-wait-recover").resume(workflow, workflow_id:)
 
           assert_equal "completed", completed.status
           assert_equal({ "id" => "wait", "slept" => true }, completed.result)

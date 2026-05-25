@@ -219,7 +219,7 @@ module Durababble
       end
 
       def bench_inline_run_workflow(i, warmup:)
-        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30, migrate: false).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
         raise "inline workflow did not complete" unless run.status == "completed"
       end
 
@@ -352,7 +352,7 @@ module Durababble
         workflow_id = @history_replay_ids.fetch(label).fetch(offset)
         @history_replay_offsets[label] = offset + 1
         workflow = @history_replay_workflows.fetch(label)
-        run = Durababble::Engine.new(store: @store, worker_id: "history-replay-#{label}-#{warmup}", lease_seconds: 30, migrate: false).resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store: @store, worker_id: "history-replay-#{label}-#{warmup}", lease_seconds: 30).resume(workflow, workflow_id:)
         raise "history replay did not complete" unless run.status == "completed"
       end
 
