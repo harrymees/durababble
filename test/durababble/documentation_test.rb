@@ -48,11 +48,14 @@ class DurababbleDocumentationTest < DurababbleTestCase
   test "ships RBS declarations for the public class API" do
     rbs = read("sig/durababble.rbs")
 
-    assert_includes rbs, "class Workflow[Input, Output]"
-    assert_includes rbs, "class DurableObject[Id, State]"
+    assert_includes rbs, "class Workflow[Input, Output, Dispatch = Object]"
+    assert_includes rbs, "class DurableObject[Id, State, Dispatch = Object]"
     assert_includes rbs, "def self.enqueue: (Input input"
-    assert_includes rbs, "def self.ref: (Id durable_id"
+    assert_includes rbs, "def self.at: (String workflow_id"
     assert_includes rbs, "def self.at: (Id durable_id"
+    assert_includes rbs, "def self.handle: (String workflow_id"
+    assert_includes rbs, "def self.handle: (Id durable_id"
+    refute_includes rbs, "def self.ref:"
     assert_includes rbs, "def self.tell: (Id durable_id"
   end
 
@@ -72,6 +75,26 @@ class DurababbleDocumentationTest < DurababbleTestCase
     examples.each { |example| evaluate_example(example, backend) }
   end
 
+  test "docs site examples can hide runnable setup from the presented snippets" do
+    workflows = read("docs/content/workflows.md")
+    durable_objects = read("docs/content/durable-objects.md")
+
+    workflow_visible = visible_marked_ruby_code(workflows, "workflow-example")
+    assert_includes workflow_visible, "FulfillOrder.start(order)"
+    assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id)"
+    assert_includes workflow_visible, "fulfillment.result"
+    refute_includes workflow_visible, "Durababble::Store.connect"
+    refute_includes workflow_visible, "Durababble::Worker.new"
+    refute_includes workflow_visible, "Durababble::Engine.new"
+
+    object_visible = visible_marked_ruby_code(durable_objects, "durable-object-example")
+    assert_includes object_visible, "account = Account.at(\"acct_readme\")"
+    assert_includes object_visible, "account.credit(1_000)"
+    refute_includes object_visible, "Account.tell"
+    refute_includes object_visible, "Durababble::Store.connect"
+    refute_includes object_visible, "Durababble::Worker.new"
+  end
+
   private
 
   def root
@@ -82,11 +105,30 @@ class DurababbleDocumentationTest < DurababbleTestCase
     Dir[File.join(root, "docs/content/*.md")].sort.flat_map do |path|
       content = File.read(path)
       content.scan(/<!-- DOCS:([\w-]+):start -->(.*?)<!-- DOCS:\1:end -->/m).map do |marker, body|
-        code_match = body.match(/```ruby\n(.*?)\n```/m)
-        assert(code_match, "marker #{marker} in #{path} does not wrap a ruby code block")
-        { marker:, path:, code: code_match[1] }
+        blocks = ruby_blocks(body)
+        assert(blocks.any?, "marker #{marker} in #{path} does not wrap a ruby code block")
+        { marker:, path:, code: blocks.join("\n\n") }
       end
     end
+  end
+
+  def marked_example_content(text, marker)
+    pattern = /<!-- DOCS:#{Regexp.escape(marker)}:start -->(.*?)<!-- DOCS:#{Regexp.escape(marker)}:end -->/m
+    match = text.match(pattern)
+    assert(match, "docs content is missing #{marker} example markers")
+    match[1]
+  end
+
+  def visible_marked_ruby_code(text, marker)
+    content = marked_example_content(text, marker)
+    visible_content = content.gsub(/<!-- DOCS:#{Regexp.escape(marker)}:hidden\b.*?-->/m, "")
+    code = ruby_blocks(visible_content)
+    assert(code.any?, "docs content #{marker} marker does not contain a visible ruby code block")
+    code.join("\n\n")
+  end
+
+  def ruby_blocks(markdown)
+    markdown.scan(/```ruby\n(.*?)\n```/m).map(&:first)
   end
 
   def evaluate_example(example, backend)
@@ -106,6 +148,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
         end
       ensure
         cleanup_constants(defined_before)
+        Durababble.default_store = nil
       end
     end
   end

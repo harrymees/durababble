@@ -1066,9 +1066,9 @@ module Durababble
         @connection.exec_query(sql)
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
-        raise if attempts >= 5
+        raise if attempts >= 20
 
-        sleep(0.01 * attempts)
+        sleep(0.05 * attempts)
         retry
       end
     end

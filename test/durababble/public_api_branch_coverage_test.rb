@@ -99,20 +99,20 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   end
 
   durababble_store_backends.each do |backend|
-    test "exposes workflow refs for keyword queries and command events with #{backend.name}" do
-      with_durababble_store(backend, "public_api_branch_workflow_ref") do |store|
+    test "exposes workflow handles for keyword queries and command events with #{backend.name}" do
+      with_durababble_store(backend, "public_api_branch_workflow_handle") do |store|
         workflow_id = store.enqueue_workflow(name: BranchTestWorkflow.workflow_name, input: { "plain" => "plain", "keyword" => "keyword" })
         store.mark_workflow_running(workflow_id, worker_id: "command-worker", lease_seconds: 60)
-        ref = BranchTestWorkflow.ref(workflow_id, store:)
+        handle = BranchTestWorkflow.handle(workflow_id, store:)
 
-        assert_respond_to(ref, :labeled_status)
-        assert_equal("status:#{workflow_id}", ref.labeled_status(prefix: "status"))
+        assert_respond_to(handle, :labeled_status)
+        assert_equal("status:#{workflow_id}", handle.labeled_status(prefix: "status"))
 
         result_queue = Queue.new
         caller = Thread.new do
           caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
           begin
-            result_queue << [:ok, BranchTestWorkflow.ref(workflow_id, store: caller_store).note(message: "hello", idempotency_key: "note:hello")]
+            result_queue << [:ok, BranchTestWorkflow.handle(workflow_id, store: caller_store).note(message: "hello", idempotency_key: "note:hello")]
           rescue StandardError => e
             result_queue << [:error, e]
           ensure
@@ -144,9 +144,48 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_equal(:ok, status)
         assert_equal("hello", value)
         assert_hash_includes(store.inbox_message(messages.first.fetch("id")), "status" => "completed", "result" => "hello")
-        assert_raises(NoMethodError) { ref.not_exposed }
+        assert_raises(NoMethodError) { handle.not_exposed }
       ensure
         caller&.kill if caller&.alive?
+      end
+    end
+  end
+
+  durababble_store_backends.each do |backend|
+    test "enqueues workflows through default and explicit engines with #{backend.name}" do
+      with_durababble_store(backend, "public_api_default_engine_workflow") do |store|
+        engine = Durababble::Engine.new(store:, migrate: false)
+
+        explicit_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(explicit_id).fetch("name"))
+        explicit_handle = BranchTestWorkflow.handle(explicit_id, engine:)
+        assert_equal("pending", explicit_handle.status)
+        assert_nil(explicit_handle.result)
+        assert_nil(explicit_handle.error)
+
+        started_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        assert_instance_of(Durababble::WorkflowRef, started_handle)
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(started_handle.workflow_id).fetch("name"))
+        completed_run = engine.run(BranchTestWorkflow, input: { "plain" => "plain", "keyword" => "keyword" })
+        completed_handle = BranchTestWorkflow.handle(completed_run.id, engine:)
+        assert_equal("completed", completed_handle.status)
+        assert_equal(completed_run.result, completed_handle.result)
+        assert_nil(completed_handle.error)
+        assert_not_respond_to(BranchTestWorkflow, :ref)
+
+        Durababble.default_store = store
+        assert_same(store, Durababble.default_engine.store)
+
+        default_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" })
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(default_id).fetch("name"))
+        assert_equal("status:#{default_id}", BranchTestWorkflow.handle(default_id).labeled_status(prefix: "status"))
+        assert_equal("status:#{default_id}", BranchTestWorkflow.handle(default_id, engine:).labeled_status(prefix: "status"))
+
+        assert_raises(ArgumentError) do
+          BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, store:, engine:)
+        end
+      ensure
+        Durababble.default_store = nil
       end
     end
   end
@@ -168,7 +207,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           lease_seconds: 30,
           migrate: false,
         )
-        account = BranchTestDurableObject.ref("acct-1", store:)
+        account = BranchTestDurableObject.handle("acct-1", store:)
         add = nil
         flaky = nil
 
@@ -177,7 +216,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_equal("balance:0", account.formatted(prefix: "balance"))
 
         add = call_with_store_async(backend) do |caller_store|
-          BranchTestDurableObject.ref("acct-1", store: caller_store).add(amount: 3)
+          BranchTestDurableObject.handle("acct-1", store: caller_store).add(amount: 3)
         end
         run_worker_until_result(worker, add.fetch(:queue))
         add_status, add_result = add.fetch(:queue).pop
@@ -186,7 +225,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_equal({ "value" => 3 }, add_result)
 
         flaky = call_with_store_async(backend) do |caller_store|
-          BranchTestDurableObject.ref("acct-1", store: caller_store).flaky_add(amount: 4)
+          BranchTestDurableObject.handle("acct-1", store: caller_store).flaky_add(amount: 4)
         end
         run_worker_until_result(worker, flaky.fetch(:queue))
         flaky_status, flaky_result = flaky.fetch(:queue).pop
@@ -226,6 +265,8 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     configured = Durababble.configure(database_url: backend.database_url, schema: schema_name)
 
     assert_same(configured, Durababble.default_store)
+    assert_same(configured, Durababble.default_engine.store)
+    assert_same(Durababble.default_engine, Durababble.engine)
     assert_equal(schema_name, Durababble.default_store.schema)
     assert_kind_of(Durababble::Store, Durababble.default_store)
   ensure
@@ -245,6 +286,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     refute(old_pool.active_connection?)
     assert_same(new_store, Durababble.default_store)
+    assert_same(new_store, Durababble.default_engine.store)
     assert_equal(new_schema, Durababble.default_store.schema)
   ensure
     old_store&.drop_schema!

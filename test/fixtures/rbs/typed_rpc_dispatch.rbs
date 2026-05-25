@@ -1,0 +1,17 @@
+module DurababbleTypeFixtures
+  module TypedWorkflowDispatch
+    def describe: (String prefix) -> String
+    def approve: (reason: String) -> bool
+  end
+
+  module TypedObjectDispatch
+    def balance: () -> Integer
+    def credit: (Integer amount_cents, ?memo: String) -> Integer
+  end
+
+  class TypedWorkflow < Durababble::Workflow[String, bool, TypedWorkflowDispatch]
+  end
+
+  class TypedObject < Durababble::DurableObject[String, Hash[String, Integer], TypedObjectDispatch]
+  end
+end

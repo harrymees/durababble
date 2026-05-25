@@ -9,13 +9,20 @@ module Durababble
   class Engine
     DEFAULT_LEASE_SECONDS = 60
 
+    #: untyped
+    attr_reader :store
+
     #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped) -> void
     def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
-      @store.migrate! if migrate
+    end
+
+    #: (untyped, input: untyped) -> untyped
+    def enqueue(workflow_class, input:)
+      @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
     end
 
     #: (untyped, input: untyped) -> untyped
@@ -26,7 +33,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.start", attributes) do
         Observability.count("durababble.workflow.starts", attributes)
-        workflow_id = @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
+        workflow_id = enqueue(workflow_class, input:)
         resume(workflow_class, workflow_id:)
       end
     end

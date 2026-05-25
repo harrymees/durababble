@@ -15,6 +15,14 @@ The simplest shape: a finite list of steps that run one after another, each one 
 
 <!-- DOCS:patterns-sequential:start -->
 
+<!-- DOCS:patterns-sequential:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
+
 ```ruby
 class GenerateReport < Durababble::Workflow
   def execute(request)
@@ -47,13 +55,30 @@ module ReportSink
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
-run = engine.run(GenerateReport, input: { "name" => "weekly", "query" => "SELECT 1" })
-{ "status" => run.status, "row_count" => run.result.fetch("row_count") }
+report = GenerateReport.start({ "name" => "weekly", "query" => "SELECT 1" })
 ```
+
+<!-- DOCS:patterns-sequential:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [GenerateReport],
+  worker_id: "report-worker",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+report.result
+```
+
+<!-- DOCS:patterns-sequential:hidden
+```ruby
+{ "status" => report.status, "row_count" => report.result.fetch("row_count") }
+```
+-->
 
 <!-- DOCS:patterns-sequential:end -->
 
@@ -64,6 +89,14 @@ If `upload_report` crashes after `fetch_rows` completed, a replaying worker reus
 When the workflow needs to run the same step against many inputs and the inputs do not depend on each other, fan them out with `Async`. Each branch is its own durable step, scheduled before any of them complete. Replay records the schedule order in history, so out-of-order completions stay consistent across crashes.
 
 <!-- DOCS:patterns-fanout:start -->
+
+<!-- DOCS:patterns-fanout:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
 
 ```ruby
 class IndexShopProducts < Durababble::Workflow
@@ -86,13 +119,30 @@ module SearchIndex
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
-run = engine.run(IndexShopProducts, input: [101, 102, 103])
-run.result.map { |row| row.fetch("product_id") }.sort
+indexing = IndexShopProducts.start([101, 102, 103])
 ```
+
+<!-- DOCS:patterns-fanout:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [IndexShopProducts],
+  worker_id: "indexer-worker",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+indexing.result
+```
+
+<!-- DOCS:patterns-fanout:hidden
+```ruby
+indexing.result.map { |row| row.fetch("product_id") }.sort
+```
+-->
 
 <!-- DOCS:patterns-fanout:end -->
 
@@ -103,6 +153,14 @@ Use fanout when the work is "do this to each item" and you do not need to gate o
 Pure fanout dispatches every item at once, which is the wrong shape when each item costs a paid API call, a slow third-party request, or a database connection from a limited pool. Process the queue in fixed-size chunks instead: each chunk fans out in parallel, the next chunk does not start until the previous one's branches all complete.
 
 <!-- DOCS:patterns-bounded-concurrency:start -->
+
+<!-- DOCS:patterns-bounded-concurrency:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
 
 ```ruby
 class RefreshTokens < Durababble::Workflow
@@ -127,13 +185,30 @@ module TokenService
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
-run = engine.run(RefreshTokens, input: [1, 2, 3, 4, 5])
-run.result.map { |row| row.fetch("user_id") }
+rotation = RefreshTokens.start([1, 2, 3, 4, 5])
 ```
+
+<!-- DOCS:patterns-bounded-concurrency:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [RefreshTokens],
+  worker_id: "token-worker",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+rotation.result
+```
+
+<!-- DOCS:patterns-bounded-concurrency:hidden
+```ruby
+rotation.result.map { |row| row.fetch("user_id") }
+```
+-->
 
 <!-- DOCS:patterns-bounded-concurrency:end -->
 
@@ -144,6 +219,14 @@ Chunking by `each_slice` gives a hard ceiling on in-flight steps without any ext
 When a workflow performs side effects that have to roll back on failure — a charge that has to be refunded, a reservation that has to be released — encode the cleanup as ordinary durable steps in a `rescue` block. Compensation steps are recorded in history exactly like forward steps, so a crash during cleanup does not re-run completed cleanup.
 
 <!-- DOCS:patterns-saga:start -->
+
+<!-- DOCS:patterns-saga:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
 
 ```ruby
 class TicketPrinterUnavailable < StandardError; end
@@ -200,14 +283,34 @@ module Payments
   end
 end
 
-store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
-store.migrate!
-engine ||= Durababble::Engine.new(store:)
-
-run = engine.run(BookTrip, input: { "trip_id" => "trip-1" })
-step_outcomes = store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] }
-{ "status" => run.status, "steps" => step_outcomes }
+booking = BookTrip.start({ "trip_id" => "trip-1" })
 ```
+
+<!-- DOCS:patterns-saga:hidden
+```ruby
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [BookTrip],
+  worker_id: "booking-worker",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+booking.status # => "failed" — the saga re-raised after compensating
+booking.error  # => "TicketPrinterUnavailable: ticket printer offline"
+```
+
+<!-- DOCS:patterns-saga:hidden
+```ruby
+{
+  "status" => booking.status,
+  "steps" => store.steps_for(booking.workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] },
+}
+```
+-->
 
 <!-- DOCS:patterns-saga:end -->
 
