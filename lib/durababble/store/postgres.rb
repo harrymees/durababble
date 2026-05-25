@@ -297,8 +297,10 @@ module Durababble
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
       token = SecureRandom.uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
+      claimed = inserted.affected_rows == 1
+      claimed ||= execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
 
-      if inserted.affected_rows == 1
+      if claimed
         begin
           result = block.call
           execute_store_query(:complete_fence, [workflow_id, key, token, dump_serialized(result)])
