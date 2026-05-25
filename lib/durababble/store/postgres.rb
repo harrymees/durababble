@@ -615,7 +615,14 @@ module Durababble
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
       # [DURABABBLE-OUTBOX-1] Only the sender that owns the processing lease can ack.
-      result = execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2", [outbox_id, worker_id])
+      result = execute_params(<<~SQL, [outbox_id, worker_id])
+        UPDATE #{table("outbox")}
+        SET status = 'processed', processed_at = now()
+        WHERE id = $1
+          AND status = 'processing'
+          AND locked_by = $2
+          AND locked_until >= now()
+      SQL
       Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
       result
     end

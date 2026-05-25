@@ -29,7 +29,7 @@ else
     curl --fail --location --show-error --silent "$ALLOY_URL" --output "$ALLOY_JAR"
   fi
 
-  if command -v java >/dev/null 2>&1; then
+  if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
     alloy=(java -jar "$ALLOY_JAR")
   elif command -v mise >/dev/null 2>&1; then
     alloy=(mise exec java@temurin-21 -- java -jar "$ALLOY_JAR")
@@ -42,4 +42,8 @@ fi
 for model in "${models[@]}"; do
   echo "Verifying $model"
   "${alloy[@]}" exec -f -s glucose -o "$ALLOY_OUTPUT_DIR" "$model"
+  if grep -q '"expects":-1' "$ALLOY_OUTPUT_DIR/receipt.json"; then
+    echo "All Alloy commands in $model must declare an expect result" >&2
+    exit 1
+  fi
 done

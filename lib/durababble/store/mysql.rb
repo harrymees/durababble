@@ -597,7 +597,14 @@ module Durababble
 
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
-      result = execute_params("UPDATE #{table("outbox")} SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?", [outbox_id, worker_id])
+      result = execute_params(<<~SQL, [outbox_id, worker_id])
+        UPDATE #{table("outbox")}
+        SET status = 'processed', processed_at = NOW(6)
+        WHERE id = ?
+          AND status = 'processing'
+          AND locked_by = ?
+          AND locked_until >= NOW(6)
+      SQL
       Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
       result
     end

@@ -184,6 +184,24 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       end
     end
 
+    test "does not acknowledge outbox messages after the sender lease expires with #{backend.name}" do
+      with_durababble_store(backend, "queue_correctness") do |store|
+        workflow_id = store.enqueue_workflow(name: "outbox-expired-owner", input: {})
+        outbox_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "ok" => true }, key: "outbox:ack-expired-owner")
+
+        assert_hash_includes store.claim_outbox(worker_id: "expired-owner", lease_seconds: -1), "id" => outbox_id
+        store.ack_outbox(outbox_id, worker_id: "expired-owner")
+        assert_hash_includes store.outbox_message(outbox_id), "status" => "processing", "locked_by" => "expired-owner"
+
+        assert_hash_includes store.claim_outbox(worker_id: "recovery-owner", lease_seconds: 60), "id" => outbox_id, "locked_by" => "recovery-owner"
+        store.ack_outbox(outbox_id, worker_id: "expired-owner")
+        assert_hash_includes store.outbox_message(outbox_id), "status" => "processing", "locked_by" => "recovery-owner"
+
+        store.ack_outbox(outbox_id, worker_id: "recovery-owner")
+        assert_hash_includes store.outbox_message(outbox_id), "status" => "processed", "locked_by" => "recovery-owner"
+      end
+    end
+
     test "does not requeue a terminal workflow when a stale timer is due with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         workflow_id = store.create_workflow(name: "stale-wait", input: {})
