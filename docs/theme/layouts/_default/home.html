@@ -1,0 +1,31 @@
+{{ define "main" }}
+  {{/* If the home page has its own _index.md, render a landing layout using its content */}}
+  {{ with .File }}
+    <section class="landing-hero">
+      {{- $content := $.Content -}}
+      {{- $content = $content | replaceRE `<img([^>]*)\ssrc="\.\./static/([^"]+)"([^>]*)>` `<img$1 src="/$2"$3>` -}}
+      <div class="lead">{{ $content | safeHTML }}</div>
+    </section>
+  {{ else }}
+    {{/* No _index.md at content root → show a simple list of top-level sections and pages */}}
+    <section>
+      {{- with .Content -}}
+        {{- $content := . -}}
+        {{- $content = $content | replaceRE `<img([^>]*)\ssrc="\.\./static/([^"]+)"([^>]*)>` `<img$1 src="/$2"$3>` -}}
+        <div class="lead">{{ $content | safeHTML }}</div>
+      {{- end -}}
+      <ul>
+        {{ $items := slice }}
+        {{ range .Site.Sections }}
+          {{ $items = $items | append . }}
+        {{ end }}
+        {{ range .RegularPages }}
+          {{ $items = $items | append . }}
+        {{ end }}
+        {{ range $items.ByWeight }}
+          <li><a href="{{ .RelPermalink }}">{{ .LinkTitle }}</a></li>
+        {{ end }}
+      </ul>
+    </section>
+  {{ end }}
+{{ end }}

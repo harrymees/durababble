@@ -2,7 +2,7 @@
 
 Durababble includes a local deterministic simulation harness inspired by `gadget-inc/silo`'s `tests/turmoil_runner` setup. Silo uses Rust `turmoil` plus `mad-turmoil` to virtualize networking, time, and randomness, then proves determinism by running each scenario twice with the same `DST_SEED` and comparing deterministic trace output byte-for-byte.
 
-Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc randomness/time and sockets for arbitrary Ruby code, so Durababble ships a small purpose-built harness in `lib/durababble/deterministic.rb`.
+Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc randomness/time and sockets for arbitrary Ruby code, so Durababble keeps a small purpose-built test harness in `test/support/deterministic.rb` rather than shipping it as production library code.
 
 ## What is virtualized
 
@@ -39,15 +39,15 @@ Current scenarios:
 - `completed_step_skip_after_crash` — a completed step is skipped after crash/recovery.
 - `incomplete_step_retry_after_crash` — a step that crashed after start is retried and stale attempts are closed.
 - `attempt_history_append_only` — repeated failures append attempts instead of overwriting history.
-- `concurrent_signal_once` — many signalers wake one wait exactly once.
+- `concurrent_timer_wake_once` — many callers race to wake one due timer exactly once.
 - `fenced_side_effect_once` — many callers share one fenced side-effect result.
-- `waits_fences_and_outbox` — event waits, idempotency fences, and outbox processing.
+- `waits_fences_and_outbox` — timer waits, idempotency fences, and outbox processing.
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
-- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late signal, and finishes as canceled.
+- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late timer wakeup, and finishes as canceled.
 - `grpc_service_contract` — the protobuf service methods are exercised under the virtual scheduler, including active-owner `DeliverMessage`, stale-owner `DeliverMessage` acknowledgement without work, workflow `CallTransient`, and object/transient `CallTransient`.
 - `grpc_workflow_rpc_response_matrix` — gRPC `CallTransient` response variants are covered together: `LeaseMoved`, `not_running`, and unavailable-node outcomes decode to typed routing failures instead of subprocess protocol errors.
 - `grpc_workflow_rpc_transport_fault_matrix` — workflow `CallTransient` is exposed to timeout, deadline-exceeded, RST, EOF, unavailable, lost-response, and duplicate-response faults.
@@ -68,7 +68,7 @@ The original prototype spec covered distributed workflow leases and lease-aware 
 Use this to search a scenario over many deterministic schedules:
 
 ```sh
-mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
+mise exec -- ruby -Ilib -Itest -e 'require "support/deterministic"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
 ```
 
 An empty array means no invariant violation was found for that seed range.

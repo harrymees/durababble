@@ -3,808 +3,10 @@
 
 require "digest"
 
+require_relative "harness"
+
 module Durababble
   module Deterministic
-    Result = Data.define(:scenario, :seed, :trace, :digest, :violations, :summary)
-
-    class << self
-      #: (untyped, seed: untyped) -> untyped
-      def prove(scenario, seed:)
-        Scenarios.fetch(scenario).call(seed)
-      end
-
-      #: (untyped, seeds: untyped) -> untyped
-      def search(scenario, seeds:)
-        seeds.filter_map do |seed|
-          result = prove(scenario, seed:)
-          [seed, result.violations] unless result.violations.empty?
-        end
-      end
-    end
-
-    class Rng
-      MASK = (1 << 64) - 1
-
-      #: (untyped) -> void
-      def initialize(seed)
-        @state = seed & MASK
-      end
-
-      #: () -> untyped
-      def next_u64
-        @state = (@state * 6_364_136_223_846_793_005 + 1_442_695_040_888_963_407) & MASK
-      end
-
-      #: (untyped) -> untyped
-      def int(max)
-        raise ArgumentError, "max must be positive" unless max.positive?
-
-        next_u64 % max
-      end
-
-      #: (untyped) -> untyped
-      def chance(percent)
-        int(100) < percent
-      end
-    end
-
-    class Trace
-      #: untyped
-      attr_reader :lines
-
-      #: () -> void
-      def initialize
-        @lines = []
-      end
-
-      #: (untyped, untyped, untyped, ?untyped) -> untyped
-      def event(time, actor, name, fields = {})
-        stable = fields.sort_by { |key, _| key.to_s }.map { |key, value| "#{key}=#{stable_value(value)}" }.join(" ")
-        @lines << format("t=%06d actor=%s event=%s%s", time, actor, name, stable.empty? ? "" : " #{stable}")
-      end
-
-      #: () -> untyped
-      def to_s
-        @lines.join("\n")
-      end
-
-      private
-
-      #: (untyped) -> untyped
-      def stable_value(value)
-        case value
-        when Hash
-          "{" + value.sort_by { |key, _| key.to_s }.map { |key, val| "#{key}:#{stable_value(val)}" }.join(",") + "}"
-        when Array
-          "[" + value.map { |val| stable_value(val) }.join(",") + "]"
-        else
-          value.inspect
-        end
-      end
-    end
-
-    class Scheduler
-      #: untyped
-      attr_reader :time, :rng, :trace
-
-      #: (seed: untyped, ?trace: untyped) -> void
-      def initialize(seed:, trace: Trace.new)
-        @rng = Rng.new(seed)
-        @trace = trace
-        @time = 0
-        @seq = 0
-        @events = []
-      end
-
-      #: (actor: untyped, delay: untyped, name: untyped) { (?) -> untyped } -> untyped
-      def schedule(actor:, delay:, name:, &block)
-        @seq += 1
-        event = [@time + delay, @seq, actor, name, block]
-        @events << event
-        @events.sort_by! { |time, seq, _actor, _name, _block| [time, seq] }
-        trace.event(@time, actor, "schedule", at: @time + delay, name:)
-      end
-
-      #: (untyped) -> untyped
-      def advance(duration)
-        @time += duration
-        trace.event(@time, "scheduler", "advance", by: duration)
-      end
-
-      #: (?max_events: untyped) -> untyped
-      def run(max_events: 10_000)
-        count = 0
-        until @events.empty?
-          raise "deterministic scheduler exceeded #{max_events} events" if count >= max_events
-
-          event_time, _seq, actor, name, block = @events.shift
-          @time = event_time
-          trace.event(@time, actor, "run", name:)
-          block.call
-          count += 1
-        end
-      end
-    end
-
-    class VirtualNetwork
-      #: (untyped) -> untyped
-      attr_accessor :duplicate_percent
-
-      #: (scheduler: untyped, ?min_latency: untyped, ?max_latency: untyped, ?drop_percent: untyped) -> void
-      def initialize(scheduler:, min_latency: 1, max_latency: 9, drop_percent: 0)
-        @scheduler = scheduler
-        @min_latency = min_latency
-        @max_latency = max_latency
-        @drop_percent = drop_percent
-        @duplicate_percent = 0
-        @partitions = {}
-      end
-
-      #: (untyped, untyped) -> untyped
-      def partition(source, target)
-        @partitions[[source, target]] = true
-        @scheduler.trace.event(@scheduler.time, "network", "partition", source:, target:)
-      end
-
-      #: (untyped, untyped) -> untyped
-      def heal(source, target)
-        @partitions.delete([source, target])
-        @scheduler.trace.event(@scheduler.time, "network", "heal", source:, target:)
-      end
-
-      #: (source: untyped, target: untyped, type: untyped, ?payload: untyped) { (?) -> untyped } -> untyped
-      def send(source:, target:, type:, payload: {}, &handler)
-        if @partitions[[source, target]] || @scheduler.rng.chance(@drop_percent)
-          @scheduler.trace.event(@scheduler.time, "network", "network.drop", source:, target:, type:)
-          return
-        end
-
-        delay = @min_latency + @scheduler.rng.int(@max_latency - @min_latency + 1)
-        @scheduler.trace.event(@scheduler.time, "network", "network.send", source:, target:, type:, delay:)
-        schedule_delivery(source:, target:, type:, payload:, delay:, duplicate: false, &handler)
-        return unless @scheduler.rng.chance(@duplicate_percent)
-
-        duplicate_delay = delay + 1 + @scheduler.rng.int(3)
-        @scheduler.trace.event(@scheduler.time, "network", "network.duplicate", source:, target:, type:, delay: duplicate_delay)
-        schedule_delivery(source:, target:, type:, payload:, delay: duplicate_delay, duplicate: true, &handler)
-      end
-
-      private
-
-      #: (source: untyped, target: untyped, type: untyped, payload: untyped, delay: untyped, duplicate: untyped) { (?) -> untyped } -> untyped
-      def schedule_delivery(source:, target:, type:, payload:, delay:, duplicate:, &handler)
-        @scheduler.schedule(actor: target, delay:, name: duplicate ? "deliver_duplicate:#{type}" : "deliver:#{type}") do
-          @scheduler.trace.event(@scheduler.time, "network", "deliver", source:, target:, type:)
-          handler.call(payload)
-        end
-      end
-    end
-
-    class FaultPlan
-      #: (scheduler: untyped) -> void
-      def initialize(scheduler:)
-        @scheduler = scheduler
-        @after = Hash.new { |hash, key| hash[key] = [] }
-        @counts = Hash.new(0)
-      end
-
-      #: (untyped, ?once: untyped, ?message: untyped) -> untyped
-      def fail_after(operation, once: 1, message: nil)
-        @after[operation.to_s] << { remaining: once, message: message || "injected fault after #{operation}" }
-      end
-
-      #: (untyped) -> untyped
-      def after(operation)
-        operation = operation.to_s
-        @counts[operation] += 1
-        fault = @after[operation].find { |candidate| candidate.fetch(:remaining).positive? }
-        return unless fault
-
-        fault[:remaining] -= 1
-        @scheduler.trace.event(@scheduler.time, "fault", "fault.injected", operation:, count: @counts.fetch(operation), message: fault.fetch(:message))
-        raise InjectedCrash, fault.fetch(:message)
-      end
-    end
-
-    class VirtualYugabyte
-      #: untyped
-      attr_reader :scheduler, :fault_plan
-
-      #: (scheduler: untyped, ?fault_plan: untyped) -> void
-      def initialize(scheduler:, fault_plan: nil)
-        @scheduler = scheduler
-        @fault_plan = fault_plan || FaultPlan.new(scheduler:)
-        @id_seq = 0
-        @workflows = {}
-        @cancellations = {}
-        @history = Hash.new { |hash, key| hash[key] = [] }
-        @steps = Hash.new { |hash, key| hash[key] = {} }
-        @attempts = Hash.new { |hash, key| hash[key] = [] }
-        @waits = {}
-        @fences = {}
-        @outbox = {}
-        @outbox_by_key = {}
-        @side_effects = 0
-        trace("init")
-      end
-
-      #: () -> untyped
-      def migrate! = self
-      #: () -> untyped
-      def close = nil
-      #: () -> untyped
-      def drop_schema! = nil
-      #: () -> untyped
-      def current_time = scheduler.time
-
-      #: (name: untyped, input: untyped) -> untyped
-      def enqueue_workflow(name:, input:)
-        id = next_id("wf")
-        @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
-        trace("enqueue_workflow", id:, name:)
-        id
-      end
-
-      #: (name: untyped, input: untyped) -> untyped
-      def create_workflow(name:, input:)
-        id = enqueue_workflow(name:, input:)
-        mark_workflow_running(id)
-        id
-      end
-
-      #: (worker_id: untyped, lease_seconds: untyped, ?workflow_names: untyped) -> untyped
-      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
-        workflow = @workflows.values.select { |row| runnable?(row) && (!workflow_names || workflow_names.include?(row.fetch("name"))) }.min_by { |row| row.fetch("id") }
-        return unless workflow
-
-        claim_row(workflow, worker_id, lease_seconds)
-      end
-
-      #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
-      def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
-        row = @workflows.fetch(workflow_id)
-        return deep(row) if row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
-        return unless row.fetch("status") == "pending" ||
-          retryable_failed?(row) ||
-          canceling_due?(row) ||
-          (row.fetch("status") == "running" && (row.fetch("locked_by") == worker_id || expired?(row)))
-
-        claim_row(row, worker_id, lease_seconds)
-      end
-
-      #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
-      def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-        row = @workflows.fetch(workflow_id)
-        if row.fetch("locked_by") == worker_id && row.fetch("status") == "running" && !expired?(row)
-          row["locked_until"] = scheduler.time + lease_seconds
-          trace("heartbeat", id: workflow_id, worker: worker_id)
-        end
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
-      def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        row = @workflows.fetch(workflow_id)
-        return unless row.fetch("locked_by") == worker_id && row.fetch("status") == "running" && !expired?(row)
-
-        row["locked_until"] = scheduler.time + lease_seconds
-        step = @steps[workflow_id][command_id]
-        return unless step&.fetch("status") == "running"
-
-        step["heartbeat_cursor"] = deep(cursor)
-        latest_attempt = @attempts[workflow_id].reverse.find { |attempt| attempt.fetch("position") == command_id && attempt.fetch("status") == "running" }
-        latest_attempt["heartbeat_cursor"] = deep(cursor) if latest_attempt
-        trace("step_heartbeat", id: workflow_id, command_id:, worker: worker_id, cursor:)
-        row.fetch("locked_until")
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
-      def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        deep(@steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil))
-      end
-
-      #: (untyped) -> untyped
-      def current_workflow_lease(workflow_id)
-        row = @workflows.fetch(workflow_id)
-        return unless row.fetch("status") == "running" && row.fetch("locked_by") && !expired?(row)
-
-        { "workflow_id" => workflow_id, "worker_id" => row.fetch("locked_by"), "locked_until" => row.fetch("locked_until") }
-      end
-
-      #: (?now: untyped) -> untyped
-      def steal_expired_leases!(now: nil)
-        now ||= scheduler.time
-        count = 0
-        @workflows.each_value do |row|
-          next unless row.fetch("status") == "running" && row.fetch("locked_until") && row.fetch("locked_until") < now
-
-          row["status"] = @cancellations.key?(row.fetch("id")) ? "canceling" : "pending"
-          row["locked_by"] = nil
-          row["locked_until"] = nil
-          count += 1
-          trace("steal_expired", id: row.fetch("id"))
-        end
-        count
-      end
-
-      #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped) -> untyped
-      def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
-        row = @workflows.fetch(workflow_id)
-        row["status"] = "running"
-        row["error"] = nil
-        if worker_id
-          row["locked_by"] = worker_id
-          row["locked_until"] = scheduler.time + lease_seconds
-          row["next_run_at"] = nil
-        end
-        deep(row)
-      end
-
-      #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
-      def suspend_workflow(workflow_id:, worker_id: nil)
-        row = @workflows.fetch(workflow_id)
-        return true if row.fetch("status") == "waiting"
-        return true if row.fetch("status") == "pending"
-        return false unless row.fetch("status") == "running"
-        return false if worker_id && row.fetch("locked_by") != worker_id
-
-        row["status"] = @waits.values.any? { |wait| wait.fetch("workflow_id") == workflow_id && wait.fetch("status") == "pending" } ? "waiting" : "pending"
-        row["locked_by"] = nil
-        row["locked_until"] = nil
-        trace("workflow_suspended", id: workflow_id)
-        true
-      end
-
-      #: (untyped, result: untyped) -> untyped
-      def complete_workflow(workflow_id, result:)
-        row = @workflows.fetch(workflow_id)
-        row["status"] = "completed"
-        row["result"] = deep(result)
-        row["error"] = nil
-        row["locked_by"] = nil
-        row["locked_until"] = nil
-        row["next_run_at"] = nil
-        trace("complete_workflow", id: workflow_id, result:)
-      end
-
-      #: (untyped, reason: untyped, ?result: untyped) -> untyped
-      def cancel_workflow(workflow_id, reason:, result: nil)
-        row = @workflows.fetch(workflow_id)
-        row["status"] = "canceled"
-        row["result"] = deep(result)
-        row["error"] = reason
-        row["locked_by"] = nil
-        row["locked_until"] = nil
-        row["next_run_at"] = nil
-        trace("cancel_workflow", id: workflow_id, reason:, result:)
-      end
-
-      #: (untyped, error: untyped) -> untyped
-      def fail_workflow(workflow_id, error:)
-        row = @workflows.fetch(workflow_id)
-        row["status"] = "failed"
-        row["error"] = error
-        row["locked_by"] = nil
-        row["locked_until"] = nil
-        row["next_run_at"] = nil
-        trace("fail_workflow", id: workflow_id, error:)
-      end
-
-      #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
-      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
-        payload = { "name" => name, "args" => deep(args), "kwargs" => deep(kwargs) }.merge(deep(metadata))
-        append_history(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
-        @steps[workflow_id][command_id] ||= { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "scheduled", "result" => nil, "error" => nil, "heartbeat_cursor" => nil }
-        trace("step_scheduled", id: workflow_id, command_id:, name:, payload:)
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
-      def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        @attempts[workflow_id].each do |attempt|
-          next unless attempt.fetch("position") == command_id && attempt.fetch("status") == "running"
-
-          attempt["status"] = "failed"
-          attempt["error"] = "superseded by retry"
-        end
-        previous_cursor = @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil)
-        @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
-        attempt_id = next_id("attempt")
-        @attempts[workflow_id] << { "id" => attempt_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "running", "result" => nil, "error" => nil, "heartbeat_cursor" => deep(previous_cursor) }
-        append_history(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
-        trace("step_started", id: workflow_id, command_id:, name:)
-        attempt_id
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
-      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        step = @steps[workflow_id].fetch(command_id)
-        step["status"] = "completed"
-        step["result"] = deep(result)
-        update_latest_attempt(workflow_id, command_id, "completed", result, nil)
-        append_history(workflow_id:, kind: "step_completed", command_id:, payload: result)
-        trace("step_completed", id: workflow_id, command_id:, result:)
-        fault_plan.after(:record_step_completed)
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        step = @steps[workflow_id].fetch(command_id)
-        step["status"] = "failed"
-        step["error"] = error
-        update_latest_attempt(workflow_id, command_id, "failed", nil, error)
-        append_history(workflow_id:, kind: "step_failed", command_id:, error:)
-        trace("step_failed", id: workflow_id, command_id:, error:)
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
-        command_id = normalize_command_id(command_id, position)
-        step = @steps[workflow_id].fetch(command_id)
-        step["status"] = "canceled"
-        step["error"] = error
-        update_latest_attempt(workflow_id, command_id, "canceled", nil, error)
-        append_history(workflow_id:, kind: "step_canceled", command_id:, error:)
-        trace("step_canceled", id: workflow_id, command_id:, error:)
-      end
-
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
-      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
-        command_id = normalize_command_id(command_id, position)
-        @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil) }
-        wait_id = next_id("wait")
-        @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
-        update_latest_attempt(workflow_id, command_id, "waiting", wait_request.context, nil)
-        append_history(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
-        trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
-        fault_plan.after(:record_wait)
-        wait_id
-      end
-
-      #: (?now: untyped) -> untyped
-      def wake_due_timers(now: nil)
-        now ||= scheduler.time
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "timer" && wait.fetch("wake_at") <= now }, {})
-      end
-
-      #: (untyped, ?payload: untyped) -> untyped
-      def signal_event(event_key, payload: {})
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "event" && wait.fetch("event_key") == event_key }, payload)
-      end
-
-      #: (untyped) -> untyped
-      def waits_for(workflow_id)
-        @waits.values.select { |wait| wait.fetch("workflow_id") == workflow_id }.sort_by { |wait| wait.fetch("id") }.map { |row| deep(row) }
-      end
-
-      #: (untyped) -> untyped
-      def workflow_history_for(workflow_id)
-        @history[workflow_id].map { |row| deep(row) }
-      end
-
-      #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
-      def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
-        fence_key = [workflow_id, key]
-        existing = @fences[fence_key]
-        return deep(existing.fetch("result")) if existing&.fetch("status") == "completed"
-        raise Error, existing.fetch("error") if existing&.fetch("status") == "failed"
-        raise FenceTimeout, "virtual fence already running: #{key}" if existing
-
-        @side_effects += 1
-        @fences[fence_key] = { "workflow_id" => workflow_id, "key" => key, "status" => "running", "result" => nil, "error" => nil }
-        trace("fence_acquired", id: workflow_id, key:)
-        result = block.call
-        @fences[fence_key]["status"] = "completed"
-        @fences[fence_key]["result"] = deep(result)
-        trace("fence_completed", id: workflow_id, key:, result:)
-        deep(result)
-      rescue StandardError => e
-        @fences[fence_key]["status"] = "failed" if @fences[fence_key]
-        @fences[fence_key]["error"] = "#{e.class}: #{e.message}" if @fences[fence_key]
-        raise
-      end
-
-      #: (workflow_id: untyped, topic: untyped, payload: untyped, key: untyped) -> untyped
-      def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-        return @outbox_by_key.fetch(key) if @outbox_by_key.key?(key)
-
-        id = next_id("outbox")
-        @outbox[id] = { "id" => id, "workflow_id" => workflow_id, "topic" => topic, "payload" => deep(payload), "key" => key, "status" => "pending", "locked_by" => nil, "locked_until" => nil }
-        @outbox_by_key[key] = id
-        trace("outbox_enqueued", id:, key:, topic:)
-        fault_plan.after(:enqueue_outbox)
-        id
-      end
-
-      #: (worker_id: untyped, lease_seconds: untyped) -> untyped
-      def claim_outbox(worker_id:, lease_seconds:)
-        row = @outbox.values.select { |message| message.fetch("status") == "pending" || (message.fetch("status") == "processing" && message.fetch("locked_until") < scheduler.time) }.min_by { |message| message.fetch("id") }
-        return unless row
-
-        row["status"] = "processing"
-        row["locked_by"] = worker_id
-        row["locked_until"] = scheduler.time + lease_seconds
-        trace("outbox_claimed", id: row.fetch("id"), worker: worker_id)
-        deep(row)
-      end
-
-      #: (untyped, worker_id: untyped) -> untyped
-      def ack_outbox(outbox_id, worker_id:)
-        row = @outbox.fetch(outbox_id)
-        return unless row.fetch("locked_by") == worker_id
-
-        row["status"] = "processed"
-        trace("outbox_processed", id: outbox_id, worker: worker_id)
-      end
-
-      #: (untyped) -> untyped
-      def outbox_message(outbox_id) = deep(@outbox.fetch(outbox_id))
-      #: (untyped) -> untyped
-      def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
-
-      #: (workflow_id: untyped, worker_id: untyped) -> untyped
-      def workflow_owned?(workflow_id:, worker_id:)
-        row = @workflows.fetch(workflow_id)
-        row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
-      end
-
-      #: (workflow_id: untyped, worker_id: untyped, run_at: untyped) -> untyped
-      def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
-        row = @workflows.fetch(workflow_id)
-        return unless row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
-
-        row["status"] = @cancellations.key?(workflow_id) ? "canceling" : "pending"
-        row["locked_by"] = nil
-        row["locked_until"] = nil
-        row["next_run_at"] = run_at
-        trace("workflow_retry_scheduled", id: workflow_id, run_at:)
-      end
-
-      #: (workflow_id: untyped, reason: untyped) -> untyped
-      def request_workflow_cancellation(workflow_id:, reason:)
-        row = @workflows.fetch(workflow_id)
-        return deep(row) if terminal_for_cancellation?(row)
-
-        first_request = !@cancellations.key?(workflow_id)
-        @cancellations[workflow_id] ||= { "workflow_id" => workflow_id, "reason" => reason, "requested_at" => scheduler.time, "delivered_at" => nil }
-        cancel_pending_waits_for_workflow(workflow_id) if first_request
-        if first_request && row.fetch("status") != "running"
-          row["status"] = "canceling"
-          row["locked_by"] = nil
-          row["locked_until"] = nil
-          row["next_run_at"] = nil
-        end
-        trace("workflow_cancel_requested", id: workflow_id, reason: @cancellations.fetch(workflow_id).fetch("reason"), status: row.fetch("status"))
-        deep(row)
-      end
-
-      #: (untyped) -> untyped
-      def workflow_cancellation(workflow_id)
-        deep(@cancellations[workflow_id])
-      end
-
-      #: (workflow_id: untyped) -> untyped
-      def mark_workflow_cancellation_delivered(workflow_id:)
-        cancellation = @cancellations[workflow_id]
-        return unless cancellation
-
-        cancellation["delivered_at"] ||= scheduler.time
-        trace("workflow_cancel_delivered", id: workflow_id)
-      end
-
-      #: (untyped, ?now: untyped) -> untyped
-      def make_workflow_due!(workflow_id, now: scheduler.time)
-        row = @workflows.fetch(workflow_id)
-        row["next_run_at"] = nil
-        trace("workflow_retry_due", id: workflow_id, now:)
-      end
-
-      #: (untyped) -> untyped
-      def steps_for(workflow_id) = @steps[workflow_id].values.sort_by { |row| row.fetch("position") }.map { |row| deep(row) }
-      #: (untyped) -> untyped
-      def step_attempts_for(workflow_id) = @attempts[workflow_id].map { |row| deep(row) }
-
-      #: () -> untyped
-      def summary
-        {
-          completed_workflows: @workflows.values.count { |row| row.fetch("status") == "completed" },
-          canceled_workflows: @workflows.values.count { |row| row.fetch("status") == "canceled" },
-          side_effects: @side_effects,
-          processed_outbox: @outbox.values.count { |row| row.fetch("status") == "processed" },
-          workflows: @workflows.length,
-        }
-      end
-
-      private
-
-      #: (untyped) -> untyped
-      def runnable?(row)
-        case row.fetch("status")
-        when "pending"
-          row.fetch("next_run_at", nil).nil? || row.fetch("next_run_at") <= scheduler.time
-        when "failed"
-          retryable_failed?(row)
-        when "canceling"
-          canceling_due?(row)
-        when "running"
-          expired?(row)
-        else
-          false
-        end
-      end
-
-      #: (untyped) -> untyped
-      def retryable_failed?(row)
-        next_run_at = row.fetch("next_run_at", nil)
-        row.fetch("status") == "failed" && !next_run_at.nil? && next_run_at <= scheduler.time
-      end
-
-      #: (untyped) -> untyped
-      def canceling_due?(row)
-        next_run_at = row.fetch("next_run_at", nil)
-        row.fetch("status") == "canceling" && (next_run_at.nil? || next_run_at <= scheduler.time)
-      end
-
-      #: (untyped) -> untyped
-      def expired?(row)
-        row.fetch("locked_until") && row.fetch("locked_until") < scheduler.time
-      end
-
-      #: (untyped, untyped, untyped) -> untyped
-      def claim_row(row, worker_id, lease_seconds)
-        row["status"] = "running"
-        row["locked_by"] = worker_id
-        row["locked_until"] = scheduler.time + lease_seconds
-        row["next_run_at"] = nil
-        trace("workflow_claimed", id: row.fetch("id"), worker: worker_id)
-        deep(row)
-      end
-
-      #: (untyped, untyped) -> untyped
-      def complete_waits(waits, payload)
-        completed = 0
-        waits.each do |wait|
-          row = @workflows.fetch(wait.fetch("workflow_id"))
-          next unless ["waiting", "running"].include?(row.fetch("status"))
-
-          wait["status"] = "completed"
-          wait["payload"] = deep(payload)
-          context = wait.fetch("context").merge(payload)
-          record_step_completed(workflow_id: wait.fetch("workflow_id"), position: wait.fetch("position"), result: context)
-          if row.fetch("status") == "waiting"
-            row["status"] = "pending"
-            row["locked_by"] = nil
-            row["locked_until"] = nil
-          end
-          completed += 1
-          trace("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
-        end
-        completed
-      end
-
-      #: (untyped) -> untyped
-      def terminal_for_cancellation?(row)
-        return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-        row.fetch("status") == "failed" && row["next_run_at"].nil?
-      end
-
-      #: (untyped) -> untyped
-      def cancel_pending_waits_for_workflow(workflow_id)
-        @waits.each_value do |wait|
-          next unless wait.fetch("workflow_id") == workflow_id && wait.fetch("status") == "pending"
-
-          wait["status"] = "canceled"
-          trace("wait_canceled", id: workflow_id, wait_id: wait.fetch("id"))
-        end
-        @steps[workflow_id].each_value do |step|
-          next unless step.fetch("status") == "waiting"
-
-          step["status"] = "canceled"
-          step["error"] = "workflow cancellation requested"
-        end
-        @attempts[workflow_id].each do |attempt|
-          next unless attempt.fetch("status") == "waiting"
-
-          attempt["status"] = "canceled"
-          attempt["error"] = "workflow cancellation requested"
-        end
-      end
-
-      #: (untyped, untyped, untyped, untyped, untyped) -> untyped
-      def update_latest_attempt(workflow_id, position, status, result, error)
-        attempt = @attempts[workflow_id].reverse.find { |row| row.fetch("position") == position && ["running", "waiting"].include?(row.fetch("status")) }
-        return unless attempt
-
-        attempt["status"] = status
-        attempt["result"] = deep(result)
-        attempt["error"] = error
-      end
-
-      #: (workflow_id: untyped, kind: untyped, ?command_id: untyped, ?name: untyped, ?attempt_id: untyped, ?payload: untyped, ?error: untyped) -> untyped
-      def append_history(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-        event = {
-          "workflow_id" => workflow_id,
-          "event_index" => @history[workflow_id].length,
-          "kind" => kind,
-          "command_id" => command_id,
-          "name" => name,
-          "attempt_id" => attempt_id,
-          "payload" => deep(payload),
-          "error" => error,
-        }
-        @history[workflow_id] << event
-        event.fetch("event_index")
-      end
-
-      #: (untyped, untyped) -> untyped
-      def normalize_command_id(command_id, position)
-        id = command_id.nil? ? position : command_id
-        raise ArgumentError, "command_id is required" if id.nil?
-
-        id
-      end
-
-      #: (untyped) -> untyped
-      def next_id(prefix)
-        @id_seq += 1
-        format("%s-%04d", prefix, @id_seq)
-      end
-
-      #: (untyped) -> untyped
-      def deep(value)
-        Marshal.load(Marshal.dump(value))
-      end
-
-      #: (untyped, ?untyped) -> untyped
-      def trace(name, fields = {})
-        scheduler.trace.event(scheduler.time, "virtual_yugabyte", name, fields)
-      end
-    end
-
-    class SimWorker
-      #: (id: untyped, scheduler: untyped, network: untyped, store: untyped, workflows: untyped, ?tick_interval: untyped, ?crash_percent: untyped) -> void
-      def initialize(id:, scheduler:, network:, store:, workflows:, tick_interval: 20, crash_percent: 0)
-        @id = id
-        @scheduler = scheduler
-        @network = network
-        @store = store
-        @workflows = workflows
-        @tick_interval = tick_interval
-        @crash_percent = crash_percent
-      end
-
-      #: (?ticks: untyped) -> untyped
-      def start(ticks: 20)
-        ticks.times do |tick|
-          @scheduler.schedule(actor: @id, delay: 5 + tick * @tick_interval + @scheduler.rng.int(7), name: "worker_tick") { run_tick }
-        end
-      end
-
-      #: () -> untyped
-      def run_tick
-        @network.send(source: @id, target: "db", type: "worker_tick") do
-          if @scheduler.rng.chance(@crash_percent)
-            @store.steal_expired_leases!(now: @scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
-            @scheduler.trace.event(@scheduler.time, @id, "crash_before_tick")
-            next
-          end
-
-          claimed = @store.claim_runnable_workflow(worker_id: @id, lease_seconds: Engine::DEFAULT_LEASE_SECONDS)
-          next unless claimed
-
-          workflow = @workflows.fetch(claimed.fetch("name"))
-          Engine.new(store: @store, worker_id: @id).resume(workflow, workflow_id: claimed.fetch("id"))
-        rescue LeaseConflict => e
-          @scheduler.trace.event(@scheduler.time, @id, "lease_conflict", error: e.message)
-        end
-      end
-    end
-
     module Scenarios
       extend self
       include Kernel
@@ -835,7 +37,7 @@ module Durababble
         run(seed, "waits_fences_and_outbox") do |h|
           h.workflows["counter"] = counter_workflow
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 60, ctx.merge("approved" => true)) }
             test_step("finish") { |ctx| ctx.merge("finished" => true) }
           end
 
@@ -843,7 +45,7 @@ module Durababble
           3.times { |i| ids << h.store.enqueue_workflow(name: "counter", input: { "count" => i }) }
           h.store.enqueue_workflow(name: "waiting", input: { "id" => "req" })
           h.add_workers(["worker-a", "worker-b"], ticks: 15)
-          h.scheduler.schedule(actor: "client-signal", delay: 120, name: "signal") { h.store.signal_event("approval:req", payload: { "approved" => true }) }
+          h.scheduler.schedule(actor: "client-timer", delay: 120, name: "wake_due_timers") { h.store.wake_due_timers }
           h.scheduler.schedule(actor: "client-fence", delay: 40, name: "fence") do
             h.store.with_fence(workflow_id: ids.first, key: "charge") { { "charge" => "ok" } }
             h.store.with_fence(workflow_id: ids.first, key: "charge") { { "charge" => "duplicate" } }
@@ -1848,24 +1050,24 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def stale_wait_signal_terminal_workflow(seed)
-        run(seed, "stale_wait_signal_terminal_workflow") do |h|
+      def stale_wait_timer_terminal_workflow(seed)
+        run(seed, "stale_wait_timer_terminal_workflow") do |h|
           id = h.store.create_workflow(name: "waiting", input: { "seed" => seed })
           h.store.record_step_started(workflow_id: id, position: 0, name: "wait")
           h.store.record_wait(
             workflow_id: id,
             position: 0,
             name: "wait",
-            wait_request: Durababble.wait_event("stale:#{seed}", { "seed" => seed }),
+            wait_request: Durababble.wait_until(h.store.current_time + 10, { "seed" => seed }),
           )
-          h.store.signal_event("stale:#{seed}", payload: { "early" => true })
+          h.store.wake_due_timers(now: h.store.current_time + 11)
           h.store.complete_workflow(id, result: { "done" => true })
-          h.scheduler.schedule(actor: "signaler", delay: h.scheduler.rng.int(5), name: "stale_signal") do
-            signaled = h.store.signal_event("stale:#{seed}", payload: { "late" => true })
-            event = signaled.zero? ? "stale_wait_ignored" : "stale_wait_completed"
-            h.scheduler.trace.event(h.scheduler.time, "signaler", event, workflow_id: id, signaled:)
+          h.scheduler.schedule(actor: "timer", delay: h.scheduler.rng.int(5), name: "stale_timer") do
+            woken = h.store.wake_due_timers(now: h.store.current_time + 11)
+            event = woken.zero? ? "stale_wait_ignored" : "stale_wait_completed"
+            h.scheduler.trace.event(h.scheduler.time, "timer", event, workflow_id: id, woken:)
           end
-          h.check("stale wait signal was ignored") { h.scheduler.trace.to_s.include?("stale_wait_ignored") }
+          h.check("stale wait timer was ignored") { h.scheduler.trace.to_s.include?("stale_wait_ignored") }
           h.check("terminal workflow remained completed") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end
@@ -1943,16 +1145,16 @@ module Durababble
 
             define_method(:execute) do |input|
               instance = self #: as untyped
-              instance.wait_for_signal(input)
+              instance.wait_for_timer(input)
               { "done" => true }
             rescue Durababble::CancellationError => e
               instance.cleanup(input.merge("reason" => e.reason))
             end
 
-            define_method(:wait_for_signal) do |input|
-              Durababble.wait_event("cancelable:#{input.fetch("id")}", input)
+            define_method(:wait_for_timer) do |input|
+              Durababble.wait_until(h.store.current_time + 60, input)
             end
-            step :wait_for_signal
+            step :wait_for_timer
 
             define_method(:cleanup) do |input|
               instance = self #: as untyped
@@ -1984,9 +1186,9 @@ module Durababble
           h.scheduler.schedule(actor: "worker-b", delay: 10, name: "cleanup") do
             Durababble::Engine.new(store: h.store, worker_id: "worker-b", lease_seconds: 20).resume(workflow, workflow_id: id)
           end
-          h.scheduler.schedule(actor: "client-signal", delay: 30, name: "late_signal") do
-            signaled = h.store.signal_event("cancelable:#{seed}", payload: { "late" => true })
-            h.scheduler.trace.event(h.scheduler.time, "client-signal", "late_signal", signaled:)
+          h.scheduler.schedule(actor: "client-timer", delay: 70, name: "late_timer") do
+            woken = h.store.wake_due_timers
+            h.scheduler.trace.event(h.scheduler.time, "client-timer", "late_timer", woken:)
           end
           h.check("workflow canceled after cleanup") { h.store.workflow(id).fetch("status") == "canceled" }
           h.check("cleanup ran once") { cleanup_runs == 1 }
@@ -1998,7 +1200,7 @@ module Durababble
             end
           end
           h.check("cleanup heartbeat persisted") { h.store.steps_for(id).any? { |step| step.fetch("name") == "cleanup" && step.fetch("heartbeat_cursor") == { "phase" => "cleanup", "run" => 1 } } }
-          h.check("late signal ignored") { h.scheduler.trace.to_s.include?("late_signal signaled=0") }
+          h.check("late timer ignored") { h.scheduler.trace.to_s.include?("late_timer woken=0") }
           h.check("waiting attempt canceled") { h.store.step_attempts_for(id).any? { |attempt| attempt.fetch("status") == "canceled" } }
         end
       end
@@ -2043,7 +1245,7 @@ module Durababble
       def store_fault_after_wait_recorded(seed)
         run(seed, "store_fault_after_wait_recorded") do |h|
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("fault-wait:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 20, ctx.merge("ok" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           h.store.fault_plan.fail_after(:record_wait, message: "lost connection after durable wait write")
@@ -2061,8 +1263,8 @@ module Durababble
           rescue InjectedCrash
             h.scheduler.trace.event(h.scheduler.time, "faulty-worker", "store_fault_observed", workflow_id: id)
           end
-          h.scheduler.schedule(actor: "signal", delay: 20, name: "signal") do
-            h.store.signal_event("fault-wait:#{seed}", payload: { "ok" => true })
+          h.scheduler.schedule(actor: "timer", delay: 20, name: "wake_due_timers") do
+            h.store.wake_due_timers(now: h.store.current_time + 100)
           end
           h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") do
             Durababble::Engine.new(store: h.store, worker_id: "recover").resume(
@@ -2116,11 +1318,11 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def duplicate_delivery_signal_and_outbox(seed)
-        run(seed, "duplicate_delivery_signal_and_outbox") do |h|
+      def duplicate_delivery_timer_and_outbox(seed)
+        run(seed, "duplicate_delivery_timer_and_outbox") do |h|
           h.network.duplicate_percent = 100
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("dup:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 10, ctx.merge("ok" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           workflow_id = h.store.enqueue_workflow(name: "waiting", input: { "id" => seed.to_s })
@@ -2130,8 +1332,8 @@ module Durababble
               workflow_id:,
             )
           end
-          h.network.send(source: "client-signal", target: "db", type: "signal", payload: {}) do
-            h.store.signal_event("dup:#{seed}", payload: { "ok" => true })
+          h.network.send(source: "client-timer", target: "db", type: "timer", payload: {}) do
+            h.store.wake_due_timers(now: h.store.current_time + 100)
           end
           h.network.send(source: "producer", target: "db", type: "outbox", payload: {}) do
             h.store.enqueue_outbox(
@@ -2152,13 +1354,13 @@ module Durababble
             )
           end
           h.check("duplicate network delivery occurred") { h.scheduler.trace.to_s.include?("network.duplicate") }
-          h.check("wait completed once despite duplicate signal") do
+          h.check("wait completed once despite duplicate timer delivery") do
             h.scheduler.trace.to_s.scan("wait_completed").length == 1
           end
           h.check("outbox message was idempotent despite duplicate producer delivery") do
             h.store.summary.fetch(:processed_outbox) == 1
           end
-          h.check("workflow completed after duplicate signal") do
+          h.check("workflow completed after duplicate timer delivery") do
             h.store.workflow(workflow_id).fetch("status") == "completed"
           end
         end
@@ -2217,20 +1419,20 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def concurrent_signal_once(seed)
-        run(seed, "concurrent_signal_once") do |h|
+      def concurrent_timer_wake_once(seed)
+        run(seed, "concurrent_timer_wake_once") do |h|
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 20, ctx.merge("woken" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "sig" })
           h.scheduler.schedule(actor: "worker", delay: 1, name: "park") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
           5.times do |i|
-            h.scheduler.schedule(actor: "signaler-#{i}", delay: 20 + h.scheduler.rng.int(5), name: "signal") { h.store.signal_event("event:sig", payload: { "signaler" => i }) }
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 20 + h.scheduler.rng.int(5), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
           end
           h.scheduler.schedule(actor: "worker", delay: 40, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
           h.check("wait completed once") { h.scheduler.trace.to_s.scan("wait_completed").length == 1 }
-          h.check("workflow completed after signal") { h.store.workflow(id).fetch("status") == "completed" }
+          h.check("workflow completed after timer wake") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end
 
@@ -2254,7 +1456,7 @@ module Durababble
         run(seed, "chaos") do |h|
           h.workflows["counter"] = counter_workflow
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 80, ctx.merge("woken" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
 
@@ -2262,7 +1464,7 @@ module Durababble
             name = h.scheduler.rng.chance(25) ? "waiting" : "counter"
             input = name == "waiting" ? { "id" => "w#{i}" } : { "count" => i }
             h.network.send(source: "client-#{i}", target: "db", type: "enqueue") { h.store.enqueue_workflow(name:, input:) }
-            h.scheduler.schedule(actor: "signal-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "signal") { h.store.signal_event("event:w#{i}", payload: { "signaled" => true }) }
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
           end
           h.add_workers(["worker-a", "worker-b", "worker-c", "worker-d"], ticks: 30, crash_percent: 15)
           8.times do |i|
@@ -2322,185 +1524,6 @@ module Durababble
         trace.event(scheduler.time, "dst", "end", scenario:, seed:)
         trace_s = trace.to_s
         Result.new(scenario:, seed:, trace: trace_s, digest: Digest::SHA256.hexdigest(trace_s), violations: harness.violations, summary: store.summary)
-      end
-    end
-
-    class Harness
-      #: untyped
-      attr_reader :scenario, :seed, :scheduler, :network, :store, :workflows, :violations
-
-      #: (scenario: untyped, seed: untyped, scheduler: untyped, network: untyped, store: untyped) -> void
-      def initialize(scenario:, seed:, scheduler:, network:, store:)
-        @scenario = scenario
-        @seed = seed
-        @scheduler = scheduler
-        @network = network
-        @store = store
-        @workflows = {}
-        @violations = []
-        @checks = []
-      end
-
-      #: (untyped, ticks: untyped, ?crash_percent: untyped) -> untyped
-      def add_workers(ids, ticks:, crash_percent: 0)
-        ids.each do |id|
-          SimWorker.new(id:, scheduler:, network:, store:, workflows:, crash_percent:).start(ticks:)
-        end
-      end
-
-      #: (untyped) { (?) -> untyped } -> untyped
-      def check(description, &block)
-        @checks << [description, block]
-      end
-
-      #: () -> untyped
-      def verify!
-        @checks.each do |description, block|
-          violations << "check failed: #{description}" unless block.call
-        rescue StandardError => e
-          violations << "check errored: #{description}: #{e.class}: #{e.message}"
-        end
-
-        verify_store_invariants!
-      end
-
-      private
-
-      #: () -> untyped
-      def verify_store_invariants!
-        workflows_state = store.instance_variable_get(:@workflows)
-        steps_state = store.instance_variable_get(:@steps)
-        attempts_state = store.instance_variable_get(:@attempts)
-        waits_state = store.instance_variable_get(:@waits)
-        outbox_state = store.instance_variable_get(:@outbox)
-
-        verify_workflow_invariants!(workflows_state)
-        verify_step_invariants!(workflows_state, steps_state, attempts_state)
-        verify_wait_invariants!(workflows_state, steps_state, waits_state)
-        verify_outbox_invariants!(workflows_state, outbox_state)
-      end
-
-      WORKFLOW_STATUSES = ["pending", "running", "waiting", "canceling", "canceled", "failed", "completed"].freeze
-      STEP_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
-      ATTEMPT_STATUSES = ["running", "waiting", "canceled", "failed", "completed"].freeze
-      WAIT_STATUSES = ["pending", "canceled", "completed"].freeze
-      OUTBOX_STATUSES = ["pending", "processing", "processed"].freeze
-      LIVE_ATTEMPT_STATUSES = ["running", "waiting"].freeze
-      TERMINAL_WORKFLOW_STATUSES = ["completed", "canceled", "failed"].freeze
-
-      #: (untyped) -> untyped
-      def verify_workflow_invariants!(workflows_state)
-        workflows_state.each do |id, row|
-          status = row.fetch("status")
-          violations << "workflow #{id} has unknown status #{status.inspect}" unless WORKFLOW_STATUSES.include?(status)
-          if row.fetch("locked_by").nil? != row.fetch("locked_until").nil?
-            violations << "workflow #{id} has partial lease"
-          end
-          if status == "running"
-            violations << "running workflow #{id} has no lease" unless row.fetch("locked_by") && row.fetch("locked_until")
-          elsif row.fetch("locked_by") || row.fetch("locked_until")
-            violations << "#{status} workflow #{id} still locked"
-          end
-        end
-      end
-
-      #: (untyped, untyped, untyped) -> untyped
-      def verify_step_invariants!(workflows_state, steps_state, attempts_state)
-        steps_state.each do |workflow_id, steps|
-          violations << "steps exist for missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
-          completed_positions = steps.values.select { |step| step.fetch("status") == "completed" }.map { |step| step.fetch("position") }
-          if completed_positions.uniq.length != completed_positions.length
-            violations << "duplicate completed step positions for #{workflow_id}"
-          end
-          steps.each do |position, step|
-            status = step.fetch("status")
-            violations << "step #{workflow_id}/#{position} has unknown status #{status.inspect}" unless STEP_STATUSES.include?(status)
-            if step.fetch("workflow_id") != workflow_id || step.fetch("position") != position
-              violations << "step #{workflow_id}/#{position} has inconsistent identity"
-            end
-
-            attempts = attempts_state[workflow_id].select { |attempt| attempt.fetch("position") == position }
-            if attempts.empty?
-              violations << "step #{workflow_id}/#{position} has no attempt history"
-            end
-            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && LIVE_ATTEMPT_STATUSES.include?(status)
-              violations << "#{workflows_state.fetch(workflow_id).fetch("status")} workflow #{workflow_id} has live step #{position}"
-            end
-
-            next if attempts.empty?
-
-            latest = attempts.last
-            if latest.fetch("name") != step.fetch("name")
-              violations << "step #{workflow_id}/#{position} name #{step.fetch("name").inspect} does not match latest attempt #{latest.fetch("name").inspect}"
-            end
-            if latest.fetch("status") != status
-              violations << "step #{workflow_id}/#{position} status #{status.inspect} does not match latest attempt #{latest.fetch("status").inspect}"
-            end
-          end
-        end
-
-        attempts_state.each do |workflow_id, attempts|
-          violations << "attempts exist for missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
-          live_attempts = Hash.new { |hash, key| hash[key] = [] }
-          attempts.each do |attempt|
-            position = attempt.fetch("position")
-            status = attempt.fetch("status")
-            violations << "attempt #{attempt.fetch("id")} has unknown status #{status.inspect}" unless ATTEMPT_STATUSES.include?(status)
-            if attempt.fetch("workflow_id") != workflow_id
-              violations << "attempt #{attempt.fetch("id")} has inconsistent workflow id"
-            end
-            live_attempts[position] << attempt if LIVE_ATTEMPT_STATUSES.include?(status)
-            workflow = workflows_state[workflow_id]
-            if workflow&.fetch("status") == "completed" && status == "running"
-              violations << "completed workflow #{workflow_id} has running attempt #{attempt.fetch("id")}"
-            end
-            unless steps_state[workflow_id].key?(position)
-              violations << "attempt #{attempt.fetch("id")} references missing step #{workflow_id}/#{position}"
-            end
-          end
-          live_attempts.each do |position, live|
-            next if live.length <= 1
-
-            ids = live.map { |attempt| attempt.fetch("id") }.join(",")
-            violations << "workflow #{workflow_id} step #{position} has multiple live attempts #{ids}"
-          end
-        end
-      end
-
-      #: (untyped, untyped, untyped) -> untyped
-      def verify_wait_invariants!(workflows_state, steps_state, waits_state)
-        waits_state.each_value do |wait|
-          wait_id = wait.fetch("id")
-          workflow_id = wait.fetch("workflow_id")
-          position = wait.fetch("position")
-          status = wait.fetch("status")
-          violations << "wait #{wait_id} has unknown status #{status.inspect}" unless WAIT_STATUSES.include?(status)
-          violations << "wait #{wait_id} references missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
-          unless steps_state[workflow_id].key?(position)
-            violations << "wait #{wait_id} references missing step #{workflow_id}/#{position}"
-          end
-          step = steps_state[workflow_id][position]
-          if status == "completed" && step && step.fetch("status") != "completed"
-            violations << "completed wait #{wait_id} has non-completed step #{workflow_id}/#{position}"
-          end
-        end
-      end
-
-      #: (untyped, untyped) -> untyped
-      def verify_outbox_invariants!(workflows_state, outbox_state)
-        outbox_state.each_value do |message|
-          outbox_id = message.fetch("id")
-          status = message.fetch("status")
-          violations << "outbox #{outbox_id} has unknown status #{status.inspect}" unless OUTBOX_STATUSES.include?(status)
-          unless workflows_state.key?(message.fetch("workflow_id"))
-            violations << "outbox #{outbox_id} references missing workflow #{message.fetch("workflow_id")}"
-          end
-          next unless status == "processing"
-
-          if message.fetch("locked_by").nil? || message.fetch("locked_until").nil?
-            violations << "processing outbox #{outbox_id} has no lease"
-          end
-        end
       end
     end
   end

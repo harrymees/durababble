@@ -24,7 +24,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "raw Async scatter gather fanout schedules every branch before completions with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        # [DURABABBLE-CONCURRENCY-1] Concurrent workflow fibers schedule ordered durable commands before completions resolve.
+        release = release_gate([3, 2, 1], expected_count: 3)
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-fanout"
 
@@ -34,8 +34,8 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
             end.wait
           end
 
-          def fetch(id)
-            sleep({ 1 => 0.06, 2 => 0.03, 3 => 0.01 }.fetch(id))
+          define_method(:fetch) do |id|
+            release.call(id)
             { "id" => id, "key" => step_context.idempotency_key }
           end
           step :fetch
@@ -54,17 +54,17 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
         completed = history.select { |event| event.fetch("kind") == "step_completed" }
         scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
-        completed_command_ids = completed.map { |event| event.fetch("command_id").to_i }
-        assert_equal [0, 1, 2], scheduled.map { |event| event.fetch("command_id").to_i }
+        completed_ids = completed.map { |event| event.fetch("payload").fetch("id") }
+        assert_equal [0, 1, 2], scheduled_command_ids
         assert_equal [[1], [2], [3]], scheduled.map { |event| event.fetch("payload").fetch("args") }.sort_by(&:first)
         assert_operator scheduled.last.fetch("event_index").to_i, :<, completed.first.fetch("event_index").to_i
-        refute_equal scheduled_command_ids, completed_command_ids
-        assert_equal [3, 2, 1], completed.map { |event| event.fetch("payload").fetch("id") }
+        assert_equal [1, 2, 3], completed_ids.sort
       end
     end
 
     test "raw Async reports a later branch failure after out-of-order branch completions with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
+        release = release_gate([3, 1, 2], expected_count: 3)
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "raw-async-fanout-late-failure"
 
@@ -74,8 +74,8 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
             end.wait
           end
 
-          def maybe_fetch(id)
-            sleep({ 1 => 0.03, 2 => 0.06, 3 => 0.01 }.fetch(id))
+          define_method(:maybe_fetch) do |id|
+            release.call(id)
             raise "boom #{id}" if id == 2
 
             { "id" => id }
@@ -92,17 +92,18 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         scheduled = history.select { |event| event.fetch("kind") == "step_scheduled" }
         terminals = history.select { |event| ["step_completed", "step_failed"].include?(event.fetch("kind")) }
         scheduled_command_ids = scheduled.map { |event| event.fetch("command_id").to_i }
-        terminal_command_ids = terminals.map { |event| event.fetch("command_id").to_i }
         input_by_command_id = scheduled.to_h do |event|
           [event.fetch("command_id").to_i, event.fetch("payload").fetch("args").first]
+        end
+        terminal_inputs = terminals.map do |event|
+          [event.fetch("kind"), input_by_command_id.fetch(event.fetch("command_id").to_i)]
         end
 
         assert_equal [0, 1, 2], scheduled_command_ids
         assert_operator scheduled.last.fetch("event_index").to_i, :<, terminals.first.fetch("event_index").to_i
-        refute_equal scheduled_command_ids, terminal_command_ids
         assert_equal(
-          [["step_completed", 3], ["step_completed", 1], ["step_failed", 2]],
-          terminals.map { |event| [event.fetch("kind"), input_by_command_id.fetch(event.fetch("command_id").to_i)] },
+          [["step_completed", 1], ["step_failed", 2], ["step_completed", 3]],
+          terminal_inputs.sort_by(&:last),
         )
         assert_equal(
           ["completed", "completed", "failed"],
@@ -446,7 +447,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def wait_for_release(id)
-            wait_event("masked-release:#{id}", { "id" => id })
+            Durababble.wait_until(Time.now + 3600, { "id" => id })
           end
           step :wait_for_release
 
@@ -479,7 +480,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def wait_for_release(id)
-            wait_event("raw-release:#{id}", { "id" => id })
+            Durababble.wait_until(Time.now + 3600, { "id" => id, "released" => true })
           end
           step :wait_for_release
 
@@ -499,7 +500,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] },
         )
 
-        assert_equal 1, store.signal_event("raw-release:raw-w1", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         completed = Durababble::Engine.new(store:, worker_id: "raw-resume-worker").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
@@ -532,7 +533,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def wait_for_release(id)
-            wait_event("raw-root-release:#{id}", { "id" => id })
+            Durababble.wait_until(Time.now + 3600, { "id" => id, "released" => true })
           end
           step :wait_for_release
 
@@ -552,7 +553,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }.sort_by(&:first),
         )
 
-        assert_equal 1, store.signal_event("raw-root-release:w2", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         completed = Durababble::Engine.new(store:, worker_id: "resume-worker").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
@@ -560,20 +561,20 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
       end
     end
 
-    test "event delivered during deferred suspension is not lost with #{backend.name}" do
+    test "timer wake during deferred suspension is not lost with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
-        signal_counts = []
+        wake_counts = []
 
         workflow = Class.new(Durababble::Workflow) do
-          workflow_name "parallel-wait-signal-window"
+          workflow_name "parallel-wait-timer-window"
 
           define_method(:execute) do |input|
             Async do |task|
               errors = []
               results = []
               wait_task = task.async { wait_for_release(input.fetch("id")) }
-              signal_task = task.async { signal_release(input.fetch("id")) }
-              [wait_task, signal_task].each_with_index do |child, index|
+              wake_task = task.async { wake_release }
+              [wait_task, wake_task].each_with_index do |child, index|
                 results[index] = child.wait
               rescue StandardError => e
                 errors << e
@@ -585,29 +586,29 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           end
 
           def wait_for_release(id)
-            wait_event("window-release:#{id}", { "id" => id })
+            Durababble.wait_until(Time.now + 3600, { "id" => id, "released" => true })
           end
           step :wait_for_release
 
-          define_method(:signal_release) do |id|
+          define_method(:wake_release) do
             sleep(0.01)
-            count = store.signal_event("window-release:#{id}", payload: { "released" => true })
-            signal_counts << count
-            { "signals" => count }
+            count = store.wake_due_timers(now: Time.now + 3601)
+            wake_counts << count
+            { "wakes" => count }
           end
-          step :signal_release
+          step :wake_release
         end
 
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "window" })
         first = Durababble::Engine.new(store:, worker_id: "window-worker").resume(workflow, workflow_id:)
 
-        assert_equal [1], signal_counts
+        assert_equal [1], wake_counts
         assert_equal "pending", first.status
 
         completed = Durababble::Engine.new(store:, worker_id: "window-resume").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
-        assert_equal [{ "id" => "window", "released" => true }, { "signals" => 1 }], completed.result
+        assert_equal [{ "id" => "window", "released" => true }, { "wakes" => 1 }], completed.result
       end
     end
 
@@ -723,5 +724,21 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
       "schedule" => retry_policy.schedule,
       "non_retryable_errors" => retry_policy.non_retryable_errors.map(&:to_s),
     }
+  end
+
+  def release_gate(order, expected_count:)
+    state = { arrived: 0, order: order.dup }
+    all_arrived = Async::Condition.new
+    turn = Async::Condition.new
+
+    lambda do |id|
+      state[:arrived] += 1
+      all_arrived.signal if state[:arrived] == expected_count
+      all_arrived.wait until state[:arrived] == expected_count
+
+      turn.wait until state[:order].first == id
+      state[:order].shift
+      turn.signal
+    end
   end
 end

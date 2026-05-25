@@ -83,3 +83,19 @@ jobs:
 
       - name: Validate formal sigils
         run: bundle exec ruby scripts/validate-durababble-sigils.rb
+
+  docs-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.152.2"
+          extended: true
+
+      - name: Build docs site
+        run: hugo --minify --destination docs/build

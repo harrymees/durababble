@@ -1,0 +1,25 @@
+{{- $videoId := .Get 0 -}}
+{{- if $videoId -}}
+  {{- /* Extract video ID from full URL if provided */ -}}
+  {{- if strings.Contains $videoId "share.descript.com/view/" -}}
+    {{- $parts := split $videoId "share.descript.com/view/" -}}
+    {{- if gt (len $parts) 1 -}}
+      {{- $videoId = index $parts 1 | strings.TrimSuffix "/" -}}
+    {{- end -}}
+  {{- else if strings.Contains $videoId "share.descript.com/embed/" -}}
+    {{- $parts := split $videoId "share.descript.com/embed/" -}}
+    {{- if gt (len $parts) 1 -}}
+      {{- $videoId = index $parts 1 | strings.TrimSuffix "/" -}}
+    {{- end -}}
+  {{- end -}}
+<div class="video-embed" style="position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; max-width: 100%; margin: 1.5rem 0;">
+  <iframe
+    src="https://share.descript.com/embed/{{ $videoId }}"
+    style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 0;"
+    allowfullscreen
+    title="Descript video player">
+  </iframe>
+</div>
+{{- else -}}
+<p style="color: red;">Error: Descript video ID or URL is required. Usage: {{ "{{< descript VIDEO_ID >}}" }} or {{ "{{< descript https://share.descript.com/view/VIDEO_ID >}}" }}</p>
+{{- end -}}

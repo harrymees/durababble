@@ -13,7 +13,7 @@ Durababble exposes two durable primitives:
 | Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, and recovery | A function or process that survives restarts |
 | Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.tell` | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
 
-Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or signal workflows. Child durable calls inherit the caller's worker pool unless explicitly overridden.
+Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
 The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, durable-object commands, and future inbox/history placeholders. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands and validates `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests.
 
@@ -29,12 +29,12 @@ The contract specifies behavior, not a mandatory internal isolation technology. 
 
 - **Durable target:** a workflow execution or durable object instance addressed by class/type, id, and worker pool.
 - **Worker pool:** a persisted routing and execution boundary. Workers in a pool may claim, route, wake, and execute only targets assigned to that pool.
-- **Lease:** a persisted ownership record for a durable target, with owner node, RPC address, lease token, and deadline.
-- **Workflow command:** a deterministic workflow operation such as a step schedule, wait, signal delivery, child workflow command, or patch marker.
+- **Lease:** a persisted ownership record for a durable target, with the owner gRPC address as the routable node identity, a lease token, and a deadline.
+- **Workflow command:** a deterministic workflow operation such as a step schedule, timer wait, workflow command delivery, child workflow command, or patch marker.
 - **Command id:** the replay identity assigned by deterministic workflow execution order.
 - **Attempt id:** the execution identity for one concrete try of a command. Retries create new attempts for the same command id.
 - **Activation:** one deterministic workflow run/replay slice that processes runnable fibers until they finish, block on durable work, or reach a safe suspension point.
-- **Inbox/mailbox:** the durable per-target message stream used for object asks/tells/wakes and workflow signals/commands.
+- **Inbox/mailbox:** the durable per-target message stream used for object asks/tells/wakes and workflow commands.
 
 ## Public programming model
 
@@ -66,7 +66,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.handle(workflow_id)` returns a query/management handle for status, result, cancellation, resume, signals, and exposed methods.
+`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.handle(workflow_id)` returns a query/management handle for status, result, cancellation, resume, and exposed methods.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -74,15 +74,13 @@ Idempotent start scopes caller keys to worker pool, workflow class, operation ki
 
 `expose` declares non-durable transient methods. Transient methods are invoked through owner-local RPC against the live workflow owner, must not mutate durable state, and must not accept `idempotency_key:`.
 
-`expose_command` declares durable workflow command methods. Commands are committed to the workflow inbox/history before returning to the caller. Synchronous command APIs return serialized results or typed remote errors.
+`expose_command` declares durable workflow command methods. A command call commits a durable inbox ask/tell row before returning to the caller, wakes the active workflow owner through `DeliverMessage` or leaves a durable target activation, and executes against the workflow at the next safe deterministic yield point. If the workflow row exists but is not actively owned, the target activation lets a worker warm it up before delivering the command; if the workflow does not exist or is terminal, the command fails instead of being buffered for a future target. Workflow authors do not park on a matching broadcast or poll an inbox manually. Synchronous command APIs wait for the ask row to store a serialized result or typed error; retrying with the same idempotency key reattaches to the same row.
 
-`signal def handler` declares deterministic workflow signal handlers. `handle.signal(:name, **args, idempotency_key:)` commits a durable signal message before returning and fails for terminal workflows.
-
-Workflow code may use durable timer and event waits through workflow helper methods or the module-level helpers: `wait_until(time, context)`, `wait_event(event_key, context)`, `Durababble.wait_until(time, context)`, and `Durababble.wait_event(event_key, context)`. `Store#signal_event(event_key, payload:)` wakes matching event waits.
+Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `sleep_until(time, context)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, `Durababble.sleep_until(time, context)`, and `Durababble.wait_until(time, context)`.
 
 Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
 
-`Durababble::Workflow.wait_condition(timeout: nil) { ... }` blocks a workflow fiber until the predicate is true or a durable timeout fires. Durable sleeps are implemented as timer waits and must survive process exit.
+`wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, persist wait rows, and resume the waiting workflow fiber when the timer completion is recorded. Durable sleeps are implemented as timer waits and must survive process exit.
 
 ### Durable objects
 
@@ -109,7 +107,7 @@ end
 
 `expose_command` registers durable mailbox commands. Commands execute through the durable object's identity, receive `command_context`, and update state only through `update_state(new_state)`. `command_context.idempotency_key` is generated from object type, object id, and mailbox message id and is stable for the durable command.
 
-Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`.
+Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`. Enqueuing a ready object command wakes the active owner through `DeliverMessage` or leaves a durable target activation for pool-local recovery. Object authors do not poll for commands; the owner drains the mailbox when woken or claimed.
 
 Lifecycle callbacks are `on_create`, `on_load`, `on_wake(payload: nil)`, and `on_destroy`. They are lifecycle hooks, not remotely callable public methods.
 
@@ -131,7 +129,7 @@ Workflow orchestration runs on a Durababble-managed deterministic scheduler. Wor
 
 Durababble integrates with Async task creation and waiting so ordinary non-transient Async child tasks inherit workflow execution context and may call durable steps. Workflow authors must not need Durababble-specific async helpers. `transient: true` Async tasks do not inherit workflow execution context and must not call durable steps.
 
-Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, waits, signals, child workflows, and deterministic local computation. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
+Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
 
 The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers. The implementation must not rely on process-wide monkeypatching to create determinism.
 
@@ -139,15 +137,15 @@ Durable commands called from any workflow fiber are assigned command ids when th
 
 ### Workflow command history
 
-Workflow replay is driven by an append-only per-workflow command/event history. Latest-state tables such as `steps` are query caches and recovery aids, not the replay source of truth.
+Workflow replay is driven by an append-only per-workflow command history. Latest-state tables such as `steps` are query caches and recovery aids, not the replay source of truth.
 
-Step scheduling, step execution starts, and step completions are distinct durable facts. A schedule event records command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start event records that an executor began a concrete attempt. A completion, failure, or wait event resolves the command's workflow future.
+Step scheduling, step execution starts, and step completions are distinct durable facts. A schedule record stores command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start record stores that an executor began a concrete attempt. A completion, failure, or wait record resolves the command's workflow future.
 
-Schedule event shape includes step method name, serialized args/kwargs or a stable payload digest, retry/executor attributes, and any semantic key if one is present. Replay validates the scheduled command shape even when no completion exists, so a step that started before a crash cannot disappear silently.
+Schedule record shape includes step method name, serialized args/kwargs or a stable payload digest, retry/executor attributes, and any semantic key if one is present. Replay validates the scheduled command shape even when no completion exists, so a step that started before a crash cannot disappear silently.
 
 Replay shape checks apply to every scheduled durable command, not only completed steps. If a previous run scheduled command `17` as `fetch_profile(user_id: 1)` and replay schedules command `17` as `fetch_profile(user_id: 2)` or `send_email`, the workflow is nondeterministic even if the original command only reached `started`.
 
-Step completions, step failures, timer fires, signal deliveries, and child-workflow completions are external events that make workflow fibers runnable. They must be appended to history and delivered to the deterministic scheduler in history order, because completion order can affect later command order.
+Step completions, step failures, timer fires, workflow command deliveries, and child-workflow completions are external inputs that make workflow fibers runnable. They must be appended to history and delivered to the deterministic scheduler in history order, because completion order can affect later command order.
 
 Process-local step execution may run multiple step attempts concurrently, but attempts must not concurrently mutate workflow history through one non-threadsafe store connection. History mutations are serialized per workflow or protected by executor-local connections/transactions with durable command ids and optimistic checks.
 
@@ -211,7 +209,7 @@ class FanoutProfiles < Durababble::Workflow
 end
 ```
 
-Durababble records a `step_scheduled` history event for each `fetch_profile(id)` command before dispatching that step body. The recorded command shape must distinguish `fetch_profile(1)` from `fetch_profile(2)`.
+Durababble records a `step_scheduled` history record for each `fetch_profile(id)` command before dispatching that step body. The recorded command shape must distinguish `fetch_profile(1)` from `fetch_profile(2)`.
 
 Continuation fanout must also replay safely:
 
@@ -242,22 +240,22 @@ end
 
 If `fetch_profile(2)` completes before `fetch_profile(1)` and schedules `score_profile(...)` first, replay must resume workflow fibers in the same history-recorded completion order. It must not resume fibers based on Ruby scheduler timing, database query order, or synchronous return of already-completed step results.
 
-### Waits and signals
+### Waits and commands
 
 Timer waits persist a wake time and Paquito context, suspend the workflow only after a safe activation boundary, and resume when the wake time is due.
 
-External event waits persist an event key and Paquito context. `Store#signal_event` completes matching waits with Paquito payloads and wakes workflows. Concurrent signalers must wake a wait once.
+A step wait is a terminal command-resolution record, but releasing the workflow lease to `waiting` happens only after the workflow activation reaches a safe suspension point. If one branch records a wait while sibling workflow fibers have already scheduled process-local steps, those sibling steps may finish and commit before the workflow row is released.
 
-A step wait is a terminal command-resolution event, but releasing the workflow lease to `waiting` happens only after the workflow activation reaches a safe suspension point. If one branch records a wait while sibling workflow fibers have already scheduled process-local steps, those sibling steps may finish and commit before the workflow row is released.
+Workflow commands are durable workflow inbox messages delivered to the workflow lease owner. A committed command must make the target runnable immediately. If a live owner holds the workflow lease, the runtime sends `DeliverMessage` after commit; if there is no live owner or advisory delivery fails, the durable target activation remains claimable by the worker pool. The command executes before a new durable workflow command starts, after a step completes/fails/waits, when a running step heartbeats or otherwise yields to the workflow engine, or when a sleep/wait activation is interrupted by message work. A non-heartbeating user step body is not preempted mid-Ruby-frame; the command runs when the active owner reaches a safe point or lease expiry/recovery gives the target to another worker.
 
-Workflow signals are durable inbox/history messages delivered to declared signal handlers at deterministic workflow yield points. Signal acceptance is idempotent by message id and fails for terminal workflows.
+Synchronous workflow command APIs are durable asks. The caller waits for the inbox row to store a serialized result or typed error, then returns/re-raises it. If the caller times out or loses its connection after the row commits, the durable command is not canceled; retrying with the same idempotency key reattaches to the same inbox row. Command responses do not require the general outbox table because the response is a one-to-one property of the ask row; workflow/object code may still write ordinary outbox messages when a command handler needs durable delivery to an external system.
 
 ### Cooperative cancellation
 
 Cancellation is cooperative execution, not hard termination.
 
 - `Workflow.handle(workflow_id).cancel(reason:)` records the first durable cancellation reason and request timestamp. Duplicate requests return the current run and preserve the first reason.
-- Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become claimable immediately. Pending waits are marked canceled so late timer/event signals cannot resume the canceled wait.
+- Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become claimable immediately. Pending waits are marked canceled so late timer wakes cannot resume the canceled wait.
 - Running workflows keep their active lease. Cancellation is observed at deterministic yield points: before a new durable command starts, when replay reaches a completed command boundary, after a step completes, and when a running step heartbeats.
 - Delivery raises `Durababble::CancellationError` with the durable reason and workflow id. Cleanup steps run as ordinary durable steps under the same command-history replay model as all other workflow work.
 - If workflow code catches cancellation and returns after cleanup, the engine records the workflow as `canceled` and stores the cleanup result. Re-raising `CancellationError` also records `canceled`.
@@ -267,7 +265,7 @@ Cancellation is cooperative execution, not hard termination.
 
 ### Workflow code evolution
 
-`patched(patch_id)` and `deprecate_patch(patch_id)` are the workflow control-flow compatibility APIs. They protect deterministic changes to step order, waits, signal handling, and other durable workflow branches by recording/checking patch markers in workflow history before new-branch durable events are emitted.
+`patched(patch_id)` and `deprecate_patch(patch_id)` are the workflow control-flow compatibility APIs. They protect deterministic changes to step order, waits, command handling, and other durable workflow branches by recording/checking patch markers in workflow history before new-branch durable records are emitted.
 
 ```ruby
 class FulfillOrder < Durababble::Workflow
@@ -286,13 +284,13 @@ end
 Rules:
 
 - `patch_id` is a stable, non-empty string unique to one logical code change. Do not reuse a removed id for an unrelated change.
-- `patched` is valid only in deterministic workflow orchestration code: `execute`, signal handlers, and `wait_condition` predicates/continuations. Calling it inside a step, durable object command, exposed transient method, or arbitrary library code outside active workflow execution raises a typed error.
-- The first `patched(patch_id)` call for a workflow execution is event-bearing. Later calls with the same id in the same execution return the memoized decision and append no duplicate marker rows.
-- When live execution reaches a history point with no persisted event, `patched(patch_id)` appends a normal patch marker and returns `true`. The marker commit must happen before the new branch produces steps, waits, signals, or other durable workflow events.
+- `patched` is valid only in deterministic workflow orchestration code: `execute` and `wait_condition` predicates/continuations. Calling it inside a step, durable object command, exposed transient method, or arbitrary library code outside active workflow execution raises a typed error.
+- The first `patched(patch_id)` call for a workflow execution writes history. Later calls with the same id in the same execution return the memoized decision and append no duplicate marker rows.
+- When live execution reaches a history point with no persisted marker, `patched(patch_id)` appends a normal patch marker and returns `true`. The marker commit must happen before the new branch produces steps, waits, commands, or other durable workflow records.
 - When replaying history that already contains a normal marker for `patch_id`, `patched(patch_id)` consumes that marker and returns `true`.
 - When replaying history that reached the change point without a marker, `patched(patch_id)` returns `false` and appends nothing, so workflow code follows the branch matching existing history.
 - If persisted history contains a normal patch marker that workflow code does not consume with `patched` or `deprecate_patch`, the checker raises nondeterminism before any further durable writes. Patch-id mismatches and out-of-order marker consumption also raise nondeterminism.
-- Patch markers are workflow-history markers, not inbox messages, state schema versions, or node-capability routing signals.
+- Patch markers are workflow-history markers, not inbox messages, state schema versions, or node-capability routing indicators.
 
 Patch lifecycle:
 
@@ -306,7 +304,7 @@ Admin and observability surfaces expose patch usage by workflow type/id: normal 
 
 Object commands, scheduled wakeups, and other mailbox work acquire an exclusive writer slot for the target. Exposed transient methods acquire shared read access, can run concurrently with each other, and stop entering once mailbox work is waiting.
 
-Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance.
+Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery.
 
 Commands execute one at a time in strict FIFO order per durable target. Target executors drain only the contiguous ready prefix from the mailbox head. `SKIP LOCKED` must not let later messages overtake a blocked head for the same target.
 
@@ -328,11 +326,10 @@ Durable operations use both library-generated keys and caller-provided keys:
 
 - Step idempotency keys are generated from workflow id plus deterministic command id and are available through `step_context.idempotency_key`.
 - Durable object command idempotency keys are generated from object type, object id, and mailbox message id and are available through `command_context.idempotency_key`.
-- Every public durable entry point accepts `idempotency_key:` where durability is implied: workflow starts, object asks, object tells, workflow signals, and externally exposed operator APIs.
+- Every public durable entry point accepts `idempotency_key:` where durability is implied: workflow starts, workflow command asks/tells, object asks, object tells, and externally exposed operator APIs.
 - Idempotency keys are scoped to worker pool, target, operation kind, method, and argument fingerprint, not just target id.
 - Same key plus same operation shape returns the existing handle/result or re-raises the saved error. Same key plus different operation shape raises `Durababble::IdempotencyKeyConflict`.
-- Caller timeout after a durable command, signal, or message commits does not cancel durable work. Retrying with the same idempotency key reattaches to the same row.
-- Completed idempotency and inbox rows have configurable retention. The default retention is 30 days unless a class or operation specifies a longer retention window.
+- Caller timeout after a durable command or message commits does not cancel durable work. Retrying with the same idempotency key reattaches to the same row.
 - Transient `expose` methods are not durable and must not accept idempotency keys.
 
 ### Fences
@@ -354,14 +351,14 @@ Durababble persists the following logical entities. Physical table names may be 
 | Entity | Purpose | Required key/query shape |
 | --- | --- | --- |
 | `workflows` | Workflow execution status, input/result/error, retry due time, cancellation metadata, and workflow metadata | Workflow id, workflow class, worker pool, status, due time |
-| `workflow_history` | Append-only ordered replay events for workflow commands, completions, signals, timers, and markers | `(workflow_id, event_index)`, command id lookup |
+| `workflow_history` | Append-only ordered replay records for workflow commands, completions, timers, and markers | `(workflow_id, record_index)`, command id lookup |
 | `steps` | Latest logical workflow command state for query/result caching | `(workflow_id, command_id)` |
 | `step_attempts` | Append-only attempt history for step execution and waits | Attempt id, workflow id, command id, status |
-| `waits` | Durable timer and external-event waits | Wait id, workflow id, due time/event key/status |
-| `leases` | Pool-scoped ownership for workflow and object targets | `(worker_pool, target_kind, target_class, target_id)` |
-| `nodes` | Worker node registry with RPC address, advertised pools, draining flag, and heartbeat | `(worker_pool, node_id)` and fresh heartbeat lookups |
-| `inbox` | Durable asks, tells, wakes, workflow signals, and workflow command messages | Target identity, sequence, status, message id |
+| `waits` | Durable timer waits | Wait id, workflow id, due time/status |
+| `leases` | Pool-scoped ownership for workflow and object targets, including the owner gRPC address | `(worker_pool, target_kind, target_class, target_id)` |
+| `inbox` | Durable asks, tells, wakes, and workflow command messages | Target identity, sequence, status, message id |
 | `mailbox_sequences` | Per-target monotonic mailbox sequence allocation | Target identity |
+| `target_activations` | Coalesced runnable target wakeups for inbox/scheduler work | Worker pool, ready time, target identity, status |
 | `idempotency_keys` | Public durable operation deduplication and shape conflict detection | Operation scope plus caller key |
 | `fences` | Workflow-local side-effect idempotency fences | `(workflow_id, key)` |
 | `outbox` | Durable outgoing messages with processing leases | Id, unique message key, lease expiry |
@@ -373,18 +370,22 @@ Query-shape and transaction requirements:
 - Claim paths use `FOR UPDATE SKIP LOCKED` where supported.
 - Persist immutable `worker_pool` on durable targets whose routing, claiming, scheduling, listing, or recovery semantics are pool-scoped.
 - Include `worker_pool` in primary keys and indexes when query patterns need to filter, route, claim, recover, or list by worker pool. Do not add it to keys whose query patterns do not care about worker pool.
-- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with `node_id`, `rpc_address`, `lease_token`, and `lease_until`.
-- The node registry is keyed by pool/node identity and records `rpc_address`, advertised pools, draining flag, and heartbeat time.
-- Object asks/tells/wakes and workflow signals/commands use the unified inbox.
-- Sequence allocation and inbox insert commit in one transaction.
+- Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with the owner gRPC address as the node identity plus `lease_token` and `lease_until`.
+- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row and dials the gRPC address stored there; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
+- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the gRPC address in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
+- Object asks/tells/wakes and workflow commands use the unified inbox. Inbox rows are durable message/result records, not a second globally polled work queue.
+- Sequence allocation, inbox insert, and ready-target activation upsert commit in one transaction.
 - Per-target mailbox sequence state lets `enqueue_message` allocate a monotonic sequence and lets target executors drain only a contiguous ready prefix from the head.
+- Enqueueing a ready inbox message must atomically upsert a target activation row, or an equivalent scheduler row, keyed by worker pool and durable target identity. Workers globally poll target activations, not the inbox table; one activation can cover many pending inbox rows for the same target.
+- Target activation completion is conditional on the target mailbox/head state: after draining, the executor clears the activation only if no ready inbox row remains, otherwise it keeps or re-arms the activation with the next due time.
+- If a worker claims a target activation but finds the target is still owned by another fresh lease, it must not hot-loop the activation; it relies on advisory `DeliverMessage` for the live owner and re-arms the durable fallback no earlier than the observed lease deadline.
 - Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload.
-- Append-only workflow history rows are ordered per workflow. Required event families include `step_scheduled`, `step_started`, `step_completed`, `step_failed`, `step_waiting`, timer/wait events, signal delivery events, child-workflow events, and patch marker events.
-- Store deterministic command ids and replay-relevant command shape on schedule events. Store concrete attempt ids on start/completion/failure/wait events. The command id is the replay identity; the attempt id is the execution/retry identity.
-- Mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution events; execution recovery uses distinct attempt start/completion events.
-- Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Event/timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
+- Append-only workflow history rows are ordered per workflow. Required record families include `step_scheduled`, `step_started`, `step_completed`, `step_failed`, `step_waiting`, timer/wait records, workflow command delivery records, child-workflow records, and patch marker records.
+- Store deterministic command ids and replay-relevant command shape on schedule records. Store concrete attempt ids on start/completion/failure/wait records. The command id is the replay identity; the attempt id is the execution/retry identity.
+- Mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution records; execution recovery uses distinct attempt start/completion records.
+- Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
 - Explicit idempotency rows cover workflow starts and any public durable operation not deduped by the inbox itself.
-- Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, event waits, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
+- Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
 - High-risk transactional pieces such as `enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, and object state plus message completion may be implemented with database functions to reduce lock-order drift, provided the common backend contract is preserved.
 - Retention and partitioning must be planned for high-volume history, step attempts, inbox, and idempotency rows before production scale.
 - Runtime value decoding only decodes known serialized binary columns.
@@ -396,7 +397,7 @@ All public durable semantics must work on PostgreSQL/YSQL and MySQL/MariaDB. Sch
 
 ### Worker lifecycle and recovery
 
-A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`. Each tick claims runnable work whose workflow or object class is present in the worker registry, then resumes it through the deterministic workflow executor or durable object mailbox executor.
+A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`. Each tick claims runnable work whose workflow or object class is present in the worker registry, including workflow rows and coalesced target activations, then resumes it through the deterministic workflow executor or durable object mailbox executor.
 
 Runnable workflows are pending rows, retryable failed rows whose non-null `next_run_at` is due, canceling rows with no live lease whose `next_run_at` is null or due, and expired running leases that are recoverable. Terminal failed rows with no retry deadline are not claimable.
 
@@ -411,17 +412,16 @@ Expired leases are reclaimed by claim paths or recovery sweeps. Recovery does no
 - Every durable target whose execution/routing is pool-scoped has an immutable persisted `worker_pool` selected at first materialization.
 - If a class declares a default pool, that pool wins unless the caller overrides while creating a new durable unit. Once the row exists, the persisted pool wins.
 - Worker pools are the routing and multiregion boundary. A pod in another pool cannot claim, route, or wake a target unless the target is explicitly relocated.
-- `nodes` records which pools each pod serves, its RPC address, draining state, and heartbeat.
 - Scheduler scans filter by pools served by the local pod.
-- `AwakenBatch`, `DeliverMessage`, and `CallTransient` are sent only to nodes in the target pool.
+- `DeliverMessage` and `CallTransient` route to the gRPC address in the target's fresh lease row. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
 - Automatic cross-pool stealing is forbidden. Regional failover is explicit `relocate_worker_pool` operator/runtime work that quiesces the target, releases the old lease, updates the row, and wakes it in the new pool.
 
 ### Sticky placement
 
 Routing keeps hot ids on the pod that already has them in memory:
 
-- Every pod loads or generates a stable `node_id` and advertises `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`.
-- Every acquired lease writes `node_id`, `rpc_address`, and a fresh `lease_token` into the lease row.
+- Every pod exposes `rpc_address = "#{POD_IP}:#{DURABABBLE_RPC_PORT}"`, and worker runtimes use that address as the lease owner identity.
+- Every acquired lease writes the owner gRPC address and a fresh `lease_token` into the lease row.
 - Lease acquisition uses a hot in-memory cache when the owner has a fresh lease and falls back to atomic SQL acquisition/lookup when cold, near expiry, or routed remotely.
 - A `LeaseRenewer` refreshes in-flight leases every `lease_ttl_ms / 3` and only when the `lease_token` still matches.
 - Cache entries are evicted on near-expiry, `EvictLease`, object CAS conflict, lease-renew failure, idle timeout, or LRU capacity pressure.
@@ -500,10 +500,10 @@ message DeliverMessageResponse {}
 RPC semantics:
 
 - **AwakenBatch** is a latency optimization after workflow starts or matured scheduler rows. It never replaces durable DB state or scheduler correctness.
-- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload; the receiver queries durable inbox rows. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
+- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload; the receiver queries durable inbox rows and schedules an owner-local target activation without blocking the gRPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
 - **CallTransient** is non-durable RPC for exposed methods against the active owner. It returns a Paquito result, a remote error, `not_running`, or `LeaseMoved`.
 - **EvictLease** asks a pod to drop a cached lease it may no longer own.
-- Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, durable inbox/scheduler recovery remains the correctness path.
+- Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, the already-committed target activation remains the correctness path and is eventually claimed by a worker in the target pool.
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
 - gRPC is required for production cross-pod calls because strongly typed protos catch shape drift and mTLS is available. Auxiliary test transports must not be used for production intranode communication.
 
@@ -549,8 +549,13 @@ Operational surfaces include CLI migration, workflow run/resume, inspection, ver
 Observability requirements:
 
 - Benchmarks record operation latency, throughput, and allocation reports for workflow queueing, leases, waits, outbox, fences, inbox, deterministic workflow replay, and local step execution.
+- OpenTelemetry support is an optional integration over the official API gems. `Durababble.configure_observability(enabled: true, attributes:)` uses `OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`; Durababble never configures an SDK, collector, or exporter for the application.
+- With observability disabled, instrumentation exits through cheap no-op checks before dynamic attributes are built. Durababble callsites construct valid, low-cardinality OpenTelemetry attribute hashes directly; application-provided static attributes should use string keys and OpenTelemetry-compatible scalar values.
+- Stable span names include `durababble.workflow.start`, `durababble.workflow.resume`, `durababble.workflow.execute`, `durababble.workflow.step`, `durababble.object.query`, `durababble.object.command.enqueue`, `durababble.object.command`, `durababble.workflow_rpc.*`, `durababble.rpc.client.*`, and `durababble.rpc.server.*`. Durababble does not wrap ActiveRecord SQL execution in its own spans; applications should use standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility.
+- Stable span and metric attributes use the `durababble.*` namespace and may include workflow id/name/status, step name/index/attempt, object type/id/method, worker pool/id, lease owner, wait kind, retry delay, store backend for higher-level queue metrics, RPC method/target shape, and `error.type`. Instrumentation must not attach SQL text, serialized payload bytes, raw user arguments, secret-bearing values, or unbounded free-form payload data.
+- Metrics include workflow start/completion/failure/cancellation counters, step attempt/success/failure/retry counters, wait start/completion counters and wait latency histograms, queue claim latency, lease heartbeat/conflict/expired-recovery counters, outbox pending/processed/failure counters, worker tick duration/counts, and workflow replay/history size measurements. Cancellation/termination, explicit outbox delivery failure, richer replay cost, and object mailbox queue-depth metrics remain reserved where the runtime feature is not implemented yet. Applications should use ActiveRecord/database OpenTelemetry instrumentation for SQL operation latency/error metrics.
 - StatsD counters/timers cover command ask latency, exposed method latency, mailbox queue/execution latency, `CallTransient`, step execution, replay frequency, recovery sweeps, sleep dispatch, lease acquisitions/forwardings/takeovers, lease-cache hit ratio, and object-cache hit ratio.
-- OpenTelemetry spans wrap public calls, workflow executions, steps, scheduler ticks, and inbound gRPC requests. Spans include worker pool, class, target id, and lease owner.
+- OpenTelemetry spans wrap public calls, workflow executions, steps, durable-object commands/queries, workflow RPC routing, and inbound gRPC requests. Spans include worker pool, class, target id, and lease owner where relevant.
 - Bugsnag/error integration reports unhandled exceptions inside commands, exposed methods, steps, and gRPC handlers.
 - Slow-step warnings are emitted.
 - Routing health metrics cover wakeup error rate, wakeup latency, and lease takeover frequency.
@@ -575,17 +580,17 @@ Observability requirements:
 | Expired leases can be recovered | Expired running work returns to a claimable state. | Complete spec guarantee plus crash matrix |
 | Completed steps are not re-executed on resume | Completed command results are returned from durable state. | Complete spec guarantee plus subprocess crash harness |
 | Incomplete steps are retried | Incomplete/running/failed/waiting command state is retried or continued according to durable state. | Crash matrix |
-| Workflow command history is replay truth | Schedule events, start events, and completion/failure/wait events are distinct append-only history facts. | Async workflow replay specs plus backend conformance |
+| Workflow command history is replay truth | Schedule, start, and completion/failure/wait records are distinct append-only history facts. | Async workflow replay specs plus backend conformance |
 | Parallel schedule shape is validated | Replay validates method, args/kwargs digest, retry/executor attributes, and semantic key for every scheduled command, including incomplete commands. | Fanout replay/nondeterminism specs |
-| Workflow future resolution is deterministic | Step completions, failures, timer fires, signals, and child completions resume workflow fibers in history order. | Continuation fanout replay specs |
+| Workflow future resolution is deterministic | Step completions, failures, timer fires, workflow command deliveries, and child completions resume workflow fibers in history order. | Continuation fanout replay specs |
 | Step attempts are append-only | Every started attempt and terminal attempt state remains inspectable. | Guarantee matrix |
-| Waiting attempts complete when signaled | Wait completion updates attempts from `waiting` to `completed` without losing payload. | Wait-attempt spec |
-| Timer waits survive process exit | Timer wait rows store wake time and serialized context. | Timer/event tests |
-| Event waits survive process exit | Event wait rows store event key and serialized context. | Timer/event plus crash matrix |
-| Signaled waits resume with payload | Matching event delivery completes waiting workflow fibers with Paquito payloads. | Timer/event test |
-| Concurrent signalers wake a wait once | Concurrent signal delivery uses locked/idempotent updates. | Event concurrency spec |
+| Timer wait attempts complete once | Wait completion updates attempts from `waiting` to `completed` without losing payload. | Wait-attempt spec |
+| Timer waits survive process exit | Timer wait rows store wake time and serialized context. | Timer wait tests |
 | Side effects can be fenced by key | A fence records `running` before yielding and exposes operator-visible recovery for abandoned owners. | Fence concurrency spec plus owner-crash spec |
 | Outbox delivery is durable and leased | Outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry. | Outbox specs |
+| Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side broadcast wait is required. | Workflow command mailbox specs plus gRPC wakeup specs |
+| Synchronous durable commands return results | Ask rows store serialized result/error and caller retries with the same idempotency key reattach. | Workflow/object ask specs |
+| Inbox is not a second global polling queue | Workers poll coalesced target activations and target owners drain inbox rows for their own target. | Query-plan and mailbox specs |
 | Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus gRPC transport spec plus DST scenarios |
 | Inter-pod RPC uses full four-method gRPC service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` with production credentials/auth callbacks. | gRPC integration/contract tests plus DST response scenarios |
 | Multi-row state transitions are transactional | Step start/finish/failure, wait transitions, inbox enqueue, mailbox advancement, and state/result writes commit atomically where required. | Implementation plus regression suite |
@@ -594,11 +599,10 @@ Observability requirements:
 | Durable object API uses durable mailboxing | `at`, `tell`, `expose`, and `expose_command` execute through per-object mailbox ordering and lease ownership. | Durable object specs |
 | Object commands are per-id FIFO and worker-driven | Inbox/mailbox execution enforces one writer, blocked-head behavior, and worker-driven retries. | Object mailbox specs |
 | Object sleeps convert to durable wake messages | Sleep rows atomically convert to wake inbox rows without losing wakes. | Object sleep specs |
-| Workflow signals are durable ordered history | Inbox rows are accepted into workflow history and replayed at deterministic yield points. | Workflow signal specs |
 | Workflow patch markers guard code evolution | `patched` / `deprecate_patch` append and check ordered workflow history markers before branch side effects. | Patch-marker unit, backend-conformance, and crash tests |
 | Transient exposed methods route to owner | `CallTransient` invokes live object/workflow owner without durable mutation. | Transient RPC specs |
 | Worker pool scopes persisted targets and relevant keys | Persisted targets and query-critical keys include `worker_pool` where routing/claiming requires it. | Worker-pool backend specs |
-| Unified inbox is the durable message model | Object commands, object wakes, workflow signals, and workflow commands share one inbox contract. | Inbox/mailbox specs |
+| Unified inbox is the durable message model | Object commands, object wakes, and workflow commands share one inbox contract. | Inbox/mailbox specs |
 | Alloy model tracks storage/lease/concurrency invariants | `formal/workflow_storage.als` checks model obligations and Durababble sigil validation ties them to Ruby implementation/tests. | `rake formal` in CI |
 | CLI supports operational basics | CLI supports migration, workflow run/resume, inspection, and version output. | CLI spec |
 
@@ -614,21 +618,20 @@ Observability requirements:
 | After step failure, before retry due time | Retry schedule persists; workflow is not claimable early. |
 | After step completion, before workflow completion | Completed step is skipped and remaining work continues. |
 | After cancellation cleanup step completes, before canceled terminal write | Completed cleanup step is skipped and workflow finishes `canceled` on recovery. |
-| While waiting for an event | Wait row survives; signal wakes workflow and execution continues. |
-| While waiting when cancellation is requested | Wait row/attempt are marked canceled; cleanup runs on next claim and late signals are ignored. |
+| While waiting when cancellation is requested | Wait row/attempt are marked canceled; cleanup runs on next claim and late timer wakes are ignored. |
 | After outbox insert, before delivery | Outbox message remains claimable exactly once at a time. |
 | After outbox claim, before ack | Expired outbox lease can be reclaimed by another sender. |
 | During lease-routed workflow RPC | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy. |
 | During app shutdown with in-flight step | Runtime stops new claims; timeout releases leases; later worker retries. |
-| Crash after inbox row commits before `DeliverMessage` | Inbox row remains; scheduler safety-net wakes target later. |
+| Crash after inbox row and target activation commit before `DeliverMessage` | Activation remains claimable; a later worker/owner drains the target inbox. |
 | Crash before inbox row commits | No message row exists; caller retry decides whether to enqueue. |
 | Crash while allocating mailbox sequence | Transaction rolls back or commits both sequence advance and inbox row. |
+| `DeliverMessage` reaches a stale owner | Receiver no-ops after lease check; activation/lease re-check routes work to the current owner. |
 | Crash while object command runs before first checkpoint | Inbox head remains unconsumed; new owner reruns command after lease expiry. |
 | Crash after object command checkpoint completion before state/message completion | Checkpoint output is cached; command replays and persists state/result once. |
 | Crash after object state persists before ask result completion | State persist and message completion must be atomic so this split state is impossible. |
 | Crash while head message is in backoff/dead-letter | Later messages remain blocked until operator action. |
 | Crash during object sleep-to-inbox conversion | Either sleep row remains or wake inbox row exists; no wake is lost. |
-| Crash while workflow signal is accepted into history | Accepted signal is replayed in sequence. |
 | Crash after patch marker commit before first new-branch step | Replay sees marker, `patched` returns true, and the new branch continues. |
 | Code removes `patched` while normal marker history still exists | Checker raises nondeterminism before any later durable write. |
 | Owner pod loses lease while activity continues | External effect may finish; checkpoint/status write fails; retry uses idempotency. |
@@ -647,7 +650,7 @@ Correctness claims must be backed by tests:
 - Subprocess crash harnesses cover real process death around durable boundaries.
 - RPC tests cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, gRPC serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
 - Object mailbox tests cover strict FIFO, blocked head behavior, ask/tell ordering, wake ordering, idempotency conflicts, owner crash, lease takeover, dead-letter, and operator repair paths.
-- Workflow signal tests cover history acceptance, deterministic replay order, timeout behavior, terminal-workflow rejection, and idempotency dedup.
+- Workflow command tests cover history acceptance, deterministic replay order, timeout behavior, terminal-workflow rejection, and idempotency dedup.
 - Workflow patch-marker tests cover first-run marker recording, no-marker `false` branches, marker-history `true` branches, missing-marker nondeterminism failures, `deprecate_patch` cleanup, duplicate-id handling, backend conformance, and crash after marker commit.
 - Exposed transient method tests verify no durable state mutation and deadline/crash semantics.
 - Observability tests verify required span/metric labels without depending on a particular vendor backend.

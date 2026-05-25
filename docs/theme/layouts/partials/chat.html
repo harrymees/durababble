@@ -1,0 +1,26 @@
+{{ $starters := .Site.Params.chat.starters | default "" }}
+{{/* Vendor the XSS-critical dependencies locally so Hugo can fingerprint them
+     and the served URL itself encodes integrity. A CDN compromise of DOMPurify
+     or marked would otherwise silently defeat our HTML sanitization. */}}
+{{ $marked := resources.Get "js/vendor/marked-15.0.0.js" | resources.Fingerprint }}
+{{ $markedHighlight := resources.Get "js/vendor/marked-highlight-2.2.1.js" | resources.Fingerprint }}
+{{ $dompurify := resources.Get "js/vendor/dompurify-3.2.4.js" | resources.Fingerprint }}
+{{/* data-site-id owns the EmbeddingCache collection name. We use the zone
+     path (which Zeitung's build plants into .Site.Title) because it's
+     unique-per-zone and build-owned — the runtime DNS-segment approach
+     silently collides between zones that share a hostname prefix. */}}
+<div id="zeitung-chat-root"
+     data-site-id="{{ .Site.Title }}"
+     data-site-title="{{ .Site.Title }}"
+     data-chat-model="{{ .Site.Params.chat.model | default "gpt-5.4" }}"
+     {{ if reflect.IsSlice $starters -}}
+       data-chat-starters="{{ delimit $starters "|" }}"
+     {{- else -}}
+       data-chat-starters="{{ $starters }}"
+     {{- end }}
+     data-ai-chunks-url="{{ "ai-chunks.json" | relURL }}"
+     data-search-index-url="{{ "search-index.json" | relURL }}"
+     data-vendor-marked-url="{{ $marked.RelPermalink }}"
+     data-vendor-marked-highlight-url="{{ $markedHighlight.RelPermalink }}"
+     data-vendor-dompurify-url="{{ $dompurify.RelPermalink }}">
+</div>

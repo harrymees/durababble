@@ -1,0 +1,127 @@
+blockquote.alert {
+  margin: 20px 0;
+  padding: 16px 20px;
+  border-left: 4px solid;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-sm);
+}
+
+blockquote.alert .alert-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  margin: 0 0 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+blockquote.alert .alert-heading .alert-icon {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: inherit;
+}
+
+blockquote.alert .alert-heading .alert-icon svg {
+  width: 16px;
+  height: 16px;
+  vertical-align: middle;
+}
+
+blockquote.alert .alert-heading .alert-icon svg path {
+  fill: currentColor;
+}
+
+blockquote.alert .alert-heading {
+  color: var(--alert-color);
+}
+
+blockquote.alert-note {
+  --alert-color: #0969da;
+}
+
+blockquote.alert-tip {
+  --alert-color: var(--success);
+}
+
+blockquote.alert-important {
+  --alert-color: #8250df;
+}
+
+blockquote.alert-warning {
+  --alert-color: var(--warning);
+}
+
+blockquote.alert-caution {
+  --alert-color: var(--error);
+}
+
+blockquote.alert .alert-heading .alert-sign {
+  margin-left: auto;
+  font-weight: 700;
+  font-size: 16px;
+  opacity: 0.7;
+  transition: transform 0.2s;
+}
+
+blockquote.alert p {
+  margin-bottom: 8px;
+}
+
+blockquote.alert p:last-child {
+  margin-bottom: 0;
+}
+
+/* Foldable alerts */
+blockquote.alert-foldable .alert-content {
+  display: block;
+}
+
+blockquote.alert-foldable.alert-collapsed .alert-content {
+  display: none;
+}
+
+blockquote.alert-foldable .alert-sign {
+  transform: rotate(0deg);
+}
+
+blockquote.alert-note {
+  --alert-color: #0969da;
+  border-left-color: var(--alert-color);
+  background: rgba(9, 105, 218, 0.1);
+}
+
+blockquote.alert-tip {
+  --alert-color: var(--success);
+  border-left-color: var(--alert-color);
+  background: rgba(0, 164, 124, 0.1);
+}
+
+blockquote.alert-important {
+  --alert-color: #8250df;
+  border-left-color: var(--alert-color);
+  background: rgba(130, 80, 223, 0.1);
+}
+
+blockquote.alert-warning {
+  --alert-color: var(--warning);
+  border-left-color: var(--alert-color);
+  background: rgba(255, 196, 83, 0.15);
+}
+
+blockquote.alert-caution {
+  --alert-color: var(--error);
+  border-left-color: var(--alert-color);
+  background: rgba(215, 44, 13, 0.1);
+}
+
+blockquote:not(.alert) {
+  margin: 20px 0;
+  padding: 0 20px;
+  border-left: 4px solid var(--border);
+  color: var(--text-secondary);
+  font-style: italic;
+}

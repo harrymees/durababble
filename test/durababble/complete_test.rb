@@ -7,14 +7,12 @@ class DurababbleCompleteTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "implements the guarantee matrix explicitly with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
-        # [DURABABBLE-WF-1] [DURABABBLE-LEASE-1] Enqueue is durable and one worker claims it.
         workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 2 })
         claim = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 60)
         assert_equal workflow_id, claim.fetch("id")
         assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 60)
 
         before = parse_time(store.workflow(workflow_id).fetch("locked_until"))
-        # [DURABABBLE-LEASE-2] [DURABABBLE-LEASE-3] Heartbeat extends ownership; expiry is reclaimable.
         store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 120)
         after = parse_time(store.workflow(workflow_id).fetch("locked_until"))
         assert_operator after, :>, before
@@ -29,12 +27,10 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal ["increment", "double"], events
         again = engine(worker_id: "worker-b").resume(counter_workflow(events:), workflow_id:)
         assert_equal({ "count" => 6 }, again.result)
-        # [DURABABBLE-STEP-1] Completed step positions replay without adding user-code events.
         assert_equal ["increment", "double"], events
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
 
         side_effects = 0
-        # [DURABABBLE-FENCE-1] Repeated fence callers observe the first completed side effect.
         first = store.with_fence(workflow_id:, key: "charge:1") do
           side_effects += 1
           { "charge_id" => "ch_1" }
@@ -47,7 +43,6 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal({ "charge_id" => "ch_1" }, second)
         assert_equal 1, side_effects
 
-        # [DURABABBLE-OUTBOX-1] Outbox key, lease, and ack behavior are durable.
         outbox_id = store.enqueue_outbox(
           workflow_id:,
           topic: "email",
@@ -69,14 +64,14 @@ class DurababbleCompleteTest < DurababbleTestCase
       end
     end
 
-    test "implements timers, external event waits, and worker polling with #{backend.name}" do
+    test "implements timer waits and worker polling with #{backend.name}" do
       with_durababble_store(backend, "complete_test") do |store|
         workflow = durababble_test_workflow("waits") do
           test_step("wait_for_time") do |ctx|
             Durababble.wait_until(Time.now + 3600, ctx.merge("after_timer" => true))
           end
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("approval:#{ctx.fetch("request_id")}", ctx.merge("after_event_wait" => true))
+          test_step("wait_for_second_timer") do |ctx|
+            Durababble.wait_until(Time.now + 3600, ctx.merge("after_second_timer" => true, "approved" => true))
           end
           test_step("finish") { |ctx| ctx.merge("finished" => true) }
         end
@@ -93,11 +88,9 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
         assert_equal ["completed", "waiting"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
-        assert_equal "approval:r1", store.waits_for(workflow_id).last.fetch("event_key")
+        assert_nil store.waits_for(workflow_id).last.fetch("event_key")
 
-        assert_equal 0, store.signal_event("approval:other", payload: {})
-        # [DURABABBLE-WAIT-1] Matching event signals complete the wait once and resume workflow work.
-        assert_equal 1, store.signal_event("approval:r1", payload: { "approved" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 7202)
         assert_equal 1, worker.run_until_idle
         assert_equal "completed", store.workflow(workflow_id).fetch("status")
         assert_hash_includes store.workflow(workflow_id).fetch("result"), "finished" => true, "approved" => true
@@ -128,7 +121,6 @@ class DurababbleCompleteTest < DurababbleTestCase
         end
         assert_equal "running", store.steps_for(started_id).first.fetch("status")
         store.steal_expired_leases!(now: Time.now + 61)
-        # [DURABABBLE-STEP-2] An incomplete step is retried after recovery instead of being skipped.
         assert_equal({ "count" => 8 }, engine(worker_id: "recover").resume(counter_workflow, workflow_id: started_id).result)
 
         events = []
@@ -145,7 +137,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal 1, events.count("increment")
 
         waiting = durababble_test_workflow("waiting") do
-          test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+          test_step("wait") { |ctx| Durababble.wait_until(Time.now + 3600, ctx.merge("slept" => true)) }
           test_step("done") { |ctx| ctx.merge("done" => true) }
         end
         waiting_id = store.enqueue_workflow(name: "waiting", input: { "id" => "w1" })
@@ -153,9 +145,9 @@ class DurababbleCompleteTest < DurababbleTestCase
           engine(crash_after: :wait_recorded).resume(waiting, workflow_id: waiting_id)
         end
         assert_equal "waiting", store.workflow(waiting_id).fetch("status")
-        assert_equal 1, store.signal_event("event:w1", payload: { "signal" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         result = engine(worker_id: "recover").resume(waiting, workflow_id: waiting_id).result
-        assert_hash_includes result, "done" => true, "signal" => true
+        assert_hash_includes result, "done" => true, "slept" => true
 
         outbox_workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 5 })
         outbox_id = store.enqueue_outbox(

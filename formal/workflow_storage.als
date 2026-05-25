@@ -17,7 +17,7 @@ sig Step { step_workflow: one Workflow }
 sig Attempt { attempt_step: one Step }
 sig Worker {}
 sig Wait { wait_step: one Step }
-sig Signal {}
+sig WaitTrigger {}
 sig Fence { fence_workflow: one Workflow }
 sig OutboxMessage { outbox_workflow: one Workflow }
 sig ObjectTarget {}
@@ -86,7 +86,7 @@ sig LeaseRow {
 sig WaitRow {
   wait_row: one Wait,
   wait_status: one WaitStatus,
-  wait_signal: lone Signal,
+  wait_trigger: lone WaitTrigger,
   wait_time: one Time
 }
 
@@ -145,7 +145,7 @@ sig DurableCommit {
 
 sig WakeEvent {
   wake_wait: one Wait,
-  wake_signal: one Signal,
+  wake_trigger: one WaitTrigger,
   wake_time: one Time
 }
 
@@ -324,7 +324,7 @@ fact durableEventsComeFromRows {
   }
 
   all e: WakeEvent | e.wake_time != last
-  all e: WakeEvent | some wf: Workflow, st: Step, att: Attempt | wakeWait[wf, st, att, e.wake_wait, e.wake_signal, e.wake_time, e.wake_time.next]
+  all e: WakeEvent | some wf: Workflow, st: Step, att: Attempt | wakeWait[wf, st, att, e.wake_wait, e.wake_trigger, e.wake_time, e.wake_time.next]
 
   all a: OutboxAck | a.ack_time != last
   all a: OutboxAck | ackOutbox[a.ack_message, a.ack_worker, a.ack_time, a.ack_time.next]
@@ -504,30 +504,35 @@ pred recordWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker
   workflowStatus[wf, t] = Running
   stepStatus[st, t] = StepRunning
   attemptStatus[att, t] = AttemptRunning
-  workflowStatus[wf, tnext] = Waiting
+  -- A wait may suspend the workflow immediately, or remain in a running activation
+  -- while already-started sibling workflow fibers drain and commit.
+  workflowStatus[wf, tnext] in (Waiting + Running)
   stepStatus[st, tnext] = StepWaiting
   attemptStatus[att, tnext] = AttemptWaiting
   waitStatus[wait, tnext] = WaitPending
-  no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
+  workflowStatus[wf, tnext] = Waiting implies no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
+  workflowStatus[wf, tnext] = Running implies liveWorkflowLease[wf, worker, tnext]
   unchangedExcept[wf, st, att, wait, none, none, none, t, tnext]
-  preserveLeasesExcept[wf, t, tnext]
+  workflowStatus[wf, tnext] = Waiting implies preserveLeasesExcept[wf, t, tnext]
+  workflowStatus[wf, tnext] = Running implies preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
 }
 
-pred wakeWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, signal: Signal, t: Time, tnext: Time] {
-  -- [DURABABBLE-WAIT-1] A pending timer/event wait completes once and wakes the workflow.
+pred wakeWait[wf: Workflow, st: Step, att: Attempt, wait: Wait, trigger: WaitTrigger, t: Time, tnext: Time] {
+  -- [DURABABBLE-WAIT-1] A pending timer wait completes once and wakes the workflow.
   st.step_workflow = wf
   att.attempt_step = st
   wait.wait_step = st
-  workflowStatus[wf, t] = Waiting
+  workflowStatus[wf, t] in (Waiting + Running)
   stepStatus[st, t] = StepWaiting
   attemptStatus[att, t] = AttemptWaiting
   waitStatus[wait, t] = WaitPending
-  workflowStatus[wf, tnext] = Pending
+  workflowStatus[wf, t] = Waiting implies workflowStatus[wf, tnext] = Pending
+  workflowStatus[wf, t] = Running implies workflowStatus[wf, tnext] = Running
   stepStatus[st, tnext] = StepCompleted
   attemptStatus[att, tnext] = AttemptCompleted
   waitStatus[wait, tnext] = WaitCompleted
-  one e: WakeEvent | e.wake_wait = wait and e.wake_signal = signal and e.wake_time = t
+  one e: WakeEvent | e.wake_wait = wait and e.wake_trigger = trigger and e.wake_time = t
   unchangedExcept[wf, st, att, wait, none, none, none, t, tnext]
   preserveLeasesExcept[none, t, tnext]
   globalFrame[t, tnext]
@@ -700,7 +705,7 @@ pred step[t: Time, tnext: Time] {
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker | completeStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | retryStep[wf, st, att, worker, due, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker | recordWait[wf, st, att, wait, worker, t, tnext]
-  or some wf: Workflow, st: Step, att: Attempt, wait: Wait, signal: Signal | wakeWait[wf, st, att, wait, signal, t, tnext]
+  or some wf: Workflow, st: Step, att: Attempt, wait: Wait, trigger: WaitTrigger | wakeWait[wf, st, att, wait, trigger, t, tnext]
   or some wf: Workflow, worker: Worker | completeWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, status: WorkflowStatus | failCancelOrTerminateWorkflow[wf, none, status, t, tnext]
   or some wf: Workflow, worker: Worker, status: WorkflowStatus | failCancelOrTerminateWorkflow[wf, worker, status, t, tnext]
@@ -866,12 +871,26 @@ pred exampleLeaseStealAndReplay {
 }
 
 pred exampleWaitWake {
-  some wf: Workflow, st: Step, att: Attempt, wait: Wait, signal: Signal, worker: Worker | {
+  some wf: Workflow, st: Step, att: Attempt, wait: Wait, trigger: WaitTrigger, worker: Worker | {
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
     startStep[wf, st, att, first.next.next, first.next.next.next]
     recordWait[wf, st, att, wait, worker, first.next.next.next, first.next.next.next.next]
-    wakeWait[wf, st, att, wait, signal, first.next.next.next.next, first.next.next.next.next.next]
+    wakeWait[wf, st, att, wait, trigger, first.next.next.next.next, first.next.next.next.next.next]
+  }
+}
+
+pred exampleWaitAllowsSiblingCompletionBeforeSuspension {
+  some wf: Workflow, waitStep, siblingStep: Step, waitAttempt, siblingAttempt: Attempt, wait: Wait, trigger: WaitTrigger, worker: Worker | {
+    waitStep != siblingStep
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    startStep[wf, waitStep, waitAttempt, first.next.next, first.next.next.next]
+    recordWait[wf, waitStep, waitAttempt, wait, worker, first.next.next.next, first.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next] = Running
+    startStep[wf, siblingStep, siblingAttempt, first.next.next.next.next, first.next.next.next.next.next]
+    completeStep[wf, siblingStep, siblingAttempt, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    wakeWait[wf, waitStep, waitAttempt, wait, trigger, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
   }
 }
 
@@ -945,7 +964,8 @@ pred exampleObjectCommandFailureRetry {
 
 run exampleWorkflowCompletes for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
 run exampleLeaseStealAndReplay for 10 but exactly 1 Workflow, 2 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time
-run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 Signal, 1 WorkflowCommand, 1 CommandShape, 8 Time
+run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 8 Time
+run exampleWaitAllowsSiblingCompletionBeforeSuspension for 12 but exactly 1 Workflow, 1 Worker, 2 Step, 2 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 9 Time
 run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
 run exampleStepStart for 6 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 5 Time
 run exampleParallelCommandSchedules for 8 but exactly 1 Workflow, 1 Worker, 2 Step, 2 WorkflowCommand, 2 CommandShape, 6 Time
@@ -960,7 +980,7 @@ check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 A
 check scheduledCommandHistoryIsReplayStable for 4 but 2 Workflow, 2 Worker, 3 Step, 3 WorkflowCommand, 3 CommandShape, 5 Time
 check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
 check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
-check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 Signal, 1 WorkflowCommand, 1 CommandShape, 6 Time
+check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 6 Time
 check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time
 check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time
 check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time
