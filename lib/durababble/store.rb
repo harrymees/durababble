@@ -281,7 +281,6 @@ module Durababble
       Integer(value)
     end
 
-
     #: (untyped, now: untyped) -> untyped
     def target_activation_ready_at_for(row, now:)
       return now if inbox_row_claimable?(row, now:)
