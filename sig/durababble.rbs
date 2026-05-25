@@ -2,6 +2,8 @@ module Durababble
   type serialized_payload = Object?
   type payload_map = Hash[String | Symbol, serialized_payload]
   type workflow_row = Hash[String, serialized_payload]
+  type workflow_handle[Input, Output, Dispatch] = WorkflowRef[Input, Output] & Dispatch
+  type durable_object_handle[Id, State, Dispatch] = DurableObjectRef[Id, State] & Dispatch
   type retry_config = {
     ?initial_interval: Numeric,
     ?backoff_coefficient: Float,
@@ -186,12 +188,13 @@ module Durababble
     def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
   end
 
-  class Workflow[Input, Output]
+  class Workflow[Input, Output, Dispatch = Object]
     def self.workflow_name: (?String value) -> String
     def self.enqueue: (Input input, ?store: Store) -> String
-    def self.start: (Input input, ?store: Store) -> WorkflowRef[Input, Output]
-    def self.ref: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
-    def self.handle: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
+    def self.start: (Input input, ?store: Store) -> workflow_handle[Input, Output, Dispatch]
+    def self.at: (String workflow_id, ?store: Store) -> workflow_handle[Input, Output, Dispatch]
+    def self.ref: (String workflow_id, ?store: Store) -> workflow_handle[Input, Output, Dispatch]
+    def self.handle: (String workflow_id, ?store: Store) -> workflow_handle[Input, Output, Dispatch]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
@@ -207,15 +210,16 @@ module Durababble
   class WorkflowRef[Input, Output]
     attr_reader workflow_id: String
 
-    def initialize: (singleton(Workflow[Input, Output]) workflow_class, String workflow_id, store: Store) -> void
+    def initialize: (singleton(Workflow) workflow_class, String workflow_id, store: Store) -> void
     def cancel: (?reason: serialized_payload) -> Run[serialized_payload]
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end
 
-  class DurableObject[Id, State]
+  class DurableObject[Id, State, Dispatch = Object]
     def self.object_type: (?String value) -> String
-    def self.ref: (Id durable_id, ?store: Store) -> DurableObjectRef[Id, State]
+    def self.at: (Id durable_id, ?store: Store) -> durable_object_handle[Id, State, Dispatch]
+    def self.ref: (Id durable_id, ?store: Store) -> durable_object_handle[Id, State, Dispatch]
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
 
@@ -231,7 +235,7 @@ module Durababble
   class DurableObjectRef[Id, State]
     attr_reader durable_id: Id
 
-    def initialize: (singleton(DurableObject[Id, State]) object_class, Id durable_id, store: Store) -> void
+    def initialize: (singleton(DurableObject) object_class, Id durable_id, store: Store) -> void
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end
@@ -247,13 +251,13 @@ module Durababble
 
   class Engine
     def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
-    def run: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, input: Input) -> Run[Output]
-    def resume: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
-    def drain_workflow_inbox: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?, ?limit: Integer) -> Integer
+    def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
+    def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
+    def drain_workflow_inbox: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?, ?limit: Integer) -> Integer
   end
 
   class Worker
-    def initialize: (store: Store, workflows: Array[singleton(Workflow[serialized_payload, serialized_payload])] | Hash[String, singleton(Workflow[serialized_payload, serialized_payload])], worker_id: String, ?lease_seconds: Numeric, ?migrate: bool) -> void
+    def initialize: (store: Store, workflows: Array[singleton(Workflow)] | Hash[String, singleton(Workflow)], worker_id: String, ?lease_seconds: Numeric, ?migrate: bool) -> void
     def tick: () -> Symbol
     def deliver_target: (target_kind: String, target_type: String, target_id: String) -> Symbol
     def run_until_idle: (?max_ticks: Integer) -> Integer
@@ -261,18 +265,18 @@ module Durababble
 
   class WorkerRuntime
     attr_reader store: Store
-    attr_reader workflows: Array[singleton(Workflow[serialized_payload, serialized_payload])] | Hash[String, singleton(Workflow[serialized_payload, serialized_payload])]
+    attr_reader workflows: Array[singleton(Workflow)] | Hash[String, singleton(Workflow)]
     attr_reader worker_pool: String
     attr_reader worker_id: String
     attr_reader last_error: StandardError?
     attr_reader rpc_address: String?
 
-    def self.start: (workflows: Array[singleton(Workflow[serialized_payload, serialized_payload])] | Hash[String, singleton(Workflow[serialized_payload, serialized_payload])], worker_pool: String, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> WorkerRuntime
+    def self.start: (workflows: Array[singleton(Workflow)] | Hash[String, singleton(Workflow)], worker_pool: String, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> WorkerRuntime
 
-    def initialize: (workflows: Array[singleton(Workflow[serialized_payload, serialized_payload])] | Hash[String, singleton(Workflow[serialized_payload, serialized_payload])], worker_pool: String, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
+    def initialize: (workflows: Array[singleton(Workflow)] | Hash[String, singleton(Workflow)], worker_pool: String, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
     def start: () -> self
-    def shutdown: (?timeout: Numeric) -> :stopped | :timeout
-    def stop: (?timeout: Numeric) -> :stopped | :timeout
+    def shutdown: (?timeout: Numeric) -> (:stopped | :timeout)
+    def stop: (?timeout: Numeric) -> (:stopped | :timeout)
     def wait: (?timeout: Numeric?) -> Thread?
     def running?: () -> bool
     def close: () -> void

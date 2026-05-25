@@ -24,6 +24,11 @@ module Durababble
       end
 
       #: (untyped, ?store: untyped) -> untyped
+      def at(durable_id, store: Durababble.store)
+        ref(durable_id, store:)
+      end
+
+      #: (untyped, ?store: untyped) -> untyped
       def ref(durable_id, store: Durababble.store)
         DurableObjectRef.new(self, String(durable_id), store:)
       end

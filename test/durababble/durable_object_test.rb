@@ -147,7 +147,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "exposes commands and queries without step semantics with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        account = ApiTestAccount.ref("acct-1", store:)
+        account = ApiTestAccount.at("acct-1", store:)
 
         assert_not_respond_to ApiTestAccount, :step
         assert_equal 0, account.balance

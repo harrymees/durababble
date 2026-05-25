@@ -64,7 +64,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.handle(workflow_id)` returns a query/management handle for status, result, cancellation, resume, signals, and exposed methods.
+`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.at(workflow_id)` and `Workflow.handle(workflow_id)` return a query/management handle for status, result, cancellation, resume, signals, and exposed methods.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -119,7 +119,7 @@ Durababble does not provide a block-form durable-object `.with(id) { ... }` API.
 
 ### Typing
 
-The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
+The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output, Dispatch = Object]` and `Durababble::DurableObject[Id, State, Dispatch = Object]` generics for static tooling only; the third generic is the type-level RPC dispatch surface exposed on handles returned by `start`, `at`, `ref`, and `handle`, while runtime serialization remains Paquito-based.
 
 ## Workflow execution semantics
 

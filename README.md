@@ -6,8 +6,8 @@ The library gives you two primitives:
 
 | Primitive         | Use it for                                                                       | Current API                                                                                                               |
 | ----------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
-| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.ref`, `expose`, `expose_command`                                              |
+| Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.at`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
+| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.at`, `DurableObject.ref`, `expose`, `expose_command`                                  |
 
 Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
 
@@ -151,7 +151,7 @@ worker = Durababble::Worker.new(
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order, store:)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.handle(workflow_id, store:)` and `FulfillOrder.ref(workflow_id, store:)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it.
+`FulfillOrder.start(order, store:)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id, store:)`, `FulfillOrder.handle(workflow_id, store:)`, and `FulfillOrder.ref(workflow_id, store:)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it.
 
 ```ruby
 handle = FulfillOrder.start(order, store:)
@@ -271,7 +271,7 @@ class ReviewWorkflow < Durababble::Workflow
   end
 end
 
-handle = ReviewWorkflow.handle(run_id, store:)
+handle = ReviewWorkflow.at(run_id, store:)
 handle.label
 handle.note(message: "approved by legal")
 ```

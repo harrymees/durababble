@@ -124,7 +124,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
       end
     end
 
-    assert_equal "wf:wf-1", positional_query.ref("wf-1", store: Object.new).describe("wf")
+    assert_equal "wf:wf-1", positional_query.at("wf-1", store: Object.new).describe("wf")
   end
 
   test "uses the store's atomic workflow command enqueue path" do

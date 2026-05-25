@@ -49,6 +49,11 @@ module Durababble
       end
 
       #: (untyped, ?store: untyped) -> untyped
+      def at(workflow_id, store: Durababble.store)
+        handle(workflow_id, store:)
+      end
+
+      #: (untyped, ?store: untyped) -> untyped
       def ref(workflow_id, store: Durababble.store)
         WorkflowRef.new(self, workflow_id, store:)
       end

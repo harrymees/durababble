@@ -24,9 +24,11 @@ class DurababbleDocumentationTest < DurababbleTestCase
   test "ships RBS declarations for the public class API" do
     rbs = read("sig/durababble.rbs")
 
-    assert_includes rbs, "class Workflow[Input, Output]"
-    assert_includes rbs, "class DurableObject[Id, State]"
+    assert_includes rbs, "class Workflow[Input, Output, Dispatch = Object]"
+    assert_includes rbs, "class DurableObject[Id, State, Dispatch = Object]"
     assert_includes rbs, "def self.enqueue: (Input input"
+    assert_includes rbs, "def self.at: (String workflow_id"
+    assert_includes rbs, "def self.at: (Id durable_id"
     assert_includes rbs, "def self.ref: (Id durable_id"
   end
 
