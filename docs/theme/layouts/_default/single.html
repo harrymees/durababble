@@ -1,0 +1,8 @@
+{{ define "main" }}
+  <article>
+    {{- $content := .Content -}}
+    {{- $content = $content | replaceRE `<img([^>]*)\ssrc="\.\./static/([^"]+)"([^>]*)>` `<img$1 src="/$2"$3>` -}}
+    <div class="prose">{{ $content | safeHTML }}</div>
+    {{ partial "page-nav.html" . }}
+  </article>
+{{ end }}

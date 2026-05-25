@@ -1,0 +1,30 @@
+{{ $icons := dict
+  "caution" (resources.Get "images/stop-16.svg")
+  "important" (resources.Get "images/report-16.svg")
+  "note" (resources.Get "images/info-16.svg")
+  "tip" (resources.Get "images/light-bulb-16.svg")
+  "warning" (resources.Get "images/alert-16.svg")
+}}
+
+{{ if eq .Type "alert" }}
+  <blockquote class="alert alert-{{ .AlertType }}{{ if .AlertSign }} alert-foldable{{ if eq .AlertSign '-' }} alert-collapsed{{ end }}{{ end }}">
+    <p class="alert-heading">
+      {{ with index $icons .AlertType }}
+        <span class="alert-icon">{{ .Content | safeHTML }}</span>
+      {{ end }}
+      {{ with .AlertTitle }}
+        {{ . }}
+      {{ else }}
+        {{ or (i18n .AlertType) (title .AlertType) }}
+      {{ end }}
+      {{ if .AlertSign }}
+        <span class="alert-sign">{{ .AlertSign }}</span>
+      {{ end }}
+    </p>
+    <div class="alert-content">{{ .Text }}</div>
+  </blockquote>
+{{ else }}
+  <blockquote>
+    {{ .Text }}
+  </blockquote>
+{{ end }}

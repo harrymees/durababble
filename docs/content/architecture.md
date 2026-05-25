@@ -1,4 +1,9 @@
-# Durababble architecture
+---
+title: "Architecture"
+weight: 70
+---
+
+# Architecture
 
 Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durable-object definitions; a SQL store owns durable coordination and recovery state. The primary tested stores are YugabyteDB/YSQL through the PostgreSQL wire protocol and MySQL/MariaDB through Trilogy.
 
@@ -182,4 +187,4 @@ Primary metrics:
 
 GitHub Actions runs `bundle exec rake test:coverage`, the same gate developers can run locally through `mise exec -- bundle exec rake test:coverage`. That task enables SimpleCov branch coverage, measures library files under `lib/**/*.rb`, and fails when global line coverage drops below 90%, global branch coverage drops below 85%, per-file line coverage drops below 59%, or per-file branch coverage drops below 41%. These ratchet thresholds are based on the current MySQL-backed CI suite, with a documented target of 95% line coverage and 90% branch coverage as meaningful tests improve the baseline. CI uploads the generated `coverage/` report so regressions can be diagnosed from the per-file HTML output and result JSON.
 
-See `docs/spec.md` for the guarantee and crash matrices implemented by tests.
+See [the spec](../spec.md) for the guarantee and crash matrices implemented by tests.
