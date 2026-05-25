@@ -23,11 +23,25 @@ module DurababbleMinitestHelper
 
     block.call(@durababble_store)
   ensure
-    @durababble_store&.drop_schema!
+    drop_durababble_test_schema
     @durababble_store&.close
     @durababble_store = nil #: untyped
     @durababble_schema = nil #: String?
     @durababble_backend = nil #: untyped
+  end
+
+  #: () -> void
+  def drop_durababble_test_schema
+    attempts = 0
+    begin
+      @durababble_store&.drop_schema!
+    rescue ActiveRecord::Deadlocked, ActiveRecord::SerializationFailure
+      attempts += 1
+      raise if attempts >= 10
+
+      sleep(0.05 * attempts)
+      retry
+    end
   end
 
   #: (Hash[untyped, untyped], Hash[untyped, untyped]) -> void

@@ -154,7 +154,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "enqueues workflows through default and explicit engines with #{backend.name}" do
       with_durababble_store(backend, "public_api_default_engine_workflow") do |store|
-        engine = Durababble::Engine.new(store:)
+        engine = Durababble::Engine.new(store:, migrate: false)
 
         explicit_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, engine:)
         assert_equal(BranchTestWorkflow.workflow_name, store.workflow(explicit_id).fetch("name"))

@@ -30,7 +30,7 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     def request(command, payload)
       @requests << [command, payload]
       @on_request&.call
-      raise Durababble::RpcClient::RemoteError, @error_message
+      raise Durababble::Rpc::RemoteError, @error_message
     end
   end
 
@@ -354,7 +354,7 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     remote_client = WorkflowRpcRemoteErrorClient.new("SomeOtherError: boom")
     router = Durababble::WorkflowRpc::Router.new(store:, rpc_clients: { "worker-a" => remote_client }, retry_on_stale: false)
 
-    assert_raises_matching(Durababble::RpcClient::RemoteError, /SomeOtherError/) do
+    assert_raises_matching(Durababble::Rpc::RemoteError, /SomeOtherError/) do
       router.request(workflow_id:, command: "status", payload: {})
     end
   end

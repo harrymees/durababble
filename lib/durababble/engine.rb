@@ -12,8 +12,8 @@ module Durababble
     #: untyped
     attr_reader :store
 
-    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped) -> void
-    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil)
+    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped) -> void
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds

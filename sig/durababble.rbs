@@ -282,7 +282,7 @@ module Durababble
   class Engine
     attr_reader store: Store
 
-    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?crash_after: Symbol?) -> void
+    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
     def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input) -> String
     def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
@@ -340,28 +340,6 @@ module Durababble
     def delay_for_attempt: (Integer attempt_number) -> Float
   end
 
-  class RpcClient
-    class Error < Durababble::Error
-    end
-
-    class RemoteError < Error
-    end
-
-    class ConnectionError < Error
-    end
-
-    class EOFError < ConnectionError
-    end
-
-    class TimeoutError < ConnectionError
-    end
-
-    def self.spawn: (command: Array[String], ?env: Hash[String, String], ?timeout: Numeric) -> RpcClient
-
-    def request: (String command, ?payload_map payload) -> serialized_payload
-    def close: () -> void
-  end
-
   module WorkflowRpc
     class Error < Durababble::Error
     end
@@ -410,6 +388,9 @@ module Durababble
     end
 
     class Unauthenticated < Error
+    end
+
+    class RemoteError < Error
     end
 
     class NodeDirectory

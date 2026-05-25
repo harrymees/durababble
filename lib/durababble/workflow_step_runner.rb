@@ -5,14 +5,14 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, root_task: untyped, futures: untyped, step_contexts: untyped, synchronize_store: untyped, raise_if_cancel_requested: untyped, assert_workflow_lease: untyped, suspend_workflow_immediately: untyped, retry_run_at: untyped, crash: untyped) -> void
+    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, retry_run_at: Proc, crash: Proc) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, retry_run_at:, crash:)
-      @store = store
+      @store = store #: as untyped
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
-      @root_task = root_task
-      @futures = futures
+      @root_task = root_task #: as untyped
+      @futures = futures #: as untyped
       @step_contexts = step_contexts
       @synchronize_store = synchronize_store
       @raise_if_cancel_requested = raise_if_cancel_requested
@@ -22,8 +22,9 @@ module Durababble
       @crash = crash
     end
 
-    #: (untyped, step: untyped, attributes: untyped) { -> untyped } -> void
+    #: (Integer, step: Object, attributes: Hash[String, Object?]) { -> Object? } -> void
     def dispatch(command_id, step:, attributes:, &block)
+      step = step #: as untyped
       @root_task.async(transient: true) do |task|
         raise_if_cancel_requested!
         synchronize_store do
@@ -58,7 +59,7 @@ module Durababble
 
     private
 
-    #: (untyped, untyped, untyped) -> untyped
+    #: (Object, Integer, Integer) -> StepContext
     def build_step_context(task, command_id, attempt_number)
       step_context = StepContext.new(
         workflow_id: @workflow_id,
@@ -70,8 +71,9 @@ module Durababble
       @step_contexts[task] = step_context
     end
 
-    #: (untyped, step: untyped, wait_request: untyped) -> void
+    #: (Integer, step: Object, wait_request: WaitRequest) -> void
     def record_wait(command_id, step:, wait_request:)
+      step = step #: as untyped
       suspend_workflow = @suspend_workflow_immediately.call
       synchronize_store do
         @store.record_wait(
@@ -88,7 +90,7 @@ module Durababble
       future(command_id).reject(error)
     end
 
-    #: (untyped, command_id: untyped, step: untyped, attributes: untyped) -> void
+    #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void
     def reject_step_error(error, command_id:, step:, attributes:)
       if error.is_a?(CancellationError)
         assert_workflow_lease!
@@ -117,8 +119,9 @@ module Durababble
       future(command_id).reject(handle_step_error(error, command_id:, step:, attributes:))
     end
 
-    #: (untyped, command_id: untyped, step: untyped, attributes: untyped) -> untyped
+    #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
     def handle_step_error(error, command_id:, step:, attributes:)
+      step = step #: as untyped
       message = "#{error.class}: #{error.message}"
       assert_workflow_lease!
       synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
@@ -142,7 +145,7 @@ module Durababble
       StepRetryScheduled.new(message)
     end
 
-    #: (untyped) -> untyped
+    #: (Integer) -> Heartbeat
     def build_heartbeat(command_id)
       Heartbeat.new(
         cursor: synchronize_store { @store.step_heartbeat_cursor(workflow_id: @workflow_id, command_id:) },
@@ -168,19 +171,21 @@ module Durababble
       )
     end
 
-    #: (untyped) -> untyped
+    #: (Integer) -> Integer
     def attempt_number_for(command_id)
-      synchronize_store do
+      count = synchronize_store do
         @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
       end
+      count = count #: as untyped
+      count.to_i
     end
 
-    #: (untyped) -> untyped
+    #: (Integer) -> untyped
     def future(command_id)
       @futures.fetch(command_id)
     end
 
-    #: () { -> untyped } -> untyped
+    #: () { -> Object? } -> Object?
     def synchronize_store(&block)
       @synchronize_store.call(&block)
     end
@@ -195,7 +200,7 @@ module Durababble
       @assert_workflow_lease.call
     end
 
-    #: (untyped) -> untyped
+    #: (Symbol) -> Object?
     def crash!(point)
       @crash.call(point)
     end

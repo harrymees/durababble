@@ -167,20 +167,6 @@ html { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 
 .navbar-brand .dot { color: var(--brand); }
 
-.btn.btn-docs {
-  margin-left: 4px;
-  padding: 7px 14px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  text-decoration: none;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  transition: all 0.15s ease;
-}
-.btn.btn-docs:hover { background: var(--bg-elev); border-color: var(--muted); }
-
 .footer-link { color: var(--brand); text-decoration: none; font-weight: 600; }
 .footer-link:hover { text-decoration: underline; }
 .external-link::after { content: " \2197"; font-size: 0.9em; }
@@ -584,6 +570,8 @@ main pre code {
   color: var(--text);
   font-size: 13px;
 }
+main .highlight { margin: 24px 0; }
+main .highlight pre { margin: 0; }
 
 /* Page navigation */
 .page-nav {
