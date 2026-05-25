@@ -10,7 +10,7 @@ Durababble exposes two durable primitives:
 
 | Primitive | Class | Public handle API | Best for | Mental model |
 | --- | --- | --- | --- | --- |
-| Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, and recovery | A function or process that survives restarts |
+| Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, termination, and recovery | A function or process that survives restarts |
 | Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.handle` typed handle calls | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
@@ -66,7 +66,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
+`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, termination, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -265,7 +265,17 @@ Cancellation is cooperative execution, not hard termination.
 - If workflow code catches cancellation and returns after cleanup, the engine records the workflow as `canceled` and stores the cleanup result. Re-raising `CancellationError` also records `canceled`.
 - If cleanup raises an unrelated error, ordinary step retry policy applies. Retryable cleanup failures remain `canceling` with `next_run_at` set and become claimable again only when due. Exhausted or non-retryable cleanup failures mark the workflow `failed`.
 - Child workflow APIs must require an explicit child-cancellation policy. Parent cancellation must not silently terminate child work or report `canceled` before the selected child policy reaches a durable outcome.
-- Operator termination is a distinct hard-stop operation. It may stop work without running cleanup, but it uses a separate state/API and must not report cooperative cleanup as completed.
+### Hard termination
+
+Termination is an operator hard stop, not cancellation with stronger wording.
+
+- `Workflow.handle(workflow_id).terminate(reason: nil)` durably marks a non-terminal workflow `terminated` as soon as the store can commit that terminal state. The terminal run has `status == "terminated"`, `result == nil`, and `error` set to the supplied reason or `"workflow terminated"` when no reason is supplied.
+- Duplicate termination calls are idempotent. If the workflow is already `terminated`, later calls return the same terminal run and preserve the first durable reason. If the workflow is already `completed`, `failed`, or `canceled`, termination is a no-op that returns the existing terminal run without changing result, error, cancellation metadata, history, waits, or commands.
+- Termination does not deliver `Durababble::CancellationError`, does not set cancellation metadata, and does not run workflow cleanup. A workflow already in `canceling` can still be terminated; if termination commits first, cleanup is skipped and the final state is `terminated`.
+- When termination wins, the store clears the workflow lease and retry deadline, records a termination history event, cancels pending waits, marks live scheduled/running/waiting step and attempt rows as canceled with a termination error, dead-letters queued or running workflow-command inbox rows, and removes pending workflow target activations.
+- A running Ruby step body is not asynchronously interrupted mid-frame. After termination commits, later step heartbeats, waits, step completions/failures, workflow completion/failure/cancellation writes, and workflow command completions are fenced by the missing running lease or the terminal workflow row and cannot revive the workflow.
+- Late timer wakes for terminated workflows are ignored because only pending waits for running/waiting workflows can complete. New workflow commands after termination fail instead of being buffered for a future run, and already queued commands complete with a terminal error rather than executing user code.
+- Race rule: the first durable terminal write wins. Completion, failure, cancellation, and termination are mutually exclusive terminal outcomes; once any one commits, the others return or observe the persisted terminal run without changing it. Recovery and replay treat `terminated` as terminal and never claim, replay, or resume it.
 
 ### Workflow code evolution
 

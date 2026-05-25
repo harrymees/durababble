@@ -36,32 +36,33 @@ module Durababble
       #: () -> untyped
       def current_time = scheduler.time
 
-      #: (name: untyped, input: untyped) -> untyped
-      def enqueue_workflow(name:, input:)
+      #: (name: untyped, input: untyped, ?worker_pool: untyped) -> untyped
+      def enqueue_workflow(name:, input:, worker_pool: "default")
         id = next_id("wf")
-        @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
+        @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
         trace("enqueue_workflow", id:, name:)
         id
       end
 
-      #: (name: untyped, input: untyped) -> untyped
-      def create_workflow(name:, input:)
-        id = enqueue_workflow(name:, input:)
-        mark_workflow_running(id)
+      #: (name: untyped, input: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?worker_pool: untyped) -> untyped
+      def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+        id = enqueue_workflow(name:, input:, worker_pool:)
+        mark_workflow_running(id, worker_id:, lease_seconds:, worker_pool:)
         id
       end
 
-      #: (worker_id: untyped, lease_seconds: untyped, ?workflow_names: untyped) -> untyped
-      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
-        workflow = @workflows.values.select { |row| runnable?(row) && (!workflow_names || workflow_names.include?(row.fetch("name"))) }.min_by { |row| row.fetch("id") }
+      #: (worker_id: untyped, lease_seconds: untyped, ?workflow_names: untyped, ?worker_pool: untyped) -> untyped
+      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+        workflow = @workflows.values.select { |row| row.fetch("worker_pool", "default") == worker_pool && runnable?(row) && (!workflow_names || workflow_names.include?(row.fetch("name"))) }.min_by { |row| row.fetch("id") }
         return unless workflow
 
         claim_row(workflow, worker_id, lease_seconds)
       end
 
-      #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
-      def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, ?worker_pool: untyped) -> untyped
+      def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
         row = @workflows.fetch(workflow_id)
+        return unless row.fetch("worker_pool", "default") == worker_pool
         return deep(row) if row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
         return unless row.fetch("status") == "pending" ||
           retryable_failed?(row) ||
@@ -103,12 +104,13 @@ module Durababble
         deep(@steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil))
       end
 
-      #: (untyped) -> untyped
-      def current_workflow_lease(workflow_id)
+      #: (untyped, ?worker_pool: untyped) -> untyped
+      def current_workflow_lease(workflow_id, worker_pool: nil)
         row = @workflows.fetch(workflow_id)
+        return if worker_pool && row.fetch("worker_pool", "default") != worker_pool
         return unless row.fetch("status") == "running" && row.fetch("locked_by") && !expired?(row)
 
-        { "workflow_id" => workflow_id, "worker_id" => row.fetch("locked_by"), "locked_until" => row.fetch("locked_until") }
+        { "workflow_id" => workflow_id, "worker_pool" => row.fetch("worker_pool", "default"), "worker_id" => row.fetch("locked_by"), "locked_until" => row.fetch("locked_until") }
       end
 
       #: (?now: untyped) -> untyped
@@ -127,9 +129,11 @@ module Durababble
         count
       end
 
-      #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped) -> untyped
-      def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
+      #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?worker_pool: untyped) -> untyped
+      def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
         row = @workflows.fetch(workflow_id)
+        return unless row.fetch("worker_pool", "default") == worker_pool
+
         row["status"] = "running"
         row["error"] = nil
         if worker_id
@@ -235,15 +239,21 @@ module Durababble
         fault_plan.after(:record_step_completed)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped, ?terminal: untyped, ?error_class: untyped, ?error_message: untyped) -> untyped
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
         assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "failed"
         step["error"] = error
         update_latest_attempt(workflow_id, command_id, "failed", nil, error)
-        append_history(workflow_id:, kind: "step_failed", command_id:, error:)
+        payload = nil
+        if terminal
+          payload = { "terminal" => true }
+          payload["error_class"] = error_class if error_class
+          payload["error_message"] = error_message if error_message
+        end
+        append_history(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
         trace("step_failed", id: workflow_id, command_id:, error:)
       end
 
@@ -359,12 +369,12 @@ module Durababble
       def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
 
       #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
-      def target_activation(target_kind:, target_type:, target_id:)
+      def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
         nil
       end
 
       #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, limit: untyped) -> untyped
-      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default")
         []
       end
 

@@ -19,19 +19,20 @@ class DurababbleWorkerTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
       claim = @claims.shift
-      claim&.merge("claimed_by" => worker_id, "lease_seconds" => lease_seconds, "workflow_names" => workflow_names)
+      claim&.merge("claimed_by" => worker_id, "lease_seconds" => lease_seconds, "workflow_names" => workflow_names, "worker_pool" => worker_pool)
     end
 
-    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:)
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:, worker_pool: "default")
       nil
     end
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       {
         "id" => workflow_id,
         "name" => "unit",
+        "worker_pool" => worker_pool,
         "status" => "running",
         "input" => { "value" => 1 },
         "claimed_by" => worker_id,
@@ -115,7 +116,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       @resumed << [:completed, workflow_id, position, result]
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       position ||= command_id
       @resumed << [:failed, workflow_id, position, error]
     end
@@ -139,11 +140,12 @@ class DurababbleWorkerTest < DurababbleTestCase
       @completed_activations = []
     end
 
-    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:)
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds:, target_types:, worker_pool: "default")
       return if @activation_claimed
 
       @activation_claimed = true
       {
+        "worker_pool" => worker_pool,
         "target_kind" => target_kinds.fetch(0),
         "target_type" => target_types.fetch(0),
         "target_id" => "wf-activated",
@@ -153,7 +155,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       }
     end
 
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       @resumed << [:activation_claim, workflow_id, worker_id, lease_seconds]
       nil
     end
@@ -195,13 +197,14 @@ class DurababbleWorkerTest < DurababbleTestCase
       @reconciled = []
     end
 
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       @resumed << [:activation_claim, workflow_id, worker_id, lease_seconds]
       return unless @claimed
 
       {
         "id" => workflow_id,
         "name" => "command-unit",
+        "worker_pool" => worker_pool,
         "status" => "running",
         "input" => {},
         "locked_by" => worker_id,
@@ -309,6 +312,7 @@ class DurababbleWorkerTest < DurababbleTestCase
           target_kind: "workflow",
           target_type: "unit",
           target_id: "wf-activated",
+          worker_pool: "default",
         },
       ],
       store.deliveries,
@@ -320,6 +324,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       target_kind: "workflow",
       target_type: "unit",
       target_id: "wf-activated",
+      worker_pool: "default",
       worker_id: "worker-a",
     )
     assert_in_delta(
@@ -388,6 +393,7 @@ class DurababbleWorkerTest < DurababbleTestCase
           target_kind: "workflow",
           target_type: "command-unit",
           target_id: "wf-command",
+          worker_pool: "default",
         },
       ],
       store.reconciled,
@@ -422,6 +428,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       target_kind: "workflow",
       target_type: "unit",
       target_id: "wf-command",
+      worker_pool: "default",
     )
     assert_equal(
       [
@@ -429,6 +436,7 @@ class DurababbleWorkerTest < DurababbleTestCase
           target_kind: "workflow",
           target_type: "unit",
           target_id: "wf-command",
+          worker_pool: "default",
         },
       ],
       store.deliveries,

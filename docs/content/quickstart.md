@@ -44,12 +44,13 @@ handle.result
 
 ## Enqueue Now, Run Later On A Worker
 
-In a real application, web requests enqueue and long-running workers claim work under SQL leases. The handle is portable across processes — anything with the workflow id and a store can query or cancel.
+In a real application, web requests enqueue and long-running workers claim work under SQL leases. The handle is portable across processes — anything with the workflow id and a store can query, cancel cooperatively, or terminate as an operator hard stop.
 
 ```ruby
 handle = FulfillOrder.start(order)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
+handle.terminate(reason: "operator hard stop")
 
 Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1", migrate: false).run_until_idle
 ```

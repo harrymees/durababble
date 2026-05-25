@@ -219,7 +219,7 @@ module Durababble
       end
 
       def bench_inline_run_workflow(i, warmup:)
-        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30, migrate: false).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
         raise "inline workflow did not complete" unless run.status == "completed"
       end
 
@@ -256,11 +256,11 @@ module Durababble
 
       def bench_timer_wait_resume_workflow(i, warmup:)
         workflow = timer_resume_workflow
-        run = Durababble::Engine.new(store: @store, worker_id: "timer-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
+        run = Durababble::Engine.new(store: @store, worker_id: "timer-runner", lease_seconds: 30).run(workflow, input: { "i" => i })
         raise "workflow did not wait" unless run.status == "waiting"
 
         @store.wake_due_timers(now: Time.now)
-        resumed = Durababble::Engine.new(store: @store, worker_id: "timer-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
+        resumed = Durababble::Engine.new(store: @store, worker_id: "timer-worker", lease_seconds: 30).resume(workflow, workflow_id: run.id)
         raise "engine did not resume timer workflow" unless resumed.status == "completed"
       end
 
@@ -284,7 +284,7 @@ module Durababble
         @store.mark_workflow_running(workflow_id, worker_id: "resume-prep", lease_seconds: 30)
         @store.record_step_started(workflow_id:, position: 0, name: "add_one")
         @store.record_step_completed(workflow_id:, position: 0, result: { "i" => i, "value" => 2 })
-        run = Durababble::Engine.new(store: @store, worker_id: "resume-prep", lease_seconds: 30, migrate: false).resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store: @store, worker_id: "resume-prep", lease_seconds: 30).resume(workflow, workflow_id:)
         raise "resume did not complete" unless run.status == "completed" && run.result.fetch("value") == 4
       end
 
@@ -352,7 +352,7 @@ module Durababble
         workflow_id = @history_replay_ids.fetch(label).fetch(offset)
         @history_replay_offsets[label] = offset + 1
         workflow = @history_replay_workflows.fetch(label)
-        run = Durababble::Engine.new(store: @store, worker_id: "history-replay-#{label}-#{warmup}", lease_seconds: 30, migrate: false).resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store: @store, worker_id: "history-replay-#{label}-#{warmup}", lease_seconds: 30).resume(workflow, workflow_id:)
         raise "history replay did not complete" unless run.status == "completed"
       end
 
@@ -649,7 +649,7 @@ module Durababble
         workflow = arithmetic_workflow("bench_state_read")
         @state_read_ids = 25.times.map do |i|
           id = @store.enqueue_workflow(name: workflow.name, input: { "i" => i, "value" => 1 })
-          Durababble::Engine.new(store: @store, worker_id: "state-reader-prep", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: id)
+          Durababble::Engine.new(store: @store, worker_id: "state-reader-prep", lease_seconds: 30).resume(workflow, workflow_id: id)
           id
         end
       end
