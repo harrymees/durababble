@@ -633,6 +633,48 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "fences stale durable object command failure and retry writes with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        stale_failure = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_failure, worker_id: "expired-object-worker", lease_seconds: -1),
+          "locked_by" => "expired-object-worker",
+        )
+        failed = store.fail_object_command(command_id: stale_failure, error: "stale failure", worker_id: "expired-object-worker", terminal: true)
+        assert(failed.nil? || failed.affected_rows.to_i.zero?)
+        assert_hash_includes store.inbox_message(stale_failure), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_failure, worker_id: "recovery-object-worker", lease_seconds: 30),
+          "locked_by" => "recovery-object-worker",
+        )
+
+        stale_retry = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc-retry",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_retry, worker_id: "expired-object-worker", lease_seconds: -1),
+          "locked_by" => "expired-object-worker",
+        )
+        retried = store.retry_object_command(command_id: stale_retry, error: "stale retry", worker_id: "expired-object-worker", ready_at: Time.now + 60)
+        assert(retried.nil? || retried.affected_rows.to_i.zero?)
+        assert_hash_includes store.inbox_message(stale_retry), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        assert_hash_includes(
+          store.claim_object_command(command_id: stale_retry, worker_id: "recovery-object-worker", lease_seconds: 30),
+          "locked_by" => "recovery-object-worker",
+        )
+      end
+    end
+
     test "does not leave MySQL transactions open after no-op claim paths with #{backend.name}" do
       skip("only the MySQL backend exposes transaction metadata") unless backend.mysql?
 

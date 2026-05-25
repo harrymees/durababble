@@ -28,6 +28,8 @@ class DurababbleDocumentationTest < DurababbleTestCase
     assert_includes rbs, "class DurableObject[Id, State]"
     assert_includes rbs, "def self.enqueue: (Input input"
     assert_includes rbs, "def self.ref: (Id durable_id"
+    assert_includes rbs, "def self.at: (Id durable_id"
+    assert_includes rbs, "def self.tell: (Id durable_id"
   end
 
   test "evaluates README examples against the implemented public API" do

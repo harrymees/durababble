@@ -7,7 +7,7 @@ The library gives you two primitives:
 | Primitive         | Use it for                                                                       | Current API                                                                                                               |
 | ----------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
-| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.ref`, `expose`, `expose_command`                                              |
+| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.at`, `DurableObject.ref`, `DurableObject.tell`, `expose`, `expose_command`    |
 
 Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
 
@@ -303,7 +303,7 @@ Durable objects are for state with a durable identity. Think of one like a class
 
 Good object-shaped work includes an account in a bank, a cart, a chatroom, or a small state machine that other entities need to coordinate with. The key sign is that the id matters: all callers talking about `acct_123`, `cart_456`, or `channel-tmp-durable-execution-discussions` should see and update the same durable state.
 
-Durababble then helps you RPC to these objects to read or write the state within them. Durababble's RPC layer correctly routes your messages to the worker where a durable object is currently live, and instantiates it or retrieves it from storage if it isn't already live. 
+Durababble then helps you send durable commands to these objects and read the latest persisted state. Commands are committed to the object's mailbox and processed by workers registered for that object type.
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
@@ -335,7 +335,17 @@ store ||= Durababble::Store.connect(database_url: Durababble.default_database_ur
 store.migrate!
 
 account = Account.ref("acct_readme", store:)
-account.credit(1_000)
+Account.tell("acct_readme", :credit, 1_000, store:)
+
+worker = Durababble::Worker.new(
+  store:,
+  workflows: {},
+  objects: [Account],
+  worker_id: "account-worker-1",
+  migrate: false,
+)
+worker.run_until_idle
+
 account.balance
 ```
 
@@ -354,8 +364,8 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: this call is written to the database and eventually processed even in the face of crashes
-account.balance       # query: reads latest persisted state
+Account.tell("acct_123", :credit, 1_000, store:) # durable command: this call is written to the database and eventually processed by an object worker
+account.balance                                # query: reads latest persisted state
 ```
 
 Use `expose` for simple RPCs such as `balance`, `status`, `members`, or `current_cursor`. Use `expose_command` for changes such as `credit`, `join`, `append_message`, `advance_cursor`, or `close`. Command methods can use `command_context.idempotency_key` when calling external systems, and command retry policy is declared on the method the same way workflow step retry policy is.

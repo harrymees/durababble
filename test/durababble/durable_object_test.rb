@@ -35,16 +35,17 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
-  class ClaimlessTestStore
-    attr_reader :state, :completed, :failed
+  class EmptyMailboxStore
+    attr_reader :claimed
 
-    def migrate! = true
-    def enqueue_object_command(**) = "cmd-1"
-    def claim_object_command(**) = nil
-    def object_state(**) = state
-    def save_object_state(state:, **) = @state = state
-    def complete_object_command(command_id:, result:, **) = @completed = [command_id, result]
-    def fail_object_command(command_id:, error:, **) = @failed = [command_id, error]
+    def initialize
+      @claimed = []
+    end
+
+    def claim_inbox_messages(**kwargs)
+      @claimed << kwargs
+      []
+    end
   end
 
   class ClaimlessTestObject < Durababble::DurableObject
@@ -54,26 +55,46 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   class BranchCommandStore
-    attr_reader :completed, :failed
+    attr_reader :completed, :failed, :retried
 
-    def initialize(complete_result: ActiveRecord::Result.empty(affected_rows: 1))
+    def initialize(complete_result: ActiveRecord::Result.empty(affected_rows: 1), messages: nil, state: { "value" => 1 })
       @complete_result = complete_result
+      @state = state
       @completed = []
       @failed = []
+      @retried = []
+      @messages = messages || [
+        {
+          "id" => "cmd-1",
+          "target_kind" => "object",
+          "target_type" => "clean_command_object",
+          "target_id" => "clean",
+          "message_kind" => "ask",
+          "method_name" => "read_only",
+          "payload" => { "method_name" => "read_only", "args" => [], "kwargs" => {} },
+          "attempts" => 1,
+        },
+      ]
     end
 
-    def migrate! = self
-    def object_state(object_type:, object_id:) = { "value" => 1 }
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:) = "cmd-1"
-    def claim_object_command(command_id:, worker_id:) = { "id" => command_id }
+    def claim_inbox_messages(**)
+      message = @messages.shift
+      message ? [message] : []
+    end
+    def object_state(object_type:, object_id:) = @state
 
     def complete_object_command(command_id:, result:, **_kwargs)
       @completed << [command_id, result]
+      @state = _kwargs.fetch(:state) if _kwargs.key?(:state) && !_kwargs.fetch(:state).equal?(Durababble::Store::NO_OBJECT_STATE)
       @complete_result
     end
 
-    def fail_object_command(command_id:, error:, worker_id:)
-      @failed << [command_id, error, worker_id]
+    def fail_object_command(command_id:, error:, worker_id:, terminal: false)
+      @failed << [command_id, error, worker_id, terminal]
+    end
+
+    def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+      @retried << [command_id, error, worker_id, ready_at]
     end
   end
 
@@ -81,6 +102,16 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     expose_command def read_only
       "unchanged"
     end
+  end
+
+  class WakeTestObject < Durababble::DurableObject
+    def on_wake(payload:)
+      update_state(payload.merge("woken" => true))
+      "awake"
+    end
+  end
+
+  class NoWakeTestObject < Durababble::DurableObject
   end
 
   class RetryStateTestCounter < Durababble::DurableObject
@@ -106,15 +137,29 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
-  test "does not execute a durable object command when its lease cannot be claimed" do
-    store = ClaimlessTestStore.new
+  test "does not execute a durable object command when no mailbox row can be claimed" do
+    store = EmptyMailboxStore.new
+    executor = Durababble::DurableObjectExecutor.new(
+      store:,
+      objects: { ClaimlessTestObject.object_type => ClaimlessTestObject },
+      worker_id: "worker-a",
+      lease_seconds: 9,
+    )
 
-    assert_raises_matching(Durababble::LeaseConflict, /could not claim durable object command/) do
-      ClaimlessTestObject.ref("object-1", store:).mutate
-    end
-    assert_nil store.state
-    assert_nil store.completed
-    assert_nil store.failed
+    assert_equal 0, executor.drain_object_inbox(ClaimlessTestObject.object_type, object_id: "object-1")
+    assert_equal(
+      [
+        {
+          target_kind: "object",
+          target_type: ClaimlessTestObject.object_type,
+          target_id: "object-1",
+          worker_id: "worker-a",
+          lease_seconds: 9,
+          limit: 1,
+        },
+      ],
+      store.claimed,
+    )
   end
 
   test "derives fallback object types, ignores unknown macros, and saves state through the store" do
@@ -135,39 +180,194 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
   test "completes read-only commands and fails them when the completion lease is lost" do
     clean_command_store = BranchCommandStore.new
-    clean_ref = CleanCommandObject.ref("clean", store: clean_command_store)
-    assert_equal "unchanged", clean_ref.read_only
+    clean_executor = Durababble::DurableObjectExecutor.new(
+      store: clean_command_store,
+      objects: { CleanCommandObject.object_type => CleanCommandObject },
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_equal 1, clean_executor.drain_object_inbox(CleanCommandObject.object_type, object_id: "clean")
     assert_equal 1, clean_command_store.completed.length
 
     lost_lease_store = BranchCommandStore.new(complete_result: ActiveRecord::Result.empty(affected_rows: 0))
-    assert_raises(Durababble::LeaseConflict) { CleanCommandObject.ref("lost", store: lost_lease_store).read_only }
-    assert_equal 1, lost_lease_store.failed.length
+    lost_executor = Durababble::DurableObjectExecutor.new(
+      store: lost_lease_store,
+      objects: { CleanCommandObject.object_type => CleanCommandObject },
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_raises(Durababble::LeaseConflict) do
+      lost_executor.drain_object_inbox(CleanCommandObject.object_type, object_id: "clean")
+    end
+    assert_empty lost_lease_store.failed
+  end
+
+  test "fails unsupported and unknown object mailbox messages without running user commands" do
+    unsupported = BranchCommandStore.new(messages: [
+      {
+        "id" => "msg-unsupported",
+        "target_kind" => "object",
+        "target_type" => CleanCommandObject.object_type,
+        "target_id" => "clean",
+        "message_kind" => "mystery",
+        "payload" => {},
+        "attempts" => 1,
+      },
+    ])
+    unsupported_executor = Durababble::DurableObjectExecutor.new(
+      store: unsupported,
+      objects: [CleanCommandObject],
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_equal 1, unsupported_executor.drain_object_inbox(CleanCommandObject.object_type, object_id: "clean")
+    assert_equal [["msg-unsupported", "Durababble::Error: unsupported object inbox message mystery", "worker-a", true]], unsupported.failed
+
+    unknown = BranchCommandStore.new(messages: [
+      {
+        "id" => "msg-unknown",
+        "target_kind" => "object",
+        "target_type" => CleanCommandObject.object_type,
+        "target_id" => "clean",
+        "message_kind" => "ask",
+        "method_name" => "missing",
+        "payload" => { "method_name" => "missing", "args" => [], "kwargs" => {} },
+        "attempts" => 1,
+      },
+    ])
+    unknown_executor = Durababble::DurableObjectExecutor.new(
+      store: unknown,
+      objects: [CleanCommandObject],
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_equal 1, unknown_executor.drain_object_inbox(CleanCommandObject.object_type, object_id: "clean")
+    assert_equal [["msg-unknown", "Durababble::WorkflowRpc::UnknownCommand: missing", "worker-a", true]], unknown.failed
+  end
+
+  test "handles object wake messages with and without lifecycle handlers" do
+    wake = BranchCommandStore.new(messages: [
+      {
+        "id" => "wake-1",
+        "target_kind" => "object",
+        "target_type" => WakeTestObject.object_type,
+        "target_id" => "wake-object",
+        "message_kind" => "wake",
+        "payload" => { "reason" => "timer" },
+        "attempts" => 1,
+      },
+    ], state: nil)
+    wake_executor = Durababble::DurableObjectExecutor.new(
+      store: wake,
+      objects: [WakeTestObject],
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_equal 1, wake_executor.drain_object_inbox(WakeTestObject.object_type, object_id: "wake-object")
+    assert_equal [["wake-1", "awake"]], wake.completed
+    assert_equal({ "reason" => "timer", "woken" => true }, wake.object_state(object_type: WakeTestObject.object_type, object_id: "wake-object"))
+
+    no_wake = BranchCommandStore.new(messages: [
+      {
+        "id" => "wake-2",
+        "target_kind" => "object",
+        "target_type" => NoWakeTestObject.object_type,
+        "target_id" => "wake-object",
+        "message_kind" => "wake",
+        "payload" => {},
+        "attempts" => 1,
+      },
+    ])
+    no_wake_executor = Durababble::DurableObjectExecutor.new(
+      store: no_wake,
+      objects: [NoWakeTestObject],
+      worker_id: "worker-a",
+      lease_seconds: 30,
+    )
+    assert_equal 1, no_wake_executor.drain_object_inbox(NoWakeTestObject.object_type, object_id: "wake-object")
+    assert_equal [["wake-2", nil]], no_wake.completed
+  end
+
+  test "covers object at, unknown tell, and unbounded retry metadata branches" do
+    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", store: Object.new)
+    assert_raises(NoMethodError) { CleanCommandObject.tell("clean", :missing, store: Object.new) }
+
+    unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
+    assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
+    assert_nil Durababble::DurableObjectRef.send(:inbox_max_attempts, unbounded)
   end
 
   durababble_store_backends.each do |backend|
-    test "exposes commands and queries without step semantics with #{backend.name}" do
+    test "runs exposed object asks on a worker and leaves caller-side state untouched with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        account = ApiTestAccount.ref("acct-1", store:)
+        worker = object_worker(store, ApiTestAccount)
 
         assert_not_respond_to ApiTestAccount, :step
-        assert_equal 0, account.balance
-        assert_equal 500, account.credit(500).balance_cents
-        assert_equal 375, account.debit(125).balance_cents
-        assert_equal 375, account.balance
+        assert_equal 0, ApiTestAccount.ref("acct-1", store:).balance
+
+        caller = call_object_command_async(backend, ApiTestAccount, "acct-1", :credit, 500)
+        wait_for_object_activation(ApiTestAccount, "acct-1")
+        assert_nil store.object_state(object_type: ApiTestAccount.object_type, object_id: "acct-1")
+        run_worker_until_result(worker, caller.fetch(:queue))
+
+        status, value = caller.fetch(:queue).pop
+        caller.fetch(:thread).join
+        assert_equal :ok, status
+        assert_equal 500, value.balance_cents
+        assert_equal 500, ApiTestAccount.ref("acct-1", store:).balance
+      ensure
+        caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
+      end
+    end
+
+    test "orders tells before later asks for the same object with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_tell_order") do |store|
+        worker = object_worker(store, ApiTestAccount)
+
+        tell_id = ApiTestAccount.tell("acct-2", :credit, 500, store:)
+        caller = call_object_command_async(backend, ApiTestAccount, "acct-2", :debit, 125)
+        wait_for_object_activation(ApiTestAccount, "acct-2")
+        run_worker_until_result(worker, caller.fetch(:queue))
+
+        status, value = caller.fetch(:queue).pop
+        caller.fetch(:thread).join
+        assert_equal :ok, status
+        assert_equal 375, value.balance_cents
+        assert_equal 375, ApiTestAccount.ref("acct-2", store:).balance
+
+        messages = store.inbox_messages_for(target_kind: "object", target_type: ApiTestAccount.object_type, target_id: "acct-2")
+        assert_equal [tell_id, messages.last.fetch("id")], messages.map { |message| message.fetch("id") }
+        assert_equal ["completed", "completed"], messages.map { |message| message.fetch("status") }
+      ensure
+        caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
       end
     end
 
     test "persists durable object state atomically with command completion with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
+        worker = object_worker(store, RetryStateTestCounter)
         counter = RetryStateTestCounter.ref("counter-1", store:)
 
-        assert_equal({ "count" => 1 }, counter.increment_with_transient_failure)
+        caller = call_object_command_async(backend, RetryStateTestCounter, "counter-1", :increment_with_transient_failure)
+        wait_for_object_activation(RetryStateTestCounter, "counter-1")
+        run_worker_until_result(worker, caller.fetch(:queue))
+        status, result = caller.fetch(:queue).pop
+        caller.fetch(:thread).join
+        assert_equal :ok, status
+        assert_equal({ "count" => 1 }, result)
         assert_equal 1, counter.count
 
-        assert_raises_matching(RuntimeError, /permanent after state update/) do
-          counter.increment_and_fail
-        end
+        failing = call_object_command_async(backend, RetryStateTestCounter, "counter-1", :increment_and_fail)
+        wait_for_object_activation(RetryStateTestCounter, "counter-1")
+        run_worker_until_result(worker, failing.fetch(:queue))
+        failed_status, error = failing.fetch(:queue).pop
+        failing.fetch(:thread).join
+        assert_equal :error, failed_status
+        assert_match(/permanent after state update/, error.message)
         assert_equal 1, counter.count
+      ensure
+        caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
+        failing&.fetch(:thread)&.kill if failing&.fetch(:thread)&.alive?
       end
     end
 
@@ -198,14 +398,94 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           end
         end
         object = retrying_object.ref("object-1", store:)
+        worker = object_worker(store, retrying_object)
 
-        result = object.write_with_retry("persisted")
+        caller = call_object_command_async(backend, retrying_object, "object-1", :write_with_retry, "persisted")
+        wait_for_object_activation(retrying_object, "object-1")
+        run_worker_until_result(worker, caller.fetch(:queue))
+        status, result = caller.fetch(:queue).pop
+        caller.fetch(:thread).join
 
+        assert_equal :ok, status
         assert_equal({ "committed_attempts" => 1, "value" => "persisted" }, result)
         assert_equal 2, seen_keys.length
         assert_equal 1, seen_keys.uniq.length
         assert_equal result, object.snapshot
+        assert_equal 2, store.inbox_messages_for(target_kind: "object", target_type: retrying_object.object_type, target_id: "object-1").first.fetch("attempts").to_i
+      ensure
+        caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
       end
+    end
+
+    test "dead-lettered object mailbox heads block later messages with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_blocked_head") do |store|
+        failing_object = Class.new(Durababble::DurableObject) do
+          object_type "blocked_head_object"
+
+          expose_command def fail_first
+            raise "blocked head"
+          end
+
+          expose_command def second
+            update_state({ "ran" => true })
+          end
+        end
+        worker = object_worker(store, failing_object)
+
+        first = failing_object.tell("object-1", :fail_first, store:)
+        second = failing_object.tell("object-1", :second, store:)
+
+        assert_equal :worked, worker.tick
+        messages = store.inbox_messages_for(target_kind: "object", target_type: failing_object.object_type, target_id: "object-1")
+        assert_equal [first, second], messages.map { |message| message.fetch("id") }
+        assert_equal ["dead_lettered", "pending"], messages.map { |message| message.fetch("status") }
+        assert_nil store.object_state(object_type: failing_object.object_type, object_id: "object-1")
+        assert_equal :idle, worker.tick
+      end
+    end
+  end
+
+  private
+
+  def object_worker(store, *objects)
+    Durababble::Worker.new(store:, workflows: {}, objects:, worker_id: "object-worker", lease_seconds: 30, migrate: false)
+  end
+
+  def call_object_command_async(backend, object_class, object_id, method_name, *args, **kwargs)
+    result_queue = Queue.new
+    caller = Thread.new do
+      caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+      begin
+        result_queue << [:ok, object_class.ref(object_id, store: caller_store).public_send(method_name, *args, **kwargs)]
+      rescue StandardError => e
+        result_queue << [:error, e]
+      ensure
+        caller_store.close
+      end
+    end
+    { thread: caller, queue: result_queue }
+  end
+
+  def wait_for_object_activation(object_class, object_id, timeout: 2)
+    deadline = Time.now + timeout
+    loop do
+      activation = store.target_activation(target_kind: "object", target_type: object_class.object_type, target_id: object_id)
+      return activation if activation
+      raise "object activation not created before timeout" if Time.now >= deadline
+
+      sleep(0.01)
+    end
+  end
+
+  def run_worker_until_result(worker, result_queue, timeout: 3)
+    deadline = Time.now + timeout
+    loop do
+      return unless result_queue.empty?
+
+      worker.tick
+      raise "object command did not complete before timeout" if Time.now >= deadline
+
+      sleep(0.01)
     end
   end
 end

@@ -160,13 +160,40 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "covers durable object query, command, retry, and missing methods with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_object") do |store|
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: {},
+          objects: [BranchTestDurableObject],
+          worker_id: "branch-object-worker",
+          lease_seconds: 30,
+          migrate: false,
+        )
         account = BranchTestDurableObject.ref("acct-1", store:)
+        add = nil
+        flaky = nil
 
         assert_equal "branch_account", BranchTestDurableObject.object_type
-        assert_respond_to account, :formatted
+        assert_respond_to(account, :formatted)
         assert_equal "balance:0", account.formatted(prefix: "balance")
-        assert_equal({ "value" => 3 }, account.add(amount: 3))
-        assert_equal({ "value" => 7, "attempts" => 1 }, account.flaky_add(amount: 4))
+
+        add = call_with_store_async(backend) do |caller_store|
+          BranchTestDurableObject.ref("acct-1", store: caller_store).add(amount: 3)
+        end
+        run_worker_until_result(worker, add.fetch(:queue))
+        add_status, add_result = add.fetch(:queue).pop
+        add.fetch(:thread).join
+        assert_equal(:ok, add_status)
+        assert_equal({ "value" => 3 }, add_result)
+
+        flaky = call_with_store_async(backend) do |caller_store|
+          BranchTestDurableObject.ref("acct-1", store: caller_store).flaky_add(amount: 4)
+        end
+        run_worker_until_result(worker, flaky.fetch(:queue))
+        flaky_status, flaky_result = flaky.fetch(:queue).pop
+        flaky.fetch(:thread).join
+        assert_equal(:ok, flaky_status)
+        assert_equal({ "value" => 7, "attempts" => 1 }, flaky_result)
+
         assert_equal "balance:7", account.formatted(prefix: "balance")
         assert_equal({ "value" => 7, "attempts" => 1 }, store.object_state(object_type: "branch_account", object_id: "acct-1"))
         assert_equal(
@@ -179,6 +206,9 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           end,
         )
         assert_raises(NoMethodError) { account.not_exposed }
+      ensure
+        add&.fetch(:thread)&.kill if add&.fetch(:thread)&.alive?
+        flaky&.fetch(:thread)&.kill if flaky&.fetch(:thread)&.alive?
       end
     end
   end
@@ -225,6 +255,34 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   end
 
   private
+
+  def call_with_store_async(backend)
+    result_queue = Queue.new
+    caller = Thread.new do
+      caller_store = nil
+      begin
+        caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+        result_queue << [:ok, yield(caller_store)]
+      rescue StandardError => e
+        result_queue << [:error, e]
+      ensure
+        caller_store&.close
+      end
+    end
+    { thread: caller, queue: result_queue }
+  end
+
+  def run_worker_until_result(worker, result_queue, timeout: 3)
+    deadline = Time.now + timeout
+    loop do
+      return unless result_queue.empty?
+
+      worker.tick
+      raise "object command did not complete before timeout" if Time.now >= deadline
+
+      sleep(0.01)
+    end
+  end
 
   def wait_until(timeout: 2)
     deadline = Time.now + timeout
