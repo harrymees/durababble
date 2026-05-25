@@ -42,13 +42,13 @@ module Durababble
     #: Engine?
     attr_reader :default_engine
 
-    #: (Store?) -> Store?
+    #: (Store?) -> Engine?
     def default_store=(store)
       @default_store = store
       @default_engine = store ? Engine.new(store:, migrate: false) : nil
     end
 
-    #: (Engine?) -> Engine?
+    #: (Engine?) -> Store?
     def default_engine=(engine)
       @default_engine = engine
       engine = engine #: as untyped
@@ -118,6 +118,7 @@ module Durababble
       raise ArgumentError, "pass store: or engine:, not both" if store && engine
 
       return store if store
+
       engine = engine #: as untyped
       return engine.store if engine
 
