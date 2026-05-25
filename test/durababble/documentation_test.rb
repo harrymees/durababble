@@ -4,6 +4,27 @@
 require_relative "../test_helper"
 
 class DurababbleDocumentationTest < DurababbleTestCase
+  # Expected return value for each marked example. The map exists so adding a
+  # new example forces a deliberate decision about what the example proves;
+  # markers found on disk that are missing from this map fail the test loudly.
+  EXPECTED_RESULTS = {
+    "workflow-example" => { "payment_id" => "pay_card_123", "label_id" => "label_pay_card_123" },
+    "durable-object-example" => 1_000,
+    "patterns-sequential" => { "status" => "completed", "row_count" => 2 },
+    "patterns-fanout" => [101, 102, 103],
+    "patterns-bounded-concurrency" => [1, 2, 3, 4, 5],
+    "patterns-saga" => {
+      "status" => "failed",
+      "steps" => [
+        ["reserve_seat", "completed"],
+        ["charge_card", "completed"],
+        ["issue_ticket", "failed"],
+        ["refund_card", "completed"],
+        ["release_seat", "completed"],
+      ],
+    },
+  }.freeze
+
   def read(path)
     File.read(File.join(root, path))
   end
@@ -35,22 +56,20 @@ class DurababbleDocumentationTest < DurababbleTestCase
     assert_includes rbs, "def self.tell: (Id durable_id"
   end
 
-  test "evaluates docs site examples against the implemented public API" do
-    workflows = read("docs/content/workflows.md")
-    durable_objects = read("docs/content/durable-objects.md")
+  test "evaluates every marked docs example against the implemented public API" do
+    examples = discover_marked_examples
+    refute_empty examples, "expected to find at least one DOCS:<name>:start marker under docs/content"
+
+    discovered_markers = examples.map { |example| example.fetch(:marker) }.sort
+    expected_markers = EXPECTED_RESULTS.keys.sort
+    assert_equal(
+      expected_markers,
+      discovered_markers,
+      "EXPECTED_RESULTS keys must match the DOCS markers under docs/content (add or remove entries to match)",
+    )
+
     backend = durababble_store_backends.reverse.first
-
-    with_durababble_store(backend, "docs_site_examples") do |store|
-      remove_documentation_example_constants
-
-      workflow_result = evaluate_marked_example(workflows, "workflow-example", binding)
-      object_result = evaluate_marked_example(durable_objects, "durable-object-example", binding)
-
-      assert_equal({ "payment_id" => "pay_card_123", "label_id" => "label_pay_card_123" }, workflow_result)
-      assert_equal(1_000, object_result)
-    ensure
-      remove_documentation_example_constants
-    end
+    examples.each { |example| evaluate_example(example, backend) }
   end
 
   private
@@ -59,25 +78,60 @@ class DurababbleDocumentationTest < DurababbleTestCase
     File.expand_path("../..", __dir__)
   end
 
-  def marked_ruby_code(text, marker)
-    pattern = /<!-- DOCS:#{Regexp.escape(marker)}:start -->(.*?)<!-- DOCS:#{Regexp.escape(marker)}:end -->/m
-    match = text.match(pattern)
-    assert(match, "docs content is missing #{marker} example markers")
-    code = match[1].match(/```ruby\n(.*?)\n```/m)
-    assert(code, "docs content #{marker} marker does not contain a ruby code block")
-    code[1]
+  def discover_marked_examples
+    Dir[File.join(root, "docs/content/*.md")].sort.flat_map do |path|
+      content = File.read(path)
+      content.scan(/<!-- DOCS:([\w-]+):start -->(.*?)<!-- DOCS:\1:end -->/m).map do |marker, body|
+        code_match = body.match(/```ruby\n(.*?)\n```/m)
+        assert(code_match, "marker #{marker} in #{path} does not wrap a ruby code block")
+        { marker:, path:, code: code_match[1] }
+      end
+    end
   end
 
-  def evaluate_marked_example(markdown, marker, context)
+  def evaluate_example(example, backend)
+    marker = example.fetch(:marker)
+    schema_suffix = "docs_#{marker.tr("-", "_")}"
+
+    with_durababble_store(backend, schema_suffix) do |store|
+      defined_before = Object.constants
+      begin
+        result = eval_example_code(example, store)
+        if EXPECTED_RESULTS.key?(marker)
+          assert_equal(
+            EXPECTED_RESULTS.fetch(marker),
+            result,
+            "docs example #{marker} (#{example.fetch(:path)}) did not match its expected return value",
+          )
+        end
+      ensure
+        cleanup_constants(defined_before)
+      end
+    end
+  end
+
+  def eval_example_code(example, store)
+    engine = Durababble::Engine.new(store:)
+    location = "#{example.fetch(:path)}##{example.fetch(:marker)}"
+    binding_for_example = build_example_binding(store, engine)
     # rubocop:disable Security/Eval -- this test intentionally executes marked documentation examples.
-    eval(marked_ruby_code(markdown, marker), context, "docs/content #{marker}")
+    eval(example.fetch(:code), binding_for_example, location)
     # rubocop:enable Security/Eval
   end
 
-  def remove_documentation_example_constants
-    Object.send(:remove_const, :FulfillOrder) if Object.const_defined?(:FulfillOrder)
-    Object.send(:remove_const, :Payments) if Object.const_defined?(:Payments)
-    Object.send(:remove_const, :Shipping) if Object.const_defined?(:Shipping)
-    Object.send(:remove_const, :Account) if Object.const_defined?(:Account)
+  def build_example_binding(store, engine)
+    # Local variables defined in this method are visible to `eval` via the
+    # returned binding, so `store ||= ...` and `engine ||= ...` in the example
+    # pick up the test-provided values rather than connecting to the default
+    # database.
+    _ = [store, engine]
+    binding
+  end
+
+  def cleanup_constants(defined_before)
+    added = Object.constants - defined_before
+    added.each do |const_name|
+      Object.send(:remove_const, const_name) if Object.const_defined?(const_name, false)
+    end
   end
 end
