@@ -63,7 +63,10 @@ module Durababble
   class LeaseConflict < Error
   end
 
-  class NonDeterminismError < Error
+  class DeterminismError < Error
+  end
+
+  class NonDeterminismError < DeterminismError
   end
 
   class FenceTimeout < Error

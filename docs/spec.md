@@ -127,9 +127,9 @@ Workflow orchestration runs on a Durababble-managed deterministic scheduler. Wor
 
 Durababble integrates with Async task creation and waiting so ordinary non-transient Async child tasks inherit workflow execution context and may call durable steps. Workflow authors must not need Durababble-specific async helpers. `transient: true` Async tasks do not inherit workflow execution context and must not call durable steps.
 
-Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
+Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. The runtime rejects unsafe direct host calls such as wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO operations with `Durababble::DeterminismError`. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
 
-The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers. The implementation must not rely on process-wide monkeypatching to create determinism.
+The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers, or reject unsafe host APIs with `Durababble::DeterminismError` until a durable deterministic API exists. The implementation must not rely on process-wide monkeypatching to create determinism.
 
 Durable commands called from any workflow fiber are assigned command ids when the workflow fiber reaches the call, before the side-effecting implementation runs. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes.
 

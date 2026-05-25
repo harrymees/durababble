@@ -2,6 +2,8 @@
 
 Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in an application database.
 
+Workflow orchestration is deterministic: direct host wall-clock time, randomness, blocking sleeps, and blocking I/O are rejected with `Durababble::DeterminismError`; put those effects in durable steps, where normal Ruby host semantics still apply.
+
 The docs site source starts at [docs/content/README.md](docs/content/README.md). From there, use the docs navigation for workflows, durable objects, storage, observability, testing, and reference material.
 
 ## Documentation

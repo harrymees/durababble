@@ -140,7 +140,9 @@ module Durababble
           workflow = workflow_class.new
           workflow.__durababble_execution__ = execution
           result = WorkflowExecutionContext.with_current(execution) do
-            workflow.execute(initial_input || initial_context(workflow_id))
+            WorkflowDeterminism.enforce(workflow_id:) do
+              workflow.execute(initial_input || initial_context(workflow_id))
+            end
           end
           WorkflowExecutionContext.with_current(execution) do
             execution.validate_replay_complete!

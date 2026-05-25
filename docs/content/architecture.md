@@ -58,6 +58,8 @@ If replay reaches a completed position with a different current method name, or 
 
 Direct waits use the same monotonic command ids and replay validation as steps, but their command names are the wait helpers rather than user step method names. A direct wait records a scheduled command before the wait row is inserted, records a waiting history entry when the wait is persisted, and later consumes the completed timer payload to resume the blocked workflow fiber.
 
+While `#execute` is running, Durababble enables a workflow-local determinism guard for the current execution thread/fibers. Direct user orchestration calls to host wall-clock time, randomness, blocking sleeps, process APIs, and blocking file/IO operations raise `Durababble::DeterminismError`; Durababble's own persistence calls are scoped out of the guard, and transient step fibers clear workflow context so step bodies keep normal Ruby host semantics.
+
 Workflow `expose` and `expose_command` define the public ref surface:
 
 ```ruby

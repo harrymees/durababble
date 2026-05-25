@@ -6,6 +6,7 @@ require "thread"
 
 require_relative "command_future"
 require_relative "execution_context"
+require_relative "workflow_determinism"
 require_relative "workflow_replay_history"
 require_relative "workflow_step_runner"
 
@@ -163,7 +164,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def timer_after(duration)
-      retry_run_at(duration)
+      WorkflowDeterminism.allow_host_operations { retry_run_at(duration) }
     end
 
     #: () -> void
@@ -297,7 +298,7 @@ module Durababble
           raise NonDeterminismError, message
         end
 
-        block_current_workflow_task { future.wait }
+        block_current_workflow_task { WorkflowDeterminism.allow_host_operations { future.wait } }
       end
     end
 
@@ -361,7 +362,9 @@ module Durababble
 
     #: (untyped) -> untyped
     def wait_condition_wake_at(timeout)
-      timeout ? @store.current_time + timeout : @store.current_time + 1
+      WorkflowDeterminism.allow_host_operations do
+        timeout ? @store.current_time + timeout : @store.current_time + 1
+      end
     end
 
     #: () -> bool
@@ -378,7 +381,7 @@ module Durababble
 
     #: () { -> untyped } -> untyped
     def synchronize_store(&block)
-      @store_mutex.synchronize(&block)
+      WorkflowDeterminism.allow_host_operations { @store_mutex.synchronize(&block) }
     end
 
     #: (untyped) -> untyped
