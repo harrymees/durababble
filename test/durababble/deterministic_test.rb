@@ -3,6 +3,8 @@
 
 require_relative "../test_helper"
 
+require "durababble/deterministic"
+
 class DurababbleDeterministicTest < DurababbleTestCase
   FUZZ_SCENARIOS = [
     "workflow_durable_before_claim",
