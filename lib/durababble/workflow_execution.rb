@@ -328,7 +328,6 @@ module Durababble
     #: () -> void
     def deliver_recorded_resolutions!
       @replay_history.deliver_resolutions(@futures) do |event, future|
-        command_id = event.fetch("command_id").to_i
         case event.fetch("kind")
         when "step_completed"
           future.resolve(event.fetch("payload"))

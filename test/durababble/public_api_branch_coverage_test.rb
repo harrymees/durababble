@@ -168,6 +168,10 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     def migrate!; end
 
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil)
+      nil
+    end
+
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
       @workflow_names = workflow_names
       nil
@@ -256,7 +260,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   end
 
   test "covers public API fallback branches" do
-    assert_match(/\Adurababble_har_1299_[0-9a-f]{12}\z/, Durababble.workspace_schema(Dir.pwd))
+    assert_match(/\Adurababble_[a-z0-9_]+_[0-9a-f]{12}\z/, Durababble.workspace_schema(Dir.pwd))
     missing_path = File.join(Dir.pwd, "tmp", "definitely-missing-workspace")
     refute_path_exists missing_path
     assert_match(/\Adurababble_definitely_missing_workspace_[0-9a-f]{12}\z/, Durababble.workspace_schema(missing_path))
