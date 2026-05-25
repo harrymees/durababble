@@ -180,13 +180,13 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: Object?) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
-      lease = current_target_lease(target_kind:, target_type:, target_id:)
+      lease = current_target_lease(target_kind:, target_type:, target_id:, worker_pool:)
       return false unless lease
 
       factory = client_factory || rpc_client_factory
       factory = factory #: as untyped
       client = factory.call(lease.fetch("worker_id"))
-      deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
+      deliver_target_message_with_retry(client, worker_pool: lease.fetch("worker_pool", worker_pool).to_s, target_kind:, target_type:, target_id:)
       true
     rescue Durababble::Rpc::Error, Durababble::WorkflowRpc::Error
       false
@@ -211,9 +211,15 @@ module Durababble
       end
     end
 
-    #: (object_type: String, object_id: String, method_name: Symbol | String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?) -> String
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
+    #: (name: String, input: Object?, ?worker_pool: String) -> String
+    def enqueue_workflow(name:, input:, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (object_type: String, object_id: String, method_name: Symbol | String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?, ?worker_pool: String) -> String
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil, worker_pool: "default")
       enqueue_inbox_message(
+        worker_pool:,
         target_kind: "object",
         target_type: object_type,
         target_id: object_id,
@@ -225,14 +231,14 @@ module Durababble
       )
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
-    def reconcile_target_activation(target_kind:, target_type:, target_id:, now: Time.now)
-      transaction { reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:) }
+    #: (target_kind: String, target_type: String, target_id: String, ?now: Time, ?worker_pool: String) -> Object?
+    def reconcile_target_activation(target_kind:, target_type:, target_id:, now: Time.now, worker_pool: "default")
+      transaction { reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:) }
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ready_at: Time) -> Object?
-    def rearm_target_activation(target_kind:, target_type:, target_id:, ready_at:)
-      transaction { set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:) }
+    #: (target_kind: String, target_type: String, target_id: String, ready_at: Time, ?worker_pool: String) -> Object?
+    def rearm_target_activation(target_kind:, target_type:, target_id:, ready_at:, worker_pool: "default")
+      transaction { set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:) }
     end
 
     private
@@ -291,19 +297,34 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Hash[String, Object?]?
-    def current_target_lease(target_kind:, target_type:, target_id:)
+    #: (target_kind: String, target_type: String, target_id: String, worker_pool: String) -> Hash[String, Object?]?
+    def current_target_lease(target_kind:, target_type:, target_id:, worker_pool:)
       case target_kind
       when "workflow"
-        current_workflow_lease(target_id)
+        current_workflow_lease(target_id, worker_pool:)
       when "object"
-        current_object_lease(target_type, target_id)
+        current_object_lease(target_type, target_id, worker_pool:)
       end
     end
 
-    #: (String, String) -> nil
-    def current_object_lease(object_type, object_id)
+    #: (String, ?worker_pool: String?) -> Hash[String, Object?]?
+    def current_workflow_lease(workflow_id, worker_pool: nil)
       nil
+    end
+
+    #: (String, String, ?worker_pool: String) -> Hash[String, Object?]?
+    def current_object_lease(object_type, object_id, worker_pool: "default")
+      nil
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
+    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
+      raise NotImplementedError
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ready_at: Time) -> Object?
+    def set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
+      raise NotImplementedError
     end
 
     #: (Object, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
@@ -371,15 +392,29 @@ module Durababble
       )
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, message_kind: String, method_name: String?, payload: Object?) -> String
-    def inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, message_kind: String, method_name: String?, payload: Object?) -> String
+    def inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       Digest::SHA256.hexdigest(SERIALIZER.dump({
+        "worker_pool" => worker_pool,
         "target_kind" => target_kind,
         "target_type" => target_type,
         "target_id" => target_id,
         "message_kind" => message_kind,
         "method_name" => method_name,
         "payload" => payload,
+      }))
+    end
+
+    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> String?
+    def inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      return unless idempotency_key
+
+      Digest::SHA256.hexdigest(SERIALIZER.dump({
+        "worker_pool" => worker_pool,
+        "target_kind" => target_kind,
+        "target_type" => target_type,
+        "target_id" => target_id,
+        "idempotency_key" => idempotency_key,
       }))
     end
 
@@ -394,6 +429,16 @@ module Durababble
     def with_command_id(row)
       row["command_id"] = row["position"] if row.key?("position") && !row.key?("command_id")
       row
+    end
+
+    #: (Hash[String, Object?], String) -> String
+    def row_string(row, key)
+      row.fetch(key).to_s
+    end
+
+    #: (Hash[String, Object?]) -> String
+    def row_worker_pool(row)
+      row.fetch("worker_pool", "default").to_s
     end
 
     #: (Hash[String, Object?], now: Time) -> Object?

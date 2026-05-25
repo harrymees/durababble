@@ -36,26 +36,36 @@ module Durababble
         workflow_name
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def enqueue(input, store: nil, engine: nil)
-        Durababble.engine_for(store:, engine:).enqueue(self, input:)
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def enqueue(input, store: nil, engine: nil, worker_pool: nil)
+        if worker_pool
+          Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, worker_pool:)
+        else
+          Durababble.engine_for(store:, engine:).enqueue(self, input:)
+        end
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def start(input, store: nil, engine: nil)
-        resolved_engine = Durababble.engine_for(store:, engine:)
-        workflow_id = resolved_engine.enqueue(self, input:)
-        handle(workflow_id, engine: resolved_engine)
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def start(input, store: nil, engine: nil, worker_pool: nil)
+        if worker_pool
+          resolved_store = Durababble.store_for(store:, engine:)
+          workflow_id = resolved_store.enqueue_workflow(name: workflow_name, input:, worker_pool:)
+          handle(workflow_id, store: resolved_store, worker_pool:)
+        else
+          resolved_engine = Durababble.engine_for(store:, engine:)
+          workflow_id = resolved_engine.enqueue(self, input:)
+          handle(workflow_id, engine: resolved_engine)
+        end
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def at(workflow_id, store: nil, engine: nil)
-        handle(workflow_id, store:, engine:)
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def at(workflow_id, store: nil, engine: nil, worker_pool: nil)
+        handle(workflow_id, store:, engine:, worker_pool:)
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def handle(workflow_id, store: nil, engine: nil)
-        WorkflowRef.new(self, workflow_id, store: Durababble.store_for(store:, engine:))
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def handle(workflow_id, store: nil, engine: nil, worker_pool: nil)
+        WorkflowRef.new(self, workflow_id, store: Durababble.store_for(store:, engine:), worker_pool:)
       end
 
       #: (?untyped, **untyped) -> untyped
@@ -155,11 +165,12 @@ module Durababble
   end
 
   class WorkflowRef
-    #: (untyped, untyped, store: untyped) -> void
-    def initialize(workflow_class, workflow_id, store:)
+    #: (untyped, untyped, store: untyped, ?worker_pool: String?) -> void
+    def initialize(workflow_class, workflow_id, store:, worker_pool: nil)
       @workflow_class = workflow_class
       @workflow_id = workflow_id
       @store = store
+      @worker_pool = worker_pool
     end
 
     #: untyped
@@ -204,6 +215,7 @@ module Durababble
           idempotency_key:,
         )
         @store.deliver_target_message(
+          worker_pool: inbox_worker_pool(message_id),
           target_kind: "workflow",
           target_type: @workflow_class.workflow_name,
           target_id: @workflow_id,
@@ -212,6 +224,11 @@ module Durababble
       else
         super
       end
+    end
+
+    #: (untyped) -> String
+    def inbox_worker_pool(message_id)
+      @worker_pool || @store.inbox_message(message_id)&.fetch("worker_pool", "default") || "default"
     end
 
     #: (untyped, ?untyped) -> untyped

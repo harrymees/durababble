@@ -154,14 +154,14 @@ end
 
 module Durababble
   class Store
-    def current_workflow_lease(workflow_id); end
+    def current_workflow_lease(workflow_id, worker_pool: nil); end
     def decode_row(row); end
     def dump_serialized(value); end
     def enqueue_inbox_message(**kwargs); end
     def inbox_message(message_id); end
     def load_serialized(value); end
-    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:); end
-    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:); end
+    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:); end
+    def set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:); end
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:); end
   end
 

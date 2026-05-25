@@ -136,7 +136,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "status"
     refute_includes sql, "UPDATE"
     assert_equal "demo", params[1]
-    assert_equal "pending", params[2]
+    assert_equal "default", params[2]
+    assert_equal "pending", params[3]
   end
 
   test "postgres create_workflow inserts the initial running row in one statement" do
@@ -154,9 +155,10 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "locked_until"
     refute_includes sql, "UPDATE"
     assert_equal "demo", params[1]
-    assert_equal "running", params[2]
-    assert_equal "worker-a", params[4]
-    assert_equal 9, params[5]
+    assert_equal "default", params[2]
+    assert_equal "running", params[3]
+    assert_equal "worker-a", params[5]
+    assert_equal 9, params[6]
   end
 
   test "mysql enqueue_workflow inserts the pending row in one statement" do
@@ -213,7 +215,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "UPDATE"
     assert_includes sql, "RETURNING workflows.*"
     assert_includes sql, "FOR UPDATE SKIP LOCKED"
-    assert_equal ["worker-a", 9, "demo"], params
+    assert_equal ["default", "worker-a", 9, "demo"], params
   end
 
   test "migrates and persists workflow plus step state" do
@@ -423,6 +425,7 @@ class DurababbleStoreTest < DurababbleTestCase
     store = pg_store
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -450,10 +453,10 @@ class DurababbleStoreTest < DurababbleTestCase
     inbox_insert = new_connection.exec_params_calls.find do |sql, _params|
       sql.include?("INSERT INTO") && sql.include?("inbox") && !sql.include?("target_activations")
     end
-    assert_equal "signal:wf-1", inbox_insert.fetch(1)[8]
+    assert_equal "signal:wf-1", inbox_insert.fetch(1)[9]
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_inbox_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -465,7 +468,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "pending-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_inbox_message(
       target_kind: "workflow",
@@ -479,7 +482,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_inbox_message(
         target_kind: "workflow",
         target_type: "approval",
@@ -496,6 +499,7 @@ class DurababbleStoreTest < DurababbleTestCase
     payload = { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } }
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -504,8 +508,8 @@ class DurababbleStoreTest < DurababbleTestCase
       payload:,
     )
     new_connection = ScriptedPgConnection.new(params_results: [
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result,
-      sql_result([{ "id" => "wf-1", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "last_sequence" => "0" }]),
       sql_result,
@@ -524,7 +528,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
       workflow_name: "approval",
@@ -535,7 +540,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-command", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "pending-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
@@ -548,7 +554,8 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+        sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_workflow_command(
         workflow_id: "wf-1",
         workflow_name: "approval",
@@ -573,6 +580,7 @@ class DurababbleStoreTest < DurababbleTestCase
     store = mysql_store
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -600,8 +608,8 @@ class DurababbleStoreTest < DurababbleTestCase
     refute_includes inbox_insert, "retained_until"
 
     duplicate = mysql_store(ScriptedMysqlConnection.new do |sql|
-      if sql.include?("idempotency_key =")
-        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
+      if sql.include?("idempotency_hash =")
+        sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end).enqueue_inbox_message(
       target_kind: "workflow",
@@ -614,8 +622,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("idempotency_key =")
-        sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
+      if sql.include?("idempotency_hash =")
+        sql_result([{ "id" => "pending-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end
     pending_duplicate = mysql_store(pending_duplicate_connection).enqueue_inbox_message(
@@ -631,8 +639,8 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       mysql_store(ScriptedMysqlConnection.new do |sql|
-        if sql.include?("idempotency_key =")
-          sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
+        if sql.include?("idempotency_hash =")
+          sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
         end
       end).enqueue_inbox_message(
         target_kind: "workflow",
@@ -696,7 +704,7 @@ class DurababbleStoreTest < DurababbleTestCase
     )
 
     helper = pg_store
-    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, target_kind: "workflow", target_type: "approval", target_id: "wf")
+    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, worker_pool: "default", target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert helper.send(:activatable_inbox_status?, "pending")
     refute helper.send(:activatable_inbox_status?, "completed")
     assert_equal ["", []], helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)

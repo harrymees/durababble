@@ -11,6 +11,7 @@ module Durababble
         CREATE TABLE IF NOT EXISTS #{table("workflows")} (
           id VARCHAR(191) PRIMARY KEY,
           name VARCHAR(191) NOT NULL,
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
           status VARCHAR(32) NOT NULL,
           input LONGBLOB NOT NULL,
           result LONGBLOB,
@@ -23,12 +24,13 @@ module Durababble
           cancel_delivered_at DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "queue"))} (status, created_at),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "runnable_due"))} (status, next_run_at, created_at),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "expired_lease"))} (status, locked_until, created_at),
+          INDEX #{@connection.quote_column_name(index_name("workflows", "queue"))} (worker_pool, status, created_at),
+          INDEX #{@connection.quote_column_name(index_name("workflows", "runnable_due"))} (worker_pool, status, next_run_at, created_at),
+          INDEX #{@connection.quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
           INDEX #{@connection.quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )
       SQL
+      add_column_if_missing("workflows", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
       add_column_if_missing("workflows", "cancel_reason", "TEXT")
       add_column_if_missing("workflows", "cancel_requested_at", "DATETIME(6)")
       add_column_if_missing("workflows", "cancel_delivered_at", "DATETIME(6)")
@@ -135,6 +137,7 @@ module Durababble
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
           object_type VARCHAR(191) NOT NULL,
           object_id VARCHAR(191) NOT NULL,
           state LONGBLOB,
@@ -142,9 +145,10 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (object_type, object_id)
+          PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
+      add_column_if_missing("durable_objects", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -190,17 +194,19 @@ module Durababble
     def create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
           target_kind VARCHAR(32) NOT NULL,
           target_type VARCHAR(191) NOT NULL,
           target_id VARCHAR(191) NOT NULL,
           last_sequence BIGINT NOT NULL DEFAULT 0,
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (target_kind, target_type, target_id)
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("inbox")} (
           id VARCHAR(191) PRIMARY KEY,
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
           target_kind VARCHAR(32) NOT NULL,
           target_type VARCHAR(191) NOT NULL,
           target_id VARCHAR(191) NOT NULL,
@@ -209,6 +215,7 @@ module Durababble
           method_name VARCHAR(191),
           operation_id VARCHAR(191) NOT NULL,
           idempotency_key VARCHAR(191),
+          idempotency_hash VARCHAR(64),
           shape_hash VARCHAR(64) NOT NULL,
           payload LONGBLOB NOT NULL,
           status VARCHAR(32) NOT NULL,
@@ -223,16 +230,17 @@ module Durababble
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           dead_lettered_at DATETIME(6),
-          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_sequence_unique"))} (target_kind, target_type, target_id, sequence),
-          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_idempotency_unique"))} (target_kind, target_type, target_id, idempotency_key),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "target_status_sequence"))} (target_kind, target_type, target_id, status, sequence),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "target_sequence"))} (target_kind, target_type, target_id, sequence),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "ready"))} (status, ready_at, created_at),
+          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_sequence_unique"))} (worker_pool, target_kind, target_type, target_id, sequence),
+          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash),
+          INDEX #{@connection.quote_column_name(index_name("inbox", "target_status_sequence"))} (worker_pool, target_kind, target_type, target_id, status, sequence),
+          INDEX #{@connection.quote_column_name(index_name("inbox", "target_sequence"))} (worker_pool, target_kind, target_type, target_id, sequence),
+          INDEX #{@connection.quote_column_name(index_name("inbox", "ready"))} (worker_pool, status, ready_at, created_at),
           INDEX #{@connection.quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)
         )
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
           target_kind VARCHAR(32) NOT NULL,
           target_type VARCHAR(191) NOT NULL,
           target_id VARCHAR(191) NOT NULL,
@@ -242,14 +250,49 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (target_kind, target_type, target_id),
-          INDEX #{@connection.quote_column_name(index_name("target_activations", "queue"))} (status, ready_at, created_at),
-          INDEX #{@connection.quote_column_name(index_name("target_activations", "expired"))} (status, locked_until, created_at),
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id),
+          INDEX #{@connection.quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
+          INDEX #{@connection.quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
           INDEX #{@connection.quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
         )
       SQL
+      add_column_if_missing("mailbox_sequences", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
+      add_column_if_missing("inbox", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
+      add_column_if_missing("inbox", "idempotency_hash", "VARCHAR(64)")
+      add_column_if_missing("target_activations", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
+      backfill_inbox_idempotency_hashes!
       drop_index_if_present("inbox", "idempotency_key")
-      add_index_if_missing("inbox", index_name("inbox", "target_idempotency_unique"), "UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_idempotency_unique"))} (target_kind, target_type, target_id, idempotency_key)")
+      add_index_if_missing("inbox", index_name("inbox", "idempotency_hash_unique"), "UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash)")
+    end
+
+    #: () -> untyped
+    def backfill_inbox_idempotency_hashes!
+      rows = execute_params(<<~SQL, []).to_a
+        SELECT id, worker_pool, target_kind, target_type, target_id, idempotency_key
+        FROM #{table("inbox")}
+        WHERE idempotency_key IS NOT NULL AND idempotency_hash IS NULL
+      SQL
+      rows.each do |row|
+        hash = inbox_idempotency_hash_for_migration(
+          row.fetch("idempotency_key"),
+          worker_pool: row.fetch("worker_pool"),
+          target_kind: row.fetch("target_kind"),
+          target_type: row.fetch("target_type"),
+          target_id: row.fetch("target_id"),
+        )
+        execute_params("UPDATE #{table("inbox")} SET idempotency_hash = ? WHERE id = ?", [hash, row.fetch("id")])
+      end
+    end
+
+    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def inbox_idempotency_hash_for_migration(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
+        "worker_pool" => worker_pool,
+        "target_kind" => target_kind,
+        "target_type" => target_type,
+        "target_id" => target_id,
+        "idempotency_key" => idempotency_key,
+      }))
     end
 
     #: () -> untyped

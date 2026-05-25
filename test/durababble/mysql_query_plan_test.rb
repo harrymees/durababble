@@ -16,18 +16,22 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       expectations = {
         "pending workflow claim probe" => {
           sql: query_sql(:claim_pending_workflow, name_sql: ""),
+          params: ["default"],
           expected_key_fragment: "workflows_queue",
         },
         "failed workflow claim probe" => {
           sql: query_sql(:claim_failed_workflow, name_sql: ""),
+          params: ["default"],
           expected_key_fragment: "workflows_queue",
         },
         "canceling workflow claim probe" => {
           sql: query_sql(:claim_canceling_workflow, name_sql: ""),
+          params: ["default"],
           expected_key_fragment: "workflows_queue",
         },
         "expired workflow claim probe" => {
           sql: query_sql(:claim_expired_workflow, name_sql: ""),
+          params: ["default"],
           expected_key_fragment: "workflows_expired_lease",
         },
         "pending outbox claim probe" => {
@@ -45,33 +49,33 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "pending target activation claim probe" => {
           sql: query_sql(:claim_pending_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
-          params: [now, "object", "counter"],
+          params: ["default", now, "object", "counter"],
           expected_key_fragment: "target_activations_queue",
         },
         "expired target activation claim probe" => {
           sql: query_sql(:claim_expired_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
-          params: [now, "object", "counter"],
+          params: ["default", now, "object", "counter"],
           expected_key_fragment: "target_activations_expired",
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
-          params: ["object", "counter", "object-1"],
+          params: ["default", "object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "inbox mailbox head probe" => {
           sql: query_sql(:inbox_head_for_update),
-          params: ["object", "counter", "object-1"],
+          params: ["default", "object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "current object lease probe" => {
           sql: query_sql(:current_object_lease),
-          params: ["counter", "object-1"],
+          params: ["default", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "inbox idempotency probe" => {
           sql: query_sql(:existing_inbox_message_for_idempotency),
-          params: ["object", "counter", "object-1", "idempotency-1"],
-          expected_key_fragment: "inbox_target_idempotency",
+          params: [inbox_idempotency_hash("idempotency-1", target_kind: "object", target_type: "counter", target_id: "object-1")],
+          expected_key_fragment: "inbox_idempotency_hash",
         },
         "workflow lease count probe" => {
           sql: query_sql(:count_workflow_leases, index: mysql_index_name("workflows", "worker_lease")),
@@ -197,6 +201,16 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     "X'#{Durababble::Store::SERIALIZER.dump(value).unpack1("H*")}'"
   end
 
+  def inbox_idempotency_hash(idempotency_key, worker_pool: "default", target_kind:, target_type:, target_id:)
+    Digest::SHA256.hexdigest(Durababble::Store::SERIALIZER.dump({
+      "worker_pool" => worker_pool,
+      "target_kind" => target_kind,
+      "target_type" => target_type,
+      "target_id" => target_id,
+      "idempotency_key" => idempotency_key,
+    }))
+  end
+
   def seed_mysql_plan_fixture
     empty = serialized_literal({})
     result = serialized_literal({ "done" => true })
@@ -223,7 +237,9 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       activation_ready_at = i == 1 ? now - 60 : now + 3600
       execute("INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at, created_at, updated_at) VALUES ('object', 'counter', 'pending-object-#{i}', 'pending', #{mysql_literal(activation_ready_at)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('object', 'counter', 'expired-object-#{i}', 'running', #{created_at}, 'owner', #{mysql_literal(now - 60)}, #{created_at}, #{created_at})")
-      execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, payload, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('inbox-object-1-#{i}', 'object', 'counter', 'object-1', #{i}, 'ask', 'increment', 'op-object-1-#{i}', #{mysql_literal(i == 1 ? "idempotency-1" : nil)}, 'shape', #{inbox_payload}, #{mysql_literal(i == 1 ? "running" : "pending")}, #{created_at}, #{mysql_literal(i == 1 ? "owner" : nil)}, #{mysql_literal(i == 1 ? now + 300 : nil)}, #{created_at}, #{created_at})")
+      idempotency_key = i == 1 ? "idempotency-1" : nil
+      idempotency_hash = idempotency_key && inbox_idempotency_hash(idempotency_key, target_kind: "object", target_type: "counter", target_id: "object-1")
+      execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, idempotency_hash, shape_hash, payload, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('inbox-object-1-#{i}', 'object', 'counter', 'object-1', #{i}, 'ask', 'increment', 'op-object-1-#{i}', #{mysql_literal(idempotency_key)}, #{mysql_literal(idempotency_hash)}, 'shape', #{inbox_payload}, #{mysql_literal(i == 1 ? "running" : "pending")}, #{created_at}, #{mysql_literal(i == 1 ? "owner" : nil)}, #{mysql_literal(i == 1 ? now + 300 : nil)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, payload, status, ready_at, created_at, updated_at) VALUES ('inbox-other-#{i}', 'object', 'counter', 'other-#{i}', 1, 'ask', 'increment', 'op-other-#{i}', NULL, 'shape', #{inbox_payload}, 'pending', #{created_at}, #{created_at}, #{created_at})")
     end
     execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")

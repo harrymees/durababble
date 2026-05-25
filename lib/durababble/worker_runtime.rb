@@ -81,7 +81,7 @@ module Durababble
         )
         start_rpc_server
         worker = begin
-          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
+          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
         rescue StandardError
           stop_rpc_server
           close_isolated_stores
@@ -201,8 +201,11 @@ module Durababble
 
     #: (**untyped) -> untyped
     def enqueue_delivery(**delivery)
+      return unless delivery.fetch(:worker_pool) == @worker_pool
+
       @mutex.synchronize do
         @deliveries << {
+          worker_pool: delivery.fetch(:worker_pool),
           target_kind: delivery.fetch(:target_kind),
           target_type: delivery[:target_type] || delivery.fetch(:target_class),
           target_id: delivery.fetch(:target_id),
@@ -220,6 +223,7 @@ module Durababble
           delivery = next_delivery
           result = if delivery
             worker.deliver_target(
+              worker_pool: delivery.fetch(:worker_pool),
               target_kind: delivery.fetch(:target_kind),
               target_type: delivery.fetch(:target_type),
               target_id: delivery.fetch(:target_id),

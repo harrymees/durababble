@@ -161,7 +161,8 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   test "maps no active lease and unavailable nodes to typed routing failures" do
     store = self.store
     server = start_rpc_server(node_id: "node-a", store:, workflow_handlers: {})
-    client = Durababble::Rpc::Client.new(address: server.address, timeout: 0.1)
+    address = server.address
+    client = Durababble::Rpc::Client.new(address:)
 
     assert_raises_matching(Durababble::WorkflowRpc::NoActiveLease, /not running/) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
@@ -169,6 +170,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
     server.stop
     server = nil
+    client = Durababble::Rpc::Client.new(address:, timeout: 0.1)
     assert_raises(Durababble::WorkflowRpc::NodeUnavailable) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
     end
@@ -187,6 +189,23 @@ class DurababbleRpcTransportTest < DurababbleTestCase
         client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
       end
     end
+  end
+
+  test "keeps server lifecycle and workflow client command validation idempotent" do
+    store = self.store
+    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0, pool_size: 2)
+
+    assert_same(server, server.start)
+    assert_same(server, server.start)
+    assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
+    assert_equal(true, Durababble::Rpc::Client.new(address: server.address).awaken_batch(worker_pool: "default", workflow_ids: []))
+
+    client = Durababble::Rpc::WorkflowClient.new(address: server.address)
+    assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /not_workflow_rpc/) do
+      client.request("not_workflow_rpc", {})
+    end
+  ensure
+    server&.stop
   end
 
   test "rejects unauthorized gRPC peers before running handlers" do
@@ -241,6 +260,39 @@ class DurababbleRpcTransportTest < DurababbleTestCase
         TestTransientResponse.new(result: :err, err: TestRemoteError.new(klass: "UnknownRemote", message: "bad")),
       )
     end
+  end
+
+  test "delivers workflow message wakeups when this node owns the workflow lease" do
+    store = self.store
+    claim_as("node-a")
+    delivered = []
+    service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store:,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: ->(**kwargs) { delivered << kwargs },
+    )
+
+    service.deliver_message(
+      Durababble::Rpc::Proto::DeliverMessageRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+      ),
+      :call,
+    )
+
+    assert_equal(
+      [{ worker_pool: "default", target_kind: "workflow", target_class: "", target_id: workflow_id }],
+      delivered,
+    )
   end
 
   test "drops stale workflow deliveries and returns local transient responses" do
