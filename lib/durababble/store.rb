@@ -283,26 +283,6 @@ module Durababble
       update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result: dump_serialized(result), error:)
     end
 
-    #: (untyped) { -> untyped } -> untyped
-    def instrument_sql(sql, &block)
-      return block.call unless Observability.configuration.enabled?
-
-      attributes = {
-        "durababble.store.backend" => Observability.store_backend(self),
-        "durababble.store.query_shape" => Observability.query_shape(sql),
-        "durababble.store.schema" => schema,
-      }
-      started_at = Observability.monotonic_ms
-      begin
-        Observability.trace("durababble.store.operation", attributes) { block.call }
-      rescue StandardError => e
-        Observability.count("durababble.store.operation.errors", attributes.merge("error.type" => e.class.name))
-        raise
-      ensure
-        Observability.record("durababble.store.operation.duration", Observability.monotonic_ms - started_at, attributes)
-      end
-    end
-
     #: (untyped, untyped) -> untyped
     def observe_claim_latency(row, queue)
       return unless row&.key?("created_at")

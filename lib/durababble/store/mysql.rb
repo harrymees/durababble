@@ -1221,19 +1221,15 @@ module Durababble
 
     #: (untyped) -> untyped
     def execute(sql)
-      instrument_sql(sql) do
-        @connection.exec_query(sql)
-      end
+      @connection.exec_query(sql)
     end
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
-      instrument_sql(sql) do
-        if trilogy_connection?
-          @connection.exec_query(sanitizer_class.send(:sanitize_sql_array, [sql, *params]), "Durababble SQL")
-        else
-          @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
-        end
+      if trilogy_connection?
+        @connection.exec_query(sanitizer_class.send(:sanitize_sql_array, [sql, *params]), "Durababble SQL")
+      else
+        @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
       end
     end
 

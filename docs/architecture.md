@@ -141,9 +141,9 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 ## Observability
 
-`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and SQL store adapters. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle events. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
 
-The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Store instrumentation wraps SQL adapter calls with a query-shape label such as `select.workflows` or `update.outbox` and never records SQL text or serialized payloads.
+The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level durable-execution signals such as workflow, step, wait, lease, outbox, queue, worker, and RPC telemetry.
 
 Primary spans:
 
@@ -151,10 +151,8 @@ Primary spans:
 | --- | --- |
 | `durababble.workflow.start`, `.resume`, `.execute`, `.step` | `Engine` / `WorkflowExecution` |
 | `durababble.object.query`, `.command.enqueue`, `.command` | `DurableObjectRef` |
-| `durababble.worker.tick` | `Worker#tick` |
 | `durababble.workflow_rpc.*` | workflow RPC lease start, route, and handler paths |
 | `durababble.rpc.client.*`, `durababble.rpc.server.*` | gRPC transport methods |
-| `durababble.store.operation` | PostgreSQL/YSQL and MySQL/MariaDB SQL execution |
 
 Primary metrics:
 
@@ -166,7 +164,6 @@ Primary metrics:
 | `durababble.queue.claim_latency` | workflow/outbox claim delay where creation time is available |
 | `durababble.leases.heartbeats/conflicts/expired_recovery` | lease health and recovery |
 | `durababble.outbox.pending/processed/failures` | outbox backlog and delivery result surface; explicit delivery failure is future work |
-| `durababble.store.operation.duration/errors` | SQL adapter latency/error rate |
 | `durababble.worker.ticks`, `durababble.worker.tick.duration` | worker loop health |
 | `durababble.workflow.history.steps`, `durababble.workflow.replay.steps` | replay/history size and replay cost proxy |
 

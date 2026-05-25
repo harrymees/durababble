@@ -1253,25 +1253,21 @@ module Durababble
 
     #: (untyped) -> untyped
     def execute(sql)
-      instrument_sql(sql) do
-        attempts = 0
-        begin
-          @connection.exec_query(sql)
-        rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
-          attempts += 1
-          raise if attempts >= 5
+      attempts = 0
+      begin
+        @connection.exec_query(sql)
+      rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
+        attempts += 1
+        raise if attempts >= 5
 
-          sleep(0.01 * attempts)
-          retry
-        end
+        sleep(0.01 * attempts)
+        retry
       end
     end
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
-      instrument_sql(sql) do
-        @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
-      end
+      @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
     end
 
     #: (untyped) -> untyped

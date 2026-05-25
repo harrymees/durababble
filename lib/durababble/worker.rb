@@ -20,30 +20,28 @@ module Durababble
     def tick
       attributes = { "durababble.worker.id" => @worker_id }
       Observability.measure("durababble.worker.tick", attributes) do
-        Observability.trace("durababble.worker.tick", attributes) do
-          activation = @store.claim_target_activation(
-            worker_id: @worker_id,
-            lease_seconds: @lease_seconds,
-            target_kinds: ["workflow"],
-            target_types: @workflows.keys,
-          )
-          if activation
-            process_target_activation(activation)
-            Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
-            return :worked
-          end
-
-          claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)
-          unless claimed
-            Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "idle"))
-            return :idle
-          end
-
-          workflow = @workflows.fetch(claimed.fetch("name"))
-          Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        activation = @store.claim_target_activation(
+          worker_id: @worker_id,
+          lease_seconds: @lease_seconds,
+          target_kinds: ["workflow"],
+          target_types: @workflows.keys,
+        )
+        if activation
+          process_target_activation(activation)
           Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
-          :worked
+          return :worked
         end
+
+        claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys)
+        unless claimed
+          Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "idle"))
+          return :idle
+        end
+
+        workflow = @workflows.fetch(claimed.fetch("name"))
+        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
+        :worked
       end
     end
 

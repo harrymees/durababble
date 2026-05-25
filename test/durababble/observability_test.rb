@@ -225,22 +225,6 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
   end
 
-  class FakeSqlResult
-    def first = nil
-    def map(&block) = [].map(&block)
-    def to_a = []
-    def cmd_tuples = 0
-  end
-
-  class FakeSqlConnection
-    def exec_query(*) = ActiveRecord::Result.empty
-    def transaction = yield
-    def close = true
-    def finished? = false
-    def quote_table_name(name) = name.to_s
-    def quote_column_name(name) = name.to_s
-  end
-
   def setup
     super
     @tracer_provider = self.class.instance_variable_get(:@test_tracer_provider) || TestTracerProvider.new
@@ -256,7 +240,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     @meter_provider.test_meter.instruments.clear
     Durababble.configure_observability(
       enabled: true,
-      attributes: { "service.name" => "durababble-test", ignored_static: nil },
+      attributes: { "service.name" => "durababble-test" },
     )
   end
 
@@ -280,29 +264,23 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_same @meter_provider.test_meter, Durababble.observability.meter
   end
 
-  test "cleans attributes and annotates traced errors" do
-    timestamp = Time.utc(2026, 5, 24, 17, 20, 0)
-
+  test "emits supplied attributes and annotates traced errors" do
     error = assert_raises(RuntimeError) do
       Durababble::Observability.trace(
         "durababble.failure",
         {
-          nil_value: nil,
-          symbol_value: :queued,
-          time_value: timestamp,
-          object_value: { "id" => "wf-1" },
+          "durababble.workflow.id" => "wf-1",
+          "durababble.workflow.status" => "running",
         },
       ) { raise "boom" }
     end
 
     assert_equal "boom", error.message
     span = @tracer_provider.test_tracer.spans.last
-    refute_includes span.attributes.keys, "ignored_static"
-    refute_includes span.attributes.keys, "nil_value"
-    assert_equal "queued", span.attributes.fetch("symbol_value")
-    assert_equal "2026-05-24T17:20:00.000000Z", span.attributes.fetch("time_value")
-    assert_equal "{\"id\" => \"wf-1\"}", span.attributes.fetch("object_value")
+    assert_equal "wf-1", span.attributes.fetch("durababble.workflow.id")
+    assert_equal "running", span.attributes.fetch("durababble.workflow.status")
     assert_equal "RuntimeError", span.attributes.fetch("error.type")
+    refute_includes span.attributes.keys, "error.message"
     assert_equal ["RuntimeError"], span.exceptions.map { |exception| exception.class.name }
   end
 
@@ -316,8 +294,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_empty span.exceptions
   end
 
-  test "labels unknown SQL shapes and MySQL stores conservatively" do
-    assert_equal "unknown.unknown", Durababble::Observability.query_shape("/* comment */")
+  test "labels MySQL stores conservatively" do
     assert_equal "mysql", Durababble::Observability.store_backend(Durababble::MysqlStore.allocate)
   end
 
@@ -340,17 +317,14 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_equal({ "count" => 5 }, counter.add(5))
     assert_equal 5, counter.count
 
-    sql_store = Durababble::PostgresStore.new(FakeSqlConnection.new, schema: "observability_test")
-    sql_store.send(:execute_params, "SELECT * FROM observability_test.workflows WHERE id = $1", ["wf-1"])
-
     span_names = @tracer_provider.test_tracer.spans.map(&:name)
     assert_includes span_names, "durababble.workflow.start"
     assert_includes span_names, "durababble.workflow.execute"
     assert_includes span_names, "durababble.workflow.step"
     assert_includes span_names, "durababble.object.command"
     assert_includes span_names, "durababble.object.query"
-    assert_includes span_names, "durababble.worker.tick"
-    assert_includes span_names, "durababble.store.operation"
+    refute_includes span_names, "durababble.worker.tick"
+    refute_includes span_names, "durababble.store.operation"
 
     step_span = @tracer_provider.test_tracer.spans.find { |span| span.name == "durababble.workflow.step" }
     assert_equal "increment", step_span.attributes.fetch("durababble.step.name")
@@ -360,11 +334,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_includes instruments.keys, "durababble.workflow.starts"
     assert_includes instruments.keys, "durababble.workflow.completions"
     assert_includes instruments.keys, "durababble.workflow.step.attempts"
-    assert_includes instruments.keys, "durababble.store.operation.duration"
+    assert_includes instruments.keys, "durababble.worker.tick.duration"
     assert_equal 1, instruments.fetch("durababble.workflow.starts").measurements.first.fetch(:value)
-
-    store_span = @tracer_provider.test_tracer.spans.find { |span| span.name == "durababble.store.operation" }
-    assert_equal "select.workflows", store_span.attributes.fetch("durababble.store.query_shape")
-    assert_equal "postgresql", store_span.attributes.fetch("durababble.store.backend")
   end
 end

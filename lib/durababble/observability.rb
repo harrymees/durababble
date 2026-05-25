@@ -8,22 +8,12 @@ require "opentelemetry-metrics-api"
 module Durababble
   module Observability
     INSTRUMENTATION_NAME = "durababble"
-    KNOWN_STORE_TABLES = [
-      "workflows",
-      "steps",
-      "step_attempts",
-      "waits",
-      "fences",
-      "outbox",
-      "durable_objects",
-      "durable_object_commands",
-    ].freeze
 
     class Configuration
       #: (enabled: untyped, ?attributes: untyped) -> void
       def initialize(enabled:, attributes: {})
         @enabled = enabled
-        @attributes = Observability.clean_attributes(attributes).freeze
+        @attributes = attributes.transform_keys(&:to_s).freeze
         @tracer = nil
         @meter = nil
         @instruments = {}
@@ -142,45 +132,21 @@ module Durababble
         store.is_a?(Durababble::MysqlStore) ? "mysql" : "postgresql"
       end
 
-      #: (untyped) -> untyped
-      def query_shape(sql)
-        operation = sql.to_s[/\A\s*([a-z]+)/i, 1]&.downcase || "unknown"
-        table = KNOWN_STORE_TABLES.find { |name| sql.to_s.include?(name) } || "unknown"
-        "#{operation}.#{table}"
-      end
-
       #: (untyped, untyped) -> untyped
       def annotate_error(span, error)
         return if ["Durababble::WorkflowSuspended", "Durababble::StepRetryScheduled"].include?(error.class.name)
 
-        attrs = { "error.type" => error.class.name, "error.message" => error.message.to_s }
-        span.add_attributes(clean_attributes(attrs))
+        span.add_attributes("error.type" => error.class.name)
         span.record_exception(error)
-      end
-
-      #: (untyped) -> untyped
-      def clean_attributes(attributes)
-        attributes.each_with_object({}) do |(key, value), cleaned|
-          next if value.nil?
-
-          cleaned[key.to_s] = case value
-          when String, Numeric, TrueClass, FalseClass
-            value
-          when Symbol
-            value.to_s
-          when Time
-            value.utc.iso8601(6)
-          else
-            value.to_s
-          end
-        end
       end
 
       #: (untyped, untyped) -> untyped
       def normalize_attribute_args(attributes, keyword_attributes)
         base = attributes || {}
         base = base.to_h if base.respond_to?(:to_h)
-        base.merge(keyword_attributes)
+        return base if keyword_attributes.empty?
+
+        base.merge(keyword_attributes.transform_keys(&:to_s))
       end
 
       #: (untyped, untyped, untyped) -> untyped
@@ -188,7 +154,7 @@ module Durababble
         dynamic_attributes = normalize_attribute_args(attributes, keyword_attributes)
         return config.attributes if dynamic_attributes.empty?
 
-        config.attributes.merge(clean_attributes(dynamic_attributes))
+        config.attributes.merge(dynamic_attributes)
       end
     end
   end
