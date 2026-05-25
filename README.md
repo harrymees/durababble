@@ -1,6 +1,6 @@
 # Durababble
 
-Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in an application database.
+Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in an application database. Workflow handles support cooperative cancellation and operator hard termination; the docs site covers the API and storage semantics.
 
 The docs site source starts at [docs/content/README.md](docs/content/README.md). From there, use the docs navigation for workflows, durable objects, storage, observability, testing, and reference material.
 

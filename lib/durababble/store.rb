@@ -348,6 +348,11 @@ module Durababble
       WorkflowStatus.terminal?(row)
     end
 
+    #: (untyped) -> String
+    def workflow_termination_error(reason)
+      reason.to_s.empty? ? "workflow terminated" : reason.to_s
+    end
+
     #: (Array[Hash[String, Object?]], now: Time) -> Array[Hash[String, Object?]]
     def contiguous_claimable_inbox_rows(rows, now:)
       claimable = []
