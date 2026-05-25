@@ -68,26 +68,6 @@ module Durababble
         end
       end
 
-      #: (untyped) -> untyped
-      def method_added(method_name)
-        super
-
-        return if @__durababble_wrapping
-
-        pending = consume_pending_durable_macro
-        return unless pending
-
-        kind, options = pending
-        case kind
-        when :step
-          register_step(method_name, **options)
-        when :expose
-          register_exposed_query(method_name)
-        when :expose_command
-          register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
-        end
-      end
-
       #: () -> untyped
       def step_order
         @step_order ||= []
@@ -99,6 +79,13 @@ module Durababble
       end
 
       private
+
+      #: (untyped, untyped, untyped) -> untyped
+      def handle_pending_durable_macro(kind, method_name, options)
+        return register_step(method_name, **options) if kind == :step
+
+        super
+      end
 
       #: (untyped, ?retry_policy: untyped) -> untyped
       def register_step(method_name, retry_policy: nil)

@@ -3,7 +3,7 @@
 
 require "digest"
 
-require_relative "../durababble"
+require "durababble"
 
 module Durababble
   module Deterministic
