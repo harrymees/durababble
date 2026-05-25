@@ -167,6 +167,18 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   class NoWakeTestObject < Durababble::DurableObject
   end
 
+  class PersistedNilStateObject < Durababble::DurableObject
+    object_type "persisted_nil_state_object"
+
+    def initialize_state
+      { "initialized" => true }
+    end
+
+    expose def snapshot
+      current_state
+    end
+  end
+
   class RetryStateTestCounter < Durababble::DurableObject
     def initialize_state
       { "count" => 0 }
@@ -402,6 +414,37 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     object = anonymous_object.new(durable_id: "obj-1", store: save_store)
     object.update_state({ "saved" => true })
     assert_equal [{ object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+  end
+
+  test "memoizes nil initialized durable object state" do
+    nil_state_object = Class.new(Durababble::DurableObject) do
+      attr_reader :initializations
+
+      def initialize(*args, **kwargs)
+        @initializations = 0
+        super
+      end
+
+      def initialize_state
+        @initializations += 1
+        nil
+      end
+    end
+    object = nil_state_object.new
+
+    assert_nil object.current_state
+    assert_nil object.current_state
+    assert_equal 1, object.initializations
+  end
+
+  durababble_store_backends.each do |backend|
+    test "does not reinitialize persisted nil durable object state with #{backend.name}" do
+      with_durababble_store(backend, "nil_object_state") do |store|
+        store.save_object_state(object_type: PersistedNilStateObject.object_type, object_id: "nil-state", state: nil)
+
+        assert_nil PersistedNilStateObject.handle("nil-state", store:).snapshot
+      end
+    end
   end
 
   test "completes read-only commands and fails them when the completion lease is lost" do

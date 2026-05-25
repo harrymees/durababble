@@ -9,6 +9,8 @@ module Durababble
   class DurableObject
     extend DurableMethodDSL
 
+    UNINITIALIZED = Object.new.freeze
+
     class << self
       #: (Class) -> void
       def inherited(subclass)
@@ -58,6 +60,20 @@ module Durababble
         end
       end
 
+      #: (Object, object_type: String, object_id: String) -> Object?
+      def state_from_store(store, object_type:, object_id:)
+        store = store #: as untyped
+        if store.respond_to?(:object_state_entry)
+          state = store.object_state_entry(object_type:, object_id:)
+          return UNINITIALIZED if state.equal?(Store::NO_OBJECT_STATE)
+
+          return state
+        end
+
+        state = store.object_state(object_type:, object_id:)
+        state.nil? ? UNINITIALIZED : state
+      end
+
       private
 
       #: (RetryPolicy) -> Integer?
@@ -82,7 +98,7 @@ module Durababble
     attr_reader :command_context
 
     #: (?durable_id: String?, ?state: Object?, ?store: Store?, ?command_context: CommandContext?) -> void
-    def initialize(durable_id: nil, state: nil, store: nil, command_context: nil)
+    def initialize(durable_id: nil, state: UNINITIALIZED, store: nil, command_context: nil)
       @durable_id = durable_id
       @current_state = state
       @store = store #: as untyped
@@ -98,7 +114,9 @@ module Durababble
 
     #: () -> Object?
     def current_state
-      @current_state.nil? ? initialize_state : @current_state
+      return @current_state unless @current_state.equal?(UNINITIALIZED)
+
+      @current_state = initialize_state
     end
 
     #: (Object?) -> Object?
@@ -152,7 +170,7 @@ module Durababble
     def invoke_query(method_name, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
-        state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
+        state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store)
         object.instance_variable_set(:@__durababble_query_context, true)
         kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
@@ -300,7 +318,7 @@ module Durababble
 
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def build_object(object_class, object_id:, message:)
-      state = @store.object_state(object_type: object_class.object_type, object_id:)
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
       context = CommandContext.new(
         object_type: object_class.object_type,
         durable_id: object_id,

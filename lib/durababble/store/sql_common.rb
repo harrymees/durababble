@@ -65,8 +65,14 @@ module Durababble
 
     #: (object_type: String, object_id: String) -> Object?
     def object_state(object_type:, object_id:)
+      state = object_state_entry(object_type:, object_id:)
+      state.equal?(Store::NO_OBJECT_STATE) ? nil : state
+    end
+
+    #: (object_type: String, object_id: String) -> Object?
+    def object_state_entry(object_type:, object_id:)
       row = execute_store_query(:object_state, [object_type, object_id]).first
-      decode_row(row).fetch("state") if row
+      row ? decode_row(row).fetch("state") : Store::NO_OBJECT_STATE
     end
 
     #: (String) -> Array[Hash[String, Object?]]
