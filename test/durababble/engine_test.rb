@@ -192,8 +192,12 @@ class DurababbleEngineTest < DurababbleTestCase
 
     test "returns a terminal failed workflow instead of trying to reclaim it with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
+        attempts = 0
         workflow = durababble_test_workflow("terminal-failure") do
-          test_step("explode") { |_ctx| raise "boom" }
+          test_step("explode") do |_ctx|
+            attempts += 1
+            raise "boom"
+          end
         end
         engine = Durababble::Engine.new(store:, worker_id: "owner")
 
@@ -203,6 +207,8 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal "failed", first.status
         assert_equal first.status, second.status
         assert_equal first.error, second.error
+        assert_equal 1, attempts
+        assert_nil store.workflow(first.id).fetch("next_run_at")
       end
     end
 
