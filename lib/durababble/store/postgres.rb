@@ -98,16 +98,8 @@ module Durababble
       @connection.transaction(requires_new: true) do
         workflows = execute_params(store_query_sql(:pg_release_workflow_leases), [worker_id]).affected_rows
         outbox = execute_params(store_query_sql(:pg_release_outbox_leases), [worker_id]).affected_rows
-        inbox = execute_params(<<~SQL, [worker_id]).affected_rows
-          UPDATE #{table("inbox")}
-          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
-          WHERE status = 'running' AND locked_by = $1
-        SQL
-        target_activations = execute_params(<<~SQL, [worker_id]).affected_rows
-          UPDATE #{table("target_activations")}
-          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
-          WHERE status = 'running' AND locked_by = $1
-        SQL
+        inbox = execute_params(store_query_sql(:pg_release_inbox_leases), [worker_id]).affected_rows
+        target_activations = execute_params(store_query_sql(:pg_release_target_activation_leases), [worker_id]).affected_rows
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
@@ -807,14 +799,6 @@ module Durababble
       @connection.transaction(requires_new: true) do
         returning = execute_params(store_query_sql(:pg_complete_waits, where_sql: "w.kind = 'timer'\n    AND w.wake_at <= $1::timestamptz", payload_param: 2), [now, dump_serialized({})])
         finish_completed_waits(returning, {})
-      end
-    end
-
-    #: (untyped, untyped) -> untyped
-    def complete_event_waits(event_key, payload)
-      @connection.transaction(requires_new: true) do
-        returning = execute_params(store_query_sql(:pg_complete_waits, where_sql: "w.kind = 'event'\n    AND w.event_key = $1", payload_param: 2), [event_key, dump_serialized(payload)])
-        finish_completed_waits(returning, payload)
       end
     end
 

@@ -95,8 +95,6 @@ module Durababble
           Operation.new(name: "fenced_workflow_completion", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "complete running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_completion)),
           Operation.new(name: "fenced_workflow_failure", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "fail running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_failure)),
           Operation.new(name: "fenced_workflow_cancellation", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "cancel running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_cancellation)),
-          Operation.new(name: "signal_events", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "signal durable event waits and wake workflows", block: method(:bench_signal_event)),
-          Operation.new(name: "event_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into event wait, signal it, and resume remaining workflow steps", block: method(:bench_event_wait_resume_workflow)),
           Operation.new(name: "timer_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into due timer wait, wake it, and resume remaining workflow steps", block: method(:bench_timer_wait_resume_workflow)),
           Operation.new(name: "worker_tick_execute_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "worker tick claim + execute a runnable workflow", block: method(:bench_worker_tick_execute_workflow)),
           Operation.new(name: "worker_run_until_idle_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "worker drains a small batch through run_until_idle", block: method(:bench_worker_run_until_idle_batch)),
@@ -111,7 +109,6 @@ module Durababble
           Operation.new(name: "durable_object_command_claim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "persist, claim, complete, and read durable object command state", block: method(:bench_durable_object_command_claim)),
           Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
           Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
-          Operation.new(name: "large_table_signal_miss", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "event-signal miss against a large pending wait set", block: method(:bench_large_table_signal_miss)),
           Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
           Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
           Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
@@ -236,33 +233,6 @@ module Durababble
         id = @store.enqueue_workflow(name: "bench_fenced_cancel", input: { "i" => i, "warmup" => warmup })
         @store.claim_workflow(workflow_id: id, worker_id: "status-owner", lease_seconds: 30)
         @store.cancel_workflow(id, reason: "synthetic cancellation", result: { "canceled" => true }, worker_id: "status-owner")
-      end
-
-      def bench_signal_event(i, warmup:)
-        workflow_id = @store.enqueue_workflow(name: "bench_wait", input: { "i" => i })
-        @store.mark_workflow_running(workflow_id, worker_id: "waiter", lease_seconds: 30)
-        @store.record_step_started(workflow_id:, position: 0, name: "wait")
-        @store.record_wait(
-          workflow_id:,
-          position: 0,
-          name: "wait",
-          wait_request: event_wait("bench:event:#{i}:#{warmup}", context: { "i" => i }),
-        )
-        woken = @store.signal_event("bench:event:#{i}:#{warmup}", payload: { "ok" => true })
-        raise "wait not woken" unless woken == 1
-
-        @store.complete_workflow(workflow_id, result: { "signaled" => true })
-      end
-
-      def bench_event_wait_resume_workflow(i, warmup:)
-        key = "bench:event-resume:#{warmup}:#{i}:#{SecureRandom.hex(4)}"
-        workflow = event_resume_workflow(key)
-        run = Durababble::Engine.new(store: @store, worker_id: "event-runner", lease_seconds: 30, migrate: false).run(workflow, input: { "i" => i })
-        raise "workflow did not wait" unless run.status == "waiting"
-
-        @store.signal_event(key, payload: { "signal" => true })
-        resumed = Durababble::Engine.new(store: @store, worker_id: "event-worker", lease_seconds: 30, migrate: false).resume(workflow, workflow_id: run.id)
-        raise "engine did not resume signaled workflow" unless resumed.status == "completed"
       end
 
       def bench_timer_wait_resume_workflow(i, warmup:)
@@ -410,12 +380,6 @@ module Durababble
         @store.complete_workflow(workflow_id, result: { "woke" => true })
       end
 
-      def bench_large_table_signal_miss(i, warmup:)
-        ensure_large_fixture!
-        woken = @store.signal_event("bench:missing:event:#{warmup}:#{i}:#{SecureRandom.hex(4)}", payload: { "ok" => false })
-        raise "missing event unexpectedly woke waits" if woken.nonzero?
-      end
-
       def bench_rpc_ping(i, warmup:)
         rpc.request("ping", "i" => i, "warmup" => warmup)
       end
@@ -460,25 +424,6 @@ module Durababble
         end
       end
 
-      def event_resume_workflow(event_key)
-        Class.new(Durababble::Workflow) do
-          workflow_name "bench_event_resume"
-
-          define_method(:execute) do |input|
-            finish_after_event(wait_for_event(input))
-          end
-
-          define_method(:wait_for_event) do |ctx|
-            Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key:, context: ctx)
-          end
-          step :wait_for_event
-
-          step def finish_after_event(ctx)
-            ctx.merge("finished" => true)
-          end
-        end
-      end
-
       def timer_resume_workflow
         @timer_resume_workflow ||= Class.new(Durababble::Workflow) do
           workflow_name "bench_timer_resume"
@@ -495,10 +440,6 @@ module Durababble
             ctx.merge("finished" => true)
           end
         end
-      end
-
-      def event_wait(event_key, context:)
-        Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
       end
 
       def state_read_ids

@@ -37,10 +37,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status = 'waiting' AND kind = 'timer' AND wake_at <= NOW(6) FOR UPDATE SKIP LOCKED",
           "waits_timer_pending",
         ],
-        "event wait signal probe" => [
-          "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status = 'waiting' AND kind = 'event' AND event_key = 'target-event' FOR UPDATE SKIP LOCKED",
-          "waits_event_pending",
-        ],
       }
 
       expectations.each do |name, (sql, expected_key_fragment)|

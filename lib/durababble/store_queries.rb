@@ -59,9 +59,9 @@ module Durababble
       },
       "wait wake scans" => {
         methods: ["Store.record_wait", "Store.complete_waits", "MysqlStore.complete_waits_mysql"],
-        indexes: ["waits_event_pending_idx", "waits_timer_pending_idx", "waits_workflow_status_idx"],
-        assertions: ["event/timer pending indexes", "workflow join remains indexed"],
-        benchmarks: ["signal_events", "large_table_due_timer_scan", "large_table_signal_miss"],
+        indexes: ["waits_timer_pending_idx", "waits_workflow_status_idx"],
+        assertions: ["timer pending index", "workflow join remains indexed"],
+        benchmarks: ["large_table_due_timer_scan"],
       },
       "outbox delivery" => {
         methods: ["Store.enqueue_outbox", "Store.claim_outbox", "Store.ack_outbox", "Store.release_worker_leases!"],
@@ -179,6 +179,18 @@ module Durababble
       "UPDATE #{table(store, "outbox")}\n" \
         "SET status = 'pending', locked_by = NULL, locked_until = NULL\n" \
         "WHERE status = 'processing' AND locked_by = $1"
+    end
+
+    define(:pg_release_inbox_leases, backend: :postgres) do |store|
+      "UPDATE #{table(store, "inbox")}\n" \
+        "SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()\n" \
+        "WHERE status = 'running' AND locked_by = $1"
+    end
+
+    define(:pg_release_target_activation_leases, backend: :postgres) do |store|
+      "UPDATE #{table(store, "target_activations")}\n" \
+        "SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()\n" \
+        "WHERE status = 'running' AND locked_by = $1"
     end
 
     define(:pg_heartbeat_step_workflow, backend: :postgres) do |store|

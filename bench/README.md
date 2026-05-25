@@ -33,8 +33,6 @@ The suite measures realistic durable-execution operations:
 - claiming/dequeueing pending work under leases;
 - lease heartbeat/renewal;
 - lease conflict checks;
-- durable event waits and signaling;
-- event waits that resume the remaining workflow after an external signal;
 - timer waits that wake and resume the remaining workflow;
 - worker `tick` claim + execute behavior;
 - worker `run_until_idle` batch draining;
@@ -48,7 +46,6 @@ The suite measures realistic durable-execution operations:
 - durable object state and command enqueue/claim/complete/read;
 - queue claim performance with large historical workflow tables;
 - due-timer wake scans with many unrelated wait rows;
-- event-signal misses with large pending wait sets;
 - JSON-line command RPC to a separate Ruby process;
 - cross-process enqueue + claim command RPC.
 

@@ -21,8 +21,4 @@ The docs site source starts at [docs/content/README.md](docs/content/README.md).
 - [Deterministic Testing](docs/deterministic-testing.md)
 - [Benchmarks](bench/README.md)
 
-## Development Notes
-
-Query-plan and benchmark coverage are part of the storage contract. When adding production SQL for hot queue, lease, wait, outbox, durable-object, or inbox-shaped paths, define it in `Durababble::StoreQueries`, add PostgreSQL/YSQL and MySQL/MariaDB plan coverage where practical, and extend `bench/run.rb` for benchmark coverage. If a registered query is intentionally not covered by the large-fixture EXPLAIN suite, add it to the explicit uncovered-query list in the query-plan test so the exemption is visible in review.
-
 The Zeitung documentation source lives in `docs/content/`; see [docs/README.md](docs/README.md) for local preview and build commands.

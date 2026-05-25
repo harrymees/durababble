@@ -49,6 +49,35 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_workflow_locked_until,
   ].freeze
 
+  module StoreQueryIdRecorder
+    THREAD_KEY = :durababble_store_query_plan_seen_ids
+
+    class << self
+      def record
+        previous = Thread.current[THREAD_KEY]
+        seen = []
+        Thread.current[THREAD_KEY] = seen
+        yield
+        seen.dup
+      ensure
+        Thread.current[THREAD_KEY] = previous
+      end
+
+      def track(id)
+        Thread.current[THREAD_KEY]&.<< id.to_sym
+      end
+    end
+  end
+
+  module StoreQueriesInstrumentation
+    def sql(id, store, locals = {})
+      StoreQueryIdRecorder.track(id)
+      super
+    end
+  end
+
+  Durababble::StoreQueries.singleton_class.prepend(StoreQueriesInstrumentation)
+
   class RecordingConnection < SimpleDelegator
     attr_reader :recorded_queries
 
@@ -58,7 +87,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       @recording = false
     end
 
-    def adapter_name = "PostgreSQL"
     def quote_column_name(identifier) = PG::Connection.quote_ident(identifier.to_s)
 
     def record
@@ -252,7 +280,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   test "store implementation routes hot SQL through the top-level query registry" do
     store_path = File.join(File.expand_path("../..", __dir__), "lib/durababble/store/postgres.rb")
     source = File.read(store_path)
-    hot_methods = source.scan(/^    def (claim_runnable_workflow|claim_workflow|heartbeat|workflow_owned\?|heartbeat_step|current_workflow_lease|steal_expired_leases!|record_step_started|record_wait|enqueue_outbox|claim_outbox|ack_outbox|save_object_state|complete_timer_waits|record_step_completed_without_transaction|update_latest_attempt_serialized)\b(.*?)(?=^    def |\n  end\nend\z)/m)
+    hot_methods = source.scan(/^    def (claim_runnable_workflow|claim_workflow|heartbeat|workflow_owned\?|release_worker_leases!|heartbeat_step|current_workflow_lease|steal_expired_leases!|record_step_started|record_wait|enqueue_outbox|claim_outbox|ack_outbox|save_object_state|complete_timer_waits|record_step_completed_without_transaction|update_latest_attempt_serialized)\b(.*?)(?=^    def |\n  end\nend\z)/m)
     refute_empty hot_methods
 
     hot_methods.each do |method_name, body|
@@ -339,8 +367,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "waits_workflow_created_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
-        allow_post_filter_indexes: ["waits_workflow_created_idx", "workflows_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "waits_workflow_created_idx", "waits_workflow_status_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allow_post_filter_indexes: ["waits_workflow_created_idx", "waits_workflow_status_idx", "workflows_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "request_workflow_cancellation" => {
         call: -> { store.request_workflow_cancellation(workflow_id: "running-owned", reason: "query plan") },
@@ -449,7 +477,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     query_ids = []
     connection.transaction do
       connection.record do
-        query_ids = store.send(:record_store_query_ids, &block)
+        query_ids = StoreQueryIdRecorder.record(&block)
       end
       raise ActiveRecord::Rollback
     end
@@ -504,10 +532,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
 
       INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
       SELECT 'timer-wait-' || i, 'waiting-' || i, 0, 'timer', NULL, now() - interval '1 minute', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
-      FROM generate_series(1, 2000) AS i;
-
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'event-wait-' || i, 'waiting-' || i, 0, 'event', CASE WHEN i = 1 THEN 'target-event' ELSE 'other-event' END, NULL, decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
       FROM generate_series(1, 2000) AS i;
 
       INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
