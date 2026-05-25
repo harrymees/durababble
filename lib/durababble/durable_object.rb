@@ -23,18 +23,19 @@ module Durababble
         @object_type || underscore((ruby_name || object_id.to_s).split("::").last)
       end
 
-      #: (untyped, ?store: untyped) -> untyped
-      def ref(durable_id, store: Durababble.store)
-        DurableObjectRef.new(self, String(durable_id), store:)
+      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def ref(durable_id, store: nil, engine: nil)
+        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
       end
 
-      #: (untyped, ?store: untyped, ?worker_pool: untyped, ?idempotency_key: untyped) -> untyped
-      def at(durable_id, store: Durababble.store, worker_pool: nil, idempotency_key: nil)
-        DurableObjectRef.new(self, String(durable_id), store:)
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: untyped, ?idempotency_key: untyped) -> untyped
+      def at(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
+        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
       end
 
-      #: (untyped, untyped, *untyped, ?store: untyped, ?idempotency_key: untyped, **untyped) -> untyped
-      def tell(durable_id, method_name, *args, store: Durababble.store, idempotency_key: nil, **kwargs)
+      #: (untyped, untyped, *untyped, ?store: untyped, ?engine: untyped, ?idempotency_key: untyped, **untyped) -> untyped
+      def tell(durable_id, method_name, *args, store: nil, engine: nil, idempotency_key: nil, **kwargs)
+        store = Durababble.store_for(store:, engine:)
         method_name = method_name.to_sym
         retry_policy = @exposed_commands[method_name]
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy

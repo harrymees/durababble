@@ -35,7 +35,19 @@ module Durababble
 
   class << self
     #: (untyped) -> untyped
-    attr_accessor :default_store
+    attr_reader :default_store, :default_engine
+
+    #: (untyped) -> untyped
+    def default_store=(store)
+      @default_store = store
+      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+    end
+
+    #: (untyped) -> untyped
+    def default_engine=(engine)
+      @default_engine = engine
+      @default_store = engine&.store
+    end
 
     #: () -> String
     def default_database_url
@@ -62,7 +74,7 @@ module Durababble
     #: (database_url: untyped, ?schema: untyped) -> untyped
     def configure(database_url:, schema: default_schema)
       @default_store&.close
-      @default_store = Store.connect(database_url:, schema:)
+      self.default_store = Store.connect(database_url:, schema:)
     end
 
     #: (?enabled: untyped, ?attributes: untyped) -> untyped
@@ -78,6 +90,31 @@ module Durababble
     #: () -> untyped
     def store
       @default_store || raise(Error, "Durababble.store is not configured; pass store: or call Durababble.configure")
+    end
+
+    #: () -> untyped
+    def engine
+      @default_engine ||= Engine.new(store:, migrate: false)
+    end
+
+    #: (?engine: untyped, ?store: untyped) -> untyped
+    def engine_for(engine: nil, store: nil)
+      raise ArgumentError, "pass store: or engine:, not both" if store && engine
+
+      return engine if engine
+      return Engine.new(store:, migrate: false) if store
+
+      self.engine
+    end
+
+    #: (?engine: untyped, ?store: untyped) -> untyped
+    def store_for(engine: nil, store: nil)
+      raise ArgumentError, "pass store: or engine:, not both" if store && engine
+
+      return store if store
+      return engine.store if engine
+
+      self.engine.store
     end
 
     #: (untyped, ?untyped) -> untyped

@@ -11,7 +11,7 @@ Durababble exposes two durable primitives:
 | Primitive | Class | Public handle API | Best for | Mental model |
 | --- | --- | --- | --- | --- |
 | Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, and recovery | A function or process that survives restarts |
-| Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.tell` | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
+| Durable object | `Durababble::DurableObject` | `DurableObject.at` typed handle calls | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
@@ -64,7 +64,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.at(workflow_id)` and `Workflow.handle(workflow_id)` return a query/management handle for status, result, cancellation, resume, and exposed methods.
+`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -82,7 +82,7 @@ Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_
 
 ### Durable objects
 
-A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, worker_pool: nil, idempotency_key: nil)` for proxy calls and by `Class.tell(id, :method, **args, idempotency_key: nil)` for asynchronous durable commands. Durable object methods are not workflow steps.
+A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, engine: nil, worker_pool: nil, idempotency_key: nil)` for typed handle calls such as `account.credit(1_000)`. When `engine:` is omitted, these helpers use Durababble's configured default engine. Durable object methods are not workflow steps.
 
 ```ruby
 class Account < Durababble::DurableObject

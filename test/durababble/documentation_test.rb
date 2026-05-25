@@ -52,6 +52,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
       assert_equal(1_000, object_result)
     ensure
       remove_documentation_example_constants
+      Durababble.default_store = nil
     end
   end
 
@@ -60,14 +61,14 @@ class DurababbleDocumentationTest < DurababbleTestCase
     durable_objects = read("docs/content/durable-objects.md")
 
     workflow_visible = visible_marked_ruby_code(workflows, "workflow-example")
-    assert_includes workflow_visible, "FulfillOrder.start(order, store:)"
-    assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id, store:)"
+    assert_includes workflow_visible, "FulfillOrder.start(order)"
+    assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id)"
     refute_includes workflow_visible, "Durababble::Store.connect"
     refute_includes workflow_visible, "Durababble::Worker.new"
     refute_includes workflow_visible, "Durababble::Engine.new"
 
     object_visible = visible_marked_ruby_code(durable_objects, "durable-object-example")
-    assert_includes object_visible, "account = Account.at(\"acct_readme\", store:)"
+    assert_includes object_visible, "account = Account.at(\"acct_readme\")"
     assert_includes object_visible, "account.credit(1_000)"
     refute_includes object_visible, "Account.tell"
     refute_includes object_visible, "Durababble::Store.connect"

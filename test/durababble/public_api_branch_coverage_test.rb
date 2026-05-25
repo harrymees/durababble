@@ -151,6 +151,39 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  durababble_store_backends.each do |backend|
+    test "enqueues workflows through default and explicit engines with #{backend.name}" do
+      with_durababble_store(backend, "public_api_default_engine_workflow") do |store|
+        engine = Durababble::Engine.new(store:, migrate: false)
+
+        explicit_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(explicit_id).fetch("name"))
+        explicit_ref = BranchTestWorkflow.handle(explicit_id, engine:)
+        assert_equal("pending", explicit_ref.status)
+        assert_nil(explicit_ref.result)
+        assert_nil(explicit_ref.error)
+
+        explicit_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        assert_instance_of(Durababble::WorkflowRef, explicit_handle)
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(explicit_handle.workflow_id).fetch("name"))
+
+        Durababble.default_store = store
+        assert_same(store, Durababble.default_engine.store)
+
+        default_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" })
+        assert_equal(BranchTestWorkflow.workflow_name, store.workflow(default_id).fetch("name"))
+        assert_equal("status:#{default_id}", BranchTestWorkflow.handle(default_id).labeled_status(prefix: "status"))
+        assert_equal("status:#{default_id}", BranchTestWorkflow.ref(default_id, engine:).labeled_status(prefix: "status"))
+
+        assert_raises(ArgumentError) do
+          BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, store:, engine:)
+        end
+      ensure
+        Durababble.default_store = nil
+      end
+    end
+  end
+
   test "raises when a workflow step is called outside workflow execution" do
     assert_raises_matching(Durababble::Error, /outside workflow execution/) do
       BranchTestWorkflow.new.echo("outside")
@@ -226,6 +259,8 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     configured = Durababble.configure(database_url: backend.database_url, schema: schema_name)
 
     assert_same(configured, Durababble.default_store)
+    assert_same(configured, Durababble.default_engine.store)
+    assert_same(Durababble.default_engine, Durababble.engine)
     assert_equal(schema_name, Durababble.default_store.schema)
     assert_kind_of(Durababble::Store, Durababble.default_store)
   ensure
@@ -245,6 +280,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
     refute(old_pool.active_connection?)
     assert_same(new_store, Durababble.default_store)
+    assert_same(new_store, Durababble.default_engine.store)
     assert_equal(new_schema, Durababble.default_store.schema)
   ensure
     old_store&.drop_schema!

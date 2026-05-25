@@ -21,6 +21,7 @@ Durable object methods are not workflow steps. Instead, the command is the durab
 ```ruby
 store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
 store.migrate!
+Durababble.default_store = store
 ```
 -->
 
@@ -44,7 +45,7 @@ class Account < Durababble::DurableObject
   end
 end
 
-account = Account.at("acct_readme", store:)
+account = Account.at("acct_readme")
 ```
 
 <!-- DOCS:durable-object-example:hidden
@@ -96,9 +97,9 @@ Simple RPCs are run in parallel and are not expected to ever mutate state on the
 Commands can mutate state on the object, and are processed in serial and recorded and redelivered durably. Use commands for RPCs that need to make it to the object, and that change the way the object will behave moving forward, like editing local state.
 
 ```ruby
-account = Account.at("acct_123", store:)
-Account.tell("acct_123", :credit, 1_000, store:) # durable command: this call is written to the database and eventually processed by an object worker
-account.balance                                  # query: reads latest persisted state
+account = Account.at("acct_123")
+account.credit(1_000) # durable command: this call is written to the database and eventually processed by an object worker
+account.balance       # query: reads latest persisted state
 ```
 
 Use `expose` for simple RPCs such as `balance`, `status`, `members`, or `current_cursor`. Use `expose_command` for changes such as `credit`, `join`, `append_message`, `advance_cursor`, or `close`. Command methods can use `command_context.idempotency_key` when calling external systems, and command retry policy is declared on the method the same way workflow step retry policy is.
@@ -121,7 +122,7 @@ class Channel < Durababble::DurableObject
   end
 end
 
-channel = Channel.at("durable-execution-discussions", store:)
+channel = Channel.at("durable-execution-discussions")
 channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```
