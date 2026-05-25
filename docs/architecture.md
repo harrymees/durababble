@@ -59,7 +59,7 @@ workflow.description
 workflow.cancel(reason: "user request")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist command events using `Store#signal_event`. A full command executor that routes to the current lease owner, executes the method body, and returns command results is future work.
+In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
 
 ### Durable objects
 
@@ -82,7 +82,7 @@ class Account < Durababble::DurableObject
 end
 ```
 
-The desired durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in `durable_object_commands`. The current prototype has the class/ref API, command rows, inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
+The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. The current prototype has the class/ref API, inbox-backed inline command execution, generated command idempotency keys, and explicit state persistence; the dedicated object-command worker/lease path is still to be hardened.
 
 ## Storage model
 
@@ -93,7 +93,8 @@ The desired durable-object contract is actor-like: commands for the same `(objec
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
 - `durable_objects`: latest durable-object state by `(object_type, object_id)`.
-- `durable_object_commands`: persisted object command calls, arguments, result/error, status, and command lease columns.
+- `mailbox_sequences`: per-target sequence allocation state for workflow and object inbox messages.
+- `inbox`: persisted object asks/tells/wakes plus workflow command/signal messages, including target identity, mailbox sequence, idempotency key, shape hash, retry/dead-letter fields, result/error, and retention deadline.
 
 ## Durability semantics
 
@@ -129,13 +130,42 @@ WORKER = Durababble::WorkerRuntime.start(
   database_url: ENV.fetch("DATABASE_URL"),
   workflows: MyApp::DurableWorkflows.for_pool("default"),
   worker_pool: "default",
-  worker_id: "#{Socket.gethostname}-#{Process.pid}"
+  rpc_host: ENV.fetch("POD_IP", "127.0.0.1"),
+  rpc_port: ENV.fetch("DURABABBLE_RPC_PORT", "50051").to_i
 )
 
 at_exit { WORKER.shutdown(timeout: 10) }
 ```
 
 The runtime only claims workflow names present in its `workflows` registry, so separate pools can run different workflow families without claiming work they cannot execute. Shutdown is cooperative: the loop stops after the current tick and returns `:stopped` if the tick completes before the deadline. If user step code exceeds the deadline, `shutdown` releases this worker's workflow and outbox leases and returns `:timeout`; the still-running thread may later observe `LeaseConflict`, but it cannot commit stale step output because state updates are lease-checked.
+
+## Observability
+
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle events. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+
+The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level durable-execution signals such as workflow, step, wait, lease, outbox, queue, worker, and RPC telemetry.
+
+Primary spans:
+
+| Span name | Emitted by |
+| --- | --- |
+| `durababble.workflow.start`, `.resume`, `.execute`, `.step` | `Engine` / `WorkflowExecution` |
+| `durababble.object.query`, `.command.enqueue`, `.command` | `DurableObjectRef` |
+| `durababble.workflow_rpc.*` | workflow RPC lease start, route, and handler paths |
+| `durababble.rpc.client.*`, `durababble.rpc.server.*` | gRPC transport methods |
+
+Primary metrics:
+
+| Metric | Purpose |
+| --- | --- |
+| `durababble.workflow.starts/completions/failures/cancellations` | workflow lifecycle; cancellations are reserved until the cancel API lands |
+| `durababble.workflow.step.attempts/successes/failures/retries` | step health and retry scheduling |
+| `durababble.waits.started/completed`, `durababble.wait.latency` | wait persistence and wake latency |
+| `durababble.queue.claim_latency` | workflow/outbox claim delay where creation time is available |
+| `durababble.leases.heartbeats/conflicts/expired_recovery` | lease health and recovery |
+| `durababble.outbox.pending/processed/failures` | outbox backlog and delivery result surface; explicit delivery failure is future work |
+| `durababble.worker.ticks`, `durababble.worker.tick.duration` | worker loop health |
+| `durababble.workflow.history.steps`, `durababble.workflow.replay.steps` | replay/history size and replay cost proxy |
 
 ## Benchmarking and query-shape validation
 

@@ -4,6 +4,19 @@
 require_relative "../test_helper"
 
 class DurababbleStoreBackendConformanceTest < DurababbleTestCase
+  class AdvisoryDeliveryClient
+    attr_reader :deliveries
+
+    def initialize
+      @deliveries = []
+    end
+
+    def deliver_message(**kwargs)
+      @deliveries << kwargs
+      true
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "migrates, enqueues, claims, completes, and decodes serialized workflow state with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
@@ -156,6 +169,18 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           args: [1],
           kwargs: { "by" => 2 },
         )
+        assert_hash_includes(
+          store.inbox_message(command_id),
+          "id" => command_id,
+          "target_kind" => "object",
+          "target_type" => "counter",
+          "target_id" => "abc",
+          "message_kind" => "ask",
+          "method_name" => "increment",
+          "status" => "pending",
+        )
+        assert_equal 1, store.inbox_message(command_id).fetch("sequence").to_i
+        assert_equal 0, store.inbox_message(command_id).fetch("attempts").to_i
         claimed = store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
         assert_hash_includes(
           claimed,
@@ -170,6 +195,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
 
         store.complete_object_command(command_id:, result: { "count" => 3 })
+        assert_hash_includes store.inbox_message(command_id), "status" => "completed", "result" => { "count" => 3 }
         assert_nil store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
 
         fenced_command_id = store.enqueue_object_command(
@@ -188,13 +214,325 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           result: { "count" => 999 },
           worker_id: "intruder",
         )
-        assert(intruder.nil? || intruder.cmd_tuples.to_i.zero?)
+        assert(intruder.nil? || intruder.affected_rows.to_i.zero?)
         owner = store.complete_object_command(
           command_id: fenced_command_id,
           result: { "count" => 4 },
           worker_id: "object-owner",
         )
-        assert_equal 1, owner.cmd_tuples
+        assert_equal 1, owner.affected_rows
+      end
+    end
+
+    test "does not claim an earlier object command when asked for a later one with #{backend.name}" do
+      with_durababble_store(backend, "object_command_fifo_claim") do |store|
+        first = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [1],
+          kwargs: {},
+        )
+        second = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [2],
+          kwargs: {},
+        )
+
+        assert_nil store.claim_object_command(command_id: second, worker_id: "object-worker", lease_seconds: 30)
+        assert_hash_includes store.inbox_message(first), "status" => "pending", "locked_by" => nil
+        assert_hash_includes store.inbox_message(second), "status" => "pending", "locked_by" => nil
+
+        assert_hash_includes(
+          store.claim_object_command(command_id: first, worker_id: "object-worker", lease_seconds: 30),
+          "id" => first,
+          "status" => "running",
+          "locked_by" => "object-worker",
+        )
+      end
+    end
+
+    test "allocates inbox sequences transactionally and drains only a contiguous ready prefix with #{backend.name}" do
+      with_durababble_store(backend, "inbox_sequence") do |store|
+        store.migrate!
+        blocked = store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "blocked",
+          message_kind: "wake",
+          payload: { "wake" => 1 },
+          ready_at: Time.now + 60,
+        )
+        ready = store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "blocked",
+          message_kind: "tell",
+          payload: { "tell" => 2 },
+        )
+
+        assert_equal [1, 2], store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "blocked").map { |message| message.fetch("sequence").to_i }
+        assert_equal [], store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2)
+        assert_hash_includes store.inbox_message(blocked), "status" => "pending"
+        assert_hash_includes store.inbox_message(ready), "status" => "pending"
+
+        future = Time.now + 120
+        due = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2, now: future)
+        assert_equal [blocked, ready], due.map { |message| message.fetch("id") }
+        assert_equal ["running", "running"], due.map { |message| message.fetch("status") }
+      end
+    end
+
+    test "coalesces inbox messages into one target activation with #{backend.name}" do
+      with_durababble_store(backend, "target_activation") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        first = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+        )
+        second = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "second" } },
+        )
+
+        activation = store.claim_target_activation(worker_id: "activation-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        assert_hash_includes(
+          activation,
+          "target_kind" => "workflow",
+          "target_type" => "approval",
+          "target_id" => workflow_id,
+          "status" => "running",
+          "locked_by" => "activation-worker",
+        )
+        assert_nil store.claim_target_activation(worker_id: "other", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
+        assert_equal [first], claimed.map { |message| message.fetch("id") }
+        store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
+        store.complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker")
+
+        rearmed = store.claim_target_activation(worker_id: "activation-worker-2", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        assert_hash_includes rearmed, "target_id" => workflow_id, "locked_by" => "activation-worker-2"
+        remaining = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker-2", lease_seconds: 30, limit: 1)
+        assert_equal [second], remaining.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "does not claim future target activations until ready with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_future") do |store|
+        store.migrate!
+        ready_at = Time.now + 60
+        store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "future",
+          message_kind: "wake",
+          payload: { "wake" => true },
+          ready_at:,
+        )
+
+        assert_nil store.claim_target_activation(worker_id: "early", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], now: Time.now)
+        activation = store.claim_target_activation(worker_id: "late", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], now: ready_at + 1)
+        assert_hash_includes activation, "target_kind" => "object", "target_type" => "counter", "target_id" => "future", "locked_by" => "late"
+      end
+    end
+
+    test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
+      with_durababble_store(backend, "inbox_idempotency") do |store|
+        store.migrate!
+        first = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-1",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+        duplicate = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-1",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+
+        assert_equal first, duplicate
+        assert_equal [1], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: "wf-1").map { |message| message.fetch("sequence").to_i }
+
+        same_key_other_target = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-2",
+          message_kind: "workflow_signal",
+          payload: { "approved" => true },
+          idempotency_key: "signal:approval:wf-1",
+        )
+
+        refute_equal first, same_key_other_target
+        assert_equal [1], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: "wf-2").map { |message| message.fetch("sequence").to_i }
+
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.enqueue_inbox_message(
+            target_kind: "workflow",
+            target_type: "approval",
+            target_id: "wf-1",
+            message_kind: "workflow_signal",
+            payload: { "approved" => false },
+            idempotency_key: "signal:approval:wf-1",
+          )
+        end
+      end
+    end
+
+    test "atomically enqueues workflow commands and rejects terminal workflows with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_enqueue") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        first = store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+          idempotency_key: "approve:1",
+        )
+        duplicate = store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "first" } },
+          idempotency_key: "approve:1",
+        )
+
+        assert_equal first, duplicate
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "different" } },
+            idempotency_key: "approve:1",
+          )
+        end
+
+        store.complete_workflow(workflow_id, result: { "done" => true })
+        assert_raises_matching(Durababble::Error, /terminal/) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "late" } },
+            idempotency_key: "approve:2",
+          )
+        end
+        assert_equal [first], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id).map { |message| message.fetch("id") }
+      end
+    end
+
+    test "advisory-delivers committed workflow messages to the active lease address with #{backend.name}" do
+      with_durababble_store(backend, "workflow_advisory_delivery") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "127.0.0.1:12345", lease_seconds: 30)
+
+        client = AdvisoryDeliveryClient.new
+        delivered = store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          client_factory: lambda do |address|
+            assert_equal("127.0.0.1:12345", address)
+            client
+          end,
+        )
+
+        assert_equal(true, delivered)
+        assert_equal(
+          [
+            {
+              worker_pool: "default",
+              target_kind: "workflow",
+              target_class: "approval",
+              target_id: workflow_id,
+            },
+          ],
+          client.deliveries,
+        )
+
+        store.suspend_workflow(workflow_id:, worker_id: "127.0.0.1:12345")
+        assert_equal false, store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          client_factory: lambda do |_address|
+            raise "should not build a client without a live lease"
+          end,
+        )
+      end
+    end
+
+    test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
+      with_durababble_store(backend, "inbox_crash_after_commit") do |store|
+        store.migrate!
+        message_id = store.enqueue_inbox_message(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: "wf-2",
+          message_kind: "workflow_command",
+          method_name: "approve",
+          payload: { "reason" => "ok" },
+        )
+
+        recovered = Durababble::Store.connect(database_url: backend.database_url, schema:)
+        begin
+          assert_hash_includes(recovered.inbox_message(message_id), "status" => "pending")
+          assert_equal(1, recovered.inbox_message(message_id).fetch("sequence").to_i)
+          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-2", worker_id: "workflow-owner", lease_seconds: 30)
+          assert_equal([message_id], claimed.map { |message| message.fetch("id") })
+        ensure
+          recovered.close
+        end
+      end
+    end
+
+    test "allocates unique contiguous mailbox sequences under concurrent enqueue with #{backend.name}" do
+      with_durababble_store(backend, "inbox_concurrent") do |store|
+        store.migrate!
+        errors = Queue.new
+        threads = 6.times.map do |index|
+          Thread.new do
+            local = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              local.enqueue_inbox_message(
+                target_kind: "object",
+                target_type: "counter",
+                target_id: "concurrent",
+                message_kind: "tell",
+                payload: { "index" => index },
+              )
+            rescue StandardError => e
+              errors << e
+            ensure
+              local&.close
+            end
+          end
+        end
+        threads.each(&:join)
+        raise errors.pop unless errors.empty?
+
+        sequences = store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "concurrent").map { |message| message.fetch("sequence").to_i }.sort
+        assert_equal [1, 2, 3, 4, 5, 6], sequences
       end
     end
 
@@ -215,7 +553,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal true, store.workflow_owned?(workflow_id:, worker_id: "worker-a")
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "worker-b")
         assert_hash_includes store.current_workflow_lease(workflow_id), "workflow_id" => workflow_id, "worker_id" => "worker-a"
-        assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).cmd_tuples
+        assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).affected_rows
 
         store.record_step_started(workflow_id:, position: 0, name: "heartbeat")
         assert_nil store.heartbeat_step(
@@ -261,7 +599,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           "locked_by" => "zombie",
         )
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
-        assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).cmd_tuples
+        assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).affected_rows
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
       end
     end

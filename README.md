@@ -309,7 +309,7 @@ Durababble then helps you RPC to these objects to read or write the state within
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
-Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after.
+Durable object methods are not workflow steps. Instead, the command is the durable boundary, and the object either applies your command or doesn't, and the state is durably persisted after. Object commands are inbox messages ordered by a per-object mailbox sequence, so a later command cannot overtake a pending, backoff, or dead-lettered head message for the same object.
 
 <!-- README:durable-object-example:start -->
 
@@ -356,7 +356,7 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: records a command row and persists state changes
+account.credit(1_000) # durable command: this call is written to the database and eventually processed even in the face of crashes
 account.balance       # query: reads latest persisted state
 ```
 
@@ -392,3 +392,72 @@ Background jobs are still the right tool for simple, short, idempotent work: sen
 Durababble is for the cases where a single retry loop becomes the hard part. If a job charges a card, writes a record, waits for a webhook, calls another service, and then ships an order, a crash in the middle forces you to rebuild durable progress tracking yourself. You end up adding status columns, idempotency keys, retry schedules, leases, recovery scans, cancellation flags, and custom "what step was I on?" logic.
 
 Durababble makes those pieces part of the programming model. Workflows persist step history and resume from durable boundaries. Durable objects keep id-addressed state behind query and command methods. RPC-style handles let other code ask durable entities for status or send durable commands without reaching into worker memory. The goal is not to replace every job; it is to make the stateful, multi-step, long-lived jobs explicit and recoverable.
+
+## OpenTelemetry Observability
+
+Durababble observability is optional and disabled by default. Disabled instrumentation only executes cheap no-op checks. Durababble depends on the official OpenTelemetry API gems for tracing and metrics, but it does not choose or configure an SDK, collector, or exporter.
+
+Applications that already configure the OpenTelemetry SDK can enable Durababble instrumentation against the global OpenTelemetry providers:
+
+```ruby
+require "opentelemetry/sdk"
+require "opentelemetry/exporter/otlp"
+
+OpenTelemetry::SDK.configure do |c|
+  c.service_name = "my-app"
+  c.use_all
+end
+
+Durababble.configure_observability(
+  enabled: true,
+  attributes: { "deployment.environment" => ENV.fetch("RACK_ENV", "development") },
+)
+```
+
+If `enabled: true` is used before an SDK is configured, OpenTelemetry's API-level no-op providers are used. That lets tests and local runs exercise instrumentation without a collector while production apps can add `opentelemetry-sdk`, `opentelemetry-metrics-sdk`, and exporters in their own boot code.
+
+Local OTLP smoke example:
+
+```sh
+docker run --rm -p 4317:4317 -p 4318:4318 otel/opentelemetry-collector:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 mise exec -- bundle exec ruby examples/your_app.rb
+```
+
+Stable spans include `durababble.workflow.start`, `durababble.workflow.resume`, `durababble.workflow.execute`, `durababble.workflow.step`, `durababble.object.query`, `durababble.object.command.enqueue`, `durababble.object.command`, `durababble.workflow_rpc.route`, `durababble.workflow_rpc.handle`, `durababble.rpc.client.*`, and `durababble.rpc.server.*`. Durababble does not wrap ActiveRecord SQL execution in its own spans; applications should use standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility.
+Stable metrics include workflow start/completion/failure counters, step attempt/success/failure/retry counters, wait start/completion counters and latency histograms, queue claim latency, lease heartbeat/conflict/recovery counters, outbox pending/processed counters, worker tick duration/counts, and workflow replay/history size measurements. Applications should use ActiveRecord/database OpenTelemetry instrumentation for SQL operation latency/error metrics.
+
+## Prototype Boundaries
+
+The README describes the implemented prototype. The spec also records the intended public direction so reviewers can distinguish current behavior from target behavior.
+
+- Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, class-method enqueueing, and current `Workflow.start` / `Workflow.handle` aliases.
+- First-class cooperative workflow cancellation through `Workflow.handle(...).cancel(reason:)`, persisted cancellation requests, `canceling` / `canceled` states, and replay-safe cleanup steps.
+- Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
+- PostgreSQL/YSQL and MySQL/MariaDB store implementations.
+- Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
+- Worker polling with leased workflow claims.
+- Heartbeats, stale lease recovery, and lease-aware resume.
+- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Retry due-time claims distinguish retryable failures from terminal failed workflows.
+- Lease-routed workflow RPC helpers.
+- Deterministic simulation tests for workflow safety and crash-recovery scenarios.
+
+- `DurableObject.at` and `DurableObject.tell` are the preferred future durable-object spellings. The current durable-object implementation still uses `DurableObject.ref`; workflow code supports both `Workflow.start` / `Workflow.handle` and lower-level `Workflow.enqueue` / `Workflow.ref` / `Engine#run`.
+- Workflow command methods currently persist command events; executing command bodies through the workflow owner and returning command results is target runtime work.
+- Full durable workflow signals (`signal def`, `wait_condition`) are target work. Implemented today are lower-level timer waits, event waits, and event signaling.
+- Durable-object commands persist command rows and execute inline in the current prototype. Per-object FIFO mailbox leasing, async `tell`, sleeps, and worker-driven object execution are target work.
+- Fences deduplicate side effects after a fence row is inserted, but fence-owner crash recovery is not complete.
+- The gRPC transport and workflow RPC routing are implemented for the prototype test matrix, but production mTLS/Spiffe policy, admin surfaces, metrics, tracing, and operator tooling are not yet implemented.
+- There is no compatibility promise for production workloads yet. Treat the SQL schema, public names, and operational knobs as prototype surfaces unless the spec states otherwise.
+
+## Documentation Gateway
+
+- [docs/spec.md](docs/spec.md): source of truth for implemented, partial, target, and future-scope guarantees.
+- [docs/architecture.md](docs/architecture.md): component overview, storage model, worker lifecycle, durability semantics, and benchmark/query-shape strategy.
+- [docs/deterministic-testing.md](docs/deterministic-testing.md): deterministic simulation harness, recovery scenarios, seed search, and bugs found by the harness.
+- [bench/README.md](bench/README.md) and [bench/run.rb](bench/run.rb): benchmark operation coverage and local benchmark commands.
+- [examples/counter.rb](examples/counter.rb): minimal runnable workflow example.
+- [docs/huginn-integration-report.md](docs/huginn-integration-report.md): integration notes from a real Rails/MySQL application experiment.
+- [sig/durababble.rbs](sig/durababble.rbs): static-only RBS declarations for the public class API.
+
+Historical comparison and review notes remain in `docs/`, but the current API and guarantees are defined by this README, the spec, and the architecture doc.

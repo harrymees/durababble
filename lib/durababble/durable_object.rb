@@ -1,19 +1,19 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "durable_method_dsl"
+
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
 
   class DurableObject
-    class << self
-      #: untyped
-      attr_reader :exposed_queries, :exposed_commands
+    extend DurableMethodDSL
 
+    class << self
       #: (untyped) -> untyped
       def inherited(subclass)
         super
-        subclass.instance_variable_set(:@exposed_queries, {})
-        subclass.instance_variable_set(:@exposed_commands, {})
+        initialize_durable_method_dsl(subclass)
       end
 
       #: (?untyped) -> untyped
@@ -26,57 +26,6 @@ module Durababble
       #: (untyped, ?store: untyped) -> untyped
       def ref(durable_id, store: Durababble.store)
         DurableObjectRef.new(self, String(durable_id), store:)
-      end
-
-      #: (?untyped) -> untyped
-      def expose(method_name = nil)
-        if method_name
-          @exposed_queries[method_name.to_sym] = true
-          method_name
-        else
-          @pending_durable_macro = [:expose, {}]
-          nil
-        end
-      end
-
-      #: (?untyped, **untyped) -> untyped
-      def expose_command(method_name = nil, **options)
-        if method_name
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
-          method_name
-        else
-          @pending_durable_macro = [:expose_command, { retry_policy: options[:retry] }]
-          nil
-        end
-      end
-
-      #: (untyped) -> untyped
-      def method_added(method_name)
-        super
-
-        return if @__durababble_wrapping
-
-        pending = @pending_durable_macro
-        return unless pending
-
-        @pending_durable_macro = nil
-        kind, options = pending
-        case kind
-        when :expose
-          @exposed_queries[method_name.to_sym] = true
-        when :expose_command
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
-        end
-      end
-
-      private
-
-      #: (untyped) -> untyped
-      def underscore(value)
-        value.gsub(/([A-Z]+)([A-Z][a-z])/, "\\1_\\2")
-          .gsub(/([a-z\d])([A-Z])/, "\\1_\\2")
-          .tr("-", "_")
-          .downcase
       end
     end
 
@@ -146,56 +95,88 @@ module Durababble
     #: (untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
     def invoke_query(method_name, args:, kwargs:, block:)
       @store.migrate!
-      state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
-      object = @object_class.new(durable_id: @durable_id, state:, store: @store) #: as untyped
-      kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+      attributes = {
+        "durababble.object.type" => @object_class.object_type,
+        "durababble.object.id" => @durable_id,
+        "durababble.object.method" => method_name,
+      }
+      Observability.trace("durababble.object.query", attributes) do
+        state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
+        object = @object_class.new(durable_id: @durable_id, state:, store: @store) #: as untyped
+        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+      end
     end
 
     #: (untyped, retry_policy: untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
     def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
       @store.migrate!
-      command_id = @store.enqueue_object_command(object_type: @object_class.object_type, object_id: @durable_id, method_name: method_name.to_s, args:, kwargs:)
-      run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
+      attributes = {
+        "durababble.object.type" => @object_class.object_type,
+        "durababble.object.id" => @durable_id,
+        "durababble.object.method" => method_name,
+      }
+      Observability.trace("durababble.object.command.enqueue", attributes) do
+        command_id = @store.enqueue_object_command(object_type: @object_class.object_type, object_id: @durable_id, method_name: method_name.to_s, args:, kwargs:)
+        run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
+      end
     end
 
     #: (untyped, untyped, retry_policy: untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
     def run_command(command_id, method_name, retry_policy:, args:, kwargs:, block:)
       attempt = 0
       worker_id = "inline-object-worker"
+      attributes = {}
       begin
         attempt += 1
+        attributes = {
+          "durababble.object.type" => @object_class.object_type,
+          "durababble.object.id" => @durable_id,
+          "durababble.object.method" => method_name,
+          "durababble.object.command.id" => command_id,
+          "durababble.object.command.attempt" => attempt,
+          "durababble.worker.id" => worker_id,
+        }
+        Observability.count("durababble.object.command.attempts", attributes)
         claimed = @store.claim_object_command(command_id:, worker_id:)
-        raise LeaseConflict, "could not claim durable object command #{command_id}" unless claimed
+        unless claimed
+          Observability.count("durababble.leases.conflicts", attributes.merge("durababble.lease.owner" => worker_id))
+          raise LeaseConflict, "could not claim durable object command #{command_id}"
+        end
 
-        state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
-        context = CommandContext.new(
-          object_type: @object_class.object_type,
-          durable_id: @durable_id,
-          command_id:,
-          attempt_number: attempt,
-          idempotency_key: "durababble:v1:object:#{@object_class.object_type}:#{@durable_id}:command:#{command_id}",
-        )
-        object = @object_class.new(durable_id: @durable_id, state:, store: @store, command_context: context) #: as untyped
-        result = kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
-        completed = if object.state_dirty?
-          @store.complete_object_command(
-            command_id:,
-            result:,
+        Observability.trace("durababble.object.command", attributes) do
+          state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
+          context = CommandContext.new(
             object_type: @object_class.object_type,
-            object_id: @durable_id,
-            state: object.current_state,
-            worker_id:,
+            durable_id: @durable_id,
+            command_id:,
+            attempt_number: attempt,
+            idempotency_key: "durababble:v1:object:#{@object_class.object_type}:#{@durable_id}:command:#{command_id}",
           )
-        else
-          @store.complete_object_command(command_id:, result:, worker_id:)
-        end
-        unless completed && (!completed.respond_to?(:cmd_tuples) || completed.cmd_tuples.to_i.positive?)
-          raise LeaseConflict, "lost durable object command lease #{command_id}"
-        end
+          object = @object_class.new(durable_id: @durable_id, state:, store: @store, command_context: context) #: as untyped
+          result = kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+          completed = if object.state_dirty?
+            @store.complete_object_command(
+              command_id:,
+              result:,
+              object_type: @object_class.object_type,
+              object_id: @durable_id,
+              state: object.current_state,
+              worker_id:,
+            )
+          else
+            @store.complete_object_command(command_id:, result:, worker_id:)
+          end
+          unless completed&.affected_rows.to_i.positive?
+            Observability.count("durababble.leases.conflicts", attributes.merge("durababble.lease.owner" => worker_id))
+            raise LeaseConflict, "lost durable object command lease #{command_id}"
+          end
 
-        result
+          Observability.count("durababble.object.command.successes", attributes)
+          result
+        end
       rescue StandardError => e
         @store.fail_object_command(command_id:, error: "#{e.class}: #{e.message}", worker_id:) if claimed
+        Observability.count("durababble.object.command.failures", attributes.merge("error.type" => e.class.name))
         retry if retry_policy.retryable?(e, attempt_number: attempt)
         raise
       end

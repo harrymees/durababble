@@ -4,6 +4,7 @@
 require "digest"
 
 require_relative "durababble/version"
+require_relative "durababble/observability"
 
 module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
@@ -15,6 +16,8 @@ module Durababble
   class LeaseConflict < Error; end
   class NonDeterminismError < Error; end
   class FenceTimeout < Error; end
+  class CommandTimeout < Error; end
+  class IdempotencyKeyConflict < Error; end
 
   class CancellationError < Error
     #: untyped
@@ -59,6 +62,16 @@ module Durababble
     def configure(database_url:, schema: default_schema)
       @default_store&.close
       @default_store = Store.connect(database_url:, schema:)
+    end
+
+    #: (?enabled: untyped, ?attributes: untyped) -> untyped
+    def configure_observability(enabled: false, attributes: {})
+      Observability.configure(enabled:, attributes:)
+    end
+
+    #: () -> untyped
+    def observability
+      Observability.configuration
     end
 
     #: () -> untyped
@@ -123,4 +136,3 @@ require_relative "durababble/worker_runtime"
 require_relative "durababble/rpc_client"
 require_relative "durababble/workflow_rpc"
 require_relative "durababble/rpc_transport"
-require_relative "durababble/deterministic"

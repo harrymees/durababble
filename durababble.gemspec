@@ -31,10 +31,13 @@ Gem::Specification.new do |spec|
   end
   spec.require_paths = ["lib"]
 
+  spec.add_dependency("activerecord", ">= 7.1", "< 9.0")
   spec.add_dependency("async", "~> 2.24")
   spec.add_dependency("bigdecimal", "~> 3.2")
   spec.add_dependency("concurrent-ruby", "~> 1.3")
   spec.add_dependency("grpc", "~> 1.70")
+  spec.add_dependency("opentelemetry-api", "~> 1.10")
+  spec.add_dependency("opentelemetry-metrics-api", "~> 0.6")
   spec.add_dependency("paquito", "~> 1.0")
   spec.add_dependency("pg", "~> 1.5")
   spec.add_dependency("trilogy", "~> 2.9")

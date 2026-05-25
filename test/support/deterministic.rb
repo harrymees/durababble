@@ -3,6 +3,8 @@
 
 require "digest"
 
+require "durababble"
+
 module Durababble
   module Deterministic
     Result = Data.define(:scenario, :seed, :trace, :digest, :violations, :summary)

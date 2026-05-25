@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "durable_method_dsl"
+
 module Durababble
   Step = Data.define(:name, :retry_policy)
 
@@ -8,17 +10,18 @@ module Durababble
   class WorkflowSuspended < Error; end
 
   class Workflow
+    extend DurableMethodDSL
+
     class << self
       #: untyped
-      attr_reader :steps, :exposed_queries, :exposed_commands
+      attr_reader :steps
 
       #: (untyped) -> untyped
       def inherited(subclass)
         super
         subclass.instance_variable_set(:@steps, {})
         subclass.instance_variable_set(:@step_order, [])
-        subclass.instance_variable_set(:@exposed_queries, {})
-        subclass.instance_variable_set(:@exposed_commands, {})
+        initialize_durable_method_dsl(subclass)
       end
 
       #: (?untyped) -> untyped
@@ -61,51 +64,7 @@ module Durababble
           register_step(method_name, retry_policy: options[:retry])
           method_name
         else
-          @pending_durable_macro = [:step, { retry_policy: options[:retry] }]
-          nil
-        end
-      end
-
-      #: (?untyped) -> untyped
-      def expose(method_name = nil)
-        if method_name
-          @exposed_queries[method_name.to_sym] = true
-          method_name
-        else
-          @pending_durable_macro = [:expose, {}]
-          nil
-        end
-      end
-
-      #: (?untyped, **untyped) -> untyped
-      def expose_command(method_name = nil, **options)
-        if method_name
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
-          method_name
-        else
-          @pending_durable_macro = [:expose_command, { retry_policy: options[:retry] }]
-          nil
-        end
-      end
-
-      #: (untyped) -> untyped
-      def method_added(method_name)
-        super
-
-        return if @__durababble_wrapping
-
-        pending = @pending_durable_macro
-        return unless pending
-
-        @pending_durable_macro = nil
-        kind, options = pending
-        case kind
-        when :step
-          register_step(method_name, **options)
-        when :expose
-          @exposed_queries[method_name.to_sym] = true
-        when :expose_command
-          @exposed_commands[method_name.to_sym] = RetryPolicy.from(options.fetch(:retry_policy, options[:retry]))
+          set_pending_durable_macro(:step, retry_policy: options[:retry])
         end
       end
 
@@ -120,6 +79,13 @@ module Durababble
       end
 
       private
+
+      #: (untyped, untyped, untyped) -> untyped
+      def handle_pending_durable_macro(kind, method_name, options)
+        return register_step(method_name, **options) if kind == :step
+
+        super
+      end
 
       #: (untyped, ?retry_policy: untyped) -> untyped
       def register_step(method_name, retry_policy: nil)
@@ -149,14 +115,6 @@ module Durababble
         end
       ensure
         @__durababble_wrapping = false
-      end
-
-      #: (untyped) -> untyped
-      def underscore(value)
-        value.gsub(/([A-Z]+)([A-Z][a-z])/, "\\1_\\2")
-          .gsub(/([a-z\d])([A-Z])/, "\\1_\\2")
-          .tr("-", "_")
-          .downcase
       end
     end
 
@@ -216,9 +174,22 @@ module Durababble
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
         kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
-        # For now exposed workflow commands are persisted as events; lease-routed RPC can back this later.
+        @store.migrate!
+        idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
-        @store.signal_event("workflow:#{@workflow_id}:command:#{method_name}", payload:)
+        message_id = @store.enqueue_workflow_command(
+          workflow_id: @workflow_id,
+          workflow_name: @workflow_class.workflow_name,
+          method_name: method_name.to_s,
+          payload:,
+          idempotency_key:,
+        )
+        @store.deliver_target_message(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+        )
+        @store.wait_for_inbox_message(message_id)
       else
         super
       end

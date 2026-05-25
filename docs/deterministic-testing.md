@@ -2,7 +2,7 @@
 
 Durababble includes a local deterministic simulation harness inspired by `gadget-inc/silo`'s `tests/turmoil_runner` setup. Silo uses Rust `turmoil` plus `mad-turmoil` to virtualize networking, time, and randomness, then proves determinism by running each scenario twice with the same `DST_SEED` and comparing deterministic trace output byte-for-byte.
 
-Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc randomness/time and sockets for arbitrary Ruby code, so Durababble ships a small purpose-built harness in `lib/durababble/deterministic.rb`.
+Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc randomness/time and sockets for arbitrary Ruby code, so Durababble keeps a small purpose-built test harness in `test/support/deterministic.rb` rather than shipping it as production library code.
 
 ## What is virtualized
 
@@ -68,7 +68,7 @@ The original prototype spec covered distributed workflow leases and lease-aware 
 Use this to search a scenario over many deterministic schedules:
 
 ```sh
-mise exec -- ruby -Ilib -e 'require "durababble"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
+mise exec -- ruby -Ilib -Itest -e 'require "support/deterministic"; p Durababble::Deterministic.search("chaos", seeds: 1..200)'
 ```
 
 An empty array means no invariant violation was found for that seed range.
