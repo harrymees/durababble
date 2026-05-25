@@ -169,12 +169,18 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_completed", "command_id" => position, "payload" => result)
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "failed", "error" => error)
       attempts[workflow_id].last.merge!("status" => "failed", "error" => error)
-      append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "error" => error)
+      payload = nil
+      if terminal
+        payload = { "terminal" => true }
+        payload["error_class"] = error_class if error_class
+        payload["error_message"] = error_message if error_message
+      end
+      append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "payload" => payload, "error" => error)
     end
 
     def complete_workflow(workflow_id, result:, worker_id: nil)

@@ -172,7 +172,7 @@ module Durababble
     def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
     def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
     def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
-    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> void
     def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]

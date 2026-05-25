@@ -320,9 +320,55 @@ module Durababble
           cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
           future.reject(cancellation_error_from(cancellation, fallback_reason: event.fetch("error")))
         when "step_failed"
-          future.reject(Error.new(event.fetch("error")))
+          future.reject(step_failure_error_from(event))
         end
       end
+    end
+
+    #: (Hash[String, Object?]) -> StandardError
+    def step_failure_error_from(event)
+      error = event.fetch("error").to_s
+      payload = event["payload"]
+      error_class = nil #: String?
+      error_message = nil #: String?
+      if payload.is_a?(Hash)
+        error_class = payload["error_class"]&.to_s
+        error_message = payload["error_message"]&.to_s if payload.key?("error_message")
+      end
+      error_class, error_message = parse_step_failure_error(error) unless error_class
+      build_step_failure_error(error_class:, error_message:, fallback: error)
+    end
+
+    #: (String) -> [String?, String?]
+    def parse_step_failure_error(error)
+      error_class, error_message = error.split(": ", 2)
+      return [nil, nil] unless error_message
+
+      [error_class, error_message]
+    end
+
+    #: (error_class: String?, error_message: String?, fallback: String) -> StandardError
+    def build_step_failure_error(error_class:, error_message:, fallback:)
+      klass = step_failure_error_class(error_class)
+      return Error.new(fallback) unless klass
+
+      klass.new(error_message || fallback) #: as StandardError
+    rescue StandardError
+      Error.new(fallback)
+    end
+
+    #: (String?) -> Class?
+    def step_failure_error_class(class_name)
+      return if class_name.nil? || class_name.empty?
+
+      # Terminal step replay persists exception class names so crash recovery can
+      # preserve user-visible rescue semantics.
+      # rubocop:disable Sorbet/ConstantsFromStrings -- reconstructing persisted user exception classes
+      klass = Object.const_get(class_name)
+      # rubocop:enable Sorbet/ConstantsFromStrings
+      klass if klass.is_a?(Class) && klass <= StandardError
+    rescue NameError
+      nil
     end
 
     #: (untyped, ?fallback_reason: untyped) -> untyped

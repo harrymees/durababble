@@ -94,9 +94,17 @@ module Durababble
       case event.fetch("kind")
       when "step_scheduled"
         @scheduled[command_id] = event
+      when "step_failed"
+        @terminal[command_id] = event if terminal_step_failure?(event)
       when *TERMINAL_KINDS
         @terminal[command_id] = event
       end
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def terminal_step_failure?(event)
+      payload = event["payload"]
+      payload.is_a?(Hash) && payload["terminal"] == true
     end
   end
 end
