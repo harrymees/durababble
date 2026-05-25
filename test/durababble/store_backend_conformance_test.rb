@@ -661,6 +661,34 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "terminal workflow writes do not leave incomplete durable work with #{backend.name}" do
+      with_durababble_store(backend, "terminal_work_cleanup") do |store|
+        completion_id = store.create_workflow(name: "reject-incomplete-complete", input: {})
+        store.record_step_scheduled(workflow_id: completion_id, command_id: 0, name: "not_done")
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completion_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(completion_id), "status" => "running", "result" => nil
+        assert_equal ["scheduled"], store.steps_for(completion_id).map { |step| step.fetch("status") }
+
+        cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
+        store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
+        store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running")
+        store.record_wait(
+          workflow_id: cancel_id,
+          command_id: 2,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+
+        store.cancel_workflow(cancel_id, reason: "operator stop")
+        assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "error" => "operator stop"
+        assert_equal ["canceled", "canceled", "canceled"], store.steps_for(cancel_id).map { |step| step.fetch("status") }
+        assert_equal ["canceled"], store.step_attempts_for(cancel_id).map { |attempt| attempt.fetch("status") }
+        assert_equal ["canceled"], store.waits_for(cancel_id).map { |wait| wait.fetch("status") }
+      end
+    end
+
     test "reclaims expired durable object command leases with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(

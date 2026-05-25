@@ -455,41 +455,50 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       update = if worker_id
-        execute_params(<<~SQL, [dump_serialized(result), workflow_id, worker_id])
+        execute_params(<<~SQL, [dump_serialized(result), workflow_id, worker_id, workflow_id, workflow_id, workflow_id])
           UPDATE #{table("workflows")}
           SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+            AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
+            AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = ? AND status IN ('running', 'waiting'))
+            AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND status = 'pending')
         SQL
       else
-        execute_params(<<~SQL, [dump_serialized(result), workflow_id])
+        execute_params(<<~SQL, [dump_serialized(result), workflow_id, workflow_id, workflow_id, workflow_id])
           UPDATE #{table("workflows")}
           SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
+            AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = ? AND status IN ('running', 'waiting'))
+            AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND status = 'pending')
         SQL
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
+      require_workflow_completion_update!(update, workflow_id:, worker_id:)
     end
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
-      update = if worker_id
-        execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id, worker_id])
-          UPDATE #{table("workflows")}
-          SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
-            cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
-            locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
-        SQL
-      else
-        execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id])
-          UPDATE #{table("workflows")}
-          SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
-            cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
-            locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-          WHERE id = ?
-        SQL
+      transaction do
+        update = if worker_id
+          execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id, worker_id])
+            UPDATE #{table("workflows")}
+            SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
+              cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
+              locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+            WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+          SQL
+        else
+          execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id])
+            UPDATE #{table("workflows")}
+            SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
+              cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
+              locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+            WHERE id = ?
+          SQL
+        end
+        require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
+        cancel_incomplete_workflow_work_for_terminal_without_transaction(workflow_id:, error: reason) if update.affected_rows.to_i == 1
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
     #: (String, error: String, ?worker_id: String?) -> Object
@@ -795,6 +804,25 @@ module Durababble
         UPDATE #{table("step_attempts")}
         SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
         WHERE workflow_id = ? AND status = 'waiting'
+      SQL
+    end
+
+    #: (workflow_id: String, error: String) -> Object?
+    def cancel_incomplete_workflow_work_for_terminal_without_transaction(workflow_id:, error:)
+      execute_params(<<~SQL, [workflow_id])
+        UPDATE #{table("waits")}
+        SET status = 'canceled', completed_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'pending'
+      SQL
+      execute_params(<<~SQL, [error, workflow_id])
+        UPDATE #{table("steps")}
+        SET status = 'canceled', error = ?, updated_at = NOW(6)
+        WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting')
+      SQL
+      execute_params(<<~SQL, [error, workflow_id])
+        UPDATE #{table("step_attempts")}
+        SET status = 'canceled', error = ?, completed_at = NOW(6)
+        WHERE workflow_id = ? AND status IN ('running', 'waiting')
       SQL
     end
 

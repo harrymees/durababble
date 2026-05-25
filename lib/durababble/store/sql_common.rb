@@ -319,6 +319,17 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
     end
 
+    #: (Object?, workflow_id: String, worker_id: String?) -> Object?
+    def require_workflow_completion_update!(result, workflow_id:, worker_id:)
+      result = result #: as untyped
+      return result if result&.affected_rows.to_i == 1
+
+      message = "workflow #{workflow_id} cannot complete while incomplete durable work remains"
+      raise LeaseConflict, "#{message} or the lease expired or moved" if worker_id
+
+      raise Error, message
+    end
+
     #: (workflow_id: String, worker_id: String) -> void
     def assert_workflow_lease_for_update!(workflow_id:, worker_id:)
       return if lock_owned_workflow_for_update(workflow_id:, worker_id:)

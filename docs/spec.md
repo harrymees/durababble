@@ -15,7 +15,7 @@ Durababble exposes two durable primitives:
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
-The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, target activations, and durable-object FIFO command rows. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands and validates `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests.
+The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, target activations, and FIFO inbox command rows for object and workflow targets. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands and validates `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests.
 
 Storage works through PostgreSQL/YSQL (`postgresql://` / `postgres://`) and MySQL/MariaDB (`mysql://` / `mysql2://`). Both adapters must provide the same public durable semantics, with backend-specific SQL hidden behind shared conformance tests and backend-specific locking/query-plan tests where query shape matters.
 

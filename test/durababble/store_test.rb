@@ -714,18 +714,28 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result([], affected_rows: 1),
       sql_result([], affected_rows: 1),
       sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
     ])
     pg_fenced_store = pg_store(pg_fenced_connection)
     pg_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 5, pg_fenced_connection.exec_params_calls.length
+    assert_equal 8, pg_fenced_connection.exec_params_calls.length
     pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("UPDATE") && sql.include?("workflows") }
     assert_equal 3, pg_fenced_workflow_updates.length
     assert pg_fenced_workflow_updates.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
 
     pg_unfenced_connection = ScriptedPgConnection.new(params_results: [
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
       sql_result([], affected_rows: 1),
       sql_result([], affected_rows: 1),
       sql_result([], affected_rows: 1),
@@ -735,7 +745,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_unfenced_store.cancel_workflow("wf", reason: "stop")
     pg_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 5, pg_unfenced_connection.exec_params_calls.length
+    assert_equal 8, pg_unfenced_connection.exec_params_calls.length
     pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("UPDATE") && sql.include?("workflows") }
     assert_equal 3, pg_unfenced_workflow_updates.length
     assert pg_unfenced_workflow_updates.none? { |sql, _params| sql.include?("AND locked_by =") }
@@ -746,18 +756,18 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 5, mysql_fenced_connection.queries.length
+    assert_equal 8, mysql_fenced_connection.queries.length
     mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("UPDATE") && sql.include?("workflows") }
     assert_equal 3, mysql_fenced_workflow_updates.length
     assert mysql_fenced_workflow_updates.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
 
-    mysql_unfenced_connection = ScriptedMysqlConnection.new
+    mysql_unfenced_connection = ScriptedMysqlConnection.new { sql_result([], affected_rows: 1) }
     mysql_unfenced_store = mysql_store(mysql_unfenced_connection)
     mysql_unfenced_store.complete_workflow("wf", result: { "ok" => true })
     mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
     mysql_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 5, mysql_unfenced_connection.queries.length
+    assert_equal 8, mysql_unfenced_connection.queries.length
     mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("UPDATE") && sql.include?("workflows") }
     assert_equal 3, mysql_unfenced_workflow_updates.length
     assert mysql_unfenced_workflow_updates.none? { |sql| sql.include?("AND locked_by =") }
