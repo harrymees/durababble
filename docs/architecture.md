@@ -39,7 +39,7 @@ class CounterWorkflow < Durababble::Workflow
 end
 ```
 
-When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. The execution object:
+When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`. Direct orchestration waits (`sleep`, `sleep_until`, `wait_until`, `wait_event`, and `wait_condition`) delegate to the same workflow command scheduler without wrapping the wait in a user step. The execution object:
 
 1. assigns the next step position;
 2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
@@ -50,6 +50,8 @@ When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution
 
 This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
 If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
+
+Direct waits use the same monotonic command ids and replay validation as steps, but their command names are the wait helpers rather than user step method names. A direct wait records a scheduled command before the wait row is inserted, records a waiting history event when the wait is persisted, and later consumes the completed timer or event payload to resume the blocked workflow fiber.
 
 Workflow `expose` and `expose_command` define the public ref surface:
 
@@ -111,7 +113,7 @@ The durable-object contract is actor-like: commands for the same `(object_type, 
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
 - Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths. Only failed rows with a non-null due `next_run_at` are treated as retryable queue work.
 - On resume, only `completed` steps are skipped; incomplete/running/failed/waiting work is retried or continued. For a retried step, `step_context.heartbeat.cursor` exposes the latest cursor from the previous incomplete invocation.
-- Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting step.
+- Wait requests persist a `waits` row and put the workflow in `waiting` until timer wake or event signal completes the waiting workflow command.
 - Workflow cancellation is cooperative, not termination. `Workflow.handle(id).cancel(reason:)` records durable cancellation metadata on the workflow row. Pending, waiting, and retry-backoff workflows move to `canceling` and become claimable immediately; running workflows keep their current lease and observe the request at the next step boundary, completed-step replay boundary, or step heartbeat. The engine raises `Durababble::CancellationError` into workflow code. Once raised, cleanup steps run as ordinary durable steps; completed cleanup steps are skipped after crash/recovery. If cleanup returns or re-raises the cancellation error, the workflow becomes `canceled`. If cleanup raises an unrelated non-retryable error, the workflow becomes `failed`; retryable cleanup failures keep `next_run_at` and retry under `canceling`.
 - First-class child workflows are still future scope. Cancellation semantics for that future surface must require an explicit durable child-cancellation policy; cooperative parent cancellation must not silently terminate child work or claim that child cleanup completed.
 - Operator termination remains a separate hard-stop concept: it may mark or remove work without running user cleanup and must not report the workflow as cooperatively `canceled`.
