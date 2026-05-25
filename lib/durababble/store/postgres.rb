@@ -408,7 +408,14 @@ module Durababble
       loop do
         row = execute_params("SELECT status, result, error FROM #{table("fences")} WHERE workflow_id = $1 AND key = $2", [workflow_id, key]).first
         decoded = decode_row(row) if row
-        case decoded&.fetch("status")
+        unless decoded
+          raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
+
+          sleep(poll_interval)
+          next
+        end
+
+        case decoded.fetch("status")
         when "completed"
           return decoded.fetch("result")
         when "failed"
