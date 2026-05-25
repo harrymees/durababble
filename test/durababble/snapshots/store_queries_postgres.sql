@@ -1,0 +1,567 @@
+-- pg_ack_outbox
+UPDATE "durababble_pg_snapshot"."outbox" SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2
+
+-- pg_cancel_pending_waits_for_workflow
+UPDATE "durababble_pg_snapshot"."waits"
+SET status = 'canceled', completed_at = now()
+WHERE workflow_id = $1 AND status = 'pending'
+
+-- pg_cancel_step
+UPDATE "durababble_pg_snapshot"."steps" SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('scheduled', 'running', 'waiting')
+
+-- pg_cancel_waiting_step_attempts_for_workflow
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET status = 'canceled', error = 'workflow cancellation requested', completed_at = now()
+WHERE workflow_id = $1 AND status = 'waiting'
+
+-- pg_cancel_waiting_steps_for_workflow
+UPDATE "durababble_pg_snapshot"."steps"
+SET status = 'canceled', error = 'workflow cancellation requested', updated_at = now()
+WHERE workflow_id = $1 AND status = 'waiting'
+
+-- pg_cancel_workflow
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1
+
+-- pg_cancel_workflow_with_worker
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()
+
+-- pg_claim_expired_outbox
+SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
+WHERE status = 'processing' AND locked_until < now()
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+
+-- pg_claim_expired_target_activation
+SELECT target_kind, target_type, target_id, ready_at, created_at FROM "durababble_pg_snapshot"."target_activations"
+WHERE status = 'running' AND locked_until < $1::timestamptz
+  <filter_sql>
+ORDER BY ready_at, created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+
+-- pg_claim_pending_outbox
+SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+
+-- pg_claim_pending_target_activation
+SELECT target_kind, target_type, target_id, ready_at, created_at FROM "durababble_pg_snapshot"."target_activations"
+WHERE status = 'pending' AND ready_at <= $1::timestamptz
+  <filter_sql>
+ORDER BY ready_at, created_at
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+
+-- pg_claim_runnable_workflow
+WITH candidate AS (
+  SELECT id FROM (
+    SELECT id, created_at FROM (
+      SELECT id, created_at FROM "durababble_pg_snapshot"."workflows"
+      WHERE status = 'pending'
+        AND runnable_immediately
+        <name_filter>
+      ORDER BY status, runnable_immediately, created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) pending_candidate
+    UNION ALL
+    SELECT id, created_at FROM (
+      SELECT id, created_at FROM "durababble_pg_snapshot"."workflows"
+      WHERE status = 'pending'
+        AND next_run_at <= now()
+        <name_filter>
+      ORDER BY next_run_at, created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) due_pending_candidate
+    UNION ALL
+    SELECT id, created_at FROM (
+      SELECT id, created_at FROM "durababble_pg_snapshot"."workflows"
+      WHERE status = 'failed'
+        AND next_run_at IS NOT NULL
+        AND next_run_at <= now()
+        <name_filter>
+      ORDER BY created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) failed_candidate
+    UNION ALL
+    SELECT id, created_at FROM (
+      SELECT id, created_at FROM "durababble_pg_snapshot"."workflows"
+      WHERE status = 'canceling'
+        AND (next_run_at IS NULL OR next_run_at <= now())
+        <name_filter>
+      ORDER BY created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) canceling_candidate
+    UNION ALL
+    SELECT id, created_at FROM (
+      SELECT id, created_at FROM "durababble_pg_snapshot"."workflows"
+      WHERE status = 'running' AND locked_until < now()
+        <name_filter>
+      ORDER BY created_at
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) expired_candidate
+  ) candidates
+  ORDER BY created_at
+  LIMIT 1
+)
+UPDATE "durababble_pg_snapshot"."workflows" AS workflows
+SET status = 'running', locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+FROM candidate
+WHERE workflows.id = candidate.id
+RETURNING workflows.*
+
+-- pg_claim_selected_outbox
+UPDATE "durababble_pg_snapshot"."outbox"
+SET status = 'processing', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
+WHERE id = $1
+RETURNING *
+
+-- pg_claim_selected_target_activation
+UPDATE "durababble_pg_snapshot"."target_activations"
+SET status = 'running', locked_by = $4, locked_until = now() + ($5::int * interval '1 second'), updated_at = now()
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+RETURNING *
+
+-- pg_claim_workflow_already_owned
+SELECT * FROM "durababble_pg_snapshot"."workflows"
+WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+
+-- pg_claim_workflow_for_activation_update
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = 'running', error = NULL, locked_by = $2,
+    locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $1
+  AND (
+    status IN ('pending', 'waiting', 'canceling')
+    OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+    OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
+  )
+RETURNING *
+
+-- pg_claim_workflow_update
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = 'running', error = NULL, locked_by = $2,
+    locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $1
+  AND (
+    status = 'pending'
+    OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+    OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
+    OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
+  )
+RETURNING *
+
+-- pg_complete_fence
+UPDATE "durababble_pg_snapshot"."fences"
+SET status = 'completed', result = $4::bytea, error = NULL, completed_at = now()
+WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
+
+-- pg_complete_inbox_message
+UPDATE "durababble_pg_snapshot"."inbox" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1
+
+-- pg_complete_step
+UPDATE "durababble_pg_snapshot"."steps" SET status = 'completed', result = $3::bytea, error = NULL, completed_at = now(), updated_at = now() WHERE workflow_id = $1 AND position = $2
+
+-- pg_complete_timer_waits
+UPDATE "durababble_pg_snapshot"."waits"
+SET status = 'completed', payload = $2::bytea, completed_at = now()
+WHERE id IN (
+  SELECT w.id FROM "durababble_pg_snapshot"."waits" AS w
+  JOIN "durababble_pg_snapshot"."workflows" AS wf ON wf.id = w.workflow_id
+  WHERE w.status = 'pending'
+    AND wf.status IN ('waiting', 'running')
+    AND w.kind = 'timer'
+    AND w.wake_at <= $1::timestamptz
+  ORDER BY w.wake_at, w.created_at
+  LIMIT $3
+  FOR UPDATE OF w SKIP LOCKED
+)
+RETURNING *
+
+-- pg_complete_workflow
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1
+
+-- pg_complete_workflow_with_worker
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
+
+-- pg_current_object_lease
+SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+FROM "durababble_pg_snapshot"."inbox"
+WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+  AND locked_by IS NOT NULL AND locked_until >= now()
+ORDER BY sequence
+LIMIT 1
+
+-- pg_current_workflow_lease
+SELECT id AS workflow_id, locked_by AS worker_id, locked_until
+FROM "durababble_pg_snapshot"."workflows"
+WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+
+-- pg_dead_letter_inbox_message
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = 'dead_lettered', error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = now(), updated_at = now()
+WHERE id = $1
+
+-- pg_delete_target_activation
+DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+
+-- pg_drop_schema
+DROP SCHEMA IF EXISTS "durababble_pg_snapshot" CASCADE
+
+-- pg_existing_inbox_message_for_idempotency
+SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
+FROM "durababble_pg_snapshot"."inbox"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3 AND idempotency_key = $4
+FOR UPDATE
+
+-- pg_fail_fence
+UPDATE "durababble_pg_snapshot"."fences"
+SET status = 'failed', error = $4, completed_at = now()
+WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
+
+-- pg_fail_inbox_message
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END,
+  error = $2, locked_by = NULL, locked_until = NULL,
+  dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
+  updated_at = now()
+WHERE id = $1
+
+-- pg_fail_step
+UPDATE "durababble_pg_snapshot"."steps" SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2
+
+-- pg_fail_workflow
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1
+
+-- pg_fail_workflow_with_worker
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
+
+-- pg_heartbeat_latest_attempt
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET heartbeat_cursor = $3::bytea
+WHERE id = (
+  SELECT id FROM "durababble_pg_snapshot"."step_attempts"
+  WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+  ORDER BY started_at DESC
+  LIMIT 1
+)
+
+-- pg_heartbeat_step_row
+UPDATE "durababble_pg_snapshot"."steps"
+SET heartbeat_cursor = $3::bytea, updated_at = now()
+WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+RETURNING heartbeat_cursor
+
+-- pg_heartbeat_step_workflow
+UPDATE "durababble_pg_snapshot"."workflows"
+SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
+RETURNING locked_until
+
+-- pg_heartbeat_workflow
+UPDATE "durababble_pg_snapshot"."workflows"
+SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
+
+-- pg_inbox_claim_rows_for_update
+SELECT *
+FROM "durababble_pg_snapshot"."inbox"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+  AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+ORDER BY sequence
+LIMIT $4
+FOR UPDATE
+
+-- pg_inbox_head_for_update
+SELECT *
+FROM "durababble_pg_snapshot"."inbox"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+  AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+ORDER BY sequence
+LIMIT 1
+FOR UPDATE
+
+-- pg_inbox_message
+SELECT * FROM "durababble_pg_snapshot"."inbox" WHERE id = $1
+
+-- pg_inbox_messages_for
+SELECT * FROM "durababble_pg_snapshot"."inbox"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+ORDER BY sequence
+
+-- pg_insert_fence
+INSERT INTO "durababble_pg_snapshot"."fences" (workflow_id, key, status, locked_by, locked_until)
+VALUES ($1, $2, 'running', $3, now() + ($4::int * interval '1 second'))
+ON CONFLICT (workflow_id, key) DO NOTHING
+
+-- pg_insert_inbox_message
+INSERT INTO "durababble_pg_snapshot"."inbox" (
+id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
+
+-- pg_insert_mailbox_sequence
+INSERT INTO "durababble_pg_snapshot"."mailbox_sequences" (target_kind, target_type, target_id, last_sequence)
+VALUES ($1, $2, $3, 0)
+ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
+
+-- pg_insert_outbox
+INSERT INTO "durababble_pg_snapshot"."outbox" (id, workflow_id, topic, payload, key, status)
+VALUES ($1, $2, $3, $4::bytea, $5, 'pending')
+ON CONFLICT (key) DO NOTHING
+
+-- pg_insert_scheduled_step
+INSERT INTO "durababble_pg_snapshot"."steps" (workflow_id, position, name, status, updated_at)
+VALUES ($1, $2, $3, 'scheduled', now())
+ON CONFLICT (workflow_id, position) DO NOTHING
+
+-- pg_insert_step_attempt
+INSERT INTO "durababble_pg_snapshot"."step_attempts" (id, workflow_id, position, name, status)
+VALUES ($1, $2, $3, $4, 'running')
+
+-- pg_insert_wait
+INSERT INTO "durababble_pg_snapshot"."waits" (id, workflow_id, position, kind, event_key, wake_at, context, status)
+VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::bytea, 'pending')
+
+-- pg_insert_workflow
+INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, status, input) VALUES ($1, $2, $3, $4::bytea)
+
+-- pg_insert_workflow_history
+INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+
+-- pg_insert_workflow_with_worker
+INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4::bytea, $5, now() + ($6::int * interval '1 second'))
+
+-- pg_lock_inbox_message
+SELECT * FROM "durababble_pg_snapshot"."inbox" WHERE id = $1 FOR UPDATE
+
+-- pg_lock_inbox_message_for_worker
+SELECT * FROM "durababble_pg_snapshot"."inbox"
+WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+FOR UPDATE
+
+-- pg_lock_owned_workflow_for_update
+SELECT 1
+FROM "durababble_pg_snapshot"."workflows"
+WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+FOR UPDATE
+
+-- pg_lock_target_activation_for_completion
+SELECT 1 FROM "durababble_pg_snapshot"."target_activations"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+  AND status = 'running' AND locked_by = $4
+FOR UPDATE
+
+-- pg_lock_workflow_for_update
+SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
+
+-- pg_lock_workflow_history_workflow
+SELECT id FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
+
+-- pg_mailbox_sequence_for_update
+SELECT last_sequence
+FROM "durababble_pg_snapshot"."mailbox_sequences"
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+FOR UPDATE
+
+-- pg_make_workflow_due
+UPDATE "durababble_pg_snapshot"."workflows" SET next_run_at = NULL, runnable_immediately = true, updated_at = $2::timestamptz WHERE id = $1
+
+-- pg_mark_inbox_row_running
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = 'running', attempts = attempts + 1, locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+WHERE id = $1
+
+-- pg_mark_wait_workflow_pending
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'pending', locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'waiting'
+
+-- pg_mark_workflow_canceling_for_request
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $1 AND status NOT IN ('completed', 'canceled')
+
+-- pg_mark_workflow_cancellation_delivered
+UPDATE "durababble_pg_snapshot"."workflows"
+SET cancel_delivered_at = COALESCE(cancel_delivered_at, now()), updated_at = now()
+WHERE id = $1 AND cancel_requested_at IS NOT NULL
+
+-- pg_mark_workflow_running
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $1
+
+-- pg_next_workflow_history_event_index
+SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
+
+-- pg_object_state
+SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2
+
+-- pg_outbox_by_key
+SELECT id FROM "durababble_pg_snapshot"."outbox" WHERE key = $1
+
+-- pg_outbox_message
+SELECT * FROM "durababble_pg_snapshot"."outbox" WHERE id = $1
+
+-- pg_read_fence
+SELECT status, result, error FROM "durababble_pg_snapshot"."fences" WHERE workflow_id = $1 AND key = $2
+
+-- pg_release_inbox_leases
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE status = 'running' AND locked_by = $1
+
+-- pg_release_outbox_leases
+UPDATE "durababble_pg_snapshot"."outbox"
+SET status = 'pending', locked_by = NULL, locked_until = NULL
+WHERE status = 'processing' AND locked_by = $1
+
+-- pg_release_target_activation_leases
+UPDATE "durababble_pg_snapshot"."target_activations"
+SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE status = 'running' AND locked_by = $1
+
+-- pg_release_workflow_leases
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = CASE
+    WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+    ELSE 'pending'
+  END,
+  locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+WHERE status = 'running' AND locked_by = $1
+
+-- pg_request_workflow_cancellation
+UPDATE "durababble_pg_snapshot"."workflows"
+SET cancel_reason = $2, cancel_requested_at = now(), updated_at = now()
+WHERE id = $1
+
+-- pg_retry_inbox_message
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = 'pending', error = $2, ready_at = $3::timestamptz, locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE id = $1
+
+-- pg_save_object_state
+INSERT INTO "durababble_pg_snapshot"."durable_objects" (object_type, object_id, state)
+VALUES ($1, $2, $3::bytea)
+ON CONFLICT (object_type, object_id) DO UPDATE
+  SET state = $3::bytea, updated_at = now()
+
+-- pg_schedule_workflow_retry
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = CASE
+    WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+    ELSE 'pending'
+  END,
+  locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, runnable_immediately = false, updated_at = now()
+WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+
+-- pg_set_target_activation_pending
+INSERT INTO "durababble_pg_snapshot"."target_activations" (target_kind, target_type, target_id, status, ready_at)
+VALUES ($1, $2, $3, 'pending', $4::timestamptz)
+ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+  SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
+
+-- pg_steal_expired_leases
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = CASE
+    WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+    ELSE 'pending'
+  END,
+  locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+WHERE status = 'running' AND locked_until < $1::timestamptz
+
+-- pg_step_attempt_count_for
+SELECT COUNT(*) AS count FROM "durababble_pg_snapshot"."step_attempts" WHERE workflow_id = $1 AND position = $2
+
+-- pg_step_attempts_for
+SELECT * FROM "durababble_pg_snapshot"."step_attempts" WHERE workflow_id = $1 ORDER BY started_at, position
+
+-- pg_step_heartbeat_cursor
+SELECT heartbeat_cursor FROM "durababble_pg_snapshot"."steps" WHERE workflow_id = $1 AND position = $2
+
+-- pg_steps_for
+SELECT * FROM "durababble_pg_snapshot"."steps" WHERE workflow_id = $1 ORDER BY position
+
+-- pg_supersede_running_step_attempts
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET status = 'failed', error = 'superseded by retry', completed_at = now()
+WHERE workflow_id = $1 AND position = $2 AND status = 'running'
+
+-- pg_suspend_workflow
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = CASE
+    WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
+    WHEN EXISTS (SELECT 1 FROM "durababble_pg_snapshot"."waits" WHERE workflow_id = $1 AND status = 'pending') THEN 'waiting'
+    ELSE 'pending'
+  END,
+  locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $1 AND status = 'running'
+  AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
+
+-- pg_target_activation
+SELECT * FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+
+-- pg_update_latest_attempt
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET status = $3, result = $4::bytea, error = $5, completed_at = now()
+WHERE id = (
+  SELECT id FROM "durababble_pg_snapshot"."step_attempts"
+  WHERE workflow_id = $1 AND position = $2 AND status IN ('running', 'waiting')
+  ORDER BY started_at DESC
+  LIMIT 1
+)
+
+-- pg_update_mailbox_sequence
+UPDATE "durababble_pg_snapshot"."mailbox_sequences"
+SET last_sequence = $4, updated_at = now()
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+
+-- pg_upsert_step_running
+INSERT INTO "durababble_pg_snapshot"."steps" (workflow_id, position, name, status, started_at, updated_at)
+VALUES ($1, $2, $3, 'running', now(), now())
+ON CONFLICT (workflow_id, position) DO UPDATE
+  SET status = 'running', error = NULL, started_at = COALESCE("durababble_pg_snapshot"."steps".started_at, now()), updated_at = now()
+
+-- pg_upsert_target_activation
+INSERT INTO "durababble_pg_snapshot"."target_activations" (target_kind, target_type, target_id, status, ready_at)
+VALUES ($1, $2, $3, 'pending', $4::timestamptz)
+ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
+  SET status = CASE WHEN "durababble_pg_snapshot"."target_activations".status = 'running' THEN "durababble_pg_snapshot"."target_activations".status ELSE 'pending' END,
+  ready_at = LEAST("durababble_pg_snapshot"."target_activations".ready_at, EXCLUDED.ready_at), updated_at = now()
+
+-- pg_upsert_waiting_step
+INSERT INTO "durababble_pg_snapshot"."steps" (workflow_id, position, name, status, result, started_at, updated_at)
+VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
+ON CONFLICT (workflow_id, position) DO UPDATE
+  SET status = 'waiting', result = $4::bytea, error = NULL, updated_at = now()
+
+-- pg_waits_for_workflow
+SELECT * FROM "durababble_pg_snapshot"."waits" WHERE workflow_id = $1 ORDER BY created_at
+
+-- pg_workflow
+SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1
+
+-- pg_workflow_cancellation
+SELECT id AS workflow_id, cancel_reason AS reason,
+cancel_requested_at AS requested_at, cancel_delivered_at AS delivered_at
+FROM "durababble_pg_snapshot"."workflows"
+WHERE id = $1 AND cancel_requested_at IS NOT NULL
+
+-- pg_workflow_history_count_for
+SELECT COUNT(*) AS count FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
+
+-- pg_workflow_history_for
+SELECT * FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1 ORDER BY event_index
+
+-- pg_workflow_owned
+SELECT 1
+FROM "durababble_pg_snapshot"."workflows"
+WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
