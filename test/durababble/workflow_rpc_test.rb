@@ -526,12 +526,12 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
       workflow_id:,
       command_id: 0,
       name: "wait",
-      wait_request: Durababble.wait_event("workflow-rpc-test:#{workflow_id}", {}),
+      wait_request: Durababble::WaitRequest.new(kind: "timer", wake_at: Time.now + 3600, event_key: nil, context: {}),
     )
   end
 
   def signal_wait_and_claim_as(worker_id)
-    store.signal_event("workflow-rpc-test:#{workflow_id}", payload: {})
+    store.wake_due_timers(now: Time.now + 7200)
     claim_as(worker_id)
   end
 end
