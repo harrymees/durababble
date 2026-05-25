@@ -56,7 +56,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   class BranchCommandStore
     attr_reader :completed, :failed
 
-    def initialize(complete_result: Durababble::MysqlStore::MysqlResult.new([], 1))
+    def initialize(complete_result: ActiveRecord::Result.empty(affected_rows: 1))
       @complete_result = complete_result
       @completed = []
       @failed = []
@@ -139,7 +139,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal "unchanged", clean_ref.read_only
     assert_equal 1, clean_command_store.completed.length
 
-    lost_lease_store = BranchCommandStore.new(complete_result: Durababble::MysqlStore::MysqlResult.new([], 0))
+    lost_lease_store = BranchCommandStore.new(complete_result: ActiveRecord::Result.empty(affected_rows: 0))
     assert_raises(Durababble::LeaseConflict) { CleanCommandObject.ref("lost", store: lost_lease_store).read_only }
     assert_equal 1, lost_lease_store.failed.length
   end
@@ -147,7 +147,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "exposes commands and queries without step semantics with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         account = ApiTestAccount.ref("acct-1", store:)
 
         assert_not_respond_to ApiTestAccount, :step
@@ -160,7 +159,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     test "persists durable object state atomically with command completion with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         counter = RetryStateTestCounter.ref("counter-1", store:)
 
         assert_equal({ "count" => 1 }, counter.increment_with_transient_failure)
@@ -175,7 +173,6 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     test "keeps a command idempotency key stable across retry with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
-        store.migrate!
         seen_keys = []
         retrying_object = Class.new(Durababble::DurableObject) do
           object_type "retrying_object"

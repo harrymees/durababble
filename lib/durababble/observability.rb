@@ -23,7 +23,7 @@ module Durababble
       #: (enabled: untyped, ?attributes: untyped) -> void
       def initialize(enabled:, attributes: {})
         @enabled = enabled
-        @attributes = attributes.transform_keys(&:to_s).freeze
+        @attributes = Observability.clean_attributes(attributes).freeze
         @tracer = nil
         @meter = nil
         @instruments = {}
@@ -85,12 +85,11 @@ module Durababble
 
       #: (untyped, ?untyped, **untyped) { (untyped) -> untyped } -> untyped
       def trace(name, attributes = nil, **keyword_attributes, &block)
-        attributes = normalize_attribute_args(attributes, keyword_attributes)
         config = configuration
         return block.call(nil) unless config.enabled?
 
         tracer = config.tracer
-        tracer.in_span(name, attributes: clean_attributes(config.attributes.merge(attributes))) do |span|
+        tracer.in_span(name, attributes: instrumentation_attributes(config, attributes, keyword_attributes)) do |span|
           block.call(span)
         rescue StandardError => e
           annotate_error(span, e)
@@ -100,20 +99,20 @@ module Durababble
 
       #: (untyped, ?untyped, ?by: untyped, **untyped) -> untyped
       def count(name, attributes = nil, by: 1, **keyword_attributes)
-        attributes = normalize_attribute_args(attributes, keyword_attributes)
-        instrument = configuration.instrument(:counter, name)
+        config = configuration
+        instrument = config.instrument(:counter, name)
         return unless instrument
 
-        instrument.add(by, attributes: clean_attributes(configuration.attributes.merge(attributes)))
+        instrument.add(by, attributes: instrumentation_attributes(config, attributes, keyword_attributes))
       end
 
       #: (untyped, untyped, ?untyped, **untyped) -> untyped
       def record(name, value, attributes = nil, **keyword_attributes)
-        attributes = normalize_attribute_args(attributes, keyword_attributes)
-        instrument = configuration.instrument(:histogram, name)
+        config = configuration
+        instrument = config.instrument(:histogram, name)
         return unless instrument
 
-        instrument.record(value, attributes: clean_attributes(configuration.attributes.merge(attributes)))
+        instrument.record(value, attributes: instrumentation_attributes(config, attributes, keyword_attributes))
       end
 
       #: () -> untyped
@@ -123,6 +122,8 @@ module Durababble
 
       #: (untyped, ?untyped, **untyped) { (?) -> untyped } -> untyped
       def measure(name, attributes = nil, **keyword_attributes, &block)
+        return block.call unless configuration.enabled?
+
         attributes = normalize_attribute_args(attributes, keyword_attributes)
         started_at = monotonic_ms
         block.call
@@ -147,12 +148,11 @@ module Durababble
 
       #: (untyped, untyped) -> untyped
       def annotate_error(span, error)
-        return unless span
         return if ["Durababble::WorkflowSuspended", "Durababble::StepRetryScheduled"].include?(error.class.name)
 
         attrs = { "error.type" => error.class.name, "error.message" => error.message.to_s }
-        span.add_attributes(clean_attributes(attrs)) if span.respond_to?(:add_attributes)
-        span.record_exception(error) if span.respond_to?(:record_exception)
+        span.add_attributes(clean_attributes(attrs))
+        span.record_exception(error)
       end
 
       #: (untyped) -> untyped
@@ -178,6 +178,14 @@ module Durababble
         base = attributes || {}
         base = base.to_h if base.respond_to?(:to_h)
         base.merge(keyword_attributes)
+      end
+
+      #: (untyped, untyped, untyped) -> untyped
+      def instrumentation_attributes(config, attributes, keyword_attributes)
+        dynamic_attributes = normalize_attribute_args(attributes, keyword_attributes)
+        return config.attributes if dynamic_attributes.empty?
+
+        config.attributes.merge(clean_attributes(dynamic_attributes))
       end
     end
   end

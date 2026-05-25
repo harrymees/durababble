@@ -197,7 +197,7 @@ module Durababble
       #: untyped
       attr_reader :node_id, :host, :port
 
-      #: (node_id: untyped, store: untyped, ?worker_pool: untyped, ?workflow_handlers: untyped, ?transient_handler: untyped, ?node_directory: untyped, ?host: untyped, ?port: untyped, ?credentials: untyped, ?pool_size: untyped, ?authorize: untyped, ?awaken_batch: untyped, ?evict_lease: untyped, ?deliver_message: untyped) -> void
+      #: (node_id: untyped, store: untyped, ?worker_pool: untyped, ?workflow_handlers: untyped, ?transient_handler: untyped, ?node_directory: untyped, ?host: untyped, ?port: untyped, ?credentials: untyped, ?pool_size: untyped, ?authorize: untyped, ?awaken_batch: untyped, ?evict_lease: untyped, ?deliver_message: untyped, ?verify_deliver_message_owner: untyped) -> void
       def initialize(
         node_id:,
         store:,
@@ -212,7 +212,8 @@ module Durababble
         authorize: nil,
         awaken_batch: nil,
         evict_lease: nil,
-        deliver_message: nil
+        deliver_message: nil,
+        verify_deliver_message_owner: true
       )
         @node_id = node_id
         @store = store
@@ -228,6 +229,7 @@ module Durababble
         @awaken_batch = awaken_batch
         @evict_lease = evict_lease
         @deliver_message = deliver_message
+        @verify_deliver_message_owner = verify_deliver_message_owner
       end
 
       #: () -> untyped
@@ -236,6 +238,7 @@ module Durababble
 
         @server = GRPC::RpcServer.new(pool_size: @pool_size)
         @port = @server.add_http2_port("#{host}:#{@requested_port}", @credentials)
+        @node_id ||= address
         @server.handle(Service.new(
           node_id:,
           store: @store,
@@ -247,6 +250,7 @@ module Durababble
           awaken_batch: @awaken_batch,
           evict_lease: @evict_lease,
           deliver_message: @deliver_message,
+          verify_deliver_message_owner: @verify_deliver_message_owner,
         ))
         @server_task = Concurrent::Promises.future { @server.run }
         self
@@ -268,7 +272,7 @@ module Durababble
     end
 
     class Service < Proto::Service
-      #: (node_id: untyped, store: untyped, worker_pool: untyped, workflow_handlers: untyped, transient_handler: untyped, node_directory: untyped, authorize: untyped, awaken_batch: untyped, evict_lease: untyped, deliver_message: untyped) -> void
+      #: (node_id: untyped, store: untyped, worker_pool: untyped, workflow_handlers: untyped, transient_handler: untyped, node_directory: untyped, authorize: untyped, awaken_batch: untyped, evict_lease: untyped, deliver_message: untyped, ?verify_deliver_message_owner: untyped) -> void
       def initialize(
         node_id:,
         store:,
@@ -279,7 +283,8 @@ module Durababble
         authorize:,
         awaken_batch:,
         evict_lease:,
-        deliver_message:
+        deliver_message:,
+        verify_deliver_message_owner: true
       )
         super()
 
@@ -293,6 +298,7 @@ module Durababble
         @awaken_batch = awaken_batch
         @evict_lease = evict_lease
         @deliver_message = deliver_message
+        @verify_deliver_message_owner = verify_deliver_message_owner
       end
 
       #: (untyped, untyped) -> untyped
@@ -322,7 +328,7 @@ module Durababble
       def deliver_message(request, call)
         Observability.trace("durababble.rpc.server.deliver_message", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
-          unless stale_workflow_message?(request)
+          unless @verify_deliver_message_owner && stale_workflow_message?(request)
             @deliver_message&.call(
               worker_pool: request.worker_pool,
               target_kind: request.target_kind,

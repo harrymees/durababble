@@ -16,6 +16,8 @@ module Durababble
   class LeaseConflict < Error; end
   class NonDeterminismError < Error; end
   class FenceTimeout < Error; end
+  class CommandTimeout < Error; end
+  class IdempotencyKeyConflict < Error; end
 
   class CancellationError < Error
     #: untyped
@@ -110,4 +112,3 @@ require_relative "durababble/worker_runtime"
 require_relative "durababble/rpc_client"
 require_relative "durababble/workflow_rpc"
 require_relative "durababble/rpc_transport"
-require_relative "durababble/deterministic"

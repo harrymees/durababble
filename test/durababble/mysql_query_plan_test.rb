@@ -9,8 +9,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     backend = durababble_store_backends.find(&:mysql?)
     skip("MySQL-backed Durababble tests require a MySQL database URL") unless backend
 
-    with_durababble_store(backend, "plan") do |store|
-      store.migrate!
+    with_durababble_store(backend, "plan") do
       seed_mysql_plan_fixture
 
       expectations = {

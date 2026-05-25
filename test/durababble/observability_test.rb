@@ -111,6 +111,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def migrate! = self
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil) = nil
 
     def enqueue_workflow(name:, input:)
       @next_id += 1
@@ -192,7 +193,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class ObjectStore
-    Result = Data.define(:cmd_tuples)
+    Result = Data.define(:affected_rows)
 
     def initialize
       @state = {}
@@ -232,11 +233,12 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class FakeSqlConnection
-    def exec(*) = FakeSqlResult.new
-    def exec_params(*) = FakeSqlResult.new
+    def exec_query(*) = ActiveRecord::Result.empty
     def transaction = yield
     def close = true
     def finished? = false
+    def quote_table_name(name) = name.to_s
+    def quote_column_name(name) = name.to_s
   end
 
   def setup
@@ -254,7 +256,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     @meter_provider.test_meter.instruments.clear
     Durababble.configure_observability(
       enabled: true,
-      attributes: { "service.name" => "durababble-test" },
+      attributes: { "service.name" => "durababble-test", ignored_static: nil },
     )
   end
 
@@ -295,6 +297,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     assert_equal "boom", error.message
     span = @tracer_provider.test_tracer.spans.last
+    refute_includes span.attributes.keys, "ignored_static"
     refute_includes span.attributes.keys, "nil_value"
     assert_equal "queued", span.attributes.fetch("symbol_value")
     assert_equal "2026-05-24T17:20:00.000000Z", span.attributes.fetch("time_value")
@@ -311,9 +314,6 @@ class DurababbleObservabilityTest < DurababbleTestCase
     span = @tracer_provider.test_tracer.spans.last
     refute_includes span.attributes.keys, "error.type"
     assert_empty span.exceptions
-
-    nil_span_result = Durababble::Observability.send(:annotate_error, nil, RuntimeError.new("ignored"))
-    assert_nil nil_span_result
   end
 
   test "labels unknown SQL shapes and MySQL stores conservatively" do
@@ -340,7 +340,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_equal({ "count" => 5 }, counter.add(5))
     assert_equal 5, counter.count
 
-    sql_store = Durababble::Store.new(FakeSqlConnection.new, schema: "observability_test")
+    sql_store = Durababble::PostgresStore.new(FakeSqlConnection.new, schema: "observability_test")
     sql_store.send(:execute_params, "SELECT * FROM observability_test.workflows WHERE id = $1", ["wf-1"])
 
     span_names = @tracer_provider.test_tracer.spans.map(&:name)
