@@ -126,13 +126,13 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.store.define_singleton_method(:claim_target_activation) do |**|
+    runtime.store.define_singleton_method(:claim_runnable_workflow) do |**|
       raise RuntimeError, "boom"
     end
     owner = runtime.store.instance_variable_get(:@owner)
 
     runtime.start
-    runtime.wait(timeout: 1)
+    eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
     runtime.close
 
     assert_kind_of RuntimeError, runtime.last_error
