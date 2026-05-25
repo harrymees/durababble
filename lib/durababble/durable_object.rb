@@ -85,6 +85,7 @@ module Durababble
       @store = store
       @command_context = command_context
       @state_dirty = false
+      @__durababble_query_context = false
     end
 
     #: () -> untyped
@@ -99,6 +100,8 @@ module Durababble
 
     #: (untyped) -> untyped
     def update_state(new_state)
+      raise Error, "cannot update durable object state from an exposed query" if @__durababble_query_context
+
       @current_state = new_state
       @state_dirty = true
       @store&.save_object_state(object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
@@ -147,6 +150,7 @@ module Durababble
       Observability.trace("durababble.object.query", attributes) do
         state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store) #: as untyped
+        object.instance_variable_set(:@__durababble_query_context, true)
         kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
       end
     end

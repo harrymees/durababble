@@ -27,7 +27,7 @@ module Durababble
       @root_task.async(transient: true) do |task|
         raise_if_cancel_requested!
         synchronize_store do
-          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name)
+          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name, worker_id: @worker_id)
         end
         crash!(:step_started)
 
@@ -43,7 +43,7 @@ module Durababble
           end
 
           assert_workflow_lease!
-          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output) }
+          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output, worker_id: @worker_id) }
           Observability.count("durababble.workflow.step.successes", attempt_attributes)
           crash!(:step_completed)
           raise_if_cancel_requested!
@@ -81,6 +81,7 @@ module Durababble
           name: step.name,
           wait_request:,
           suspend_workflow:,
+          worker_id: @worker_id,
         )
       end
       crash!(:wait_recorded)
@@ -97,6 +98,7 @@ module Durababble
             workflow_id: @workflow_id,
             command_id:,
             error: "#{error.class}: #{error.message}",
+            worker_id: @worker_id,
           )
         end
         future(command_id).reject(error)
@@ -120,7 +122,7 @@ module Durababble
     def handle_step_error(error, command_id:, step:, attributes:)
       message = "#{error.class}: #{error.message}"
       assert_workflow_lease!
-      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message) }
+      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,

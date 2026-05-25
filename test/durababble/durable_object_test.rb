@@ -438,6 +438,32 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       end
     end
 
+    test "rejects state mutation from exposed queries with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_api") do |store|
+        unsafe_object = Class.new(Durababble::DurableObject) do
+          object_type "unsafe_query_object"
+
+          def initialize_state
+            { "count" => 0 }
+          end
+
+          expose def bump_from_query
+            update_state({ "count" => current_state.fetch("count") + 1 })
+          end
+
+          expose def snapshot
+            current_state
+          end
+        end
+        object = unsafe_object.ref("object-1", store:)
+
+        assert_raises_matching(Durababble::Error, /cannot update durable object state from an exposed query/) do
+          object.bump_from_query
+        end
+        assert_equal({ "count" => 0 }, object.snapshot)
+      end
+    end
+
     test "keeps a command idempotency key stable across retry with #{backend.name}" do
       with_durababble_store(backend, "durable_object_api") do |store|
         seen_keys = []

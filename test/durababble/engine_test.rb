@@ -19,7 +19,12 @@ class DurababbleEngineTest < DurababbleTestCase
   class CommandDrainStore
     attr_reader :claim_limits, :completed, :failed, :suspended
 
-    def initialize
+    def initialize(workflow_status: "waiting", messages: nil)
+      @workflow_status = workflow_status
+      @messages = messages || [
+        { "id" => "msg-1", "message_kind" => "workflow_command", "method_name" => "fail_first", "payload" => { "method" => "fail_first", "args" => [], "kwargs" => {} } },
+        { "id" => "msg-2", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
+      ]
       @claim_limits = []
       @completed = []
       @failed = []
@@ -27,7 +32,7 @@ class DurababbleEngineTest < DurababbleTestCase
     end
 
     def workflow(workflow_id)
-      { "id" => workflow_id, "status" => "waiting", "input" => {} }
+      { "id" => workflow_id, "status" => @workflow_status, "input" => {} }
     end
 
     def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
@@ -40,11 +45,7 @@ class DurababbleEngineTest < DurababbleTestCase
       return [] unless worker_id == "worker-a" && lease_seconds == 9
       return [] unless @failed.empty?
 
-      messages = [
-        { "id" => "msg-1", "message_kind" => "workflow_command", "method_name" => "fail_first", "payload" => { "method" => "fail_first", "args" => [], "kwargs" => {} } },
-        { "id" => "msg-2", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
-      ]
-      messages.first(limit)
+      @messages.first(limit)
     end
 
     def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
@@ -81,6 +82,46 @@ class DurababbleEngineTest < DurababbleTestCase
     assert_equal ["wf-1", "worker-a"], store.suspended
   end
 
+  test "does not drain workflow command inboxes for terminal workflows" do
+    store = CommandDrainStore.new(workflow_status: "completed")
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+
+    assert_equal 0, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    assert_empty store.claim_limits
+    assert_empty store.failed
+    assert_equal false, store.suspended
+  end
+
+  test "fails unsupported workflow inbox message kinds without dispatching followers" do
+    store = CommandDrainStore.new(
+      messages: [
+        { "id" => "msg-bad", "message_kind" => "object_command" },
+        { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
+      ],
+    )
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+
+    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    assert_empty store.completed
+    assert_equal "msg-bad", store.failed.fetch(0).fetch(:message_id)
+    assert_match(/unsupported workflow inbox message object_command/, store.failed.fetch(0).fetch(:error))
+  end
+
+  test "fails unknown workflow commands without dispatching followers" do
+    store = CommandDrainStore.new(
+      messages: [
+        { "id" => "msg-missing", "message_kind" => "workflow_command", "method_name" => "missing", "payload" => { "method" => "missing", "args" => [], "kwargs" => {} } },
+        { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
+      ],
+    )
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+
+    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    assert_empty store.completed
+    assert_equal "msg-missing", store.failed.fetch(0).fetch(:message_id)
+    assert_match(/UnknownCommand: missing/, store.failed.fetch(0).fetch(:error))
+  end
+
   durababble_store_backends.each do |backend|
     test "runs a workflow once and records durable step outputs with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
@@ -101,6 +142,22 @@ class DurababbleEngineTest < DurababbleTestCase
           ],
           store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] },
         )
+      end
+    end
+
+    test "returns a terminal failed workflow instead of trying to reclaim it with #{backend.name}" do
+      with_durababble_store(backend, "engine_test") do |store|
+        workflow = durababble_test_workflow("terminal-failure") do
+          test_step("explode") { |_ctx| raise "boom" }
+        end
+        engine = Durababble::Engine.new(store:, worker_id: "owner")
+
+        first = engine.run(workflow, input: {})
+        second = engine.resume(workflow, workflow_id: first.id)
+
+        assert_equal "failed", first.status
+        assert_equal first.status, second.status
+        assert_equal first.error, second.error
       end
     end
 
