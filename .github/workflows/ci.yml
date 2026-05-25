@@ -60,33 +60,41 @@ jobs:
       matrix:
         include:
           - shard: async-workflow
-            files: test/durababble/async_workflow_test.rb
-          - shard: store-conformance
-            files: test/durababble/store_backend_conformance_test.rb
-          - shard: cancellation-queue
-            files: >-
-              test/durababble/workflow_cancellation_test.rb
-              test/durababble/store_queue_correctness_test.rb
-          - shard: store-plans
-            files: >-
-              test/durababble/store_test.rb
-              test/durababble/query_plan_test.rb
-              test/durababble/documentation_test.rb
-              test/durababble/hardening_test.rb
-              test/durababble/public_workflow_api_test.rb
-              test/durababble/worker_lifecycle_test.rb
-          - shard: workflows-objects
-            files: >-
-              test/durababble/complete_test.rb
-              test/durababble/durable_object_test.rb
-              test/durababble/engine_test.rb
-              test/durababble/hatchet_inspired_test.rb
-              test/durababble/workflow_test.rb
-          - shard: waits-retries-heartbeats
-            files: >-
-              test/durababble/durable_wait_recovery_test.rb
-              test/durababble/heartbeat_test.rb
-              test/durababble/step_retry_test.rb
+            file: test/durababble/async_workflow_test.rb
+          - shard: complete
+            file: test/durababble/complete_test.rb
+          - shard: documentation
+            file: test/durababble/documentation_test.rb
+          - shard: durable-object
+            file: test/durababble/durable_object_test.rb
+          - shard: durable-wait-recovery
+            file: test/durababble/durable_wait_recovery_test.rb
+          - shard: engine
+            file: test/durababble/engine_test.rb
+          - shard: hardening
+            file: test/durababble/hardening_test.rb
+          - shard: hatchet-inspired
+            file: test/durababble/hatchet_inspired_test.rb
+          - shard: heartbeat
+            file: test/durababble/heartbeat_test.rb
+          - shard: public-workflow-api
+            file: test/durababble/public_workflow_api_test.rb
+          - shard: query-plan
+            file: test/durababble/query_plan_test.rb
+          - shard: step-retry
+            file: test/durababble/step_retry_test.rb
+          - shard: store-backend-conformance
+            file: test/durababble/store_backend_conformance_test.rb
+          - shard: store-queue-correctness
+            file: test/durababble/store_queue_correctness_test.rb
+          - shard: store
+            file: test/durababble/store_test.rb
+          - shard: worker-lifecycle
+            file: test/durababble/worker_lifecycle_test.rb
+          - shard: workflow-cancellation
+            file: test/durababble/workflow_cancellation_test.rb
+          - shard: workflow
+            file: test/durababble/workflow_test.rb
 
     steps:
       - uses: actions/checkout@v4
@@ -128,7 +136,7 @@ jobs:
           DURABABBLE_DATABASE_URL: postgresql://yugabyte@127.0.0.1:5433/yugabyte
           DURABABBLE_TEST_BACKENDS: yugabyte
           DURABABBLE_YUGABYTE_DATABASE_URL: postgresql://yugabyte@127.0.0.1:5433/yugabyte
-        run: bundle exec ruby -Ilib -Itest ${{ matrix.files }}
+        run: bundle exec ruby -Ilib -Itest ${{ matrix.file }}
 
   lint-typecheck:
     runs-on: ubuntu-latest

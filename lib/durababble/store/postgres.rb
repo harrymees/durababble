@@ -66,7 +66,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = candidates.min_by { |candidate_row| timestamp_sort_key(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -528,7 +528,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = candidates.min_by { |candidate_row| timestamp_sort_key(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -585,7 +585,7 @@ module Durababble
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = candidates.min_by { |candidate_row| timestamp_sort_key(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
@@ -1085,6 +1085,13 @@ module Durababble
     #: (untyped) -> untyped
     def timestamp_or_nil(time)
       time ? timestamp(time) : nil
+    end
+
+    #: (untyped) -> untyped
+    def timestamp_sort_key(value)
+      return value if value.is_a?(Time)
+
+      Time.parse(value.to_s)
     end
   end
 end
