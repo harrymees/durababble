@@ -36,15 +36,15 @@ module Durababble
         workflow_name
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def enqueue(input, store: nil, engine: nil)
-        Durababble.engine_for(store:, engine:).enqueue(self, input:)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def enqueue(input, id: nil, store: nil, engine: nil)
+        Durababble.engine_for(store:, engine:).enqueue(self, input:, id:)
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def start(input, store: nil, engine: nil)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped) -> untyped
+      def start(input, id: nil, store: nil, engine: nil)
         resolved_engine = Durababble.engine_for(store:, engine:)
-        workflow_id = resolved_engine.enqueue(self, input:)
+        workflow_id = resolved_engine.enqueue(self, input:, id:)
         handle(workflow_id, engine: resolved_engine)
       end
 

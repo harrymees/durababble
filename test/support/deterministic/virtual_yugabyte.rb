@@ -36,9 +36,11 @@ module Durababble
       #: () -> untyped
       def current_time = scheduler.time
 
-      #: (name: untyped, input: untyped) -> untyped
-      def enqueue_workflow(name:, input:)
-        id = next_id("wf")
+      #: (name: untyped, input: untyped, ?id: untyped) -> untyped
+      def enqueue_workflow(name:, input:, id: nil)
+        id ||= next_id("wf")
+        raise WorkflowAlreadyExists, "workflow #{id} already exists" if @workflows.key?(id)
+
         @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
         trace("enqueue_workflow", id:, name:)
         id

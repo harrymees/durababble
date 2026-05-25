@@ -103,10 +103,11 @@ fulfillment.result
 
 ## Enqueuing And Workflow Handles
 
-`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `engine:` when you want an explicit engine instead of the configured default.
+`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `id:` when the caller needs to choose a stable workflow id; Durababble persists that exact id and raises `Durababble::WorkflowAlreadyExists` if it is already taken. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
 workflow_id = FulfillOrder.enqueue(order)
+workflow_id = FulfillOrder.enqueue(order, id: "fulfillment-order-123")
 
 # in some other long lived process, you'd do:
 worker = Durababble::Worker.new(
@@ -117,10 +118,10 @@ worker = Durababble::Worker.new(
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. It also accepts `id:` and returns a handle whose `workflow_id` is exactly that value. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
-handle = FulfillOrder.start(order)
+handle = FulfillOrder.start(order, id: "fulfillment-order-123")
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 ```

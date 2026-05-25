@@ -87,6 +87,9 @@ module Durababble
   class IdempotencyKeyConflict < Error
   end
 
+  class WorkflowAlreadyExists < Error
+  end
+
   class CancellationError < Error
     attr_reader workflow_id: String?
     attr_reader reason: serialized_payload
@@ -163,7 +166,7 @@ module Durababble
     def drop_schema!: () -> void
     def close: () -> void
     def current_time: () -> Time
-    def enqueue_workflow: (name: String, input: serialized_payload) -> String
+    def enqueue_workflow: (name: String, input: serialized_payload, ?id: String?) -> String
     def create_workflow: (name: String, input: serialized_payload, ?worker_id: String?, ?lease_seconds: Numeric) -> String
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
@@ -226,8 +229,8 @@ module Durababble
 
   class Workflow[Input, Output, Dispatch = Object]
     def self.workflow_name: (?String value) -> String
-    def self.enqueue: (Input input, ?store: Store, ?engine: Engine) -> String
-    def self.start: (Input input, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
+    def self.enqueue: (Input input, ?id: String?, ?store: Store, ?engine: Engine) -> String
+    def self.start: (Input input, ?id: String?, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
     def self.at: (String workflow_id, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
     def self.handle: (String workflow_id, ?store: Store, ?engine: Engine) -> workflow_handle[Input, Output, Dispatch]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
@@ -299,7 +302,7 @@ module Durababble
     attr_reader store: Store
 
     def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
-    def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input) -> String
+    def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input, ?id: String?) -> String
     def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
     def drain_workflow_inbox: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?, ?limit: Integer) -> Integer

@@ -388,15 +388,17 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
-      id = SecureRandom.uuid
+    #: (name: String, input: Object?, status: String, ?id: String?, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, id: nil, worker_id: nil, lease_seconds: nil)
+      workflow_id = id || SecureRandom.uuid
       if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
       else
-        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
+        execute_store_query(:insert_workflow, [workflow_id, name, status, dump_serialized(input)])
       end
-      id
+      workflow_id
+    rescue ActiveRecord::RecordNotUnique
+      raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
     #: (String) -> Object?

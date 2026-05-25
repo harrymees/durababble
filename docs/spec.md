@@ -66,7 +66,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
+`Workflow.enqueue(input, id: nil, engine: nil, store: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, id: nil, engine: nil, store: nil)` enqueues the same durable execution and returns a workflow handle. When `id:` is omitted, Durababble generates a new workflow id; when `id:` is provided, the enqueue path persists that exact id atomically and raises `Durababble::WorkflowAlreadyExists` if a workflow row already owns it, without appending workflow history, inbox messages, waits, or target activations. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 

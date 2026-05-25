@@ -20,9 +20,9 @@ module Durababble
       @crash_after = crash_after
     end
 
-    #: (untyped, input: untyped) -> untyped
-    def enqueue(workflow_class, input:)
-      @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
+    #: (untyped, input: untyped, ?id: untyped) -> untyped
+    def enqueue(workflow_class, input:, id: nil)
+      @store.enqueue_workflow(name: workflow_class.workflow_name, input:, id:)
     end
 
     #: (untyped, input: untyped) -> untyped

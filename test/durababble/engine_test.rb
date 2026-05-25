@@ -139,7 +139,7 @@ class DurababbleEngineTest < DurababbleTestCase
       "wf-inline"
     end
 
-    def enqueue_workflow(name:, input:)
+    def enqueue_workflow(name:, input:, id: nil)
       raise "Engine#run should create the leased running workflow directly"
     end
 
@@ -183,9 +183,9 @@ class DurababbleEngineTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def enqueue_workflow(name:, input:)
-      @enqueued << { name:, input: }
-      "wf-#{@enqueued.length}"
+    def enqueue_workflow(name:, input:, id: nil)
+      @enqueued << { name:, input:, id: }
+      id || "wf-#{@enqueued.length}"
     end
   end
 
@@ -239,7 +239,17 @@ class DurababbleEngineTest < DurababbleTestCase
 
     assert_equal "wf-1", workflow_id
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 } }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil }], store.enqueued
+  end
+
+  test "passes explicit workflow ids to the store enqueue path" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: "wf-explicit" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do

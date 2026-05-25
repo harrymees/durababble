@@ -163,8 +163,17 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_nil(explicit_handle.result)
         assert_nil(explicit_handle.error)
 
-        started_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        explicit_workflow_id = "branch-api-explicit-#{SecureRandom.hex(4)}"
+        assert_equal(
+          explicit_workflow_id,
+          BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, id: explicit_workflow_id, engine:),
+        )
+        assert_equal(explicit_workflow_id, store.workflow(explicit_workflow_id).fetch("id"))
+
+        explicit_start_id = "branch-api-start-#{SecureRandom.hex(4)}"
+        started_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, id: explicit_start_id, engine:)
         assert_instance_of(Durababble::WorkflowRef, started_handle)
+        assert_equal(explicit_start_id, started_handle.workflow_id)
         assert_equal(BranchTestWorkflow.workflow_name, store.workflow(started_handle.workflow_id).fetch("name"))
         completed_run = engine.run(BranchTestWorkflow, input: { "plain" => "plain", "keyword" => "keyword" })
         completed_handle = BranchTestWorkflow.handle(completed_run.id, engine:)

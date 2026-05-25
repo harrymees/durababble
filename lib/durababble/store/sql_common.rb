@@ -5,9 +5,9 @@ module Durababble
   class SqlStore < Store
     TIMER_WAKE_BATCH_SIZE = 100
 
-    #: (name: String, input: Object?) -> String
-    def enqueue_workflow(name:, input:)
-      insert_workflow(name:, input:, status: "pending")
+    #: (name: String, input: Object?, ?id: String?) -> String
+    def enqueue_workflow(name:, input:, id: nil)
+      insert_workflow(name:, input:, status: "pending", id:)
     end
 
     #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric) -> String
@@ -335,8 +335,8 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
+    #: (name: String, input: Object?, status: String, ?id: String?, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, id: nil, worker_id: nil, lease_seconds: nil)
       raise NotImplementedError
     end
 
