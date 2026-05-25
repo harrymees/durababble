@@ -250,6 +250,7 @@ module Durababble
         args: shape.fetch("args"),
         kwargs: shape.fetch("kwargs"),
         metadata: shape.reject { |key, _value| ["name", "args", "kwargs"].include?(key) },
+        worker_id: @worker_id,
       )
       crash!(:step_scheduled)
       @replay_history.remember_scheduled(command_id, step_name: name, shape:)

@@ -1,0 +1,11 @@
+{{- $index := slice -}}
+{{- range .Site.AllPages -}}
+  {{- $title := .Title -}}
+  {{- $url := .RelPermalink -}}
+  {{- $plain := .Plain | replaceRE `\s+` " " | strings.TrimSpace -}}
+  {{- if $plain -}}
+    {{- $entry := dict "url" $url "title" $title "text" $plain -}}
+    {{- $index = $index | append $entry -}}
+  {{- end -}}
+{{- end -}}
+{{- $index | jsonify -}}

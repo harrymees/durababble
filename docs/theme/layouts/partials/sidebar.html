@@ -1,0 +1,154 @@
+<div id="td-sidebar-menu" class="td-sidebar__inner">
+  <nav class="td-sidebar-nav" id="td-section-nav">
+    <ul class="td-sidebar-nav__section pe-md-3 ul-0">
+      {{/* Build once and cache in scratch */}}
+      {{ partial "nav-build.html" . }}
+      {{ $docsPages := .Scratch.Get "nav_pages" }}
+      {{ $allPaths := slice }}
+      {{ $relPaths := slice }}
+      {{ $filteredPages := slice }}
+      {{ range .Site.AllPages }}
+        {{ if .File }}
+          {{ $allPaths = $allPaths | append .File.Filename }}
+          {{ $relPaths = $relPaths | append .File.Path }}
+          {{ $filteredPages = $filteredPages | append . }}
+        {{ end }}
+      {{ end }}
+
+      {{/* Calculate common base path */}}
+      {{ $basePath := "" }}
+      {{ if gt (len $allPaths) 0 }}
+        {{ $basePath = index $allPaths 0 }}
+        {{ range $allPaths }}
+          {{ $basePath = strings.TrimSuffix "/" $basePath }}
+          {{ $path := strings.TrimSuffix "/" . }}
+          {{ $shorter := cond (lt (len $basePath) (len $path)) $basePath $path }}
+          {{ $foundDiff := false }}
+          {{ range $i := seq 0 (sub (len $shorter) 1) }}
+            {{ if not $foundDiff }}
+              {{ if ne (substr $basePath $i 1) (substr $path $i 1) }}
+                {{ $basePath = substr $basePath 0 $i }}
+                {{ $foundDiff = true }}
+              {{ end }}
+            {{ end }}
+          {{ end }}
+        {{ end }}
+      {{ end }}
+
+      {{/* Determine top-level section from relative paths (ignore top-level _index.md) */}}
+      {{ $rootDir := "" }}
+      {{ range $relPaths }}
+        {{ if eq $rootDir "" }}
+          {{ $parts := split . "/" }}
+          {{ if gt (len $parts) 1 }}
+            {{ $rootDir = printf "%s/" (index $parts 0) }}
+          {{ end }}
+        {{ end }}
+      {{ end }}
+
+      {{/* docsPages already from nav-build */}}
+
+      {{/* Render tree directly at content root, no wrapper item */}}
+      {{ template "filetree" (dict "currentDir" "" "pages" $docsPages "currentPage" .) }}
+    </ul>
+  </nav>
+</div>
+
+{{/* Recursive template for file tree navigation */}}
+{{ define "filetree" }}
+  {{ $currentDir := .currentDir }}
+  {{ $pages := .pages }}
+  {{ $currentPage := .currentPage }}
+  {{ $subdirs := dict }}
+  {{ $currentPages := slice }}
+
+  {{/* Separate pages and directories */}}
+  {{ range $pages }}
+    {{ $rel := .File.Path }}
+    {{ $relPath := strings.TrimPrefix $currentDir $rel }}
+    {{ $parts := split $relPath "/" }}
+    {{ if eq (len $parts) 1 }}
+      {{ $currentPages = $currentPages | append . }}
+    {{ else }}
+      {{ $subdir := index $parts 0 }}
+      {{ $subdirs = merge $subdirs (dict $subdir (dict)) }}
+    {{ end }}
+  {{ end }}
+
+  {{/* Create unified list of pages and directories sorted by weight */}}
+  {{ $allItems := slice }}
+  
+  {{/* Add individual pages */}}
+  {{ range $currentPages }}
+    {{ if ne .File.BaseFileName "_index" }}
+      {{ $allItems = $allItems | append (dict "type" "page" "weight" (.Params.weight | default 999) "page" .) }}
+    {{ end }}
+  {{ end }}
+  
+  {{/* Add subdirectories */}}
+  {{ range $subdir, $_ := $subdirs }}
+    {{ $subdirPages := slice }}
+    {{ $subdirIndex := "" }}
+    {{ range $pages }}
+      {{ if hasPrefix .File.Path (printf "%s%s/" $currentDir $subdir) }}
+        {{ $subdirPages = $subdirPages | append . }}
+        {{ if eq .File.Path (printf "%s%s/_index.md" $currentDir $subdir) }}
+          {{ $subdirIndex = . }}
+        {{ end }}
+      {{ end }}
+    {{ end }}
+    {{ if gt (len $subdirPages) 0 }}
+      {{ $weight := 999 }}
+      {{ if $subdirIndex }}
+        {{ $weight = $subdirIndex.Params.weight | default 999 }}
+      {{ end }}
+      {{ $allItems = $allItems | append (dict "type" "directory" "weight" $weight "name" $subdir "pages" $subdirPages "index" $subdirIndex) }}
+    {{ end }}
+  {{ end }}
+  
+  {{/* Render all items sorted by weight */}}
+  {{ range sort $allItems "weight" }}
+    {{ if eq .type "page" }}
+      {{/* Render individual page */}}
+      <li>
+        <a href="{{ .page.RelPermalink }}" class="td-sidebar-link td-sidebar-link__page {{ if eq $currentPage.RelPermalink .page.RelPermalink }}active{{ end }}">
+          <span class="{{ if eq $currentPage.RelPermalink .page.RelPermalink }}td-sidebar-nav-active-item{{ end }}">{{ or .page.Params.linkTitle (or .page.Title (replace .page.File.ContentBaseName `-` ` ` | title)) }}</span>
+        </a>
+      </li>
+    {{ else if eq .type "directory" }}
+      {{- $subdirActive := false }}
+      {{- $isIndexPage := false }}
+      {{- $subdirIndex := .index }}
+      {{- range .pages }}
+        {{- if eq $currentPage.RelPermalink .RelPermalink }}
+          {{- $subdirActive = true }}
+          {{- if and $subdirIndex (eq .RelPermalink $subdirIndex.RelPermalink) }}
+            {{- $isIndexPage = true }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- $subdirId := printf "%s-%s" ($currentDir | anchorize) (.name | anchorize) }}
+      <li class="td-sidebar-nav__section-title td-sidebar-nav__section with-child{{ if $subdirActive }} active-path{{ end }}">
+        <input type="checkbox" id="section-{{ $subdirId }}"{{ if $subdirActive }} checked{{ end }} />
+        <label for="section-{{ $subdirId }}" class="section-toggle">
+          {{- if $subdirIndex -}}
+            <a href="{{ $subdirIndex.RelPermalink }}"
+               class="section-title-link{{ if $isIndexPage }} active{{ end }}"
+               onclick="event.stopPropagation();">
+              <span class="section-title">
+                {{- or $subdirIndex.Params.linkTitle (or $subdirIndex.Title (replace .name `-` ` ` | title)) -}}
+              </span>
+            </a>
+            <span class="toggle-icon">▼</span>
+          {{- else -}}
+            <span class="section-title">{{ replace .name `-` ` ` | title }}</span>
+            <span class="toggle-icon">▼</span>
+          {{- end -}}
+        </label>
+        <ul class="section-pages collapsible">
+          {{- template "filetree" (dict "currentDir" (printf "%s%s/" $currentDir .name) "pages" .pages "currentPage" $currentPage) -}}
+        </ul>
+      </li>
+    {{ end }}
+  {{ end }}
+{{ end }}

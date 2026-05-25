@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,500;1,600;1,700;1,800;1,900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+    <script>
+      // Set theme immediately to prevent flash
+      (function () {
+        const theme = localStorage.getItem("dev-theme") || "dark";
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+    <title>{{ .Title }}</title>
+    {{ $css := resources.Get "css/main.css" | resources.Minify | resources.Fingerprint }}
+    <link rel="stylesheet" href="{{ $css.RelPermalink }}" integrity="{{ $css.Data.Integrity }}" />
+    {{ $alertsCss := resources.Get "css/alerts.css" | resources.Minify | resources.Fingerprint }}
+    <link rel="stylesheet" href="{{ $alertsCss.RelPermalink }}" integrity="{{ $alertsCss.Data.Integrity }}" />
+    {{ $tablesCss := resources.Get "css/tables.css" | resources.Minify | resources.Fingerprint }}
+    <link rel="stylesheet" href="{{ $tablesCss.RelPermalink }}" integrity="{{ $tablesCss.Data.Integrity }}" />
+    {{ $js := resources.Get "js/main.js" | resources.Minify | resources.Fingerprint }}
+    <script src="{{ $js.RelPermalink }}" integrity="{{ $js.Data.Integrity }}"></script>
+    {{ $alertsJs := resources.Get "js/alerts.js" | resources.Minify | resources.Fingerprint }}
+    <script src="{{ $alertsJs.RelPermalink }}" integrity="{{ $alertsJs.Data.Integrity }}"></script>
+    {{ $search := resources.Get "js/search.js" | resources.Minify | resources.Fingerprint }}
+    <script src="{{ $search.RelPermalink }}" integrity="{{ $search.Data.Integrity }}"></script>
+    {{/* Hugo's `default` treats `false` as empty → coerces it back to true,
+         so `enabled = false` in hugo.toml was silently ignored. Use isset to
+         distinguish "not set" (default on) from "explicitly set to false". */}}
+    {{ $chatEnabled := true }}{{ if isset .Site.Params.chat "enabled" }}{{ $chatEnabled = .Site.Params.chat.enabled }}{{ end }}
+    {{ if $chatEnabled }}
+      {{ $chatCss := resources.Get "css/chat.css" | resources.Minify | resources.Fingerprint }}
+      <link rel="stylesheet" href="{{ $chatCss.RelPermalink }}" integrity="{{ $chatCss.Data.Integrity }}" />
+    {{ end }}
+  </head>
+  <body>
+    <header>
+      {{ partial "navbar.html" . }}
+    </header>
+    <div class="container-fluid">
+      <div class="row">
+          <aside class="d-none d-lg-block col-lg-3 col-xl-2 td-sidebar">
+            {{ partial "sidebar.html" . }}
+          </aside>
+          <main class="col-md-9 col-lg-6 col-xl-8 ps-md-5">
+            {{ if not .IsHome }}{{ partial "breadcrumb.html" . }}{{ end }}
+            {{ block "main" . }}{{ end }}
+          </main>
+          <aside class="d-none d-lg-block col-lg-3 col-xl-2 td-sidebar-toc">
+            {{ partial "toc.html" . }}
+          </aside>
+      </div>
+    </div>
+    <footer class="td-footer">
+      {{ partial "footer.html" . }}
+    </footer>
+    {{ if $chatEnabled }}
+      {{/* quick.js loads async so a slow Quick response doesn't block the
+           footer or the chat mount. chat.js waits for `quick` to appear
+           rather than reading it synchronously at DOMContentLoaded. */}}
+      <script src="/client/quick.js" async onerror="this.remove()"></script>
+      {{ partial "chat.html" . }}
+      {{ $chatJs := resources.Get "js/chat.js" | resources.Minify | resources.Fingerprint }}
+      <script src="{{ $chatJs.RelPermalink }}" integrity="{{ $chatJs.Data.Integrity }}" type="module"></script>
+    {{ end }}
+    {{ if .Store.Get "hasMermaid" }}
+      <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true });
+      </script>
+    {{ end }}
+  </body>
+</html>

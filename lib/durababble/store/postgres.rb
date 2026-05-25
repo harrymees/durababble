@@ -417,10 +417,11 @@ module Durababble
       require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
     end
 
-    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped, ?worker_id: untyped) -> untyped
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
         execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, updated_at)
@@ -430,10 +431,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, ?worker_id: untyped) -> untyped
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(<<~SQL, [workflow_id, command_id])
           UPDATE #{table("step_attempts")}
           SET status = 'failed', error = 'superseded by retry', completed_at = now()
@@ -455,10 +457,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(
           "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('scheduled', 'running', 'waiting')",
           [workflow_id, command_id, error],
@@ -472,6 +475,7 @@ module Durababble
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(<<~SQL, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, result, started_at, updated_at)
           VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
@@ -815,6 +819,16 @@ module Durababble
     #: (untyped) -> untyped
     def lock_workflow_for_update(workflow_id)
       execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
+    end
+
+    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
+      execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT 1
+        FROM #{table("workflows")}
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+        FOR UPDATE
+      SQL
     end
 
     #: (id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, sequence: untyped, message_kind: untyped, method_name: untyped, operation_id: untyped, idempotency_key: untyped, shape_hash: untyped, payload: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped

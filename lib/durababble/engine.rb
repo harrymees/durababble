@@ -40,7 +40,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.resume", attributes) do
         current = claimed || @store.workflow(workflow_id)
-        return run_from_row(current) if WorkflowStatus.completed?(current)
+        return run_from_row(current) if terminal_workflow_row?(current)
 
         owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
         unless owned_claim
