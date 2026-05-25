@@ -132,7 +132,7 @@ module Durababble
       result
     end
 
-    #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped) -> untyped
+    #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?interrupt_on_command: bool) -> untyped
     def call_wait(wait_request, name:, args: [], kwargs: {}, interrupt_on_command: false)
       assert_workflow_task!("durable wait #{name}")
       shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
@@ -382,7 +382,7 @@ module Durababble
       @futures.fetch(command_id).reject(error)
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (untyped, untyped, ?interrupt_on_command: bool) -> untyped
     def await_command_future(future, command_id, interrupt_on_command: false)
       loop do
         deliver_recorded_resolutions!

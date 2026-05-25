@@ -289,11 +289,11 @@ class DurababbleWorkflowTest < DurababbleTestCase
           { "ready" => true, "approved" => true },
           completed.fetch("result"),
         )
-        assert_equal command_object_ids.last, execute_object_ids.last
-        assert_equal command_object_ids.last, finish_object_ids.last
-        assert_equal 2, execute_object_ids.length
-        assert_equal 1, command_object_ids.length
-        assert_nil store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id)
+        assert_equal(command_object_ids.last, execute_object_ids.last)
+        assert_equal(command_object_ids.last, finish_object_ids.last)
+        assert_equal(2, execute_object_ids.length)
+        assert_equal(1, command_object_ids.length)
+        assert_nil(store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id))
 
         history = store.workflow_history_for(workflow_id)
         assert_equal(

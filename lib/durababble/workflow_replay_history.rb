@@ -43,6 +43,7 @@ module Durababble
     def validate_scheduled_shape!(workflow_id:, command_id:, shape:)
       scheduled = recorded_schedule(command_id)
       return false unless scheduled
+
       if scheduled.fetch("payload") == shape
         consume_event!(scheduled)
         return true
@@ -153,7 +154,7 @@ module Durababble
 
     #: (Hash[String, Object?]) -> bool
     def workflow_command_event_deliverable?(event)
-      event_index = event.fetch("event_index").to_i
+      event_index = event.fetch("event_index").to_s.to_i
       blocking_event_indexes_before(event_index).all? { |index| @consumed_event_indexes[index] }
     end
 
@@ -162,8 +163,11 @@ module Durababble
       return false if @workflow_command_index >= @workflow_command_events.length
 
       workflow_command = @workflow_command_events.fetch(@workflow_command_index)
-      workflow_command.fetch("event_index").to_i < event.fetch("event_index").to_i &&
-        workflow_command_event_deliverable?(workflow_command)
+      workflow_command_event_index = workflow_command.fetch("event_index").to_s.to_i
+      event_index = event.fetch("event_index").to_s.to_i
+      return false if workflow_command_event_index >= event_index
+
+      workflow_command_event_deliverable?(workflow_command)
     end
 
     #: (Integer) -> Array[Integer]
@@ -179,7 +183,7 @@ module Durababble
     #: (Hash[String, Object?]) -> void
     def consume_event!(event)
       event_index = event["event_index"]
-      @consumed_event_indexes[event_index.to_i] = true if event_index
+      @consumed_event_indexes[event_index.to_s.to_i] = true if event_index
     end
 
     #: (Hash[String, Object?]) -> bool
