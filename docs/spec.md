@@ -390,6 +390,8 @@ Query-shape and transaction requirements:
 - Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Event/timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
 - Explicit idempotency rows cover workflow starts and any public durable operation not deduped by the inbox itself.
 - Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, event waits, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
+- Worker lease release, cancellation wait cleanup, and durable-object command paths have explicit indexes and query-plan coverage where they can become hot at scale.
+- New production Store SQL must be added to `Durababble::StoreQueries`; each new registered query must be covered by plan assertions, benchmark coverage, backend conformance coverage, or an explicit uncovered-query list entry reviewed in the query-plan suite.
 - High-risk transactional pieces such as `enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, and object state plus message completion may be implemented with database functions to reduce lock-order drift, provided the common backend contract is preserved.
 - Retention and partitioning must be planned for high-volume history, step attempts, inbox, and idempotency rows before production scale.
 - Runtime value decoding only decodes known serialized binary columns.

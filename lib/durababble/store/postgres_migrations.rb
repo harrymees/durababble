@@ -19,6 +19,7 @@ module Durababble
           locked_by text,
           locked_until timestamptz,
           next_run_at timestamptz,
+          runnable_immediately boolean NOT NULL DEFAULT true,
           cancel_reason text,
           cancel_requested_at timestamptz,
           cancel_delivered_at timestamptz,
@@ -29,6 +30,8 @@ module Durababble
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_by text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS runnable_immediately boolean NOT NULL DEFAULT true")
+      execute("UPDATE #{table("workflows")} SET runnable_immediately = (next_run_at IS NULL) WHERE status = 'pending'")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_reason text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_delivered_at timestamptz")
@@ -243,24 +246,70 @@ module Durababble
 
     #: () -> untyped
     def create_performance_indexes!
-      execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
-      execute("CREATE INDEX IF NOT EXISTS workflow_history_command_idx ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
-      execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, kind, event_key, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, kind, wake_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
-      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
-      execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
+      create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (status ASC, created_at ASC)")
+      create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (status ASC, next_run_at ASC, created_at ASC)")
+      create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (status ASC, locked_until ASC)")
+      drop_postgres_index("workflows_pending_created_idx")
+      create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (created_at ASC) WHERE status = 'pending' AND runnable_immediately")
+      create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (next_run_at ASC, created_at ASC) WHERE status = 'failed'")
+      create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (created_at ASC) WHERE status = 'canceling'")
+      create_postgres_index("workflow_history_command_idx", "ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
+      create_postgres_index("waits_event_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, event_key ASC, created_at ASC)")
+      create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")
+      create_postgres_index("waits_workflow_created_idx", "ON #{table("waits")} (workflow_id ASC, created_at ASC)")
+      create_postgres_index("waits_workflow_status_idx", "ON #{table("waits")} (workflow_id ASC, status ASC)")
+      create_postgres_index("step_attempts_workflow_started_position_idx", "ON #{table("step_attempts")} (workflow_id ASC, started_at ASC, position ASC)")
+      create_postgres_index("step_attempts_workflow_position_status_started_idx", "ON #{table("step_attempts")} (workflow_id ASC, position ASC, status ASC, started_at DESC)")
+      create_postgres_index("outbox_queue_idx", "ON #{table("outbox")} (status ASC, created_at ASC)")
+      create_postgres_index("outbox_expired_lease_idx", "ON #{table("outbox")} (status ASC, locked_until ASC)")
+      drop_postgres_index("workflows_worker_lease_idx")
+      drop_postgres_index("outbox_worker_lease_idx")
+      create_postgres_index("workflows_worker_lease_idx", "ON #{table("workflows")} (locked_by ASC) WHERE status = 'running'")
+      create_postgres_index("outbox_worker_lease_idx", "ON #{table("outbox")} (status ASC, locked_by ASC)")
       execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
-      execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_target_idempotency_idx ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
-      execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
-      execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
-      execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS target_activations_queue_idx ON #{table("target_activations")} (status, ready_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS target_activations_expired_idx ON #{table("target_activations")} (status, locked_until, created_at)")
+      create_postgres_index("inbox_target_idempotency_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL", unique: true)
+      create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
+      create_postgres_index("inbox_target_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
+      create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
+      create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (status, ready_at, created_at)")
+      create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (status, locked_until, created_at)")
+    end
+
+    #: (untyped, untyped, ?unique: bool) -> untyped
+    def create_postgres_index(name, definition, unique: false)
+      index_name = postgres_index_name(name)
+      exists = execute_params(<<~SQL, [schema, index_name]).first
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'i'
+        LIMIT 1
+      SQL
+      return if exists
+
+      execute("SET search_path TO #{quoted_schema}")
+      execute("CREATE #{"UNIQUE " if unique}INDEX IF NOT EXISTS #{@connection.quote_column_name(index_name)} #{definition}")
+    ensure
+      execute("RESET search_path")
+    end
+
+    #: (untyped) -> untyped
+    def drop_postgres_index(name)
+      [name.to_s, postgres_index_name(name)].uniq.each do |index_name|
+        execute("DROP INDEX IF EXISTS #{quoted_schema}.#{@connection.quote_column_name(index_name)}")
+      end
+    end
+
+    #: (untyped) -> untyped
+    def postgres_index_name(name)
+      logical = name.to_s
+      max_identifier_length = 63
+      return logical if schema.to_s == "public"
+      return logical[-max_identifier_length..] if logical.length >= max_identifier_length
+
+      prefix = schema.to_s.gsub(/[^A-Za-z0-9_]/, "_")
+      prefix_length = max_identifier_length - logical.length - 1
+      "#{prefix[0, prefix_length]}_#{logical}"
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped

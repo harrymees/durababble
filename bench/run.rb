@@ -105,6 +105,7 @@ module Durababble
           Operation.new(name: "fence_cached_result", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "read cached idempotency fence result without re-running side effect", block: method(:bench_fence_cached_result)),
           Operation.new(name: "outbox_claim_ack", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "claim and acknowledge outbox messages", block: method(:bench_outbox_claim_ack)),
           Operation.new(name: "outbox_expired_reclaim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "reclaim an outbox message whose processing lease expired", block: method(:bench_outbox_expired_reclaim)),
+          Operation.new(name: "durable_object_command_claim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "persist, claim, complete, and read durable object command state", block: method(:bench_durable_object_command_claim)),
           Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
           Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
           Operation.new(name: "large_table_signal_miss", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "event-signal miss against a large pending wait set", block: method(:bench_large_table_signal_miss)),
@@ -289,7 +290,7 @@ module Durababble
         @store.mark_workflow_running(workflow_id, worker_id: "failure-owner", lease_seconds: 30)
         @store.record_step_started(workflow_id:, position: 0, name: "flaky")
         @store.record_step_failed(workflow_id:, position: 0, error: "synthetic failure")
-        @store.fail_workflow(workflow_id, error: "synthetic failure")
+        @store.schedule_workflow_retry(workflow_id:, worker_id: "failure-owner", run_at: Time.now - 1)
         claimed = @store.claim_runnable_workflow(worker_id: "retry-worker", lease_seconds: 30)
         raise "failed workflow was not retry-claimable" unless claimed
       end
@@ -336,6 +337,31 @@ module Durababble
         expire_outbox_lease(outbox_id)
         second = @store.claim_outbox(worker_id: "outbox-reclaimer", lease_seconds: 30)
         raise "expired outbox was not reclaimed" unless second && second.fetch("id") == outbox_id
+      end
+
+      def bench_durable_object_command_claim(i, warmup:)
+        object_id = "bench-object-#{warmup}-#{i}-#{SecureRandom.hex(4)}"
+        @store.save_object_state(object_type: "bench-counter", object_id:, state: { "count" => i })
+        command_id = @store.enqueue_object_command(
+          object_type: "bench-counter",
+          object_id:,
+          method_name: "increment",
+          args: [1],
+          kwargs: {},
+        )
+        command = @store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
+        raise "durable object command was not claimed" unless command && command.fetch("id") == command_id
+
+        @store.complete_object_command(
+          command_id:,
+          object_type: "bench-counter",
+          object_id:,
+          state: { "count" => i + 1 },
+          result: { "count" => i + 1 },
+          worker_id: "object-worker",
+        )
+        state = @store.object_state(object_type: "bench-counter", object_id:)
+        raise "durable object state did not persist" unless state.fetch("count") == i + 1
       end
 
       def bench_large_table_claim_scan(i, warmup:)
@@ -507,7 +533,7 @@ module Durababble
         @rpc ||= Durababble::RpcClient.spawn(
           command: [RbConfig.ruby, File.expand_path("rpc_worker.rb", __dir__)],
           env: { "DURABABBLE_DATABASE_URL" => @database_url, "DURABABBLE_BENCH_SCHEMA" => @schema },
-          timeout: 10,
+          timeout: 30,
         )
       end
 

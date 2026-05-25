@@ -248,9 +248,9 @@ If a workflow is already completed, failed, or canceled, cancellation is idempot
 
 ### RPC
 
-Workflows can expose an RPC surface for other members of the Durababble cluster to invoke. RPCs can just return state, or mutate it, or change how the workflow execution will proceed, or all of the above! 
+Workflows can expose an RPC surface for other members of the Durababble cluster to invoke. RPCs can just return state, or mutate it, or change how the workflow execution will proceed, or all of the above!
 
-RPCs are done by getting a workflow handle for your workflow, and then calling Ruby methods on the handle itself. A caller does not need a Ruby object in the same process as the worker; it needs the workflow id, the workflow class, and a store. 
+RPCs are done by getting a workflow handle for your workflow, and then calling Ruby methods on the handle itself. A caller does not need a Ruby object in the same process as the worker; it needs the workflow id, the workflow class, and a store.
 
 There's two kinds of RPCs you can expose: simple RPCs, and command RPCs.
 
@@ -313,7 +313,7 @@ Durable objects are for state with a durable identity. Think of one like a class
 
 Good object-shaped work includes an account in a bank, a cart, a chatroom, or a small state machine that other entities need to coordinate with. The key sign is that the id matters: all callers talking about `acct_123`, `cart_456`, or `channel-tmp-durable-execution-discussions` should see and update the same durable state.
 
-Durababble then helps you RPC to these objects to read or write the state within them. Durababble's RPC layer correctly routes your messages to the worker where a durable object is currently live, and instantiates it or retrieves it from storage if it isn't already live. 
+Durababble then helps you RPC to these objects to read or write the state within them. Durababble's RPC layer correctly routes your messages to the worker where a durable object is currently live, and instantiates it or retrieves it from storage if it isn't already live.
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
@@ -355,7 +355,7 @@ account.balance
 
 Durable objects can expose methods to callers. You first _expose_ a method on the durable object, and then using a reference to the object, you can call that method from any other process in the system.
 
-There's two kinds of methods that can be exposed: simple RPCs, and command RPCs. 
+There's two kinds of methods that can be exposed: simple RPCs, and command RPCs.
 
 Simple RPCs are run in parallel and are not expected to ever mutate state on the object -- they aren't recorded durably, and so they can be lost. Use simple RPCs for reads, for things you need to be really cheap, or for situations where the object is the "owner" of another resource under the hood that doesn't record durable state in the durable object itself.
 
@@ -400,3 +400,7 @@ Background jobs are still the right tool for simple, short, idempotent work: sen
 Durababble is for the cases where a single retry loop becomes the hard part. If a job charges a card, writes a record, waits for a webhook, calls another service, and then ships an order, a crash in the middle forces you to rebuild durable progress tracking yourself. You end up adding status columns, idempotency keys, retry schedules, leases, recovery scans, cancellation flags, and custom "what step was I on?" logic.
 
 Durababble makes those pieces part of the programming model. Workflows persist step history and resume from durable boundaries. Durable objects keep id-addressed state behind query and command methods. RPC-style handles let other code ask durable entities for status or send durable commands without reaching into worker memory. The goal is not to replace every job; it is to make the stateful, multi-step, long-lived jobs explicit and recoverable.
+
+## Development Notes
+
+Query-plan and benchmark coverage are part of the storage contract. When adding a production SQL query for the store, define it in `Durababble::StoreQueries`, add PostgreSQL/YSQL and MySQL/MariaDB plan coverage where practical, and extend `bench/run.rb` for hot queue, lease, wait, outbox, durable-object, or inbox-shaped paths. If a registered query is intentionally not covered by the large-fixture EXPLAIN suite, add it to the explicit uncovered-query list in the query-plan test so the exemption is visible in review.

@@ -172,6 +172,22 @@ module Durababble
       @connection.transaction(requires_new: true, &block)
     end
 
+    #: () { (?) -> untyped } -> untyped
+    def record_store_query_ids(&block)
+      previous = @recorded_store_query_ids
+      @recorded_store_query_ids = []
+      yield
+      @recorded_store_query_ids.dup
+    ensure
+      @recorded_store_query_ids = previous
+    end
+
+    #: (untyped, **untyped) -> untyped
+    def store_query_sql(id, **locals)
+      @recorded_store_query_ids << id.to_sym if @recorded_store_query_ids
+      StoreQueries.sql(id, self, locals)
+    end
+
     #: (target_kind: untyped, target_id: untyped) -> untyped
     def current_target_lease(target_kind:, target_id:)
       case target_kind

@@ -127,6 +127,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, created_at) VALUES ('pending-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'pending-key-#{i}', 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, locked_by, locked_until, created_at) VALUES ('processing-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'processing-key-#{i}', 'processing', 'owner', #{mysql_literal(now - 60)}, #{created_at})")
     end
+    execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
+    execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")
   rescue StandardError
     begin
