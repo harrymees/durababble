@@ -81,11 +81,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       message = @messages.shift
       message ? [message] : []
     end
+
     def object_state(object_type:, object_id:) = @state
 
-    def complete_object_command(command_id:, result:, **_kwargs)
+    def complete_object_command(command_id:, result:, **kwargs)
       @completed << [command_id, result]
-      @state = _kwargs.fetch(:state) if _kwargs.key?(:state) && !_kwargs.fetch(:state).equal?(Durababble::Store::NO_OBJECT_STATE)
+      @state = kwargs.fetch(:state) if kwargs.key?(:state) && !kwargs.fetch(:state).equal?(Durababble::Store::NO_OBJECT_STATE)
       @complete_result
     end
 
@@ -98,9 +99,53 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class AskWaitStore
+    attr_reader :enqueued, :waits
+
+    def initialize
+      @enqueued = []
+      @waits = []
+    end
+
+    def migrate! = true
+
+    def enqueue_object_command(**kwargs)
+      @enqueued << kwargs
+      "cmd-#{@enqueued.length}"
+    end
+
+    def deliver_target_message(**) = false
+
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
+      @waits << { message_id:, poll_interval:, timeout: }
+      "waited:#{message_id}"
+    end
+  end
+
   class CleanCommandObject < Durababble::DurableObject
     expose_command def read_only
       "unchanged"
+    end
+  end
+
+  class LongScheduleAskObject < Durababble::DurableObject
+    expose_command retry: { maximum_attempts: 3, schedule: [11, 13] }
+    def eventually
+      "ok"
+    end
+  end
+
+  class ExponentialBackoffAskObject < Durababble::DurableObject
+    expose_command retry: { maximum_attempts: 4, initial_interval: 2, backoff_coefficient: 3, maximum_interval: 10 }
+    def eventually
+      "ok"
+    end
+  end
+
+  class UnboundedAskObject < Durababble::DurableObject
+    expose_command retry: { maximum_attempts: nil, schedule: [11] }
+    def eventually
+      "ok"
     end
   end
 
@@ -246,17 +291,20 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   test "handles object wake messages with and without lifecycle handlers" do
-    wake = BranchCommandStore.new(messages: [
-      {
-        "id" => "wake-1",
-        "target_kind" => "object",
-        "target_type" => WakeTestObject.object_type,
-        "target_id" => "wake-object",
-        "message_kind" => "wake",
-        "payload" => { "reason" => "timer" },
-        "attempts" => 1,
-      },
-    ], state: nil)
+    wake = BranchCommandStore.new(
+      messages: [
+        {
+          "id" => "wake-1",
+          "target_kind" => "object",
+          "target_type" => WakeTestObject.object_type,
+          "target_id" => "wake-object",
+          "message_kind" => "wake",
+          "payload" => { "reason" => "timer" },
+          "attempts" => 1,
+        },
+      ],
+      state: nil,
+    )
     wake_executor = Durababble::DurableObjectExecutor.new(
       store: wake,
       objects: [WakeTestObject],
@@ -294,7 +342,26 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
     assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
-    assert_nil Durababble::DurableObjectRef.send(:inbox_max_attempts, unbounded)
+    assert_nil CleanCommandObject.ref("clean", store: Object.new).send(:inbox_max_attempts, unbounded)
+  end
+
+  test "waits long enough for synchronous asks to exhaust finite retry policies" do
+    long_schedule_store = AskWaitStore.new
+    assert_equal "waited:cmd-1", LongScheduleAskObject.ref("object-1", store: long_schedule_store).eventually
+    assert_equal 3, long_schedule_store.enqueued.first.fetch(:max_attempts)
+    assert_equal 34, long_schedule_store.waits.first.fetch(:timeout)
+
+    exponential_store = AskWaitStore.new
+    assert_equal "waited:cmd-1", ExponentialBackoffAskObject.ref("object-1", store: exponential_store).eventually
+    assert_equal 4, exponential_store.enqueued.first.fetch(:max_attempts)
+    assert_equal 28, exponential_store.waits.first.fetch(:timeout)
+  end
+
+  test "does not impose the default ask wait timeout on unbounded retry policies" do
+    store = AskWaitStore.new
+    assert_equal "waited:cmd-1", UnboundedAskObject.ref("object-1", store:).eventually
+    assert_nil store.enqueued.first.fetch(:max_attempts)
+    assert_nil store.waits.first.fetch(:timeout)
   end
 
   durababble_store_backends.each do |backend|
@@ -302,19 +369,19 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       with_durababble_store(backend, "durable_object_api") do |store|
         worker = object_worker(store, ApiTestAccount)
 
-        assert_not_respond_to ApiTestAccount, :step
-        assert_equal 0, ApiTestAccount.ref("acct-1", store:).balance
+        assert_not_respond_to(ApiTestAccount, :step)
+        assert_equal(0, ApiTestAccount.ref("acct-1", store:).balance)
 
-        caller = call_object_command_async(backend, ApiTestAccount, "acct-1", :credit, 500)
+        caller = call_object_command_async(backend, ApiTestAccount, "acct-1", [:credit, 500])
         wait_for_object_activation(ApiTestAccount, "acct-1")
-        assert_nil store.object_state(object_type: ApiTestAccount.object_type, object_id: "acct-1")
+        assert_nil(store.object_state(object_type: ApiTestAccount.object_type, object_id: "acct-1"))
         run_worker_until_result(worker, caller.fetch(:queue))
 
         status, value = caller.fetch(:queue).pop
         caller.fetch(:thread).join
-        assert_equal :ok, status
-        assert_equal 500, value.balance_cents
-        assert_equal 500, ApiTestAccount.ref("acct-1", store:).balance
+        assert_equal(:ok, status)
+        assert_equal(500, value.balance_cents)
+        assert_equal(500, ApiTestAccount.ref("acct-1", store:).balance)
       ensure
         caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
       end
@@ -325,19 +392,19 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         worker = object_worker(store, ApiTestAccount)
 
         tell_id = ApiTestAccount.tell("acct-2", :credit, 500, store:)
-        caller = call_object_command_async(backend, ApiTestAccount, "acct-2", :debit, 125)
+        caller = call_object_command_async(backend, ApiTestAccount, "acct-2", [:debit, 125])
         wait_for_object_activation(ApiTestAccount, "acct-2")
         run_worker_until_result(worker, caller.fetch(:queue))
 
         status, value = caller.fetch(:queue).pop
         caller.fetch(:thread).join
-        assert_equal :ok, status
-        assert_equal 375, value.balance_cents
-        assert_equal 375, ApiTestAccount.ref("acct-2", store:).balance
+        assert_equal(:ok, status)
+        assert_equal(375, value.balance_cents)
+        assert_equal(375, ApiTestAccount.ref("acct-2", store:).balance)
 
         messages = store.inbox_messages_for(target_kind: "object", target_type: ApiTestAccount.object_type, target_id: "acct-2")
-        assert_equal [tell_id, messages.last.fetch("id")], messages.map { |message| message.fetch("id") }
-        assert_equal ["completed", "completed"], messages.map { |message| message.fetch("status") }
+        assert_equal([tell_id, messages.last.fetch("id")], messages.map { |message| message.fetch("id") })
+        assert_equal(["completed", "completed"], messages.map { |message| message.fetch("status") })
       ensure
         caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
       end
@@ -348,23 +415,23 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         worker = object_worker(store, RetryStateTestCounter)
         counter = RetryStateTestCounter.ref("counter-1", store:)
 
-        caller = call_object_command_async(backend, RetryStateTestCounter, "counter-1", :increment_with_transient_failure)
+        caller = call_object_command_async(backend, RetryStateTestCounter, "counter-1", [:increment_with_transient_failure])
         wait_for_object_activation(RetryStateTestCounter, "counter-1")
         run_worker_until_result(worker, caller.fetch(:queue))
         status, result = caller.fetch(:queue).pop
         caller.fetch(:thread).join
-        assert_equal :ok, status
+        assert_equal(:ok, status)
         assert_equal({ "count" => 1 }, result)
-        assert_equal 1, counter.count
+        assert_equal(1, counter.count)
 
-        failing = call_object_command_async(backend, RetryStateTestCounter, "counter-1", :increment_and_fail)
+        failing = call_object_command_async(backend, RetryStateTestCounter, "counter-1", [:increment_and_fail])
         wait_for_object_activation(RetryStateTestCounter, "counter-1")
         run_worker_until_result(worker, failing.fetch(:queue))
         failed_status, error = failing.fetch(:queue).pop
         failing.fetch(:thread).join
-        assert_equal :error, failed_status
+        assert_equal(:error, failed_status)
         assert_match(/permanent after state update/, error.message)
-        assert_equal 1, counter.count
+        assert_equal(1, counter.count)
       ensure
         caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
         failing&.fetch(:thread)&.kill if failing&.fetch(:thread)&.alive?
@@ -400,18 +467,21 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         object = retrying_object.ref("object-1", store:)
         worker = object_worker(store, retrying_object)
 
-        caller = call_object_command_async(backend, retrying_object, "object-1", :write_with_retry, "persisted")
+        caller = call_object_command_async(backend, retrying_object, "object-1", [:write_with_retry, "persisted"])
         wait_for_object_activation(retrying_object, "object-1")
         run_worker_until_result(worker, caller.fetch(:queue))
         status, result = caller.fetch(:queue).pop
         caller.fetch(:thread).join
 
-        assert_equal :ok, status
+        assert_equal(:ok, status)
         assert_equal({ "committed_attempts" => 1, "value" => "persisted" }, result)
-        assert_equal 2, seen_keys.length
-        assert_equal 1, seen_keys.uniq.length
-        assert_equal result, object.snapshot
-        assert_equal 2, store.inbox_messages_for(target_kind: "object", target_type: retrying_object.object_type, target_id: "object-1").first.fetch("attempts").to_i
+        assert_equal(2, seen_keys.length)
+        assert_equal(1, seen_keys.uniq.length)
+        assert_equal(result, object.snapshot)
+        assert_equal(
+          2,
+          store.inbox_messages_for(target_kind: "object", target_type: retrying_object.object_type, target_id: "object-1").first.fetch("attempts").to_i,
+        )
       ensure
         caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
       end
@@ -451,12 +521,13 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     Durababble::Worker.new(store:, workflows: {}, objects:, worker_id: "object-worker", lease_seconds: 30, migrate: false)
   end
 
-  def call_object_command_async(backend, object_class, object_id, method_name, *args, **kwargs)
+  def call_object_command_async(backend, object_class, object_id, command)
+    method_name, *args = command
     result_queue = Queue.new
     caller = Thread.new do
       caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
       begin
-        result_queue << [:ok, object_class.ref(object_id, store: caller_store).public_send(method_name, *args, **kwargs)]
+        result_queue << [:ok, object_class.ref(object_id, store: caller_store).public_send(method_name, *args)]
       rescue StandardError => e
         result_queue << [:error, e]
       ensure

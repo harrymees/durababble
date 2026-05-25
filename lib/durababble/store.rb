@@ -184,6 +184,11 @@ module Durababble
       end
     end
 
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      nil
+    end
+
     #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def deliver_target_message_with_retry(client, worker_pool:, target_kind:, target_type:, target_id:)
       attempts = 0

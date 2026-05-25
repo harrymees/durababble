@@ -588,6 +588,41 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
         assert_hash_includes store.release_worker_leases!(worker_id: "worker-b"), "workflows" => 1
         assert_hash_includes store.claim_workflow(workflow_id:, worker_id: "worker-c", lease_seconds: 30), "locked_by" => "worker-c"
+
+        object_command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "release",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_target_activation(worker_id: "object-worker", lease_seconds: 60, target_kinds: ["object"], target_types: ["counter"]),
+          "target_kind" => "object",
+          "target_type" => "counter",
+          "target_id" => "release",
+          "locked_by" => "object-worker",
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: object_command_id, worker_id: "object-worker", lease_seconds: 60),
+          "status" => "running",
+          "locked_by" => "object-worker",
+        )
+
+        released = store.release_worker_leases!(worker_id: "object-worker")
+        assert_hash_includes released, "inbox" => 1, "target_activations" => 1
+        assert_hash_includes store.inbox_message(object_command_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil
+        assert_hash_includes(
+          store.claim_target_activation(worker_id: "object-recovery", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"]),
+          "target_id" => "release",
+          "locked_by" => "object-recovery",
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id: object_command_id, worker_id: "object-recovery", lease_seconds: 30),
+          "status" => "running",
+          "locked_by" => "object-recovery",
+        )
+
         store.fail_workflow(workflow_id, error: "fatal")
         assert_hash_includes store.workflow(workflow_id), "status" => "failed", "error" => "fatal"
         assert_nil store.claim_runnable_workflow(worker_id: "worker-d", lease_seconds: 30)

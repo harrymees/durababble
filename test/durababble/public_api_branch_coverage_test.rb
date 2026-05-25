@@ -172,9 +172,9 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         add = nil
         flaky = nil
 
-        assert_equal "branch_account", BranchTestDurableObject.object_type
+        assert_equal("branch_account", BranchTestDurableObject.object_type)
         assert_respond_to(account, :formatted)
-        assert_equal "balance:0", account.formatted(prefix: "balance")
+        assert_equal("balance:0", account.formatted(prefix: "balance"))
 
         add = call_with_store_async(backend) do |caller_store|
           BranchTestDurableObject.ref("acct-1", store: caller_store).add(amount: 3)
@@ -194,7 +194,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_equal(:ok, flaky_status)
         assert_equal({ "value" => 7, "attempts" => 1 }, flaky_result)
 
-        assert_equal "balance:7", account.formatted(prefix: "balance")
+        assert_equal("balance:7", account.formatted(prefix: "balance"))
         assert_equal({ "value" => 7, "attempts" => 1 }, store.object_state(object_type: "branch_account", object_id: "acct-1"))
         assert_equal(
           [

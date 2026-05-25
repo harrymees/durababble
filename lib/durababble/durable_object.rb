@@ -165,23 +165,23 @@ module Durababble
           kwargs:,
           message_kind: "ask",
           idempotency_key:,
-          max_attempts: self.class.inbox_max_attempts(retry_policy),
+          max_attempts: inbox_max_attempts(retry_policy),
         )
         @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id)
-        @store.wait_for_inbox_message(command_id, timeout: self.class.command_wait_timeout(retry_policy))
+        @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
     end
 
     #: (untyped) -> untyped
-    def self.inbox_max_attempts(retry_policy)
+    def inbox_max_attempts(retry_policy)
       attempts = retry_policy.maximum_attempts
       attempts.finite? ? attempts : nil
     end
 
     #: (untyped) -> untyped
-    def self.command_wait_timeout(retry_policy)
+    def command_wait_timeout(retry_policy)
       attempts = retry_policy.maximum_attempts
-      return nil unless attempts.finite?
+      return unless attempts.finite?
 
       retry_delay = (1...attempts.to_i).sum { |attempt_number| retry_policy.delay_for_attempt(attempt_number) }
       COMMAND_WAIT_TIMEOUT_SLACK_SECONDS + retry_delay
