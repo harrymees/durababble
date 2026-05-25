@@ -40,7 +40,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.resume", attributes) do
         current = claimed || @store.workflow(workflow_id)
-        return run_from_row(current) if WorkflowStatus.completed?(current)
+        return run_from_row(current) if terminal_workflow_row?(current)
 
         owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
         unless owned_claim
@@ -146,10 +146,10 @@ module Durababble
             execution.validate_replay_complete!
             assert_workflow_lease!(workflow_id)
             if execution.cancellation_delivered?
-              @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
+              @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
               Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
             else
-              @store.complete_workflow(workflow_id, result:)
+              @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
               Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
             end
           end
@@ -171,7 +171,7 @@ module Durababble
       snapshot(workflow_id)
     rescue CancellationError => e
       assert_workflow_lease!(workflow_id)
-      @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil)
+      @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
       Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
       snapshot(workflow_id)
     rescue StandardError => e
@@ -179,7 +179,7 @@ module Durababble
 
       message = "#{e.class}: #{e.message}"
       assert_workflow_lease!(workflow_id)
-      @store.fail_workflow(workflow_id, error: message)
+      @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)
     end

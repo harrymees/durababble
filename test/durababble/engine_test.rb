@@ -104,6 +104,22 @@ class DurababbleEngineTest < DurababbleTestCase
       end
     end
 
+    test "returns a terminal failed workflow instead of trying to reclaim it with #{backend.name}" do
+      with_durababble_store(backend, "engine_test") do |store|
+        workflow = durababble_test_workflow("terminal-failure") do
+          test_step("explode") { |_ctx| raise "boom" }
+        end
+        engine = Durababble::Engine.new(store:, worker_id: "owner")
+
+        first = engine.run(workflow, input: {})
+        second = engine.resume(workflow, workflow_id: first.id)
+
+        assert_equal "failed", first.status
+        assert_equal first.status, second.status
+        assert_equal first.error, second.error
+      end
+    end
+
     test "can resume a due retry without rerunning completed steps with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
         first_step_runs = 0

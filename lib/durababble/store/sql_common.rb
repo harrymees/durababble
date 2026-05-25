@@ -10,16 +10,22 @@ module Durababble
       id
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped, ?worker_id: untyped) -> untyped
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      transaction { record_step_completed_without_transaction(workflow_id:, command_id:, result:) }
+      transaction do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
+        record_step_completed_without_transaction(workflow_id:, command_id:, result:)
+      end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      transaction { record_step_failed_without_transaction(workflow_id:, command_id:, error:) }
+      transaction do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+      end
     end
 
     #: (untyped) -> untyped
@@ -299,6 +305,13 @@ module Durababble
 
     private
 
+    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    def assert_workflow_lease_for_update!(workflow_id:, worker_id:)
+      return if lock_owned_workflow_for_update(workflow_id:, worker_id:)
+
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
+    end
+
     #: (name: untyped, input: untyped) -> untyped
     def enqueue_workflow(name:, input:)
       raise NotImplementedError
@@ -371,6 +384,11 @@ module Durababble
 
     #: (untyped) -> untyped
     def lock_workflow_for_update(workflow_id)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       raise NotImplementedError
     end
 

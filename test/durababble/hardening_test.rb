@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "delegate"
 require "open3"
 require "rbconfig"
 require "thread"
@@ -76,6 +77,50 @@ class DurababbleHardeningTest < DurababbleTestCase
 
     assert_equal "completed", run.status
     assert_equal ["failed", "completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+  end
+
+  test "does not let a stale owner checkpoint after its lease moves" do
+    attempts = 0
+    workflow = durababble_test_workflow("lease-move-checkpoint") do
+      test_step("work") do |ctx|
+        attempts += 1
+        ctx.merge("attempt" => attempts)
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.name, input: {})
+    stale_store = Class.new(SimpleDelegator) do
+      attr_reader :moved
+
+      def initialize(delegate)
+        super(delegate)
+        @delegate = delegate
+        @armed = true
+        @moved = false
+      end
+
+      def workflow_owned?(workflow_id:, worker_id:)
+        owned = @delegate.workflow_owned?(workflow_id:, worker_id:)
+        if owned && @armed
+          @armed = false
+          @moved = true
+          @delegate.release_worker_leases!(worker_id:)
+          @delegate.claim_workflow(workflow_id:, worker_id: "recovery", lease_seconds: 60)
+        end
+        owned
+      end
+    end.new(store)
+
+    assert_raises_matching(Durababble::LeaseConflict, /expired or moved/) do
+      Durababble::Engine.new(store: stale_store, worker_id: "zombie", migrate: false).resume(workflow, workflow_id:)
+    end
+    assert_equal true, stale_store.moved
+    assert_equal ["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+    refute_includes store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "step_completed"
+
+    recovered = Durababble::Engine.new(store:, worker_id: "recovery", migrate: false).resume(workflow, workflow_id:)
+
+    assert_equal "completed", recovered.status
+    assert_equal({ "attempt" => 2 }, recovered.result)
   end
 
   test "preserves scalar step results and text columns that look parseable" do

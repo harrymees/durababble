@@ -155,8 +155,9 @@ module Durababble
         true
       end
 
-      #: (untyped, result: untyped) -> untyped
-      def complete_workflow(workflow_id, result:)
+      #: (untyped, result: untyped, ?worker_id: untyped) -> untyped
+      def complete_workflow(workflow_id, result:, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         row = @workflows.fetch(workflow_id)
         row["status"] = "completed"
         row["result"] = deep(result)
@@ -167,8 +168,9 @@ module Durababble
         trace("complete_workflow", id: workflow_id, result:)
       end
 
-      #: (untyped, reason: untyped, ?result: untyped) -> untyped
-      def cancel_workflow(workflow_id, reason:, result: nil)
+      #: (untyped, reason: untyped, ?result: untyped, ?worker_id: untyped) -> untyped
+      def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         row = @workflows.fetch(workflow_id)
         row["status"] = "canceled"
         row["result"] = deep(result)
@@ -179,8 +181,9 @@ module Durababble
         trace("cancel_workflow", id: workflow_id, reason:, result:)
       end
 
-      #: (untyped, error: untyped) -> untyped
-      def fail_workflow(workflow_id, error:)
+      #: (untyped, error: untyped, ?worker_id: untyped) -> untyped
+      def fail_workflow(workflow_id, error:, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         row = @workflows.fetch(workflow_id)
         row["status"] = "failed"
         row["error"] = error
@@ -190,16 +193,18 @@ module Durababble
         trace("fail_workflow", id: workflow_id, error:)
       end
 
-      #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
-      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+      #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped, ?worker_id: untyped) -> untyped
+      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         payload = { "name" => name, "args" => deep(args), "kwargs" => deep(kwargs) }.merge(deep(metadata))
         append_history(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
         @steps[workflow_id][command_id] ||= { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "scheduled", "result" => nil, "error" => nil, "heartbeat_cursor" => nil }
         trace("step_scheduled", id: workflow_id, command_id:, name:, payload:)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
-      def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, ?worker_id: untyped) -> untyped
+      def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         @attempts[workflow_id].each do |attempt|
           next unless attempt.fetch("position") == command_id && attempt.fetch("status") == "running"
@@ -216,8 +221,9 @@ module Durababble
         attempt_id
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
-      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped, ?worker_id: untyped) -> untyped
+      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "completed"
@@ -228,8 +234,9 @@ module Durababble
         fault_plan.after(:record_step_completed)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "failed"
@@ -239,8 +246,9 @@ module Durababble
         trace("step_failed", id: workflow_id, command_id:, error:)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "canceled"
@@ -250,15 +258,16 @@ module Durababble
         trace("step_canceled", id: workflow_id, command_id:, error:)
       end
 
-      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
-      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped, ?worker_id: untyped) -> untyped
+      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+        assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil) }
         wait_id = next_id("wait")
         @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
         update_latest_attempt(workflow_id, command_id, "waiting", wait_request.context, nil)
         append_history(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
+        suspend_workflow(workflow_id:, worker_id:) if suspend_workflow
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
         wait_id
@@ -451,6 +460,13 @@ module Durababble
       #: (untyped) -> untyped
       def expired?(row)
         row.fetch("locked_until") && row.fetch("locked_until") < scheduler.time
+      end
+
+      #: (untyped, untyped) -> untyped
+      def assert_workflow_lease!(workflow_id, worker_id)
+        return if workflow_owned?(workflow_id:, worker_id:)
+
+        raise Durababble::LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
       end
 
       #: (untyped, untyped, untyped) -> untyped
