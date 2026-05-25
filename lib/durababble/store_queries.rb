@@ -1128,6 +1128,10 @@ module Durababble
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = $1 ORDER BY event_index"
     end
 
+    define(:pg_workflow_history_count_for, backend: :postgres) do |store|
+      "SELECT COUNT(*) AS count FROM #{table(store, "workflow_history")} WHERE workflow_id = $1"
+    end
+
     define(:pg_inbox_message, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "inbox")} WHERE id = $1"
     end
@@ -1690,6 +1694,10 @@ module Durababble
 
     define(:mysql_workflow_history_for, backend: :mysql) do |store|
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = ? ORDER BY event_index"
+    end
+
+    define(:mysql_workflow_history_count_for, backend: :mysql) do |store|
+      "SELECT COUNT(*) AS count FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     define(:mysql_waits_for_workflow, backend: :mysql) do |store|

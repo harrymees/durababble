@@ -57,6 +57,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_update_mailbox_sequence,
     :pg_upsert_target_activation,
     :pg_workflow_cancellation,
+    :pg_workflow_history_count_for,
     :pg_workflow_history_for,
   ].freeze
 
@@ -171,6 +172,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_waits_for_workflow,
     :mysql_workflow,
     :mysql_workflow_cancellation,
+    :mysql_workflow_history_count_for,
     :mysql_workflow_history_for,
     :mysql_workflow_locked_until,
     :mysql_workflow_owned,

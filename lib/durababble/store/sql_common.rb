@@ -65,6 +65,14 @@ module Durababble
         .map { |row| decode_row(row) }
     end
 
+    #: (String) -> Integer
+    def workflow_history_count_for(workflow_id)
+      row = execute_store_query(:workflow_history_count_for, [workflow_id]).first
+      return 0 unless row
+
+      row.fetch("count").to_s.to_i
+    end
+
     #: (?now: Time, ?batch_size: Integer) -> Integer
     def wake_due_timers(now: Time.now, batch_size: TIMER_WAKE_BATCH_SIZE)
       batch_size = Integer(batch_size)
