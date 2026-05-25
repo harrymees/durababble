@@ -3,7 +3,7 @@
 
 require_relative "../test_helper"
 
-require "durababble/deterministic"
+require_relative "../support/deterministic"
 
 class DurababbleDeterministicTest < DurababbleTestCase
   FUZZ_SCENARIOS = [
