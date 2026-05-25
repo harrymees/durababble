@@ -5,31 +5,31 @@ require_relative "../test_helper"
 
 class DurababbleWorkflowWaitTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
-    test "event waits can run directly from workflow orchestration with #{backend.name}" do
-      with_durababble_store(backend, "workflow_wait_event") do |store|
+    test "sleep waits can run directly from workflow orchestration with #{backend.name}" do
+      with_durababble_store(backend, "workflow_wait_sleep") do |store|
         store.migrate!
         workflow = Class.new(Durababble::Workflow) do
-          workflow_name "direct-event-wait"
+          workflow_name "direct-sleep-wait"
 
           def execute(input)
-            approved = wait_event("direct:#{input.fetch("id")}", input)
-            approved.merge("done" => true)
+            slept = sleep(3600, input.merge("slept" => true))
+            slept.merge("done" => true)
           end
         end
-        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "event" })
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "sleep" })
 
         waiting = Durababble::Engine.new(store:, worker_id: "direct-wait", migrate: false).resume(workflow, workflow_id:)
 
         assert_equal "waiting", waiting.status
-        assert_equal [["wait_event", "waiting"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
+        assert_equal [["sleep", "waiting"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["step_scheduled", "step_waiting"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
 
-        assert_equal 1, store.signal_event("direct:event", payload: { "approved" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         completed = Durababble::Engine.new(store:, worker_id: "direct-resume", migrate: false).resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
-        assert_equal({ "id" => "event", "approved" => true, "done" => true }, completed.result)
+        assert_equal({ "id" => "sleep", "slept" => true, "done" => true }, completed.result)
         assert_equal ["step_scheduled", "step_waiting", "step_completed"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
       end
     end
@@ -70,14 +70,14 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
       end
     end
 
-    test "cancellation cancels direct pending waits and ignores late signals with #{backend.name}" do
+    test "cancellation cancels direct pending waits and ignores late timer wakeups with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_cancel") do |store|
         store.migrate!
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "direct-wait-cancel"
 
           def execute(input)
-            wait_event("cancel-direct:#{input.fetch("id")}", input)
+            sleep(3600, input)
           end
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wait" })
@@ -90,7 +90,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         canceled = Durababble::Engine.new(store:, worker_id: "cancel-resume", migrate: false).resume(workflow, workflow_id:)
 
         assert_equal "canceled", canceled.status
-        assert_equal 0, store.signal_event("cancel-direct:wait", payload: { "late" => true })
+        assert_equal 0, store.wake_due_timers(now: Time.now + 3601)
       end
     end
 
@@ -130,7 +130,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
 
           def execute(input)
             Async do |task|
-              wait_task = task.async { wait_event("direct-async:#{input.fetch("id")}", { "id" => input.fetch("id") }) }
+              wait_task = task.async { sleep(3600, { "id" => input.fetch("id"), "released" => true }) }
               work_task = task.async { persist_sibling(input.fetch("id")) }
               [wait_task.wait, work_task.wait]
             end.wait
@@ -148,11 +148,11 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
 
         assert_equal "waiting", waiting.status
         assert_equal(
-          [["persist_sibling", "completed"], ["wait_event", "waiting"]],
+          [["persist_sibling", "completed"], ["sleep", "waiting"]],
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }.sort_by(&:first),
         )
 
-        assert_equal 1, store.signal_event("direct-async:async", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         completed = Durababble::Engine.new(store:, worker_id: "async-resume", migrate: false).resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status

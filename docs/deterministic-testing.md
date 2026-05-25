@@ -39,15 +39,15 @@ Current scenarios:
 - `completed_step_skip_after_crash` — a completed step is skipped after crash/recovery.
 - `incomplete_step_retry_after_crash` — a step that crashed after start is retried and stale attempts are closed.
 - `attempt_history_append_only` — repeated failures append attempts instead of overwriting history.
-- `concurrent_signal_once` — many signalers wake one wait exactly once.
+- `concurrent_timer_wake_once` — many callers race to wake one due timer exactly once.
 - `fenced_side_effect_once` — many callers share one fenced side-effect result.
-- `waits_fences_and_outbox` — event waits, idempotency fences, and outbox processing.
+- `waits_fences_and_outbox` — timer waits, idempotency fences, and outbox processing.
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
-- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late signal, and finishes as canceled.
+- `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels the pending wait, delivers `CancellationError`, runs cleanup once, ignores a late timer wakeup, and finishes as canceled.
 - `grpc_service_contract` — the protobuf service methods are exercised under the virtual scheduler, including active-owner `DeliverMessage`, stale-owner `DeliverMessage` acknowledgement without work, workflow `CallTransient`, and object/transient `CallTransient`.
 - `grpc_workflow_rpc_response_matrix` — gRPC `CallTransient` response variants are covered together: `LeaseMoved`, `not_running`, and unavailable-node outcomes decode to typed routing failures instead of subprocess protocol errors.
 - `grpc_workflow_rpc_transport_fault_matrix` — workflow `CallTransient` is exposed to timeout, deadline-exceeded, RST, EOF, unavailable, lost-response, and duplicate-response faults.

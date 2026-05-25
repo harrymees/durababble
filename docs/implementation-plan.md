@@ -10,7 +10,7 @@
 - Distributed leases, heartbeats, stale lease stealing, and lease-aware resume.
 - Transactional multi-row step and wait transitions.
 - Durable step attempts, including waiting attempts that become completed after wake.
-- Timer waits and external event waits with concurrent signal protection.
+- Timer waits with concurrent wake protection.
 - Side-effect idempotency fences that acquire before side-effect execution.
 - Durable outbox with unique keys, leasing, expiry recovery, and acknowledgement.
 - CLI commands for migration, counter workflow execution, inspection, and resume.

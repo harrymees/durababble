@@ -143,9 +143,9 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 ## Observability
 
-`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle events. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle transitions. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
 
-The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level durable-execution signals such as workflow, step, wait, lease, outbox, queue, worker, and RPC telemetry.
+The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level telemetry for workflows, steps, waits, leases, outbox rows, queues, workers, and RPCs.
 
 Primary spans:
 

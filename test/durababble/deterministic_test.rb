@@ -18,16 +18,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "completed_step_skip_after_crash",
     "incomplete_step_retry_after_crash",
     "attempt_history_append_only",
-    "concurrent_signal_once",
+    "concurrent_timer_wake_once",
     "timer_and_partition",
-    "stale_wait_signal_terminal_workflow",
+    "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
     "fenced_side_effect_once",
     "outbox_lease_expiry",
     "store_fault_after_step_completed",
     "store_fault_after_wait_recorded",
     "store_fault_after_outbox_enqueue",
-    "duplicate_delivery_signal_and_outbox",
+    "duplicate_delivery_timer_and_outbox",
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
     "grpc_workflow_rpc_response_matrix",
@@ -209,18 +209,18 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
-    store.record_step_scheduled(workflow_id:, command_id: 0, name: "wait_for_event", args: ["evt"])
-    store.record_step_started(workflow_id:, command_id: 0, name: "wait_for_event")
+    store.record_step_scheduled(workflow_id:, command_id: 0, name: "sleep", args: [10])
+    store.record_step_started(workflow_id:, command_id: 0, name: "sleep")
     store.record_wait(
       workflow_id:,
       command_id: 0,
-      name: "wait_for_event",
-      wait_request: Durababble.wait_event("evt", { "started" => true }),
+      name: "sleep",
+      wait_request: Durababble.wait_until(store.current_time + 10, { "started" => true }),
       suspend_workflow: false,
     )
 
     assert_equal "running", store.workflow(workflow_id).fetch("status")
-    assert_equal 1, store.signal_event("evt", payload: { "finished" => true })
+    assert_equal 1, store.wake_due_timers(now: scheduler.time + 11)
     assert_equal "running", store.workflow(workflow_id).fetch("status")
 
     store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
@@ -305,7 +305,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
   end
 
   test "models duplicate network delivery without duplicate wait or outbox effects" do
-    result = Durababble::Deterministic.prove("duplicate_delivery_signal_and_outbox", seed: 50)
+    result = Durababble::Deterministic.prove("duplicate_delivery_timer_and_outbox", seed: 50)
 
     assert_empty result.violations
     assert_includes result.trace, "network.duplicate"
@@ -313,9 +313,9 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:processed_outbox)
   end
 
-  test "rejects zombie heartbeats and stale wait signals in the virtual store" do
+  test "rejects zombie heartbeats and stale timer waits in the virtual store" do
     zombie = Durababble::Deterministic.prove("zombie_workflow_heartbeat_after_expiry", seed: 51)
-    stale_wait = Durababble::Deterministic.prove("stale_wait_signal_terminal_workflow", seed: 52)
+    stale_wait = Durababble::Deterministic.prove("stale_wait_timer_terminal_workflow", seed: 52)
 
     assert_empty zombie.violations
     assert_includes zombie.trace, "zombie_heartbeat_rejected"

@@ -445,14 +445,14 @@ The README describes the implemented prototype. The spec also records the intend
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
 - Worker polling with leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
-- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Timer waits, side-effect fences, and durable outbox primitives.
 - Retry due-time claims distinguish retryable failures from terminal failed workflows.
 - Lease-routed workflow RPC helpers.
 - Deterministic simulation tests for workflow safety and crash-recovery scenarios.
 
 - `DurableObject.at` and `DurableObject.tell` are the preferred future durable-object spellings. The current durable-object implementation still uses `DurableObject.ref`; workflow code supports both `Workflow.start` / `Workflow.handle` and lower-level `Workflow.enqueue` / `Workflow.ref` / `Engine#run`.
-- Workflow command methods currently persist command events; executing command bodies through the workflow owner and returning command results is target runtime work.
-- Full durable workflow signals (`signal def`, `wait_condition`) are target work. Implemented today are lower-level timer waits, event waits, and event signaling.
+- Workflow command methods currently persist durable inbox rows, execute command bodies through the workflow owner, and return command results to synchronous callers.
+- Workflow `wait_condition` is implemented as a timer-backed durable wait. Broader broadcast-style delivery concepts are intentionally out of scope.
 - Durable-object commands persist command rows and execute inline in the current prototype. Per-object FIFO mailbox leasing, async `tell`, sleeps, and worker-driven object execution are target work.
 - Fences deduplicate side effects after a fence row is inserted, but fence-owner crash recovery is not complete.
 - The gRPC transport and workflow RPC routing are implemented for the prototype test matrix, but production mTLS/Spiffe policy, admin surfaces, metrics, tracing, and operator tooling are not yet implemented.

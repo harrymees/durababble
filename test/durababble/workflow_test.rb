@@ -40,10 +40,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
 
     step def wait_for_approval(input)
-      Durababble.wait_event(
-        "workflow:#{step_context.workflow_id}:command:approve",
-        input.merge("waiting_for" => "approve"),
-      )
+      Durababble.wait_until(Time.now + 3600, input.merge("waiting_for" => "approve"))
     end
 
     expose_command def approve(reason:)

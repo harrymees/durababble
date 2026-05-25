@@ -473,11 +473,6 @@ module Durababble
         complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "timer" && wait.fetch("wake_at") <= now }, {})
       end
 
-      #: (untyped, ?payload: untyped) -> untyped
-      def signal_event(event_key, payload: {})
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "event" && wait.fetch("event_key") == event_key }, payload)
-      end
-
       #: (untyped) -> untyped
       def waits_for(workflow_id)
         @waits.values.select { |wait| wait.fetch("workflow_id") == workflow_id }.sort_by { |wait| wait.fetch("id") }.map { |row| deep(row) }
@@ -837,7 +832,7 @@ module Durababble
         run(seed, "waits_fences_and_outbox") do |h|
           h.workflows["counter"] = counter_workflow
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 60, ctx.merge("approved" => true)) }
             test_step("finish") { |ctx| ctx.merge("finished" => true) }
           end
 
@@ -845,7 +840,7 @@ module Durababble
           3.times { |i| ids << h.store.enqueue_workflow(name: "counter", input: { "count" => i }) }
           h.store.enqueue_workflow(name: "waiting", input: { "id" => "req" })
           h.add_workers(["worker-a", "worker-b"], ticks: 15)
-          h.scheduler.schedule(actor: "client-signal", delay: 120, name: "signal") { h.store.signal_event("approval:req", payload: { "approved" => true }) }
+          h.scheduler.schedule(actor: "client-timer", delay: 120, name: "wake_due_timers") { h.store.wake_due_timers }
           h.scheduler.schedule(actor: "client-fence", delay: 40, name: "fence") do
             h.store.with_fence(workflow_id: ids.first, key: "charge") { { "charge" => "ok" } }
             h.store.with_fence(workflow_id: ids.first, key: "charge") { { "charge" => "duplicate" } }
@@ -1850,24 +1845,24 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def stale_wait_signal_terminal_workflow(seed)
-        run(seed, "stale_wait_signal_terminal_workflow") do |h|
+      def stale_wait_timer_terminal_workflow(seed)
+        run(seed, "stale_wait_timer_terminal_workflow") do |h|
           id = h.store.create_workflow(name: "waiting", input: { "seed" => seed })
           h.store.record_step_started(workflow_id: id, position: 0, name: "wait")
           h.store.record_wait(
             workflow_id: id,
             position: 0,
             name: "wait",
-            wait_request: Durababble.wait_event("stale:#{seed}", { "seed" => seed }),
+            wait_request: Durababble.wait_until(h.store.current_time + 10, { "seed" => seed }),
           )
-          h.store.signal_event("stale:#{seed}", payload: { "early" => true })
+          h.store.wake_due_timers(now: h.store.current_time + 11)
           h.store.complete_workflow(id, result: { "done" => true })
-          h.scheduler.schedule(actor: "signaler", delay: h.scheduler.rng.int(5), name: "stale_signal") do
-            signaled = h.store.signal_event("stale:#{seed}", payload: { "late" => true })
-            event = signaled.zero? ? "stale_wait_ignored" : "stale_wait_completed"
-            h.scheduler.trace.event(h.scheduler.time, "signaler", event, workflow_id: id, signaled:)
+          h.scheduler.schedule(actor: "timer", delay: h.scheduler.rng.int(5), name: "stale_timer") do
+            woken = h.store.wake_due_timers(now: h.store.current_time + 11)
+            event = woken.zero? ? "stale_wait_ignored" : "stale_wait_completed"
+            h.scheduler.trace.event(h.scheduler.time, "timer", event, workflow_id: id, woken:)
           end
-          h.check("stale wait signal was ignored") { h.scheduler.trace.to_s.include?("stale_wait_ignored") }
+          h.check("stale wait timer was ignored") { h.scheduler.trace.to_s.include?("stale_wait_ignored") }
           h.check("terminal workflow remained completed") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end
@@ -1945,16 +1940,16 @@ module Durababble
 
             define_method(:execute) do |input|
               instance = self #: as untyped
-              instance.wait_for_signal(input)
+              instance.wait_for_timer(input)
               { "done" => true }
             rescue Durababble::CancellationError => e
               instance.cleanup(input.merge("reason" => e.reason))
             end
 
-            define_method(:wait_for_signal) do |input|
-              Durababble.wait_event("cancelable:#{input.fetch("id")}", input)
+            define_method(:wait_for_timer) do |input|
+              Durababble.wait_until(h.store.current_time + 60, input)
             end
-            step :wait_for_signal
+            step :wait_for_timer
 
             define_method(:cleanup) do |input|
               instance = self #: as untyped
@@ -1986,9 +1981,9 @@ module Durababble
           h.scheduler.schedule(actor: "worker-b", delay: 10, name: "cleanup") do
             Durababble::Engine.new(store: h.store, worker_id: "worker-b", lease_seconds: 20).resume(workflow, workflow_id: id)
           end
-          h.scheduler.schedule(actor: "client-signal", delay: 30, name: "late_signal") do
-            signaled = h.store.signal_event("cancelable:#{seed}", payload: { "late" => true })
-            h.scheduler.trace.event(h.scheduler.time, "client-signal", "late_signal", signaled:)
+          h.scheduler.schedule(actor: "client-timer", delay: 70, name: "late_timer") do
+            woken = h.store.wake_due_timers
+            h.scheduler.trace.event(h.scheduler.time, "client-timer", "late_timer", woken:)
           end
           h.check("workflow canceled after cleanup") { h.store.workflow(id).fetch("status") == "canceled" }
           h.check("cleanup ran once") { cleanup_runs == 1 }
@@ -2000,7 +1995,7 @@ module Durababble
             end
           end
           h.check("cleanup heartbeat persisted") { h.store.steps_for(id).any? { |step| step.fetch("name") == "cleanup" && step.fetch("heartbeat_cursor") == { "phase" => "cleanup", "run" => 1 } } }
-          h.check("late signal ignored") { h.scheduler.trace.to_s.include?("late_signal signaled=0") }
+          h.check("late timer ignored") { h.scheduler.trace.to_s.include?("late_timer woken=0") }
           h.check("waiting attempt canceled") { h.store.step_attempts_for(id).any? { |attempt| attempt.fetch("status") == "canceled" } }
         end
       end
@@ -2045,7 +2040,7 @@ module Durababble
       def store_fault_after_wait_recorded(seed)
         run(seed, "store_fault_after_wait_recorded") do |h|
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("fault-wait:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 20, ctx.merge("ok" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           h.store.fault_plan.fail_after(:record_wait, message: "lost connection after durable wait write")
@@ -2063,8 +2058,8 @@ module Durababble
           rescue InjectedCrash
             h.scheduler.trace.event(h.scheduler.time, "faulty-worker", "store_fault_observed", workflow_id: id)
           end
-          h.scheduler.schedule(actor: "signal", delay: 20, name: "signal") do
-            h.store.signal_event("fault-wait:#{seed}", payload: { "ok" => true })
+          h.scheduler.schedule(actor: "timer", delay: 20, name: "wake_due_timers") do
+            h.store.wake_due_timers(now: h.store.current_time + 100)
           end
           h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") do
             Durababble::Engine.new(store: h.store, worker_id: "recover").resume(
@@ -2118,11 +2113,11 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def duplicate_delivery_signal_and_outbox(seed)
-        run(seed, "duplicate_delivery_signal_and_outbox") do |h|
+      def duplicate_delivery_timer_and_outbox(seed)
+        run(seed, "duplicate_delivery_timer_and_outbox") do |h|
           h.network.duplicate_percent = 100
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("dup:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 10, ctx.merge("ok" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           workflow_id = h.store.enqueue_workflow(name: "waiting", input: { "id" => seed.to_s })
@@ -2132,8 +2127,8 @@ module Durababble
               workflow_id:,
             )
           end
-          h.network.send(source: "client-signal", target: "db", type: "signal", payload: {}) do
-            h.store.signal_event("dup:#{seed}", payload: { "ok" => true })
+          h.network.send(source: "client-timer", target: "db", type: "timer", payload: {}) do
+            h.store.wake_due_timers(now: h.store.current_time + 100)
           end
           h.network.send(source: "producer", target: "db", type: "outbox", payload: {}) do
             h.store.enqueue_outbox(
@@ -2154,13 +2149,13 @@ module Durababble
             )
           end
           h.check("duplicate network delivery occurred") { h.scheduler.trace.to_s.include?("network.duplicate") }
-          h.check("wait completed once despite duplicate signal") do
+          h.check("wait completed once despite duplicate timer delivery") do
             h.scheduler.trace.to_s.scan("wait_completed").length == 1
           end
           h.check("outbox message was idempotent despite duplicate producer delivery") do
             h.store.summary.fetch(:processed_outbox) == 1
           end
-          h.check("workflow completed after duplicate signal") do
+          h.check("workflow completed after duplicate timer delivery") do
             h.store.workflow(workflow_id).fetch("status") == "completed"
           end
         end
@@ -2219,20 +2214,20 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def concurrent_signal_once(seed)
-        run(seed, "concurrent_signal_once") do |h|
+      def concurrent_timer_wake_once(seed)
+        run(seed, "concurrent_timer_wake_once") do |h|
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 20, ctx.merge("woken" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
           id = h.store.enqueue_workflow(name: "waiting", input: { "id" => "sig" })
           h.scheduler.schedule(actor: "worker", delay: 1, name: "park") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
           5.times do |i|
-            h.scheduler.schedule(actor: "signaler-#{i}", delay: 20 + h.scheduler.rng.int(5), name: "signal") { h.store.signal_event("event:sig", payload: { "signaler" => i }) }
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 20 + h.scheduler.rng.int(5), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
           end
           h.scheduler.schedule(actor: "worker", delay: 40, name: "resume") { Durababble::Engine.new(store: h.store, worker_id: "worker").resume(h.workflows.fetch("waiting"), workflow_id: id) }
           h.check("wait completed once") { h.scheduler.trace.to_s.scan("wait_completed").length == 1 }
-          h.check("workflow completed after signal") { h.store.workflow(id).fetch("status") == "completed" }
+          h.check("workflow completed after timer wake") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end
 
@@ -2256,7 +2251,7 @@ module Durababble
         run(seed, "chaos") do |h|
           h.workflows["counter"] = counter_workflow
           h.workflows["waiting"] = workflow_class("waiting") do
-            test_step("wait") { |ctx| Durababble.wait_event("event:#{ctx.fetch("id")}", ctx) }
+            test_step("wait") { |ctx| Durababble.wait_until(h.store.current_time + 80, ctx.merge("woken" => true)) }
             test_step("done") { |ctx| ctx.merge("done" => true) }
           end
 
@@ -2264,7 +2259,7 @@ module Durababble
             name = h.scheduler.rng.chance(25) ? "waiting" : "counter"
             input = name == "waiting" ? { "id" => "w#{i}" } : { "count" => i }
             h.network.send(source: "client-#{i}", target: "db", type: "enqueue") { h.store.enqueue_workflow(name:, input:) }
-            h.scheduler.schedule(actor: "signal-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "signal") { h.store.signal_event("event:w#{i}", payload: { "signaled" => true }) }
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
           end
           h.add_workers(["worker-a", "worker-b", "worker-c", "worker-d"], ticks: 30, crash_percent: 15)
           8.times do |i|

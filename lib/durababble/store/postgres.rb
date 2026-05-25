@@ -876,27 +876,6 @@ module Durababble
       ["AND #{filters.join(" AND ")}", params]
     end
 
-    #: (untyped, untyped) -> untyped
-    def complete_event_waits(event_key, payload)
-      @connection.transaction(requires_new: true) do
-        returning = execute_params(<<~SQL, [event_key, dump_serialized(payload)])
-          UPDATE #{table("waits")}
-          SET status = 'completed', payload = $2::bytea, completed_at = now()
-          WHERE id IN (
-            SELECT w.id FROM #{table("waits")} AS w
-            JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
-            WHERE w.status = 'pending'
-              AND wf.status IN ('waiting', 'running')
-              AND w.kind = 'event'
-              AND w.event_key = $1
-            FOR UPDATE OF w, wf SKIP LOCKED
-          )
-          RETURNING *
-        SQL
-        finish_completed_waits(returning, payload)
-      end
-    end
-
     #: (untyped) -> untyped
     def complete_timer_waits(now)
       @connection.transaction(requires_new: true) do

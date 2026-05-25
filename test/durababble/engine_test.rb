@@ -157,7 +157,7 @@ class DurababbleEngineTest < DurababbleTestCase
           end
 
           define_method(:wait_for_release) do |ctx|
-            Durababble.wait_event("large-history:#{ctx.fetch("id")}", ctx)
+            Durababble.wait_until(Time.now + 3600, ctx.merge("released" => true))
           end
 
           define_method(:finish) do |ctx|
@@ -190,7 +190,7 @@ class DurababbleEngineTest < DurababbleTestCase
           end,
         )
 
-        assert_equal 1, store.signal_event("large-history:history", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         assert_equal :worked, worker.tick
 
         assert_hash_includes(
