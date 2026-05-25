@@ -4,6 +4,36 @@
 require_relative "../test_helper"
 
 class DurababbleWorkflowTerminationTest < DurababbleTestCase
+  class TerminateBeforeSuspendStore
+    attr_reader :termination_requests
+
+    def initialize(store, reason:)
+      @store = store
+      @reason = reason
+      @termination_requests = 0
+    end
+
+    def suspend_workflow(workflow_id:, worker_id: nil)
+      if @termination_requests.zero?
+        @termination_requests += 1
+        @store.request_workflow_termination(workflow_id:, reason: @reason)
+      end
+      @store.suspend_workflow(workflow_id:, worker_id:)
+    end
+
+    def method_missing(method_name, *args, **kwargs, &block)
+      if @store.respond_to?(method_name)
+        @store.public_send(method_name, *args, **kwargs, &block)
+      else
+        super
+      end
+    end
+
+    def respond_to_missing?(method_name, include_private = false)
+      @store.respond_to?(method_name, include_private) || super
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "terminates a running workflow without delivering cancellation cleanup with #{backend.name}" do
       with_durababble_store(backend, "workflow_termination_running") do |store|
@@ -98,6 +128,36 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
         assert_equal ["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
         assert_equal 0, store.wake_due_timers(now: Time.now + 3601)
+      end
+    end
+
+    test "returns terminal workflow when termination races deferred wait suspension with #{backend.name}" do
+      with_durababble_store(backend, "workflow_termination_wait_suspend_race") do |store|
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "terminate-deferred-wait-suspension"
+
+          def execute(input)
+            Async do |task|
+              task.async { wait_for_release(input.fetch("id")) }.wait
+            end.wait
+          end
+
+          def wait_for_release(id)
+            Durababble.wait_until(Time.now + 3600, { "id" => id, "released" => true })
+          end
+          step :wait_for_release
+        end
+        workflow_id = workflow.enqueue({ "id" => "wait-race" }, store:)
+        race_store = TerminateBeforeSuspendStore.new(store, reason: "operator stop at wait boundary")
+
+        run = Durababble::Engine.new(store: race_store, worker_id: "race-owner").resume(workflow, workflow_id:)
+
+        assert_equal "terminated", run.status
+        assert_equal "operator stop at wait boundary", run.error
+        assert_equal 1, race_store.termination_requests
+        assert_equal ["canceled"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+        assert_equal ["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
 
