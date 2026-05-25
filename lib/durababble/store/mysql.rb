@@ -423,7 +423,11 @@ module Durababble
         execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, started_at, updated_at)
           VALUES (?, ?, ?, 'running', NOW(6), NOW(6))
-          ON DUPLICATE KEY UPDATE status = 'running', error = NULL, updated_at = NOW(6)
+          ON DUPLICATE KEY UPDATE
+            status = 'running',
+            error = NULL,
+            started_at = COALESCE(#{table("steps")}.started_at, NOW(6)),
+            updated_at = NOW(6)
         SQL
         attempt_id = SecureRandom.uuid
         execute_params(<<~SQL, [attempt_id, workflow_id, command_id, name])
