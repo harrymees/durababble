@@ -133,7 +133,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
           step :release_seat
         end
 
-        run = Durababble::Engine.new(store:, worker_id: "temporal-saga-worker", migrate: false).run(workflow, input: { "trip_id" => "trip-1" })
+        run = Durababble::Engine.new(store:, worker_id: "temporal-saga-worker").run(workflow, input: { "trip_id" => "trip-1" })
 
         assert_equal "failed", run.status
         assert_match(/TemporalExampleActivityError: ticket printer unavailable/, run.error)

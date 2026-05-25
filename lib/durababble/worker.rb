@@ -35,7 +35,7 @@ module Durababble
         end
 
         workflow = @workflows.fetch(claimed.fetch("name"))
-        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
         Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
         :worked
       end
@@ -86,7 +86,7 @@ module Durababble
     def process_workflow_activation(activation, advisory: false)
       workflow_id = activation.fetch("target_id")
       workflow = @workflows.fetch(activation.fetch("target_type"))
-      engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: false)
+      engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
       engine.drain_workflow_inbox(workflow, workflow_id:, claimed:) if claimed
       if advisory

@@ -18,7 +18,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "sleep" })
 
-        waiting = Durababble::Engine.new(store:, worker_id: "direct-wait", migrate: false).resume(workflow, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "direct-wait").resume(workflow, workflow_id:)
 
         assert_equal "waiting", waiting.status
         assert_equal [["sleep", "waiting"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
@@ -26,7 +26,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_equal ["step_scheduled", "step_waiting"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
 
         assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "direct-resume", migrate: false).resume(workflow, workflow_id:)
+        completed = Durababble::Engine.new(store:, worker_id: "direct-resume").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
         assert_equal({ "id" => "sleep", "slept" => true, "done" => true }, completed.result)
@@ -53,7 +53,6 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
             store:,
             worker_id: "direct-crasher",
             crash_after: :wait_recorded,
-            migrate: false,
           ).resume(workflow, workflow_id:)
         end
 
@@ -61,7 +60,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
 
         assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-        recovered = Durababble::Engine.new(store:, worker_id: "direct-recover", migrate: false).resume(workflow, workflow_id:)
+        recovered = Durababble::Engine.new(store:, worker_id: "direct-recover").resume(workflow, workflow_id:)
 
         assert_equal "completed", recovered.status
         assert_equal({ "id" => "timer", "slept" => true, "done" => true }, recovered.result)
@@ -82,12 +81,12 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wait" })
 
-        waiting = Durababble::Engine.new(store:, worker_id: "cancel-wait", migrate: false).resume(workflow, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "cancel-wait").resume(workflow, workflow_id:)
         assert_equal "waiting", waiting.status
 
         workflow.handle(workflow_id, store:).cancel(reason: "stop direct wait")
         assert_equal ["canceled"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
-        canceled = Durababble::Engine.new(store:, worker_id: "cancel-resume", migrate: false).resume(workflow, workflow_id:)
+        canceled = Durababble::Engine.new(store:, worker_id: "cancel-resume").resume(workflow, workflow_id:)
 
         assert_equal "canceled", canceled.status
         assert_equal 0, store.wake_due_timers(now: Time.now + 3601)
@@ -111,11 +110,11 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
 
-        waiting = Durababble::Engine.new(store:, worker_id: "condition-wait", migrate: false).resume(workflow, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "condition-wait").resume(workflow, workflow_id:)
         assert_equal "waiting", waiting.status
 
         assert_equal 1, store.wake_due_timers(now: Time.now + 2)
-        completed = Durababble::Engine.new(store:, worker_id: "condition-resume", migrate: false).resume(workflow, workflow_id:)
+        completed = Durababble::Engine.new(store:, worker_id: "condition-resume").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
         assert_equal({ "ready" => true, "checks" => 2 }, completed.result)
@@ -139,11 +138,11 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
 
-        waiting = Durababble::Engine.new(store:, worker_id: "condition-poll-wait", migrate: false).resume(workflow, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "condition-poll-wait").resume(workflow, workflow_id:)
         assert_equal "waiting", waiting.status
 
         assert_equal 1, store.wake_due_timers(now: Time.now + 2)
-        completed = Durababble::Engine.new(store:, worker_id: "condition-poll-resume", migrate: false).resume(workflow, workflow_id:)
+        completed = Durababble::Engine.new(store:, worker_id: "condition-poll-resume").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
         assert_equal({ "ready" => true, "checks" => 2 }, completed.result)
@@ -172,7 +171,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "async" })
 
-        waiting = Durababble::Engine.new(store:, worker_id: "async-wait", migrate: false).resume(workflow, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "async-wait").resume(workflow, workflow_id:)
 
         assert_equal "waiting", waiting.status
         assert_equal(
@@ -181,7 +180,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         )
 
         assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "async-resume", migrate: false).resume(workflow, workflow_id:)
+        completed = Durababble::Engine.new(store:, worker_id: "async-resume").resume(workflow, workflow_id:)
 
         assert_equal "completed", completed.status
         assert_equal [{ "id" => "async", "released" => true }, { "sibling" => "async" }], completed.result

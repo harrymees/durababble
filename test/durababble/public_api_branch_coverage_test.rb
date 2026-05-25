@@ -74,7 +74,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "covers explicit and pending workflow macros plus keyword step invocation with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_workflow") do |store|
-        run = Durababble::Engine.new(store:, migrate: false).run(
+        run = Durababble::Engine.new(store:).run(
           BranchTestWorkflow,
           input: { "plain" => "plain", "keyword" => "keyword" },
         )
@@ -135,7 +135,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           "idempotency_key" => "note:hello",
         )
 
-        drained = Durababble::Engine.new(store:, worker_id: "command-worker", migrate: false)
+        drained = Durababble::Engine.new(store:, worker_id: "command-worker")
           .drain_workflow_inbox(BranchTestWorkflow, workflow_id:)
         status, value = result_queue.pop
         caller.join
