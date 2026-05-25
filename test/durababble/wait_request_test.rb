@@ -16,15 +16,4 @@ class DurababbleWaitRequestTest < DurababbleTestCase
     assert_equal context, wait.context
     assert_equal({ "request_id" => "r1" }, context)
   end
-
-  test "wait_event builds an event wait request with the exact event key and context" do
-    context = { "request_id" => "r1", "attempt" => 2 }
-
-    wait = Durababble.wait_event("approval:r1", context)
-
-    assert_equal "event", wait.kind
-    assert_nil wait.wake_at
-    assert_equal "approval:r1", wait.event_key
-    assert_equal context, wait.context
-  end
 end

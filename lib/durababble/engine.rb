@@ -20,19 +20,36 @@ module Durababble
 
     #: (untyped, input: untyped) -> untyped
     def run(workflow_class, input:)
-      workflow_id = @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
-      resume(workflow_class, workflow_id:)
+      attributes = {
+        "durababble.workflow.name" => workflow_class.workflow_name,
+        "durababble.worker.id" => @worker_id,
+      }
+      Observability.trace("durababble.workflow.start", attributes) do
+        Observability.count("durababble.workflow.starts", attributes)
+        workflow_id = @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
+        resume(workflow_class, workflow_id:)
+      end
     end
 
     #: (untyped, workflow_id: untyped, ?claimed: untyped) -> untyped
     def resume(workflow_class, workflow_id:, claimed: nil)
-      current = claimed || @store.workflow(workflow_id)
-      return run_from_row(current) if ["completed", "canceled"].include?(current.fetch("status"))
+      attributes = {
+        "durababble.workflow.id" => workflow_id,
+        "durababble.workflow.name" => workflow_class.workflow_name,
+        "durababble.worker.id" => @worker_id,
+      }
+      Observability.trace("durababble.workflow.resume", attributes) do
+        current = claimed || @store.workflow(workflow_id)
+        return run_from_row(current) if terminal_workflow_row?(current)
 
-      claimed ||= @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
-      raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
+        owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+        unless owned_claim
+          Observability.count("durababble.leases.conflicts", attributes.merge("durababble.lease.owner" => @worker_id))
+          raise LeaseConflict, "workflow #{workflow_id} is leased by another worker"
+        end
 
-      execute(workflow_class, workflow_id:, initial_input: claimed.fetch("input"))
+        execute(workflow_class, workflow_id:, initial_input: owned_claim.fetch("input"))
+      end
     end
 
     #: (untyped, workflow_id: untyped, ?claimed: untyped, ?limit: untyped) -> untyped
@@ -69,9 +86,7 @@ module Durababble
 
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
+      WorkflowStatus.terminal?(row)
     end
 
     #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped
@@ -98,41 +113,57 @@ module Durababble
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
-      workflow = nil #: untyped
-      root_error = nil #: StandardError?
-      root = Async do |root_task|
-        history = @store.workflow_history_for(workflow_id)
-        execution = WorkflowExecution.new(
-          store: @store,
-          workflow_id:,
-          worker_id: @worker_id,
-          lease_seconds: @lease_seconds,
-          history:,
-          root_task:,
-          crash_after: @crash_after,
-        )
-        workflow = workflow_class.new
-        workflow.__durababble_execution__ = execution
-        result = WorkflowExecutionContext.with_current(execution) do
-          workflow.execute(initial_input || initial_context(workflow_id))
-        end
-        WorkflowExecutionContext.with_current(execution) do
-          execution.validate_replay_complete!
-          assert_workflow_lease!(workflow_id)
-          if execution.cancellation_delivered?
-            @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:)
-          else
-            @store.complete_workflow(workflow_id, result:)
+      attributes = {
+        "durababble.workflow.id" => workflow_id,
+        "durababble.workflow.name" => workflow_class.workflow_name,
+        "durababble.worker.id" => @worker_id,
+      }
+      Observability.trace("durababble.workflow.execute", attributes) do
+        workflow = nil #: untyped
+        root_error = nil #: StandardError?
+        root = Async do |root_task|
+          history = @store.workflow_history_for(workflow_id)
+          Observability.record(
+            "durababble.workflow.history.steps",
+            history.count { |event| event.fetch("kind") == "step_completed" },
+            attributes,
+          )
+          execution = WorkflowExecution.new(
+            store: @store,
+            workflow_id:,
+            worker_id: @worker_id,
+            lease_seconds: @lease_seconds,
+            history:,
+            root_task:,
+            crash_after: @crash_after,
+          )
+          workflow = workflow_class.new
+          workflow.__durababble_execution__ = execution
+          result = WorkflowExecutionContext.with_current(execution) do
+            workflow.execute(initial_input || initial_context(workflow_id))
           end
+          WorkflowExecutionContext.with_current(execution) do
+            execution.validate_replay_complete!
+            assert_workflow_lease!(workflow_id)
+            if execution.cancellation_delivered?
+              @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
+              Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+            else
+              @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
+              Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+            end
+          end
+          crash!(:workflow_completed)
+        rescue StandardError => e
+          root_error = e
         end
-        crash!(:workflow_completed)
-      rescue StandardError => e
-        root_error = e
-      end
-      root.wait
-      raise root_error if root_error
+        root.wait
+        raise root_error if root_error
 
-      snapshot(workflow_id)
+        snapshot(workflow_id)
+      ensure
+        workflow.__durababble_execution__ = nil if workflow
+      end
     rescue WorkflowSuspended
       @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
       snapshot(workflow_id)
@@ -140,17 +171,17 @@ module Durababble
       snapshot(workflow_id)
     rescue CancellationError => e
       assert_workflow_lease!(workflow_id)
-      @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil)
+      @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
+      Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
       snapshot(workflow_id)
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
       message = "#{e.class}: #{e.message}"
       assert_workflow_lease!(workflow_id)
-      @store.fail_workflow(workflow_id, error: message)
+      @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
+      Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)
-    ensure
-      workflow.__durababble_execution__ = nil if workflow
     end
 
     #: (untyped) -> untyped

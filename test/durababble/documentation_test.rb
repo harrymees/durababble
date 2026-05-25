@@ -30,6 +30,8 @@ class DurababbleDocumentationTest < DurababbleTestCase
     assert_includes rbs, "def self.at: (String workflow_id"
     assert_includes rbs, "def self.at: (Id durable_id"
     assert_includes rbs, "def self.ref: (Id durable_id"
+    assert_includes rbs, "def self.at: (Id durable_id"
+    assert_includes rbs, "def self.tell: (Id durable_id"
   end
 
   test "evaluates README examples against the implemented public API" do

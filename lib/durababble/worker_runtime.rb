@@ -9,7 +9,7 @@ module Durababble
     DEFAULT_SHUTDOWN_TIMEOUT = 10
 
     #: untyped
-    attr_reader :store, :workflows, :worker_pool, :worker_id, :last_error, :rpc_address
+    attr_reader :store, :workflows, :objects, :worker_pool, :worker_id, :last_error, :rpc_address
 
     class << self
       #: (**untyped) -> untyped
@@ -19,10 +19,11 @@ module Durababble
       end
     end
 
-    #: (workflows: untyped, worker_pool: untyped, ?store: untyped, ?database_url: untyped, ?schema: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?poll_interval: untyped, ?migrate: untyped, ?rpc_host: untyped, ?rpc_port: untyped, ?rpc_credentials: untyped, ?rpc_pool_size: untyped) -> void
+    #: (workflows: untyped, worker_pool: untyped, ?objects: untyped, ?store: untyped, ?database_url: untyped, ?schema: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?poll_interval: untyped, ?migrate: untyped, ?rpc_host: untyped, ?rpc_port: untyped, ?rpc_credentials: untyped, ?rpc_pool_size: untyped) -> void
     def initialize(
       workflows:,
       worker_pool:,
+      objects: [],
       store: nil,
       database_url: nil,
       schema: nil,
@@ -43,6 +44,7 @@ module Durababble
       @store = store || Store.connect(database_url:, schema:)
       @owns_store = store.nil?
       @workflows = workflows
+      @objects = objects
       @worker_pool = worker_pool
       @worker_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
       @lease_seconds = lease_seconds
@@ -70,9 +72,14 @@ module Durababble
         @stopping = false
         @last_error = nil
         @deliveries.clear
+        Observability.count(
+          "durababble.worker.runtime.starts",
+          "durababble.worker.pool" => @worker_pool,
+          "durababble.worker.id" => @worker_id,
+        )
         start_rpc_server
         worker = begin
-          Worker.new(store: @store, workflows: @workflows, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
+          Worker.new(store: @store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
         rescue StandardError
           stop_rpc_server
           raise
@@ -94,13 +101,20 @@ module Durababble
         return :stopped
       end
 
+      attributes = {
+        "durababble.worker.pool" => @worker_pool,
+        "durababble.worker.id" => @worker_id,
+      }
       if thread.join(timeout)
         stop_rpc_server
+        Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "stopped"))
         return :stopped
       end
 
-      @store.release_worker_leases!(worker_id: @worker_id)
+      released = @store.release_worker_leases!(worker_id: @worker_id)
       stop_rpc_server
+      Observability.count("durababble.leases.expired_recovery", attributes, by: released.fetch("workflows", 0).to_i)
+      Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "timeout"))
       :timeout
     end
 

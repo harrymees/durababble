@@ -7,6 +7,7 @@ require "thread"
 require_relative "command_future"
 require_relative "execution_context"
 require_relative "workflow_replay_history"
+require_relative "workflow_step_runner"
 
 module Durababble
   class WorkflowExecution
@@ -27,6 +28,21 @@ module Durababble
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
       @cancellation_delivered = false
+      @step_runner = WorkflowStepRunner.new(
+        store: @store,
+        workflow_id: @workflow_id,
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        root_task: @root_task,
+        futures: @futures,
+        step_contexts: @step_contexts,
+        synchronize_store: ->(&block) { synchronize_store(&block) },
+        raise_if_cancel_requested: -> { raise_if_cancel_requested! },
+        assert_workflow_lease: -> { assert_workflow_lease! },
+        suspend_workflow_immediately: -> { suspend_workflow_immediately? },
+        retry_run_at: ->(delay) { retry_run_at(delay) },
+        crash: ->(point) { crash!(point) },
+      )
       register_workflow_task(root_task)
     end
 
@@ -74,22 +90,80 @@ module Durababble
     def call_step(instance, method_name:, args:, kwargs:, &block)
       assert_workflow_task!("durable step #{method_name}")
       step = instance.class.step_definition(method_name)
-      shape = command_shape(step:, args:, kwargs:)
+      shape = step_command_shape(step:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
       command_id, future = synchronize_store do
         command_id = @next_command_id
         @next_command_id += 1
         future = CommandFuture.new(command_id)
         @futures[command_id] = future
-        schedule_command!(command_id, step:, shape:)
+        schedule_command!(command_id, name: step.name, shape:)
         [command_id, future]
       end
+      attributes = step_attributes(instance, step:, command_id:)
+      Observability.count("durababble.workflow.replay.steps", attributes) if @replay_history.terminal_recorded?(command_id)
 
-      dispatch_command!(command_id, step:, shape:, &block) unless @replay_history.terminal_recorded?(command_id)
+      dispatch_command!(command_id, step:, attributes:, &block) unless @replay_history.terminal_recorded?(command_id)
       deliver_recorded_resolutions!
       result = await_command_future(future, command_id)
       raise_if_cancel_requested!
       result
+    end
+
+    #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped) -> untyped
+    def call_wait(wait_request, name:, args: [], kwargs: {})
+      assert_workflow_task!("durable wait #{name}")
+      shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
+      raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
+      command_id, future = synchronize_store do
+        command_id = @next_command_id
+        @next_command_id += 1
+        future = CommandFuture.new(command_id)
+        @futures[command_id] = future
+        schedule_command!(command_id, name:, shape:)
+        [command_id, future]
+      end
+
+      record_wait_command!(command_id, name:, wait_request:) unless @replay_history.terminal_recorded?(command_id)
+      deliver_recorded_resolutions!
+      result = await_command_future(future, command_id)
+      raise_if_cancel_requested!
+      result
+    end
+
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      loop do
+        if scheduled_history_for_next_command?
+          wait_request = WaitRequest.new(
+            kind: "timer",
+            wake_at: wait_condition_wake_at(timeout),
+            event_key: nil,
+            context: {},
+          )
+          call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
+          return !!block.call if timeout
+
+          next
+        end
+
+        raise_if_cancel_requested!
+        return true if block.call
+
+        wait_request = WaitRequest.new(
+          kind: "timer",
+          wake_at: wait_condition_wake_at(timeout),
+          event_key: nil,
+          context: {},
+        )
+        call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
+        return !!block.call if timeout
+      end
+    end
+
+    #: (untyped) -> untyped
+    def timer_after(duration)
+      retry_run_at(duration)
     end
 
     #: () -> void
@@ -116,13 +190,40 @@ module Durababble
       raise Error, "#{operation} must run inside a Durababble-managed workflow task"
     end
 
+    #: (?untyped, step: untyped, command_id: untyped) -> untyped
+    def step_attributes(instance = nil, step:, command_id:)
+      attributes = {
+        "durababble.workflow.id" => @workflow_id,
+        "durababble.step.name" => step.name,
+        "durababble.step.index" => command_id,
+        "durababble.worker.id" => @worker_id,
+      }
+      attributes["durababble.workflow.name"] = instance.class.workflow_name if instance
+      attributes
+    end
+
     #: (step: untyped, args: untyped, kwargs: untyped) -> untyped
-    def command_shape(step:, args:, kwargs:)
+    def step_command_shape(step:, args:, kwargs:)
       {
         "name" => step.name,
         "args" => args,
         "kwargs" => kwargs,
         "retry" => retry_shape(step.retry_policy),
+      }
+    end
+
+    #: (name: untyped, wait_request: untyped, args: untyped, kwargs: untyped) -> untyped
+    def wait_command_shape(name:, wait_request:, args:, kwargs:)
+      {
+        "name" => name,
+        "args" => args,
+        "kwargs" => kwargs,
+        "wait" => {
+          "kind" => wait_request.kind,
+          "event_key" => wait_request.event_key,
+          "wake_at" => replay_stable_wait_wake_at(name, wait_request),
+          "context" => wait_request.context,
+        },
       }
     end
 
@@ -138,115 +239,50 @@ module Durababble
       }
     end
 
-    #: (untyped, step: untyped, shape: untyped) -> void
-    def schedule_command!(command_id, step:, shape:)
+    #: (untyped, name: untyped, shape: untyped) -> void
+    def schedule_command!(command_id, name:, shape:)
       return if @replay_history.validate_scheduled_shape!(workflow_id: @workflow_id, command_id:, shape:)
 
       @store.record_step_scheduled(
         workflow_id: @workflow_id,
         command_id:,
-        name: step.name,
+        name:,
         args: shape.fetch("args"),
         kwargs: shape.fetch("kwargs"),
-        metadata: { "retry" => shape.fetch("retry") },
+        metadata: shape.reject { |key, _value| ["name", "args", "kwargs"].include?(key) },
+        worker_id: @worker_id,
       )
       crash!(:step_scheduled)
-      @replay_history.remember_scheduled(command_id, step_name: step.name, shape:)
+      @replay_history.remember_scheduled(command_id, step_name: name, shape:)
     end
 
-    #: (untyped, step: untyped, shape: untyped) { -> untyped } -> void
-    def dispatch_command!(command_id, step:, shape:, &block)
-      @root_task.async(transient: true) do |task|
-        raise_if_cancel_requested!
-        synchronize_store do
-          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name)
-        end
-        crash!(:step_started)
-        attempt_number = synchronize_store do
-          @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
-        end
-        step_context = StepContext.new(
+    #: (untyped, step: untyped, attributes: untyped) { -> untyped } -> void
+    def dispatch_command!(command_id, step:, attributes:, &block)
+      @step_runner.dispatch(command_id, step:, attributes:, &block)
+    end
+
+    #: (untyped, name: untyped, wait_request: untyped) -> void
+    def record_wait_command!(command_id, name:, wait_request:)
+      assert_workflow_lease!
+      suspend_workflow = suspend_workflow_immediately?
+      synchronize_store do
+        @store.record_wait(
           workflow_id: @workflow_id,
-          step_index: command_id,
-          attempt_number:,
-          idempotency_key: "durababble:v1:workflow:#{@workflow_id}:step:#{command_id}",
-          heartbeat: build_heartbeat(command_id),
+          command_id:,
+          name:,
+          wait_request:,
+          suspend_workflow:,
+          worker_id: @worker_id,
         )
-        @step_contexts[task] = step_context
-
-        output = StepExecutionContext.with_current(step_context) { block.call }
-        if output.is_a?(WaitRequest)
-          assert_workflow_lease!
-          suspend_workflow = suspend_workflow_immediately?
-          synchronize_store do
-            @store.record_wait(
-              workflow_id: @workflow_id,
-              command_id:,
-              name: step.name,
-              wait_request: output,
-              suspend_workflow:,
-            )
-          end
-          crash!(:wait_recorded)
-          error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-          @futures.fetch(command_id).reject(error)
-          next
-        end
-
-        assert_workflow_lease!
-        synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output) }
-        crash!(:step_completed)
-        raise_if_cancel_requested!
-        @futures.fetch(command_id).resolve(output)
-      rescue StandardError => e
-        if e.is_a?(CancellationError)
-          assert_workflow_lease!
-          synchronize_store do
-            @store.record_step_canceled(
-              workflow_id: @workflow_id,
-              command_id:,
-              error: "#{e.class}: #{e.message}",
-            )
-          end
-          @futures.fetch(command_id).reject(e)
-          next
-        end
-        if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
-          @futures.fetch(command_id).reject(e)
-          next
-        end
-        if e.is_a?(WorkflowSuspended) || e.is_a?(StepRetryScheduled) || e.is_a?(NonDeterminismError)
-          @futures.fetch(command_id).reject(e)
-          next
-        end
-
-        error = handle_step_error(e, command_id:, step:)
-        @futures.fetch(command_id).reject(error)
-      ensure
-        @step_contexts.delete(task)
       end
+      crash!(:wait_recorded)
+      error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
+      @futures.fetch(command_id).reject(error)
     end
 
     #: () -> bool
     def suspend_workflow_immediately?
       @workflow_task_count <= 1
-    end
-
-    #: (untyped, command_id: untyped, step: untyped) -> untyped
-    def handle_step_error(error, command_id:, step:)
-      message = "#{error.class}: #{error.message}"
-      assert_workflow_lease!
-      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message) }
-      attempt_number = synchronize_store do
-        @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
-      end
-      return error unless step.retry_policy.retryable?(error, attempt_number:)
-
-      delay = step.retry_policy.delay_for_attempt(attempt_number)
-      synchronize_store do
-        @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: retry_run_at(delay))
-      end
-      StepRetryScheduled.new(message)
     end
 
     #: (untyped, untyped) -> untyped
@@ -312,22 +348,6 @@ module Durababble
       !@replay_history.recorded_schedule_matches?(@next_command_id, shape)
     end
 
-    #: (untyped) -> untyped
-    def build_heartbeat(command_id)
-      Heartbeat.new(
-        cursor: synchronize_store { @store.step_heartbeat_cursor(workflow_id: @workflow_id, command_id:) },
-        recorder: lambda do |cursor|
-          renewed = synchronize_store do
-            @store.heartbeat_step(workflow_id: @workflow_id, command_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, cursor:)
-          end
-          raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before heartbeat" unless renewed
-
-          raise_if_cancel_requested!
-          true
-        end,
-      )
-    end
-
     #: () -> untyped
     def assert_workflow_lease!
       return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
@@ -338,6 +358,23 @@ module Durababble
     #: (untyped) -> untyped
     def retry_run_at(delay)
       @store.current_time + delay
+    end
+
+    #: (untyped) -> untyped
+    def wait_condition_wake_at(timeout)
+      timeout ? @store.current_time + timeout : @store.current_time + 1
+    end
+
+    #: () -> bool
+    def scheduled_history_for_next_command?
+      !!@replay_history.recorded_schedule(@next_command_id)
+    end
+
+    #: (untyped, untyped) -> untyped
+    def replay_stable_wait_wake_at(name, wait_request)
+      return if ["sleep", "wait_condition"].include?(name.to_s)
+
+      wait_request.wake_at
     end
 
     #: () { -> untyped } -> untyped

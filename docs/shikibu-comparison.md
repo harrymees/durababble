@@ -29,7 +29,7 @@ My recommendation: keep Durababble as the correctness/coordination laboratory an
 | Storage                   | hand-written `pg` SQL, one schema, Paquito `bytea` runtime columns                                                          | Sequel over SQLite/PostgreSQL/MySQL, shared schema submodule, JSON text plus optional binary columns                     | Shikibu for portability; Durababble for binary storage/YSQL-specific control                        |
 | Recovery model            | step table + append-only attempts; skip completed steps; retry incomplete rows                                              | deterministic replay from `workflow_history`; cached activity results by activity id                                     | Shikibu has the more conventional Temporal/Edda model; Durababble has explicit step-state semantics |
 | Multi-worker coordination | workflow leases, `FOR UPDATE SKIP LOCKED`, heartbeats, stale lease recovery                                                 | distributed locks on workflow instances, stale lock cleanup, leader election for background tasks                        | Shikibu has fuller runtime orchestration; Durababble has clearer lease/RPC invariants               |
-| Waiting                   | timer waits and external event waits                                                                                        | timer sleep, wait_event, channel messaging, direct/competing/broadcast delivery                                          | Shikibu substantially better                                                                        |
+| Waiting                   | durable timer waits                                                                                                         | timer sleep, external-wait helper, channel messaging, direct/competing/broadcast delivery                               | Shikibu substantially broader                                                                       |
 | Side effects              | idempotency fences and durable outbox, but no crash recovery for running fences yet                                         | activity history caching, saga compensation, transactional outbox relayer                                                | Different emphasis; Shikibu better for app patterns, Durababble more explicit about fence semantics |
 | Messaging                 | lease-routed workflow RPC through current owner                                                                             | channel messaging + CloudEvents/Rack + PostgreSQL NOTIFY                                                                 | Shikibu better external/app messaging; Durababble has a unique owner-routed RPC idea                |
 | Testing                   | real Yugabyte integration suite, crash harness, DST-style deterministic simulator, SimpleCov thresholds, benchmark workflow | unit tests, PostgreSQL/MySQL integration tests in CI, examples, RuboCop                                                  | Durababble stronger on explicit failure-model proof; Shikibu broader coverage/examples              |
@@ -125,7 +125,7 @@ Shikibu's core model:
 
 Shikibu's strongest choices:
 
-1. **Much better developer API.** Subclassing a workflow and writing normal-looking `execute` code with `activity`, `sleep`, `wait_event`, `publish`, and `receive` is more likely to be adopted than Durababble's context-step DSL.
+1. **Much better developer API.** Subclassing a workflow and writing normal-looking `execute` code with `activity`, `sleep`, external waits, `publish`, and `receive` is more likely to be adopted than Durababble's context-step DSL.
 2. **Activity/result history replay.** The `activity` abstraction is the key API primitive Durababble lacks. It maps directly to durable execution mental models.
 3. **Saga compensation.** `on_failure` registers named compensations; `ReplayEngine` can resume compensating workflows from DB state.
 4. **Typed workflows.** Optional `dry-struct`/Data-like input/output validation is a strong ergonomics and correctness feature.
@@ -133,7 +133,7 @@ Shikibu's strongest choices:
 6. **Integrations and ops surface.** Rack, Rails docs, Sidekiq/ActiveJob examples, CloudEvents endpoints, status/result/cancel endpoints, health checks, CI, release workflow, and docs structure make this feel like a product.
 7. **Background runtime.** A real app object and worker threads solve things Durababble still leaves as `tick` loops.
 8. **PostgreSQL wakeups.** LISTEN/NOTIFY reduces polling latency/load for PostgreSQL deployments.
-9. **Channel messaging.** Broadcast, competing, and direct modes are a bigger concept than Durababble's event waits.
+9. **Channel messaging.** Broadcast, competing, and direct modes are a bigger messaging concept than Durababble currently exposes.
 10. **Shared schema/ecosystem.** Compatibility with Edda/Romancy is strategically valuable.
 
 Shikibu weaknesses / caution areas:
@@ -194,12 +194,12 @@ Decision point: if Durababble wants to be a product, add SQLite dev support. If 
 
 ### 4. Waiting and messaging
 
-Durababble supports timer waits and external event waits with transactional wakeup and concurrent signal protection. It also has lease-routed workflow RPC, which is unique and useful for sending commands to the current owner.
+Durababble supports timer waits with transactional wakeup protection. It also has lease-routed workflow RPC, which is unique and useful for sending commands to the current owner.
 
 Shikibu has a much richer messaging story:
 
 - `sleep` / `sleep_until`
-- `wait_event`
+- external wait helper
 - `subscribe` / `receive` / `try_receive`
 - `publish`
 - `send_to`

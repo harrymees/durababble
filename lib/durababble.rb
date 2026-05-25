@@ -4,6 +4,8 @@
 require "digest"
 
 require_relative "durababble/version"
+require_relative "durababble/statuses"
+require_relative "durababble/observability"
 
 module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
@@ -63,6 +65,16 @@ module Durababble
       @default_store = Store.connect(database_url:, schema:)
     end
 
+    #: (?enabled: untyped, ?attributes: untyped) -> untyped
+    def configure_observability(enabled: false, attributes: {})
+      Observability.configure(enabled:, attributes:)
+    end
+
+    #: () -> untyped
+    def observability
+      Observability.configuration
+    end
+
     #: () -> untyped
     def store
       @default_store || raise(Error, "Durababble.store is not configured; pass store: or call Durababble.configure")
@@ -70,12 +82,31 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
-      WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      wait_request = WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_wait(wait_request, name: "wait_until", args: [time, context])
+      end
+
+      wait_request
     end
 
+    alias_method :sleep_until, :wait_until
+
     #: (untyped, ?untyped) -> untyped
-    def wait_event(event_key, context = {})
-      WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
+    def sleep(duration, context = {})
+      execution = WorkflowExecutionContext.current
+      return Kernel.sleep(duration) unless execution
+
+      wait_request = WaitRequest.new(kind: "timer", wake_at: execution.timer_after(duration), event_key: nil, context:)
+      execution.call_wait(wait_request, name: "sleep", args: [duration, context])
+    end
+
+    #: (?timeout: untyped) { -> bool } -> bool
+    def wait_condition(timeout: nil, &block)
+      execution = WorkflowExecutionContext.current
+      raise Error, "wait_condition must run inside workflow orchestration" unless execution
+
+      execution.wait_condition(timeout:, &block)
     end
 
     private

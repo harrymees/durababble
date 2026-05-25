@@ -4,10 +4,10 @@ Durababble is durable executor for workflows and durable objects. It is for work
 
 The library gives you two primitives:
 
-| Primitive         | Use it for                                                                       | Current API                                                                                                               |
-| ----------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.at`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref` |
-| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.at`, `DurableObject.ref`, `expose`, `expose_command`                                  |
+| Primitive         | Use it for                                                                       | Current API                                                                                                                                 |
+| ----------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Durable workflows | One-off executions with durable steps, waits, retries, cancellation, and results | `Durababble::Workflow`, `Workflow.start`, `Workflow.at`, `Workflow.handle`, `Durababble::Engine#run`, `Workflow.enqueue`, `Workflow.ref`   |
+| Durable objects   | Long-lived instances with durable state, like Cloudflare's Durable Objects       | `Durababble::DurableObject`, `DurableObject.at`, `DurableObject.ref`, `DurableObject.tell`, `expose`, `expose_command`                    |
 
 Detailed guarantees live in [docs/spec.md](docs/spec.md) and [docs/architecture.md](docs/architecture.md).
 
@@ -43,7 +43,7 @@ Use a durable workflow when you want to describe a process from beginning to end
 
 Good workflow-shaped examples include charging then shipping an order, importing a large CSV across several API calls, running a complicated LLM agent turn with tool calls till completion, or an automated review process that sometimes has a human-in-the-loop approval step. The key sign is that the work has a start, an expected finish, and a sequence of durable side effects you do not want to accidentally repeat.
 
-Because they are durable, durable workflows can sleep for many days, or await some event that might take a long time to occur. Durable workflows can be cancelled mid execution, and can return a result to callers.
+Because they are durable, durable workflows can sleep for many days, accept durable command RPCs from other processes, be cancelled mid execution, and return a result to callers.
 
 <!-- README:workflow-example:start -->
 
@@ -161,24 +161,19 @@ handle.cancel(reason: "customer requested cancellation")
 
 ### Sleeping
 
-A workflow can park itself without keeping a worker thread busy. There are two different shapes:
+A workflow can park itself until a specific time without keeping a worker thread busy.
 
-- `wait_until(time, context)` is a timer wait. Use it when the workflow should resume at or after a known time.
-- `wait_event(event_key, context)` is an external event wait. Use it when the workflow should resume only after another process records a matching event with `store.signal_event`.
+Use `wait_until(time, context)` when the workflow should resume at or after a known time.
 
-Under the hood, Durababble stores the wait, releases the worker lease, and resumes the workflow later after the timer or event is completed.
+Under the hood, Durababble stores the timer wait, releases the worker lease, and resumes the workflow after the timer is due.
 
 Timer waits are useful for reminders, delayed retries that are part of business logic, cooling-off periods, scheduled followups, or "do not continue before this time" gates:
 
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    after_delay = sleep_until_reminder_time(reminder)
+    after_delay = sleep_until(reminder.fetch("send_at"), reminder)
     send_reminder(after_delay)
-  end
-
-  step def sleep_until_reminder_time(reminder)
-    wait_until(reminder.fetch("send_at"), reminder)
   end
 
   step def send_reminder(reminder)
@@ -191,30 +186,35 @@ class SendReminderAfterDelay < Durababble::Workflow
 end
 ```
 
-Event waits are useful when the workflow cannot know its resume time up front: human approval, webhook delivery, a batch import finishing elsewhere, or another durable entity signaling that some state changed.
+When the workflow cannot know its next action up front because it depends on human approval, webhook delivery, a batch import finishing elsewhere, or another durable entity changing state, expose a workflow command RPC for that transition. The command is durable, routed to the workflow owner, and can warm the workflow on a worker before it runs; if the workflow does not exist or is terminal, the command fails instead of being buffered for a future target.
 
 ```ruby
 class AwaitOrderApproval < Durababble::Workflow
+  attr_reader :approval
+
   def execute(order)
-    approval = wait_for_approval(order)
+    approval = wait_for_approval
     apply_approval(order, approval)
   end
 
-  step def wait_for_approval(order)
-    wait_event("approval:#{order.fetch("id")}", order)
+  def wait_for_approval
+    Durababble::Workflow.wait_condition { approval }
   end
 
   step def apply_approval(order, approval)
     order.merge("approved" => approval.fetch("approved"))
   end
+
+  expose_command def approve(approved:)
+    @approval = { "approved" => approved }
+  end
 end
 
-store.signal_event("approval:ord_123", payload: { "approved" => true })
+handle = AwaitOrderApproval.handle(run_id, store:)
+handle.approve(approved: true)
 ```
 
-The `context` you pass to `wait_until` or `wait_event` is the base value Durababble resumes with when the wait completes. For event waits, the signal payload is merged into that resumed value, which is how the approval example receives `"approved" => true`.
-
-The current implementation records waits through step history, so the examples return waits from small step methods. That is an implementation limitation, not the ideal public shape; workflow waits should become workflow-level yield points. Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow.
+The `context` you pass to `sleep_until` or `wait_until` is the base value Durababble resumes with when the wait completes. Direct waits are durable workflow yield points: they schedule replay-checked workflow history, persist a wait row, release the worker lease at a safe suspension point, and resume the waiting workflow fiber when the timer completes. Do not use `Thread.sleep` in workflow orchestration code, because that actually blocks the worker thread instead of durably parking the workflow.
 
 ### Cancellation
 
@@ -293,9 +293,9 @@ end
 
 Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
-### Workflow event log length
+### Workflow History Length
 
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, and replay will take very long, and system performance will suffer.
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded history will grow to be very long, and replay will take very long, and system performance will suffer.
 
 Prefer durable objects for long-lived identities, and prefer splitting very large jobs into a workflow per bounded batch or phase.
 
@@ -313,7 +313,7 @@ Durable objects are for state with a durable identity. Think of one like a class
 
 Good object-shaped work includes an account in a bank, a cart, a chatroom, or a small state machine that other entities need to coordinate with. The key sign is that the id matters: all callers talking about `acct_123`, `cart_456`, or `channel-tmp-durable-execution-discussions` should see and update the same durable state.
 
-Durababble then helps you RPC to these objects to read or write the state within them. Durababble's RPC layer correctly routes your messages to the worker where a durable object is currently live, and instantiates it or retrieves it from storage if it isn't already live. 
+Durababble then helps you send durable commands to these objects and read the latest persisted state. Commands are committed to the object's mailbox and processed by workers registered for that object type.
 
 You can safely create many many thousands of object instances, and rely on Durababble's orchestration to move the instances in and out of durable storage as they send and recieve messages. A durable object doesn't have a fixed footprint resource requirement, as when it is inactive, it's just a row in the DB recording what state the entity with that ID is currently in.
 
@@ -345,7 +345,17 @@ store ||= Durababble::Store.connect(database_url: Durababble.default_database_ur
 store.migrate!
 
 account = Account.ref("acct_readme", store:)
-account.credit(1_000)
+Account.tell("acct_readme", :credit, 1_000, store:)
+
+worker = Durababble::Worker.new(
+  store:,
+  workflows: {},
+  objects: [Account],
+  worker_id: "account-worker-1",
+  migrate: false,
+)
+worker.run_until_idle
+
 account.balance
 ```
 
@@ -364,8 +374,8 @@ Commands can mutate state on the object, and are thusly processed in serial and 
 
 ```ruby
 account = Account.ref("acct_123", store:)
-account.credit(1_000) # durable command: this call is written to the database and eventually processed even in the face of crashes
-account.balance       # query: reads latest persisted state
+Account.tell("acct_123", :credit, 1_000, store:) # durable command: this call is written to the database and eventually processed by an object worker
+account.balance                                # query: reads latest persisted state
 ```
 
 Use `expose` for simple RPCs such as `balance`, `status`, `members`, or `current_cursor`. Use `expose_command` for changes such as `credit`, `join`, `append_message`, `advance_cursor`, or `close`. Command methods can use `command_context.idempotency_key` when calling external systems, and command retry policy is declared on the method the same way workflow step retry policy is.
@@ -400,3 +410,72 @@ Background jobs are still the right tool for simple, short, idempotent work: sen
 Durababble is for the cases where a single retry loop becomes the hard part. If a job charges a card, writes a record, waits for a webhook, calls another service, and then ships an order, a crash in the middle forces you to rebuild durable progress tracking yourself. You end up adding status columns, idempotency keys, retry schedules, leases, recovery scans, cancellation flags, and custom "what step was I on?" logic.
 
 Durababble makes those pieces part of the programming model. Workflows persist step history and resume from durable boundaries. Durable objects keep id-addressed state behind query and command methods. RPC-style handles let other code ask durable entities for status or send durable commands without reaching into worker memory. The goal is not to replace every job; it is to make the stateful, multi-step, long-lived jobs explicit and recoverable.
+
+## OpenTelemetry Observability
+
+Durababble observability is optional and disabled by default. Disabled instrumentation only executes cheap no-op checks. Durababble depends on the official OpenTelemetry API gems for tracing and metrics, but it does not choose or configure an SDK, collector, or exporter.
+
+Applications that already configure the OpenTelemetry SDK can enable Durababble instrumentation against the global OpenTelemetry providers:
+
+```ruby
+require "opentelemetry/sdk"
+require "opentelemetry/exporter/otlp"
+
+OpenTelemetry::SDK.configure do |c|
+  c.service_name = "my-app"
+  c.use_all
+end
+
+Durababble.configure_observability(
+  enabled: true,
+  attributes: { "deployment.environment" => ENV.fetch("RACK_ENV", "development") },
+)
+```
+
+If `enabled: true` is used before an SDK is configured, OpenTelemetry's API-level no-op providers are used. That lets tests and local runs exercise instrumentation without a collector while production apps can add `opentelemetry-sdk`, `opentelemetry-metrics-sdk`, and exporters in their own boot code.
+
+Local OTLP smoke example:
+
+```sh
+docker run --rm -p 4317:4317 -p 4318:4318 otel/opentelemetry-collector:latest
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 mise exec -- bundle exec ruby examples/your_app.rb
+```
+
+Stable spans include `durababble.workflow.start`, `durababble.workflow.resume`, `durababble.workflow.execute`, `durababble.workflow.step`, `durababble.object.query`, `durababble.object.command.enqueue`, `durababble.object.command`, `durababble.workflow_rpc.route`, `durababble.workflow_rpc.handle`, `durababble.rpc.client.*`, and `durababble.rpc.server.*`. Durababble does not wrap ActiveRecord SQL execution in its own spans; applications should use standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility.
+Stable metrics include workflow start/completion/failure counters, step attempt/success/failure/retry counters, wait start/completion counters and latency histograms, queue claim latency, lease heartbeat/conflict/recovery counters, outbox pending/processed counters, worker tick duration/counts, and workflow replay/history size measurements. Applications should use ActiveRecord/database OpenTelemetry instrumentation for SQL operation latency/error metrics.
+
+## Prototype Boundaries
+
+The README describes the implemented prototype. The spec also records the intended public direction so reviewers can distinguish current behavior from target behavior.
+
+- Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, class-method enqueueing, and current `Workflow.start` / `Workflow.handle` aliases.
+- First-class cooperative workflow cancellation through `Workflow.handle(...).cancel(reason:)`, persisted cancellation requests, `canceling` / `canceled` states, and replay-safe cleanup steps.
+- Class-oriented durable object API with `ref`, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
+- PostgreSQL/YSQL and MySQL/MariaDB store implementations.
+- Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
+- Worker polling with leased workflow claims.
+- Heartbeats, stale lease recovery, and lease-aware resume.
+- Timer waits, side-effect fences, and durable outbox primitives.
+- Retry due-time claims distinguish retryable failures from terminal failed workflows.
+- Lease-routed workflow RPC helpers.
+- Deterministic simulation tests for workflow safety and crash-recovery scenarios.
+
+- `DurableObject.at` and `DurableObject.tell` are the preferred future durable-object spellings. The current durable-object implementation still uses `DurableObject.ref`; workflow code supports both `Workflow.start` / `Workflow.handle` and lower-level `Workflow.enqueue` / `Workflow.ref` / `Engine#run`.
+- Workflow command methods currently persist durable inbox rows, execute command bodies through the workflow owner, and return command results to synchronous callers.
+- Workflow `wait_condition` is implemented as a timer-backed durable wait. Broader broadcast-style delivery concepts are intentionally out of scope.
+- Durable-object commands persist command rows and execute inline in the current prototype. Per-object FIFO mailbox leasing, async `tell`, sleeps, and worker-driven object execution are target work.
+- Fences deduplicate side effects after a fence row is inserted, but fence-owner crash recovery is not complete.
+- The gRPC transport and workflow RPC routing are implemented for the prototype test matrix, but production mTLS/Spiffe policy, admin surfaces, metrics, tracing, and operator tooling are not yet implemented.
+- There is no compatibility promise for production workloads yet. Treat the SQL schema, public names, and operational knobs as prototype surfaces unless the spec states otherwise.
+
+## Documentation Gateway
+
+- [docs/spec.md](docs/spec.md): source of truth for implemented, partial, target, and future-scope guarantees.
+- [docs/architecture.md](docs/architecture.md): component overview, storage model, worker lifecycle, durability semantics, and benchmark/query-shape strategy.
+- [docs/deterministic-testing.md](docs/deterministic-testing.md): deterministic simulation harness, recovery scenarios, seed search, and bugs found by the harness.
+- [bench/README.md](bench/README.md) and [bench/run.rb](bench/run.rb): benchmark operation coverage and local benchmark commands.
+- [examples/counter.rb](examples/counter.rb): minimal runnable workflow example.
+- [docs/huginn-integration-report.md](docs/huginn-integration-report.md): integration notes from a real Rails/MySQL application experiment.
+- [sig/durababble.rbs](sig/durababble.rbs): static-only RBS declarations for the public class API.
+
+Historical comparison and review notes remain in `docs/`, but the current API and guarantees are defined by this README, the spec, and the architecture doc.
