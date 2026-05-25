@@ -708,6 +708,57 @@ class DurababbleStoreTest < DurababbleTestCase
     )
   end
 
+  test "terminal workflow updates choose fenced and unfenced SQL paths" do
+    pg_fenced_connection = ScriptedPgConnection.new(params_results: [
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+    ])
+    pg_fenced_store = pg_store(pg_fenced_connection)
+    pg_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
+    pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
+    pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
+
+    assert_equal 3, pg_fenced_connection.exec_params_calls.length
+    assert pg_fenced_connection.exec_params_calls.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
+
+    pg_unfenced_connection = ScriptedPgConnection.new(params_results: [
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+      sql_result([], affected_rows: 1),
+    ])
+    pg_unfenced_store = pg_store(pg_unfenced_connection)
+    pg_unfenced_store.complete_workflow("wf", result: { "ok" => true })
+    pg_unfenced_store.cancel_workflow("wf", reason: "stop")
+    pg_unfenced_store.fail_workflow("wf", error: "boom")
+
+    assert_equal 3, pg_unfenced_connection.exec_params_calls.length
+    assert pg_unfenced_connection.exec_params_calls.none? { |sql, _params| sql.include?("AND locked_by =") }
+
+    mysql_fenced_connection = ScriptedMysqlConnection.new { sql_result([], affected_rows: 1) }
+    mysql_fenced_store = mysql_store(mysql_fenced_connection)
+    mysql_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
+    mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
+    mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
+
+    assert_equal 3, mysql_fenced_connection.queries.length
+    assert mysql_fenced_connection.queries.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
+
+    mysql_unfenced_connection = ScriptedMysqlConnection.new
+    mysql_unfenced_store = mysql_store(mysql_unfenced_connection)
+    mysql_unfenced_store.complete_workflow("wf", result: { "ok" => true })
+    mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
+    mysql_unfenced_store.fail_workflow("wf", error: "boom")
+
+    assert_equal 3, mysql_unfenced_connection.queries.length
+    assert mysql_unfenced_connection.queries.none? { |sql| sql.include?("AND locked_by =") }
+
+    stale_pg_store = pg_store(ScriptedPgConnection.new(params_results: [sql_result([], affected_rows: 0)]))
+    assert_raises(Durababble::LeaseConflict) do
+      stale_pg_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "stale-worker")
+    end
+  end
+
   test "handles postgres fence replay, serialization migration, retry, and helper branches" do
     completed = { "status" => "completed", "result" => pg_dump({ "done" => true }), "error" => nil }
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }

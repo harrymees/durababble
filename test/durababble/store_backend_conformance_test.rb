@@ -610,6 +610,35 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "fences terminal workflow status updates with the active workflow lease for #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        completion_id = store.enqueue_workflow(name: "fenced-complete", input: {})
+        store.claim_workflow(workflow_id: completion_id, worker_id: "owner", lease_seconds: 30)
+        assert_raises(Durababble::LeaseConflict) do
+          store.complete_workflow(completion_id, result: { "done" => true }, worker_id: "intruder")
+        end
+        assert_hash_includes store.workflow(completion_id), "status" => "running", "locked_by" => "owner", "result" => nil
+        store.complete_workflow(completion_id, result: { "done" => true }, worker_id: "owner")
+        assert_hash_includes store.workflow(completion_id), "status" => "completed", "locked_by" => nil, "result" => { "done" => true }
+
+        failure_id = store.enqueue_workflow(name: "fenced-fail", input: {})
+        store.claim_workflow(workflow_id: failure_id, worker_id: "owner", lease_seconds: -1)
+        assert_raises(Durababble::LeaseConflict) do
+          store.fail_workflow(failure_id, error: "late failure", worker_id: "owner")
+        end
+        assert_hash_includes store.workflow(failure_id), "status" => "running", "locked_by" => "owner", "error" => nil
+
+        cancel_id = store.enqueue_workflow(name: "fenced-cancel", input: {})
+        store.claim_workflow(workflow_id: cancel_id, worker_id: "owner", lease_seconds: 30)
+        assert_raises(Durababble::LeaseConflict) do
+          store.cancel_workflow(cancel_id, reason: "wrong owner", worker_id: "intruder")
+        end
+        assert_hash_includes store.workflow(cancel_id), "status" => "running", "locked_by" => "owner", "error" => nil
+        store.cancel_workflow(cancel_id, reason: "owner cancel", result: { "cleanup" => true }, worker_id: "owner")
+        assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "locked_by" => nil, "error" => "owner cancel", "result" => { "cleanup" => true }
+      end
+    end
+
     test "reclaims expired durable object command leases with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(
