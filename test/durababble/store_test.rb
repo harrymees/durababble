@@ -262,6 +262,21 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
+  test "normalizes string step positions when exposing command ids" do
+    store = Durababble::Store.allocate
+
+    numeric_row = store.send(:with_command_id, { "position" => "7" })
+    assert_equal 7, numeric_row.fetch("position")
+    assert_equal 7, numeric_row.fetch("command_id")
+
+    named_row = store.send(:with_command_id, { "position" => "custom" })
+    assert_equal "custom", named_row.fetch("position")
+    assert_equal "custom", named_row.fetch("command_id")
+
+    missing_position_row = store.send(:with_command_id, { "status" => "completed" })
+    refute missing_position_row.key?("command_id")
+  end
+
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })

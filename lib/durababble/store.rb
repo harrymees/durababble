@@ -267,9 +267,20 @@ module Durababble
 
     #: (untyped) -> untyped
     def with_command_id(row)
-      row["command_id"] = row["position"] if row.key?("position") && !row.key?("command_id")
+      if row.key?("position")
+        row["position"] = normalize_numeric_column(row["position"])
+        row["command_id"] = row["position"] unless row.key?("command_id")
+      end
       row
     end
+
+    #: (untyped) -> untyped
+    def normalize_numeric_column(value)
+      return value unless value.is_a?(String) && value.match?(/\A-?\d+\z/)
+
+      Integer(value)
+    end
+
 
     #: (untyped, now: untyped) -> untyped
     def target_activation_ready_at_for(row, now:)

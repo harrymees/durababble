@@ -39,6 +39,13 @@ def durababble_yugabyte_enabled?
   !ENV["DURABABBLE_YUGABYTE_DATABASE_URL"].to_s.empty?
 end
 
+def durababble_selected_test_backends
+  ENV.fetch("DURABABBLE_TEST_BACKENDS", "")
+    .split(",")
+    .map { |name| name.strip.downcase }
+    .reject(&:empty?)
+end
+
 def durababble_store_backends
   backends = [
     DurababbleStoreBackend.new(
@@ -56,7 +63,19 @@ def durababble_store_backends
     )
   end
 
-  backends
+  selected = durababble_selected_test_backends
+  return backends if selected.empty?
+
+  available_names = backends.map(&:name)
+  unknown_names = selected - available_names
+  unless unknown_names.empty?
+    raise(
+      "unknown DURABABBLE_TEST_BACKENDS #{unknown_names.join(", ").inspect}; " \
+        "available backends: #{available_names.join(", ")}",
+    )
+  end
+
+  backends.select { |backend| selected.include?(backend.name) }
 end
 
 def skip_without_yugabyte!

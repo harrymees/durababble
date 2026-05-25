@@ -7,8 +7,24 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.backend }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: mysql
+            database_url: mysql://root@127.0.0.1:3306/sidekick_server_test
+            rake_task: test:coverage
+            test_backends: mysql
+            yugabyte_database_url: ""
+          - backend: yugabyte
+            database_url: postgresql://yugabyte@127.0.0.1:5433/yugabyte
+            rake_task: test
+            test_backends: yugabyte
+            yugabyte_database_url: postgresql://yugabyte@127.0.0.1:5433/yugabyte
 
     services:
       mysql:
@@ -27,18 +43,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Start YugabyteDB
+        if: matrix.backend == 'yugabyte'
+        run: |
+          docker run \
+            --detach \
+            --name durababble-yugabyte \
+            --publish 5433:5433 \
+            yugabytedb/yugabyte:2.25.1.0-b381 \
+            bin/yugabyted start --background=false
+
+          container_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' durababble-yugabyte)
+          for attempt in {1..60}; do
+            if docker exec durababble-yugabyte bin/ysqlsh \
+              -h "$container_ip" \
+              -p 5433 \
+              -U yugabyte \
+              -d yugabyte \
+              -c "SELECT 1" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs durababble-yugabyte
+          exit 1
+
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.4"
           bundler-cache: true
 
-      - name: Run coverage gate
+      - name: Run ${{ matrix.backend }} test suite
         env:
+          DURABABBLE_DATABASE_URL: ${{ matrix.database_url }}
           DURABABBLE_MYSQL_HOST: 127.0.0.1
-        run: bundle exec rake test:coverage
+          DURABABBLE_TEST_BACKENDS: ${{ matrix.test_backends }}
+          DURABABBLE_YUGABYTE_DATABASE_URL: ${{ matrix.yugabyte_database_url }}
+        run: bundle exec rake ${{ matrix.rake_task }}
 
       - name: Upload coverage report
-        if: always()
+        if: always() && matrix.backend == 'mysql'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report

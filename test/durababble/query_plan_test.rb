@@ -194,13 +194,13 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "record_step_started" => {
         call: -> { store.record_step_started(workflow_id: "running-owned", position: 1, name: "next") },
-        allowed_indexes: ["step_attempts_workflow_position_status_started_idx", "steps_pkey"],
-        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["step_attempts_workflow_position_status_started_idx", "steps_pkey", "workflows_pkey", "workflow_history_pkey"],
+        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx", "workflows_pkey"],
       },
       "record_step_completed" => {
         call: -> { store.record_step_completed(workflow_id: "running-owned", position: 0, result: { "ok" => true }) },
-        allowed_indexes: ["steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx", "workflow_history_pkey", "workflows_pkey"],
+        allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx", "workflows_pkey"],
       },
       "record_wait" => {
         call: lambda do
@@ -216,17 +216,17 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["steps_pkey", "workflows_pkey", "waits_workflow_created_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx", "workflow_history_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
-        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflow_history_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "signal_event" => {
         call: -> { store.signal_event("target-event", payload: { "seen" => true }) },
-        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey"],
+        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey", "workflow_history_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {
