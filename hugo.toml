@@ -1,0 +1,38 @@
+languagecode = "en-us"
+title = "Durababble"
+theme = "theme"
+themesdir = "docs"
+contentdir = "docs/content"
+builddrafts = false
+buildexpired = true
+buildfuture = true
+cleandestinationdir = true
+disablekinds = ["taxonomy", "term", "rss", "sitemap", "robotstxt", "404"]
+enablegitinfo = false
+disablehugogeneratorinject = true
+enableemoji = true
+ignorecache = true
+nobuildlock = true
+relativeURLs = true
+
+[outputFormats.SearchIndex]
+  mediaType = "application/json"
+  baseName = "search-index"
+  isPlainText = true
+  notAlternative = true
+
+[outputFormats.AIChunks]
+  mediaType = "application/json"
+  baseName = "ai-chunks"
+  isPlainText = true
+  notAlternative = true
+
+[outputs]
+  home = ["HTML", "SearchIndex", "AIChunks"]
+
+[markup.goldmark.renderer]
+  unsafe = true
+
+[markup.goldmark.parser]
+  [markup.goldmark.parser.attribute]
+    block = true
