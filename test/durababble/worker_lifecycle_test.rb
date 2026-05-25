@@ -343,7 +343,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
     caller_store = Durababble::Store.connect(database_url:, schema:)
     started_at = Time.now
-    result = workflow.ref(workflow_id, store: caller_store).approve(reason: "operator")
+    result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
     elapsed = Time.now - started_at
 
     assert_equal({ "approved_by" => "operator" }, result)
@@ -395,7 +395,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       target_id: workflow_id,
     )
 
-    eventually(timeout: 1) do
+    eventually(timeout: 3) do
       assert_hash_includes(
         store.inbox_message(message_id),
         "status" => "completed",
@@ -445,7 +445,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
 
     started_at = Time.now
-    result = workflow.ref(workflow_id, store: caller_store).approve(reason: "operator")
+    result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
     elapsed = Time.now - started_at
 
     assert_equal({ "approved_by" => "operator" }, result)

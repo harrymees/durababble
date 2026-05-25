@@ -61,6 +61,24 @@ class DurababbleEngineTest < DurababbleTestCase
     end
   end
 
+  class MigrationTrackingStore
+    attr_reader :migrations, :enqueued
+
+    def initialize
+      @migrations = 0
+      @enqueued = []
+    end
+
+    def migrate!
+      @migrations += 1
+    end
+
+    def enqueue_workflow(name:, input:)
+      @enqueued << { name:, input: }
+      "wf-#{@enqueued.length}"
+    end
+  end
+
   class ImmediateWorkflow < Durababble::Workflow
     workflow_name "immediate"
 
@@ -100,6 +118,17 @@ class DurababbleEngineTest < DurababbleTestCase
     no_lease_store = Object.new
     crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
+  end
+
+  test "does not run migrations from engine construction or enqueue helpers" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
+
+    assert_equal "wf-1", workflow_id
+    assert_equal 0, store.migrations
+    assert_equal [{ name: "immediate", input: { "seed" => 1 } }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
@@ -192,8 +221,12 @@ class DurababbleEngineTest < DurababbleTestCase
 
     test "returns a terminal failed workflow instead of trying to reclaim it with #{backend.name}" do
       with_durababble_store(backend, "engine_test") do |store|
+        attempts = 0
         workflow = durababble_test_workflow("terminal-failure") do
-          test_step("explode") { |_ctx| raise "boom" }
+          test_step("explode") do |_ctx|
+            attempts += 1
+            raise "boom"
+          end
         end
         engine = Durababble::Engine.new(store:, worker_id: "owner")
 
@@ -203,6 +236,8 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal "failed", first.status
         assert_equal first.status, second.status
         assert_equal first.error, second.error
+        assert_equal 1, attempts
+        assert_nil store.workflow(first.id).fetch("next_run_at")
       end
     end
 

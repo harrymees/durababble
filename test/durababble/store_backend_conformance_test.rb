@@ -47,6 +47,28 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "sets and preserves step started_at when a scheduled step starts with #{backend.name}" do
+      with_durababble_store(backend, "step_start_metadata") do |store|
+        workflow_id = store.create_workflow(name: "step-start-metadata", input: {})
+
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "existing_step")
+        scheduled = store.steps_for(workflow_id).first
+        assert_hash_includes scheduled, "status" => "scheduled", "started_at" => nil
+
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        running = store.steps_for(workflow_id).first
+        assert_hash_includes running, "status" => "running", "error" => nil
+        refute_nil running.fetch("started_at")
+        first_started_at = running.fetch("started_at")
+
+        sleep 0.01
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        restarted = store.steps_for(workflow_id).first
+        assert_hash_includes restarted, "status" => "running", "error" => nil
+        assert_equal first_started_at, restarted.fetch("started_at")
+      end
+    end
+
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
