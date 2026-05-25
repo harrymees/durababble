@@ -154,7 +154,7 @@ module Durababble
     def heartbeat: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Object
     def workflow_owned?: (workflow_id: String, worker_id: String) -> bool
     def release_worker_leases!: (worker_id: String) -> lease_release_counts
-    def schedule_workflow_retry: (workflow_id: String, worker_id: String, run_at: Time) -> void
+    def schedule_workflow_retry: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
     def suspend_workflow: (workflow_id: String, ?worker_id: String?) -> bool
     def make_workflow_due!: (String workflow_id, ?now: Time) -> void
     def heartbeat_step: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> bool

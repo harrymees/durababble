@@ -47,6 +47,28 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "sets and preserves step started_at when a scheduled step starts with #{backend.name}" do
+      with_durababble_store(backend, "step_start_metadata") do |store|
+        workflow_id = store.create_workflow(name: "step-start-metadata", input: {})
+
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "existing_step")
+        scheduled = store.steps_for(workflow_id).first
+        assert_hash_includes scheduled, "status" => "scheduled", "started_at" => nil
+
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        running = store.steps_for(workflow_id).first
+        assert_hash_includes running, "status" => "running", "error" => nil
+        refute_nil running.fetch("started_at")
+        first_started_at = running.fetch("started_at")
+
+        sleep 0.01
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        restarted = store.steps_for(workflow_id).first
+        assert_hash_includes restarted, "status" => "running", "error" => nil
+        assert_equal first_started_at, restarted.fetch("started_at")
+      end
+    end
+
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
@@ -607,6 +629,35 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
         assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).affected_rows
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
+      end
+    end
+
+    test "fences terminal workflow status updates with the active workflow lease for #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        completion_id = store.enqueue_workflow(name: "fenced-complete", input: {})
+        store.claim_workflow(workflow_id: completion_id, worker_id: "owner", lease_seconds: 30)
+        assert_raises(Durababble::LeaseConflict) do
+          store.complete_workflow(completion_id, result: { "done" => true }, worker_id: "intruder")
+        end
+        assert_hash_includes store.workflow(completion_id), "status" => "running", "locked_by" => "owner", "result" => nil
+        store.complete_workflow(completion_id, result: { "done" => true }, worker_id: "owner")
+        assert_hash_includes store.workflow(completion_id), "status" => "completed", "locked_by" => nil, "result" => { "done" => true }
+
+        failure_id = store.enqueue_workflow(name: "fenced-fail", input: {})
+        store.claim_workflow(workflow_id: failure_id, worker_id: "owner", lease_seconds: -1)
+        assert_raises(Durababble::LeaseConflict) do
+          store.fail_workflow(failure_id, error: "late failure", worker_id: "owner")
+        end
+        assert_hash_includes store.workflow(failure_id), "status" => "running", "locked_by" => "owner", "error" => nil
+
+        cancel_id = store.enqueue_workflow(name: "fenced-cancel", input: {})
+        store.claim_workflow(workflow_id: cancel_id, worker_id: "owner", lease_seconds: 30)
+        assert_raises(Durababble::LeaseConflict) do
+          store.cancel_workflow(cancel_id, reason: "wrong owner", worker_id: "intruder")
+        end
+        assert_hash_includes store.workflow(cancel_id), "status" => "running", "locked_by" => "owner", "error" => nil
+        store.cancel_workflow(cancel_id, reason: "owner cancel", result: { "cleanup" => true }, worker_id: "owner")
+        assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "locked_by" => nil, "error" => "owner cancel", "result" => { "cleanup" => true }
       end
     end
 

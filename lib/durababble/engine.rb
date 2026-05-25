@@ -144,7 +144,6 @@ module Durababble
           end
           WorkflowExecutionContext.with_current(execution) do
             execution.validate_replay_complete!
-            assert_workflow_lease!(workflow_id)
             if execution.cancellation_delivered?
               @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
               Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
@@ -165,12 +164,12 @@ module Durababble
         workflow.__durababble_execution__ = nil if workflow
       end
     rescue WorkflowSuspended
-      @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension" unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+
       snapshot(workflow_id)
     rescue StepRetryScheduled
       snapshot(workflow_id)
     rescue CancellationError => e
-      assert_workflow_lease!(workflow_id)
       @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
       Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
       snapshot(workflow_id)
@@ -178,17 +177,9 @@ module Durababble
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
       message = "#{e.class}: #{e.message}"
-      assert_workflow_lease!(workflow_id)
       @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)
-    end
-
-    #: (untyped) -> untyped
-    def assert_workflow_lease!(workflow_id)
-      return if @store.workflow_owned?(workflow_id:, worker_id: @worker_id)
-
-      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
     #: (untyped) -> untyped
