@@ -55,7 +55,7 @@ end
 
 store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
 store.migrate!
-engine ||= Durababble::Engine.new(store:)
+Durababble.default_store = store
 
 order ||= {
   "card_token" => "card_123",
@@ -64,10 +64,11 @@ order ||= {
 }
 
 # enqueue the workflow
-run = engine.run(FulfillOrder, input: order)
+handle = FulfillOrder.start(order)
 
-# wait for it to finish and get its return value -- will overcome step failures or crashes or whatever strange issues arise by retrying each step, and eventually return!
-run.result
+# let a worker claim and complete the durable run
+Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1").run_until_idle
+handle.result
 ```
 
 <!-- DOCS:workflow-example:end -->
@@ -103,24 +104,24 @@ If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the sa
 
 ## Enqueuing And Workflow Handles
 
-`Engine#run` is the small-script path: it creates a workflow row, runs it immediately in the current process, and returns the completed `Durababble::Run`. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases.
+`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
-workflow_id = FulfillOrder.enqueue(order, store:)
+workflow_id = FulfillOrder.enqueue(order)
 
 # in some other long lived process, you'd do:
 worker = Durababble::Worker.new(
-  store:,
+  store: Durababble.store,
   workflows: [FulfillOrder],
   worker_id: "orders-worker-1",
 )
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order, store:)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.handle(workflow_id, store:)` and `FulfillOrder.ref(workflow_id, store:)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.handle(workflow_id)` and `FulfillOrder.ref(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each of these accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
-handle = FulfillOrder.start(order, store:)
+handle = FulfillOrder.start(order)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 ```
@@ -180,7 +181,7 @@ class ImportCustomers < Durababble::Workflow
   end
 end
 
-handle = ImportCustomers.start({ "file_id" => "file_123" }, store:)
+handle = ImportCustomers.start({ "file_id" => "file_123" })
 handle.cancel(reason: "user uploaded a replacement file")
 ```
 
@@ -211,7 +212,7 @@ class ReviewWorkflow < Durababble::Workflow
   end
 end
 
-handle = ReviewWorkflow.handle(run_id, store:)
+handle = ReviewWorkflow.handle(run_id)
 handle.label
 handle.note(message: "approved by legal")
 ```
@@ -241,8 +242,8 @@ Prefer durable objects for long-lived identities, and prefer splitting very larg
 
 ```ruby
 # Prefer this shape for ongoing per-shop state:
-ShopSync.ref(shop_id, store:).record_cursor(cursor)
+ShopSync.at(shop_id).record_cursor(cursor)
 
 # Prefer this shape for bounded work:
-SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor }, store:)
+SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
 ```

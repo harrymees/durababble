@@ -10,9 +10,9 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 ## Components
 
 - `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
-- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.at(id, store:)` / `Class.ref(id, store:)` for synchronous asks and `Class.tell(id, :method, store:)` for asynchronous tells, exposes public read methods with `expose`, exposes public mutating commands with `expose_command`, and mutates state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
+- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.at(id)` / `Class.ref(id)` for synchronous asks and `Class.tell(id, :method)` for asynchronous tells through the configured default engine; each helper also accepts `engine:` or `store:` for explicit routing. Durable objects expose public read methods with `expose`, expose public mutating commands with `expose_command`, and mutate state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
-- `Durababble::Engine`: creates/resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery.
+- `Durababble::Engine`: enqueues and resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery. `Durababble.configure` installs a default engine over the configured default store for top-level class helpers.
 - `Durababble::Worker`: polls for one runnable workflow or target activation at a time. Workflow rows execute through the deterministic engine; workflow and object target activations drain the target inbox under the worker's lease identity. The worker registry contains workflow classes and durable object classes.
 - `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, serves RPC wakeups, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
 - `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` records durable workflow command inbox rows and wakes or warms the workflow target before execution.
@@ -61,7 +61,7 @@ Direct waits use the same monotonic command ids and replay validation as steps, 
 Workflow `expose` and `expose_command` define the public ref surface:
 
 ```ruby
-workflow = CounterWorkflow.ref(run_id, store:)
+workflow = CounterWorkflow.handle(run_id)
 workflow.description
 workflow.cancel(reason: "user request")
 ```

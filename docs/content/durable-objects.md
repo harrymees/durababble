@@ -39,9 +39,10 @@ end
 
 store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
 store.migrate!
+Durababble.default_store = store
 
-account = Account.ref("acct_readme", store:)
-Account.tell("acct_readme", :credit, 1_000, store:)
+account = Account.at("acct_readme")
+Account.tell("acct_readme", :credit, 1_000)
 
 worker = Durababble::Worker.new(
   store:,
@@ -68,8 +69,8 @@ Simple RPCs are run in parallel and are not expected to ever mutate state on the
 Commands can mutate state on the object, and are processed in serial and recorded and redelivered durably. Use commands for RPCs that need to make it to the object, and that change the way the object will behave moving forward, like editing local state.
 
 ```ruby
-account = Account.ref("acct_123", store:)
-Account.tell("acct_123", :credit, 1_000, store:) # durable command: this call is written to the database and eventually processed by an object worker
+account = Account.at("acct_123")
+Account.tell("acct_123", :credit, 1_000) # durable command: this call is written to the database and eventually processed by an object worker
 account.balance                                  # query: reads latest persisted state
 ```
 
@@ -93,7 +94,7 @@ class Channel < Durababble::DurableObject
   end
 end
 
-channel = Channel.ref("durable-execution-discussions", store:)
+channel = Channel.at("durable-execution-discussions")
 channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```

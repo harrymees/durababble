@@ -205,10 +205,10 @@ module Durababble
 
   class Workflow[Input, Output]
     def self.workflow_name: (?String value) -> String
-    def self.enqueue: (Input input, ?store: Store) -> String
-    def self.start: (Input input, ?store: Store) -> WorkflowRef[Input, Output]
-    def self.ref: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
-    def self.handle: (String workflow_id, ?store: Store) -> WorkflowRef[Input, Output]
+    def self.enqueue: (Input input, ?store: Store, ?engine: Engine) -> String
+    def self.start: (Input input, ?store: Store, ?engine: Engine) -> WorkflowRef[Input, Output]
+    def self.ref: (String workflow_id, ?store: Store, ?engine: Engine) -> WorkflowRef[Input, Output]
+    def self.handle: (String workflow_id, ?store: Store, ?engine: Engine) -> WorkflowRef[Input, Output]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
@@ -227,6 +227,9 @@ module Durababble
     attr_reader workflow_id: String
 
     def initialize: (singleton(Workflow[Input, Output]) workflow_class, String workflow_id, store: Store) -> void
+    def status: () -> String
+    def result: () -> Output?
+    def error: () -> String?
     def cancel: (?reason: serialized_payload) -> Run[serialized_payload]
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
@@ -234,9 +237,9 @@ module Durababble
 
   class DurableObject[Id, State]
     def self.object_type: (?String value) -> String
-    def self.ref: (Id durable_id, ?store: Store) -> DurableObjectRef[Id, State]
-    def self.at: (Id durable_id, ?store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> DurableObjectRef[Id, State]
-    def self.tell: (Id durable_id, Symbol method_name, *serialized_payload args, ?store: Store, ?idempotency_key: String?, **serialized_payload kwargs) -> String
+    def self.ref: (Id durable_id, ?store: Store, ?engine: Engine) -> DurableObjectRef[Id, State]
+    def self.at: (Id durable_id, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?) -> DurableObjectRef[Id, State]
+    def self.tell: (Id durable_id, Symbol method_name, *serialized_payload args, ?store: Store, ?engine: Engine, ?idempotency_key: String?, **serialized_payload kwargs) -> String
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
 
@@ -272,7 +275,10 @@ module Durababble
   end
 
   class Engine
+    attr_reader store: Store
+
     def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?) -> void
+    def enqueue: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, input: Input) -> String
     def run: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
     def drain_workflow_inbox: [Input, Output] (singleton(Workflow[Input, Output]) workflow_class, workflow_id: String, ?claimed: workflow_row?, ?limit: Integer) -> Integer
@@ -456,12 +462,16 @@ module Durababble
   end
 
   attr_accessor self.default_store: Store?
+  attr_accessor self.default_engine: Engine?
 
   def self.default_database_url: () -> String
   def self.default_schema: () -> String
   def self.workspace_schema: (?String? workspace_path, ?prefix: String) -> String
   def self.configure: (database_url: String, ?schema: String) -> Store
   def self.store: () -> Store
+  def self.engine: () -> Engine
+  def self.engine_for: (?engine: Engine?, ?store: Store?) -> Engine
+  def self.store_for: (?engine: Engine?, ?store: Store?) -> Store
   def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload

@@ -36,7 +36,7 @@ To execute a workflow or process a durable object's inbox, a worker first claims
 
 A simple call flows like this:
 
-1. Caller has a handle: `ReviewWorkflow.handle(run_id, store:)`.
+1. Caller has a handle: `ReviewWorkflow.handle(run_id)`.
 2. Caller invokes a method: `handle.label`.
 3. The router reads `current_workflow_lease(workflow_id)` and gets back the owning worker's id (which is its gRPC address).
 4. The router opens (or reuses) a gRPC connection to that address and sends the call.
@@ -44,7 +44,7 @@ A simple call flows like this:
 
 If the lease has moved (the owner crashed, the workflow was rescheduled), the caller gets `StaleLease` or `NodeUnavailable` and can retry, which re-reads the lease and dials the new owner. The DB is consulted to find the owner, not to carry the payload.
 
-For durable objects, the same flow applies. `Account.ref("acct_123", store:).balance` reads the object's lease, dials the owner, and returns the current state. `Account.tell("acct_123", :credit, 1_000, store:)` does the durable thing instead: it writes a row to the object's inbox and trusts the owning worker's mailbox loop to apply it.
+For durable objects, the same flow applies. `Account.at("acct_123").balance` reads the object's lease, dials the owner, and returns the current state. `Account.tell("acct_123", :credit, 1_000)` does the durable thing instead: it writes a row to the object's inbox and trusts the owning worker's mailbox loop to apply it.
 
 ## What This Buys
 

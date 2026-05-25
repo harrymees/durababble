@@ -64,7 +64,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.handle(workflow_id)` returns a query/management handle for status, result, cancellation, resume, and exposed methods.
+`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.handle(workflow_id, engine: nil)` returns a query/management handle for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -82,7 +82,7 @@ Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_
 
 ### Durable objects
 
-A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, worker_pool: nil, idempotency_key: nil)` for proxy calls and by `Class.tell(id, :method, **args, idempotency_key: nil)` for asynchronous durable commands. Durable object methods are not workflow steps.
+A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, engine: nil, worker_pool: nil, idempotency_key: nil)` for proxy calls and by `Class.tell(id, :method, **args, engine: nil, idempotency_key: nil)` for asynchronous durable commands. When `engine:` is omitted, these helpers use Durababble's configured default engine. Durable object methods are not workflow steps.
 
 ```ruby
 class Account < Durababble::DurableObject
