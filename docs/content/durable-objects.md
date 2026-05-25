@@ -88,7 +88,7 @@ object_result
 
 ## Object RPCs
 
-Durable objects can expose methods to callers. You first expose a method on the durable object, and then using a reference to the object, you can call that method from any other process in the system.
+Durable objects can expose methods to callers. You first expose a method on the durable object, and then using a handle to the object, you can call that method from any other process in the system.
 
 There are two kinds of methods that can be exposed: simple RPCs, and command RPCs.
 

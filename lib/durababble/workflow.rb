@@ -54,13 +54,8 @@ module Durababble
       end
 
       #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def ref(workflow_id, store: nil, engine: nil)
-        WorkflowRef.new(self, workflow_id, store: Durababble.store_for(store:, engine:))
-      end
-
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
       def handle(workflow_id, store: nil, engine: nil)
-        ref(workflow_id, store:, engine:)
+        WorkflowRef.new(self, workflow_id, store: Durababble.store_for(store:, engine:))
       end
 
       #: (?untyped, **untyped) -> untyped
@@ -199,7 +194,6 @@ module Durababble
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
         kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
-        @store.migrate!
         idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
         message_id = @store.enqueue_workflow_command(

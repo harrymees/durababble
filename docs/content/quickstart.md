@@ -12,6 +12,7 @@ require "durababble"
 
 Durababble.configure(database_url: Durababble.default_database_url)
 store = Durababble.store
+store.migrate!
 ```
 
 ## A Workflow With Retries
@@ -37,7 +38,7 @@ class FulfillOrder < Durababble::Workflow
 end
 
 handle = FulfillOrder.start(order)
-Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1").run_until_idle
+Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1", migrate: false).run_until_idle
 handle.result
 ```
 
@@ -50,7 +51,7 @@ handle = FulfillOrder.start(order)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 
-Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1").run_until_idle
+Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1", migrate: false).run_until_idle
 ```
 
 ## Sleeping

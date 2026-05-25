@@ -190,7 +190,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
         assert_equal(1, store.inbox_messages_for(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id).length)
 
         assert_raises(Durababble::IdempotencyKeyConflict) do
-          workflow.ref(workflow_id, store:).approve(reason: "different", idempotency_key: "approve-once")
+          workflow.handle(workflow_id, store:).approve(reason: "different", idempotency_key: "approve-once")
         end
       ensure
         first&.fetch(:thread)&.kill if first&.fetch(:thread)&.alive?
@@ -236,7 +236,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
 
         assert_equal(:ok, status)
         assert_equal({ "items" => ["sku-1"], "checked_out" => true }, result)
-        assert_equal(result, cart.ref("cart-1", store:).snapshot)
+        assert_equal(result, cart.handle("cart-1", store:).snapshot)
         messages = store.inbox_messages_for(target_kind: "object", target_type: cart.object_type, target_id: "cart-1")
         assert_equal([tell_id, messages.last.fetch("id")], messages.map { |message| message.fetch("id") })
         assert_equal(["completed", "completed"], messages.map { |message| message.fetch("status") })
@@ -284,7 +284,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
     caller = Thread.new do
       caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
       begin
-        result_queue << [:ok, workflow_class.ref(workflow_id, store: caller_store).public_send(method_name, **kwargs)]
+        result_queue << [:ok, workflow_class.handle(workflow_id, store: caller_store).public_send(method_name, **kwargs)]
       rescue StandardError => e
         result_queue << [:error, e]
       ensure
@@ -299,7 +299,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
     caller = Thread.new do
       caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
       begin
-        result_queue << [:ok, object_class.ref(object_id, store: caller_store).public_send(method_name, *args)]
+        result_queue << [:ok, object_class.handle(object_id, store: caller_store).public_send(method_name, *args)]
       rescue StandardError => e
         result_queue << [:error, e]
       ensure

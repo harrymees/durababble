@@ -1,6 +1,6 @@
 # Durababble
 
-Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in an application database. Configure a default store once with `Durababble.configure`, then enqueue workflows with `SomeWorkflow.enqueue(...)` / `SomeWorkflow.start(...)` and address durable objects with `SomeObject.at("id")`.
+Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in an application database.
 
 The docs site source starts at [docs/content/README.md](docs/content/README.md). From there, use the docs navigation for workflows, durable objects, storage, observability, testing, and reference material.
 

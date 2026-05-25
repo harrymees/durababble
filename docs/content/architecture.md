@@ -10,15 +10,17 @@ Durababble is a Ruby 4 durable execution prototype. Ruby owns workflow and durab
 ## Components
 
 - `Durababble::Workflow`: class-oriented workflow base. A subclass implements `#execute(input)` for deterministic orchestration and marks side-effect boundaries with `step def ...` or `step retry: ...` followed by `def ...`. Steps are called as ordinary methods on `self`; the engine assigns durable positions by deterministic execution order.
-- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.at(id)` / `Class.ref(id)` for typed handle calls; each helper also accepts `engine:` or `store:` for explicit routing. Durable objects expose public read methods with `expose`, expose public mutating commands with `expose_command`, and mutate state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
+- `Durababble::DurableObject`: class-oriented durable object base. A subclass is addressed by `Class.at(id)` / `Class.handle(id)` for typed handle calls; each helper also accepts `engine:` or `store:` for explicit routing. Durable objects expose public read methods with `expose`, expose public mutating commands with `expose_command`, and mutate state explicitly with `update_state(new_state)`. Durable object methods are not workflow steps.
 - `Durababble::RetryPolicy`: normalizes retry options (`initial_interval`, `backoff_coefficient`, `maximum_interval`, `maximum_attempts`, explicit `schedule`, and `non_retryable_errors`) and computes durable retry delays for workflow steps and durable-object commands.
 - `Durababble::Engine`: enqueues and resumes workflow runs, enforces workflow lease ownership, records workflow step transitions, handles explicit step heartbeats, handles retryable step failures, handles waits, and skips completed steps during recovery. `Durababble.configure` installs a default engine over the configured default store for top-level class helpers.
 - `Durababble::Worker`: polls for one runnable workflow or target activation at a time. Workflow rows execute through the deterministic engine; workflow and object target activations drain the target inbox under the worker's lease identity. The worker registry contains workflow classes and durable object classes.
 - `Durababble::WorkerRuntime`: high-level app/process entrypoint for a named worker pool. It starts a background polling loop, serves RPC wakeups, stops taking new work on shutdown, waits for in-flight work up to a timeout, and releases this worker's leases if the timeout expires.
-- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.ref(...).expose_command` records durable workflow command inbox rows and wakes or warms the workflow target before execution.
+- `Durababble::WorkflowRpc`: routes node-to-node workflow RPCs through the current workflow lease holder and rejects stale in-flight messages when ownership changes or the workflow stops running. This is the lower-level routing primitive; public `Workflow.handle(...).expose_command` records durable workflow command inbox rows and wakes or warms the workflow target before execution.
 - `Durababble::Rpc::Server` / `Durababble::Rpc::Client`: protobuf/gRPC transport for cross-node wakeups, evictions, transient calls, and durable-message wakeups. Workflow transient calls use `Durababble::Rpc::WorkflowClient` to bridge `WorkflowRpc::Router` onto the `CallTransient` gRPC method.
 - `Durababble::Store`: backend-selecting durable store facade. `postgresql://`/`postgres://` URLs use the PostgreSQL/YSQL adapter with the `pg` gem; `mysql://`/`mysql2://`/`trilogy://` URLs use the MySQL/MariaDB adapter with the `trilogy` gem. It owns schema migration and all durable state transitions. Runtime Ruby values are serialized through Paquito and stored in binary columns (`bytea` on PostgreSQL/YSQL, `LONGBLOB` on MySQL/MariaDB). If callers do not pass `schema:`, the default namespace comes from `DURABABBLE_SCHEMA` or from deterministic `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`; PostgreSQL/YSQL uses that namespace as a schema, while MySQL/MariaDB uses it as the durable table prefix inside the configured database.
 - `sig/durababble.rbs`: static-only RBS declarations for the public class API, including the optional handle dispatch generic used by workflow and durable object RPC handles. Runtime execution does not load or validate RBS.
+
+Application setup owns migrations. `Store#migrate!` should run from deploy/setup orchestration before workflow engines, class helpers, or durable-object handles enqueue or query work; those runtime paths expect the selected namespace to already exist rather than migrating on demand.
 
 ## Public API model
 
@@ -58,7 +60,7 @@ If replay reaches a completed position with a different current method name, or 
 
 Direct waits use the same monotonic command ids and replay validation as steps, but their command names are the wait helpers rather than user step method names. A direct wait records a scheduled command before the wait row is inserted, records a waiting history entry when the wait is persisted, and later consumes the completed timer payload to resume the blocked workflow fiber.
 
-Workflow `expose` and `expose_command` define the public ref surface:
+Workflow `expose` and `expose_command` define the public handle surface:
 
 ```ruby
 workflow = CounterWorkflow.at(run_id)
@@ -66,7 +68,7 @@ workflow.description
 workflow.cancel(reason: "user request")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight ref instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
+In the current prototype, exposed workflow queries execute against a lightweight handle instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
 
 ### Durable objects
 
@@ -148,7 +150,7 @@ The runtime only claims workflow names present in its `workflows` registry, so s
 
 ## Observability
 
-`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object refs, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle transitions. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
+`Durababble::Observability` is a thin OpenTelemetry integration used by the workflow engine, durable-object handles, worker/runtime loop, workflow RPC, gRPC transport, and higher-level store lifecycle transitions. It is disabled by default and only executes cheap no-op checks in that mode. When `Durababble.configure_observability(enabled: true, attributes:)` is called, Durababble uses the official OpenTelemetry API globals (`OpenTelemetry.tracer_provider` and `OpenTelemetry.meter_provider`) and leaves SDK/exporter/collector setup to the host application.
 
 The instrumentation boundary is intentionally outside durable state semantics. Spans and metrics describe already-durable transitions; they do not decide leases, retries, wakeups, or command completion. Durababble does not wrap raw ActiveRecord SQL calls in its own spans or metrics; applications should enable standard ActiveRecord/database OpenTelemetry instrumentation for SQL visibility, while Durababble emits higher-level telemetry for workflows, steps, waits, leases, outbox rows, queues, workers, and RPCs.
 
@@ -157,7 +159,7 @@ Primary spans:
 | Span name | Emitted by |
 | --- | --- |
 | `durababble.workflow.start`, `.resume`, `.execute`, `.step` | `Engine` / `WorkflowExecution` |
-| `durababble.object.query`, `.command.enqueue`, `.command` | `DurableObjectRef` |
+| `durababble.object.query`, `.command.enqueue`, `.command` | durable object handle |
 | `durababble.workflow_rpc.*` | workflow RPC lease start, route, and handler paths |
 | `durababble.rpc.client.*`, `durababble.rpc.server.*` | gRPC transport methods |
 

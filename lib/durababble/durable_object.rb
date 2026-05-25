@@ -23,13 +23,13 @@ module Durababble
         @object_type || underscore((ruby_name || object_id.to_s).split("::").last)
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped) -> untyped
-      def ref(durable_id, store: nil, engine: nil)
-        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
+      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: untyped, ?idempotency_key: untyped) -> untyped
+      def at(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
+        handle(durable_id, store:, engine:, worker_pool:, idempotency_key:)
       end
 
       #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: untyped, ?idempotency_key: untyped) -> untyped
-      def at(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
+      def handle(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
         DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
       end
 
@@ -40,7 +40,6 @@ module Durababble
         retry_policy = @exposed_commands[method_name]
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy
 
-        store.migrate!
         attributes = object_command_attributes(object_id: String(durable_id), method_name:)
         Observability.trace("durababble.object.command.enqueue", attributes) do
           message_id = store.enqueue_object_command(
@@ -146,7 +145,6 @@ module Durababble
 
     #: (untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
     def invoke_query(method_name, args:, kwargs:, block:)
-      @store.migrate!
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
         state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
@@ -158,7 +156,6 @@ module Durababble
 
     #: (untyped, retry_policy: untyped, args: untyped, kwargs: untyped, block: untyped) -> untyped
     def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
-      @store.migrate!
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
         idempotency_key = kwargs.delete(:idempotency_key)

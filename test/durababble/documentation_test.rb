@@ -32,7 +32,9 @@ class DurababbleDocumentationTest < DurababbleTestCase
     assert_includes rbs, "def self.enqueue: (Input input"
     assert_includes rbs, "def self.at: (String workflow_id"
     assert_includes rbs, "def self.at: (Id durable_id"
-    assert_includes rbs, "def self.ref: (Id durable_id"
+    assert_includes rbs, "def self.handle: (String workflow_id"
+    assert_includes rbs, "def self.handle: (Id durable_id"
+    refute_includes rbs, "def self.ref:"
     assert_includes rbs, "def self.at: (Id durable_id"
     assert_includes rbs, "def self.tell: (Id durable_id"
   end
@@ -63,6 +65,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
     workflow_visible = visible_marked_ruby_code(workflows, "workflow-example")
     assert_includes workflow_visible, "FulfillOrder.start(order)"
     assert_includes workflow_visible, "FulfillOrder.at(fulfillment.workflow_id)"
+    assert_includes workflow_visible, "fulfillment.result"
     refute_includes workflow_visible, "Durababble::Store.connect"
     refute_includes workflow_visible, "Durababble::Worker.new"
     refute_includes workflow_visible, "Durababble::Engine.new"

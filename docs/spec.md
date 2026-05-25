@@ -11,7 +11,7 @@ Durababble exposes two durable primitives:
 | Primitive | Class | Public handle API | Best for | Mental model |
 | --- | --- | --- | --- | --- |
 | Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, and recovery | A function or process that survives restarts |
-| Durable object | `Durababble::DurableObject` | `DurableObject.at` typed handle calls | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
+| Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.handle` typed handle calls | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
@@ -20,6 +20,8 @@ Storage works through PostgreSQL/YSQL (`postgresql://` / `postgres://`) and MySQ
 Runtime values are serialized with Paquito into binary columns. PostgreSQL/YSQL stores runtime payloads as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. Runtime payloads include workflow inputs/results/errors, step args/results, wait contexts, inbox payloads, durable object state, command args/results/errors, idempotency fingerprints, and heartbeat cursors.
 
 The default storage namespace is `DURABABBLE_SCHEMA` when set. Otherwise it is derived from `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)` so concurrent worktrees do not share internal tables by accident. PostgreSQL/YSQL uses the selected namespace as a SQL schema; MySQL/MariaDB uses it as the durable table prefix inside the configured database.
+
+Store migrations are an explicit setup/deploy responsibility. Runtime workflow engines, class helpers, and object/workflow handles do not run `migrate!` on demand before enqueueing, querying, or dispatching work; callers must migrate the selected namespace before handing the store to runtime paths.
 
 The contract specifies behavior, not a mandatory internal isolation technology. Workflow execution must be deterministic, workflow-local, and free of process-wide monkeypatching, but the implementation may choose the isolation mechanism that provides those guarantees.
 
@@ -82,7 +84,7 @@ Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_
 
 ### Durable objects
 
-A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, engine: nil, worker_pool: nil, idempotency_key: nil)` for typed handle calls such as `account.credit(1_000)`. When `engine:` is omitted, these helpers use Durababble's configured default engine. Durable object methods are not workflow steps.
+A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, engine: nil, worker_pool: nil, idempotency_key: nil)` or `Class.handle(id, engine: nil, worker_pool: nil, idempotency_key: nil)` for typed handle calls such as `account.credit(1_000)`. When `engine:` is omitted, these helpers use Durababble's configured default engine. Durable object methods are not workflow steps.
 
 ```ruby
 class Account < Durababble::DurableObject
@@ -117,7 +119,7 @@ Durababble does not provide a block-form durable-object `.with(id) { ... }` API.
 
 ### Typing
 
-The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output, Dispatch = Object]` and `Durababble::DurableObject[Id, State, Dispatch = Object]` generics for static tooling only; the third generic is the type-level RPC dispatch surface exposed on handles returned by `start`, `at`, `ref`, and `handle`, while runtime serialization remains Paquito-based.
+The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output, Dispatch = Object]` and `Durababble::DurableObject[Id, State, Dispatch = Object]` generics for static tooling only; the third generic is the type-level RPC dispatch surface exposed on handles returned by `start`, `at`, and `handle`, while runtime serialization remains Paquito-based.
 
 ## Workflow execution semantics
 

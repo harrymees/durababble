@@ -86,11 +86,12 @@ worker.run_until_idle
 ```ruby
 # later, any process can recover the same handle by id
 fulfillment = FulfillOrder.at(fulfillment.workflow_id)
+fulfillment.result
 ```
 
 <!-- DOCS:workflow-example:hidden
 ```ruby
-store.workflow(fulfillment.workflow_id).fetch("result")
+fulfillment.result
 ```
 -->
 
@@ -141,7 +142,7 @@ worker = Durababble::Worker.new(
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)`, `FulfillOrder.handle(workflow_id)`, and `FulfillOrder.ref(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
 handle = FulfillOrder.start(order)

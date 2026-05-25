@@ -11,7 +11,7 @@ This reference summarizes the implemented prototype. The spec records the intend
 
 - Class-oriented workflow API with `#execute`, `step def`, retry policy, step idempotency keys, class-method enqueueing, `Workflow.start` / `Workflow.at` / `Workflow.handle` aliases, and optional `engine:` overrides.
 - First-class cooperative workflow cancellation through `Workflow.handle(...).cancel(reason:)`, persisted cancellation requests, `canceling` / `canceled` states, and replay-safe cleanup steps.
-- Class-oriented durable object API with typed `at` / `ref` handles, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
+- Class-oriented durable object API with typed `at` / `handle` handles, `expose`, `expose_command`, command idempotency keys, and explicit state updates.
 - PostgreSQL/YSQL and MySQL/MariaDB store implementations.
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
 - Worker polling with leased workflow claims.
@@ -23,7 +23,7 @@ This reference summarizes the implemented prototype. The spec records the intend
 
 ## Prototype Boundaries
 
-- `Durababble.configure` installs a default store and default engine for top-level workflow and object helpers. Callers can still pass `store:` for compatibility or `engine:` when they need explicit routing.
+- `Durababble.configure` installs a default store and default engine for top-level workflow and object helpers. Callers can still pass `store:` for compatibility or `engine:` when they need explicit routing. Runtime helpers expect the selected namespace to be migrated by setup/deploy orchestration before use.
 - Workflow command methods currently persist durable inbox rows, execute command bodies through the workflow owner, and return command results to synchronous callers.
 - Workflow `wait_condition` is implemented as a timer-backed durable wait. Broader broadcast-style delivery concepts are intentionally out of scope.
 - Durable-object commands persist inbox rows and execute through object workers with per-object FIFO activation.

@@ -114,7 +114,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     assert_equal [:repeat], odd_workflow.step_order
   end
 
-  test "passes positional arguments to workflow ref query methods" do
+  test "passes positional arguments to workflow handle query methods" do
     positional_query = Class.new(Durababble::Workflow) do
       expose def describe(prefix)
         "#{prefix}:#{@__durababble_ref_workflow_id}"
@@ -127,7 +127,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
   test "uses the store's atomic workflow command enqueue path" do
     store = TerminalRaceCommandStore.new
     error = assert_raises(Durababble::Error) do
-      ApiTestApprovalWorkflow.ref("wf-race", store:).approve(reason: "late")
+      ApiTestApprovalWorkflow.handle("wf-race", store:).approve(reason: "late")
     end
 
     assert_match(/terminal/, error.message)
@@ -155,7 +155,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
         caller = Thread.new do
           caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
           begin
-            result_queue << [:ok, ApiTestApprovalWorkflow.ref(workflow_id, store: caller_store).approve(reason: "operator")]
+            result_queue << [:ok, ApiTestApprovalWorkflow.handle(workflow_id, store: caller_store).approve(reason: "operator")]
           rescue StandardError => e
             result_queue << [:error, e]
           ensure
@@ -211,7 +211,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
         caller = Thread.new do
           caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
           begin
-            ApiTestApprovalWorkflow.ref(workflow_id, store: caller_store).reject(reason: "no")
+            ApiTestApprovalWorkflow.handle(workflow_id, store: caller_store).reject(reason: "no")
             result_queue << [:ok, nil]
           rescue StandardError => e
             result_queue << [:error, e]

@@ -16,6 +16,9 @@ class TypedRpcDispatchTest < DurababbleTestCase
 
     at_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedWorkflow", "at")
     assert_includes(at_output, "workflow_handle[Input, Output, Dispatch]")
+    handle_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedWorkflow", "handle")
+    assert_includes(handle_output, "workflow_handle[Input, Output, Dispatch]")
+    assert_rbs_missing_method(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedWorkflow", "ref")
 
     approve_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "DurababbleTypeFixtures::TypedWorkflowDispatch", "approve")
     assert_includes(approve_output, "(reason: ::String) -> bool")
@@ -33,6 +36,9 @@ class TypedRpcDispatchTest < DurababbleTestCase
 
     at_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedObject", "at")
     assert_includes(at_output, "durable_object_handle[Id, State, Dispatch]")
+    handle_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedObject", "handle")
+    assert_includes(handle_output, "durable_object_handle[Id, State, Dispatch]")
+    assert_rbs_missing_method(*RBS_LOAD_PATH, "method", "--singleton", "DurababbleTypeFixtures::TypedObject", "ref")
 
     balance_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "DurababbleTypeFixtures::TypedObjectDispatch", "balance")
     assert_includes(balance_output, "() -> ::Integer")

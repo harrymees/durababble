@@ -18,12 +18,10 @@ module Durababble
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
-      @store.migrate! if migrate
     end
 
     #: (untyped, input: untyped) -> untyped
     def enqueue(workflow_class, input:)
-      @store.migrate!
       @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
     end
 
