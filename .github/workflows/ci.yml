@@ -60,3 +60,19 @@ jobs:
 
       - name: Run RuboCop, RBS validation, and typecheck
         run: bundle exec rake lint
+
+  docs-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.152.2"
+          extended: true
+
+      - name: Build docs site
+        run: hugo --minify --destination docs/build
