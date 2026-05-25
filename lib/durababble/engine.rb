@@ -96,6 +96,19 @@ module Durababble
       WorkflowStatus.terminal?(row)
     end
 
+    #: (untyped, ?history_count: untyped) -> void
+    def assert_workflow_history_limit!(workflow_id, history_count: nil)
+      history_count ||= @store.workflow_history_count_for(workflow_id)
+      max_history_events = Durababble.max_workflow_history_events
+      return if history_count <= max_history_events
+
+      raise WorkflowHistoryLimitExceeded.new(
+        workflow_id,
+        history_events: history_count,
+        max_history_events: max_history_events,
+      )
+    end
+
     #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped
     def dispatch_workflow_command(workflow_class, workflow, workflow_id:, message:)
       unless message.fetch("message_kind") == "workflow_command"
@@ -129,7 +142,9 @@ module Durababble
         workflow = nil #: untyped
         root_error = nil #: StandardError?
         root = Async do |root_task|
+          assert_workflow_history_limit!(workflow_id) if @store.respond_to?(:workflow_history_count_for)
           history = @store.workflow_history_for(workflow_id)
+          assert_workflow_history_limit!(workflow_id, history_count: history.length) unless @store.respond_to?(:workflow_history_count_for)
           Observability.record(
             "durababble.workflow.history.steps",
             history.count { |event| event.fetch("kind") == "step_completed" },

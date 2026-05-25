@@ -5,8 +5,12 @@ module Durababble
   class WorkflowReplayHistory
     TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
 
+    #: Integer
+    attr_reader :event_count
+
     #: (Array[Hash[String, Object?]]) -> void
     def initialize(events)
+      @event_count = events.length
       @scheduled = {}
       @terminal = {}
       @terminal_events = []
@@ -49,6 +53,12 @@ module Durababble
         "name" => step_name,
         "payload" => shape,
       }
+      @event_count += 1
+    end
+
+    #: (Integer) -> void
+    def reserve_events!(count)
+      @event_count += count
     end
 
     #: (workflow_id: String, next_command_id: Integer) -> void

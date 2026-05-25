@@ -139,6 +139,8 @@ Durable commands called from any workflow fiber are assigned command ids when th
 
 Workflow replay is driven by an append-only per-workflow command history. Latest-state tables such as `steps` are query caches and recovery aids, not the replay source of truth.
 
+Replay is bounded by a configurable maximum number of per-workflow `workflow_history` rows. The count includes every replay/history fact for that workflow: step schedules, starts, completions, failures, wait records, timer completions, workflow command completion/failure records, child-workflow records, and patch markers. It does not count latest-state or recovery helper rows in `steps`, `step_attempts`, `waits`, `inbox`, or `outbox`, except where those operations append a workflow-history fact. The engine checks the count before loading full replay payloads and checks projected growth before scheduling a new durable command. If an open workflow exceeds the bound, the engine raises `Durababble::WorkflowHistoryLimitExceeded`, records that typed error on the workflow row, clears the lease, and returns a terminal failed run so workers do not repeatedly replay the same oversized history. Terminal workflows are returned without applying the replay bound so completed results and terminal errors remain inspectable.
+
 Step scheduling, step execution starts, and step completions are distinct durable facts. A schedule record stores command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start record stores that an executor began a concrete attempt. A completion, failure, or wait record resolves the command's workflow future.
 
 Schedule record shape includes step method name, serialized args/kwargs or a stable payload digest, retry/executor attributes, and any semantic key if one is present. Replay validates the scheduled command shape even when no completion exists, so a step that started before a crash cannot disappear silently.
@@ -540,11 +542,14 @@ Durababble.configure do |c|
   c.warn_step_output_bytes = 1 * 1024 * 1024
   c.max_object_state_bytes = 4 * 1024 * 1024
   c.warn_object_state_bytes = 1 * 1024 * 1024
+  c.max_workflow_history_events = ENV.fetch("DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS", "10000").to_i
   c.observability = MyApp::Observability::Durababble
 end
 ```
 
 Size guards are production requirements. Durababble warns at configured thresholds and raises `Durababble::PayloadTooLarge` when serialized workflow args, step outputs, or object state exceed max bytes. The runtime does not silently spill oversized values to blob storage.
+
+The workflow-history guard is a replay-cost and correctness guard, not a retention system. Applications should alert on `Durababble::WorkflowHistoryLimitExceeded`, inspect the workflow type/id and history count, and remediate by splitting the workflow into smaller durable runs/objects, pruning or compacting old terminal histories with an explicit operator tool, or raising `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` only after the long-history benchmark shows acceptable replay latency and allocation cost.
 
 Operational surfaces include CLI migration, workflow run/resume, inspection, version output, built-in bounded listing/finding of workflows and objects, and operator actions for dead-lettered mailbox heads: retry now, skip, cancel target, destroy target, and repair/decode failed payloads.
 

@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "digest"
+require "logger"
 
 require_relative "durababble/version"
 require_relative "durababble/statuses"
@@ -11,12 +12,28 @@ module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
   DEFAULT_SCHEMA_PREFIX = "durababble"
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
+  DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000
+  DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS = 8_000
 
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
   class DeterminismError < Error; end
   class NonDeterminismError < DeterminismError; end
+
+  class WorkflowHistoryLimitExceeded < Error
+    #: untyped
+    attr_reader :workflow_id, :history_events, :max_history_events
+
+    #: (untyped, history_events: Integer, max_history_events: Integer) -> void
+    def initialize(workflow_id, history_events:, max_history_events:)
+      @workflow_id = workflow_id
+      @history_events = history_events
+      @max_history_events = max_history_events
+      super("workflow #{workflow_id} has #{history_events} history events, exceeding max #{max_history_events}")
+    end
+  end
+
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
@@ -41,6 +58,12 @@ module Durababble
     attr_reader :default_store
     #: Engine?
     attr_reader :default_engine
+    #: untyped
+    attr_writer :logger
+    #: untyped
+    attr_writer :max_workflow_history_events
+    #: untyped
+    attr_writer :workflow_history_warning_events
 
     #: (Store?) -> Engine?
     def default_store=(store)
@@ -75,6 +98,49 @@ module Durababble
       max_base_length = MAX_SCHEMA_IDENTIFIER_LENGTH - suffix.length - 1
       trimmed_base = base.slice(0, max_base_length).to_s.sub(/_+\z/, "")
       "#{trimmed_base}_#{suffix}"
+    end
+
+    #: () -> Integer
+    def max_workflow_history_events
+      configured = if instance_variable_defined?(:@max_workflow_history_events)
+        @max_workflow_history_events
+      else
+        ENV.fetch("DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS", DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS)
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "max workflow history events must be positive" unless value.positive?
+      end
+    end
+
+    #: () -> Integer
+    def workflow_history_warning_events
+      configured = if instance_variable_defined?(:@workflow_history_warning_events)
+        @workflow_history_warning_events
+      else
+        ENV.fetch("DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS", DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS)
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "workflow history warning events must be positive" unless value.positive?
+      end
+    end
+
+    #: () -> untyped
+    def logger
+      return @logger if instance_variable_defined?(:@logger)
+
+      @logger = Logger.new($stderr).tap { |logger| logger.level = Logger::WARN }
+    end
+
+    #: (workflow_id: untyped, history_events: Integer, max_history_events: Integer) -> bool
+    def warn_workflow_history_events(workflow_id:, history_events:, max_history_events:)
+      warning_events = workflow_history_warning_events
+      return false if history_events < warning_events
+
+      logger&.warn(
+        "Durababble workflow #{workflow_id} has #{history_events} workflow history events; " \
+          "warning threshold is #{warning_events}, max is #{max_history_events}",
+      )
+      true
     end
 
     #: (database_url: String, ?schema: String) -> Store
