@@ -123,9 +123,40 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
+  test "postgres create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedPgConnection.new
+    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "'running'"
+    refute_includes sql, "UPDATE"
+    assert_equal "demo", params[1]
+  end
+
+  test "mysql create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedMysqlConnection.new
+    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.queries.length
+    sql = connection.queries.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "'running'"
+    refute_includes sql, "UPDATE"
+  end
+
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+
+      assert_hash_includes store.workflow(workflow_id), "status" => "running", "input" => { "count" => 1 }
 
       store.record_step_started(workflow_id:, position: 0, name: "add_one")
       store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 })

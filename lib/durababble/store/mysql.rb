@@ -25,6 +25,13 @@ module Durababble
       id
     end
 
+    #: (name: String, input: Object?) -> Object?
+    def create_workflow(name:, input:)
+      id = SecureRandom.uuid
+      execute_store_query(:create_workflow, [id, name, dump_serialized(input)])
+      id
+    end
+
     #: (String, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
       if worker_id
