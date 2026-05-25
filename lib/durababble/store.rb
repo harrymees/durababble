@@ -317,6 +317,7 @@ module Durababble
         "durababble.queue.name" => queue,
         "durababble.store.backend" => Observability.store_backend(self),
       )
+      nil
     rescue StandardError
       nil
     end
@@ -334,6 +335,7 @@ module Durababble
         [((completed_at.to_time - created_at.to_time) * 1000.0), 0].max,
         "durababble.wait.kind" => wait["kind"],
       )
+      nil
     rescue StandardError
       nil
     end
