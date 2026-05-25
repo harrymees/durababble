@@ -283,7 +283,7 @@ module Durababble
           kind: "workflow_command_completed",
           name: command["method_name"],
           attempt_id: message_id,
-          payload: { "message_id" => message_id, "result" => result },
+          payload: workflow_command_history_payload(command, message_id:, result:, include_result: true),
         )
         updated = complete_inbox_message_without_transaction(message_id:, result:)
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
@@ -302,7 +302,7 @@ module Durababble
           kind: "workflow_command_failed",
           name: command["method_name"],
           attempt_id: message_id,
-          payload: { "message_id" => message_id },
+          payload: workflow_command_history_payload(command, message_id:),
           error:,
         )
         updated = dead_letter_inbox_message_without_transaction(message_id:, error:)
@@ -458,6 +458,23 @@ module Durababble
     #: (message_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_inbox_message_for_completion(message_id:, worker_id:)
       raise NotImplementedError
+    end
+
+    #: (Hash[String, Object?], message_id: String, ?result: Object?, ?include_result: bool) -> Hash[String, Object?]
+    def workflow_command_history_payload(command, message_id:, result: nil, include_result: false)
+      command = decode_row(command) if command.key?("payload") && !command["payload"].is_a?(Hash)
+      payload = command["payload"].is_a?(Hash) ? command.fetch("payload") : {}
+      payload = payload #: as untyped
+      history_payload = {
+        "message_id" => message_id,
+        "method" => command["method_name"] || payload["method"] || payload["method_name"],
+        "args" => payload.fetch("args", []),
+        "kwargs" => payload.fetch("kwargs", {}),
+        "shape_hash" => command["shape_hash"],
+        "sequence" => command["sequence"],
+      }
+      history_payload["result"] = result if include_result
+      history_payload
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?

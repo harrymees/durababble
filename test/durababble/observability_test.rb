@@ -150,6 +150,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def workflow_cancellation(_workflow_id) = nil
+    def target_activation(target_kind:, target_type:, target_id:) = nil
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:) = []
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]

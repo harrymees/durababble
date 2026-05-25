@@ -192,6 +192,95 @@ class DurababbleWorkflowTest < DurababbleTestCase
       end
     end
 
+    test "delivers workflow commands into the active deterministic execution with #{backend.name}" do
+      with_durababble_store(backend, "workflow_active_commands") do |store|
+        store.migrate!
+        execute_object_ids = []
+        command_object_ids = []
+        finish_object_ids = []
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "active-approval-command"
+
+          define_method(:execute) do |_input|
+            execute_object_ids << object_id
+            @approved = false
+            ready = wait_condition(timeout: 60) { @approved }
+            finish(ready)
+          end
+
+          define_method(:finish) do |ready|
+            finish_object_ids << object_id
+            { "ready" => ready, "approved" => @approved }
+          end
+          step :finish
+
+          define_method(:approve) do
+            @approved = true
+            command_object_ids << object_id
+            { "approved" => @approved }
+          end
+          expose_command :approve
+        end
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.workflow_name => workflow },
+          worker_id: "active-command-worker",
+          migrate: false,
+        )
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        assert_equal(:worked, worker.tick)
+        assert_equal("waiting", store.workflow(workflow_id).fetch("status"))
+
+        result_queue = Queue.new
+        caller = Thread.new do
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+          begin
+            result_queue << [:ok, workflow.handle(workflow_id, store: caller_store).approve]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          ensure
+            caller_store.close
+          end
+        end
+
+        wait_until { store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id) }
+        assert_equal(:worked, worker.tick)
+        status, command_result = result_queue.pop
+        caller.join
+
+        assert_equal(:ok, status)
+        assert_equal(true, command_result.fetch("approved"))
+        completed = store.workflow(workflow_id)
+        assert_hash_includes(completed, "status" => "completed")
+        assert_equal(
+          { "ready" => true, "approved" => true },
+          completed.fetch("result"),
+        )
+        assert_equal command_object_ids.last, execute_object_ids.last
+        assert_equal command_object_ids.last, finish_object_ids.last
+        assert_equal 2, execute_object_ids.length
+        assert_equal 1, command_object_ids.length
+        assert_nil store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id)
+
+        history = store.workflow_history_for(workflow_id)
+        assert_equal(
+          ["step_scheduled", "step_waiting", "workflow_command_completed", "step_scheduled", "step_started", "step_completed"],
+          history.map { |event| event.fetch("kind") },
+        )
+        command_event = history.detect { |event| event.fetch("kind") == "workflow_command_completed" }
+        assert_hash_includes(
+          command_event.fetch("payload"),
+          "method" => "approve",
+          "args" => [],
+          "kwargs" => {},
+          "result" => command_result,
+        )
+      ensure
+        caller&.kill if caller&.alive?
+      end
+    end
+
     test "returns exposed workflow command errors through the ask row with #{backend.name}" do
       with_durababble_store(backend, "workflow_command_errors") do |store|
         store.migrate!

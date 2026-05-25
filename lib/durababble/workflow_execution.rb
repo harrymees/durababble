@@ -12,13 +12,15 @@ require_relative "workflow_step_runner"
 
 module Durababble
   class WorkflowExecution
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, crash_after: nil, history_warning_logged: false)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, workflow_class: untyped, workflow: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, crash_after: nil, history_warning_logged: false)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @root_task = root_task
+      @workflow_class = workflow_class
+      @workflow = workflow
       @crash_after = crash_after
       @next_command_id = 0
       @futures = {}
@@ -30,6 +32,7 @@ module Durababble
       @replay_history = WorkflowReplayHistory.new(history)
       @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
+      @delivering_workflow_command = false
       @step_runner = WorkflowStepRunner.new(
         store: @store,
         workflow_id: @workflow_id,
@@ -113,13 +116,19 @@ module Durababble
         dispatch_command!(command_id, step:, attributes:, &block)
       end
       deliver_recorded_resolutions!
-      result = await_command_future(future, command_id)
+      result = begin
+        await_command_future(future, command_id)
+      rescue WorkflowSuspended
+        deliver_workflow_commands_at_safe_point!
+        raise
+      end
+      deliver_workflow_commands_at_safe_point!
       raise_if_cancel_requested!
       result
     end
 
     #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped) -> untyped
-    def call_wait(wait_request, name:, args: [], kwargs: {})
+    def call_wait(wait_request, name:, args: [], kwargs: {}, interrupt_on_command: false)
       assert_workflow_task!("durable wait #{name}")
       shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
@@ -140,7 +149,18 @@ module Durababble
         record_wait_command!(command_id, name:, wait_request:)
       end
       deliver_recorded_resolutions!
-      result = await_command_future(future, command_id)
+      result = begin
+        await_command_future(future, command_id, interrupt_on_command:)
+      rescue WorkflowSuspended
+        if interrupt_on_command
+          delivered = deliver_workflow_commands_at_safe_point!
+          raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}" if delivered.positive?
+        end
+
+        deliver_workflow_commands_at_safe_point!
+        raise
+      end
+      deliver_workflow_commands_at_safe_point!
       raise_if_cancel_requested!
       result
     end
@@ -148,6 +168,7 @@ module Durababble
     #: (?timeout: untyped) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
       loop do
+        deliver_workflow_commands_at_safe_point!
         if scheduled_history_for_next_command?
           wait_request = WaitRequest.new(
             kind: "timer",
@@ -155,13 +176,18 @@ module Durababble
             event_key: nil,
             context: {},
           )
-          call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
+          begin
+            call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
+          rescue WorkflowCommandDelivered
+            next
+          end
           return !!block.call if timeout
 
           next
         end
 
         raise_if_cancel_requested!
+        deliver_workflow_commands_at_safe_point!
         return true if block.call
 
         wait_request = WaitRequest.new(
@@ -170,7 +196,11 @@ module Durababble
           event_key: nil,
           context: {},
         )
-        call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
+        begin
+          call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
+        rescue WorkflowCommandDelivered
+          next
+        end
         return !!block.call if timeout
       end
     end
@@ -322,9 +352,12 @@ module Durababble
     end
 
     #: (untyped, untyped) -> untyped
-    def await_command_future(future, command_id)
+    def await_command_future(future, command_id, interrupt_on_command: false)
       loop do
         deliver_recorded_resolutions!
+        if interrupt_on_command && deliver_workflow_commands_at_safe_point!.positive?
+          raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}"
+        end
         return future.value if future.done?
 
         missing_command_id = @replay_history.next_undeliverable_command_id(@futures)
@@ -359,6 +392,163 @@ module Durababble
           future.reject(Error.new(event.fetch("error")))
         end
       end
+    end
+
+    #: (?limit: Integer) -> Integer
+    def deliver_workflow_commands_at_safe_point!(limit: 10)
+      return 0 if @delivering_workflow_command
+
+      delivered = 0
+      @delivering_workflow_command = true
+      begin
+        delivered += deliver_recorded_workflow_commands
+        return delivered if @replay_history.blocked_recorded_workflow_command?
+        return delivered if @replay_history.blocked_by_replay_history?
+
+        while delivered < limit
+          message = claim_next_workflow_command_message
+          break unless message
+
+          dispatch_workflow_command_message(message)
+          delivered += 1
+        end
+      ensure
+        @delivering_workflow_command = false
+      end
+      delivered
+    end
+
+    #: () -> Integer
+    def deliver_recorded_workflow_commands
+      @replay_history.deliver_workflow_commands do |event|
+        replay_workflow_command_event(event)
+      end
+    end
+
+    #: () -> Hash[String, Object?]?
+    def claim_next_workflow_command_message
+      row = synchronize_store { @store.workflow(@workflow_id) }
+      return unless row.fetch("status") == "running"
+
+      activation = synchronize_store do
+        @store.target_activation(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+        )
+      end
+      return unless activation
+
+      begin
+        assert_workflow_lease!
+      rescue LeaseConflict
+        latest = synchronize_store { @store.workflow(@workflow_id) }
+        return unless latest.fetch("status") == "running"
+
+        raise
+      end
+      messages = synchronize_store do
+        @store.claim_inbox_messages(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          worker_id: @worker_id,
+          lease_seconds: @lease_seconds,
+          limit: 1,
+        )
+      end
+      messages.first
+    end
+
+    #: (Hash[String, Object?]) -> void
+    def dispatch_workflow_command_message(message)
+      unless message.fetch("message_kind") == "workflow_command"
+        fail_workflow_command_message(message, "Durababble::Error: unsupported workflow inbox message #{message.fetch("message_kind")}")
+        return
+      end
+
+      method_name, args, kwargs = workflow_command_call_shape(message)
+      unless @workflow_class.exposed_commands.key?(method_name)
+        fail_workflow_command_message(message, "Durababble::WorkflowRpc::UnknownCommand: #{method_name}")
+        return
+      end
+
+      result = invoke_workflow_command(method_name, args:, kwargs:)
+      reserve_workflow_command_history_event!
+      synchronize_store do
+        @store.complete_workflow_command(
+          message_id: message.fetch("id"),
+          workflow_id: @workflow_id,
+          result:,
+          worker_id: @worker_id,
+        )
+      end
+    rescue StandardError => e
+      fail_workflow_command_message(message, "#{e.class}: #{e.message}")
+    end
+
+    #: (Hash[String, Object?]) -> void
+    def replay_workflow_command_event(event)
+      payload = event["payload"] || {}
+      payload = payload #: as untyped
+      method_name = (payload["method"] || event["name"]).to_sym
+      args = payload.fetch("args", [])
+      kwargs = payload.fetch("kwargs", {})
+
+      unless @workflow_class.exposed_commands.key?(method_name)
+        raise NonDeterminismError, "workflow #{@workflow_id} replay reached unknown workflow command #{method_name}"
+      end
+
+      case event.fetch("kind")
+      when "workflow_command_completed"
+        result = invoke_workflow_command(method_name, args:, kwargs:)
+        return unless payload.key?("result")
+        return if result == payload.fetch("result")
+
+        raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different result than recorded history"
+      when "workflow_command_failed"
+        begin
+          invoke_workflow_command(method_name, args:, kwargs:)
+        rescue StandardError => e
+          expected = event["error"]
+          return if expected.nil? || expected == "#{e.class}: #{e.message}"
+
+          raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different error than recorded history"
+        end
+        raise NonDeterminismError, "workflow #{@workflow_id} replay expected workflow command #{method_name} to fail"
+      end
+    end
+
+    #: (Hash[String, Object?]) -> [Symbol, Array[Object?], Hash[Symbol, Object?]]
+    def workflow_command_call_shape(message)
+      payload = message.fetch("payload")
+      payload = payload #: as untyped
+      method_name = (message["method_name"] || payload.fetch("method")).to_sym
+      [method_name, payload.fetch("args", []), payload.fetch("kwargs", {})]
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object?
+    def invoke_workflow_command(method_name, args:, kwargs:)
+      kwargs.empty? ? @workflow.public_send(method_name, *args) : @workflow.public_send(method_name, *args, **kwargs)
+    end
+
+    #: (Hash[String, Object?], String) -> void
+    def fail_workflow_command_message(message, error)
+      reserve_workflow_command_history_event!
+      synchronize_store do
+        @store.fail_workflow_command(
+          message_id: message.fetch("id"),
+          workflow_id: @workflow_id,
+          error:,
+          worker_id: @worker_id,
+        )
+      end
+    end
+
+    #: () -> void
+    def reserve_workflow_command_history_event!
+      ensure_history_limit_allows!(additional_events: 1)
+      @replay_history.reserve_events!(1)
     end
 
     #: (untyped, ?fallback_reason: untyped) -> untyped

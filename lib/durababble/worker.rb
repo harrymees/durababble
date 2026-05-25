@@ -88,7 +88,7 @@ module Durababble
       workflow = @workflows.fetch(activation.fetch("target_type"))
       engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
-      engine.drain_workflow_inbox(workflow, workflow_id:, claimed:) if claimed
+      engine.resume(workflow, workflow_id:, claimed:) if claimed
       if advisory
         if claimed
           @store.reconcile_target_activation(

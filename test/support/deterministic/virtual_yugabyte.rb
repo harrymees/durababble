@@ -358,6 +358,16 @@ module Durababble
       #: (untyped) -> untyped
       def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
 
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+      def target_activation(target_kind:, target_type:, target_id:)
+        nil
+      end
+
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, limit: untyped) -> untyped
+      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+        []
+      end
+
       #: (workflow_id: untyped, worker_id: untyped) -> untyped
       def workflow_owned?(workflow_id:, worker_id:)
         row = @workflows.fetch(workflow_id)

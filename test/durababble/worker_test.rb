@@ -75,6 +75,14 @@ class DurababbleWorkerTest < DurababbleTestCase
       0
     end
 
+    def target_activation(**)
+      nil
+    end
+
+    def claim_inbox_messages(**)
+      []
+    end
+
     def record_step_scheduled(workflow_id:, command_id:, name:, **)
       @resumed << [:scheduled, workflow_id, command_id, name]
     end
@@ -200,6 +208,15 @@ class DurababbleWorkerTest < DurababbleTestCase
       }
     end
 
+    def target_activation(**)
+      {
+        "target_kind" => "workflow",
+        "target_type" => "command-unit",
+        "target_id" => "wf-command",
+        "status" => "running",
+      }
+    end
+
     def claim_inbox_messages(**)
       message = @messages.shift
       message ? [message] : []
@@ -313,10 +330,18 @@ class DurababbleWorkerTest < DurababbleTestCase
     assert_operator completion.fetch(:now), :<, locked_until
   end
 
-  test "drains a workflow inbox from an advisory delivery without claiming the activation row" do
+  test "delivers a workflow inbox from an advisory delivery through workflow execution" do
     store = AdvisoryDeliveryStore.new
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "command-unit"
+
+      def execute(input)
+        finish(input)
+      end
+
+      step def finish(input)
+        input
+      end
 
       expose_command def approve(reason:)
         { "approved_by" => reason }
@@ -338,9 +363,12 @@ class DurababbleWorkerTest < DurababbleTestCase
     assert_equal(
       [
         [:activation_claim, "wf-command", "worker-a", 17],
-        [:suspend, { workflow_id: "wf-command", worker_id: "worker-a" }],
+        [:scheduled, "wf-command", 0, "finish"],
+        [:started, "wf-command", 0, "finish"],
+        [:completed, "wf-command", 0, {}],
+        [:workflow_completed, "wf-command", {}],
       ],
-      store.resumed,
+      store.resumed.reject { |event| [:owned, :heartbeat_cursor].include?(event.first) },
     )
     assert_equal(
       [

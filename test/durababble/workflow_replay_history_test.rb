@@ -9,7 +9,11 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
   end
 
   def completed_event(command_id, event_index:)
-    { "kind" => "step_completed", "command_id" => command_id, "event_index" => event_index, "result" => { "ok" => true } }
+    { "kind" => "step_completed", "command_id" => command_id, "event_index" => event_index, "payload" => { "ok" => true } }
+  end
+
+  def workflow_command_event(event_index:)
+    { "kind" => "workflow_command_completed", "event_index" => event_index, "name" => "approve", "payload" => { "method" => "approve", "args" => [], "kwargs" => {}, "result" => { "approved" => true } } }
   end
 
   test "event_count reflects the number of persisted events" do
@@ -77,5 +81,41 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
 
     assert_equal [0], delivered
     assert_nil history.next_undeliverable_command_id({ 0 => Durababble::CommandFuture.new(0) })
+  end
+
+  test "workflow command delivery waits for preceding scheduled history consumption" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, payload: { "name" => "wait" }, event_index: 0),
+      workflow_command_event(event_index: 1),
+    ])
+    delivered = []
+
+    assert_equal 0, history.deliver_workflow_commands { |event| delivered << event.fetch("name") }
+    assert history.blocked_recorded_workflow_command?
+
+    history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "wait" })
+
+    assert_equal 1, history.deliver_workflow_commands { |event| delivered << event.fetch("name") }
+    assert_equal ["approve"], delivered
+    refute history.blocked_recorded_workflow_command?
+  end
+
+  test "terminal resolution waits behind an earlier workflow command event" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, payload: { "name" => "wait" }, event_index: 0),
+      workflow_command_event(event_index: 1),
+      completed_event(0, event_index: 2),
+    ])
+    future = Durababble::CommandFuture.new(0)
+    resolutions = []
+
+    history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "wait" })
+    history.deliver_resolutions({ 0 => future }) { |event, _future| resolutions << event.fetch("kind") }
+    assert_empty resolutions
+
+    history.deliver_workflow_commands { |_event| }
+    history.deliver_resolutions({ 0 => future }) { |event, _future| resolutions << event.fetch("kind") }
+
+    assert_equal ["step_completed"], resolutions
   end
 end
