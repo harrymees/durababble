@@ -271,6 +271,7 @@ module Durababble
         if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
           raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
         end
+
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
         wait_id

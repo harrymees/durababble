@@ -611,6 +611,7 @@ module Durababble
         if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
           raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
         end
+
         Observability.count(
           "durababble.waits.started",
           "durababble.workflow.id" => workflow_id,
