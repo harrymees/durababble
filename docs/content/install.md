@@ -65,6 +65,27 @@ store.migrate!
 
 `from_active_record` also accepts a bare `connection:` for cases where you already hold a checked-out ActiveRecord connection. The adapter is detected from `connection.adapter_name`, so the same call works for MySQL, PostgreSQL, and YugabyteDB.
 
+## Workers And Cluster Addresses
+
+A `Durababble::Worker` is enough for a single process: it polls the store, claims leases, and drains workflows and object inboxes. In production you usually run many workers across many pods, and they need to reach each other over the network so that simple RPCs (`expose`) and live command delivery (`expose_command`) can land on the worker that currently owns the workflow or durable object.
+
+`Durababble::WorkerRuntime` wraps a `Worker` with a gRPC server and is the production-shaped entry point. Each runtime advertises an address that becomes its `worker_id`, and the lease row written when the runtime claims a workflow records that address as the owner. Any other worker that wants to RPC into the lease holder reads the same row and dials the address directly:
+
+```ruby
+runtime = Durababble::WorkerRuntime.start(
+  store:,
+  workflows: [FulfillOrder],
+  objects: [Account],
+  worker_pool: "orders",
+  rpc_host: ENV.fetch("POD_IP"),  # the address other pods can reach this one at
+  rpc_port: 50_051,
+)
+```
+
+The address is the worker's public identity, so `rpc_host` must be a value other pods can actually connect to. In Kubernetes this is typically the pod IP exposed through the downward API; on bare metal it is the host's routable address. The defaults (`rpc_host: "127.0.0.1"`, `rpc_port: 0`) are fine for single-process examples and tests but leave the worker unreachable from anywhere else. `rpc_credentials:` defaults to insecure local-only credentials; production deployments should pass mTLS credentials through this argument.
+
+For more on how peer-to-peer routing works once workers are wired up — and why Durababble routes simple RPC and live command delivery through the cluster mesh rather than the database — see [Cluster RPC](cluster-rpc.md).
+
 ## Schemas And Table Prefixes
 
 The store namespaces its tables so multiple applications can share one database. Pass `schema:` explicitly when you want a stable name:
