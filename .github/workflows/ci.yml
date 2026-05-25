@@ -6,25 +6,10 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    name: test (${{ matrix.backend }})
+  mysql-test:
+    name: test (mysql)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - backend: mysql
-            database_url: mysql://root@127.0.0.1:3306/sidekick_server_test
-            rake_task: test:coverage
-            test_backends: mysql
-            yugabyte_database_url: ""
-          - backend: yugabyte
-            database_url: postgresql://yugabyte@127.0.0.1:5433/yugabyte
-            rake_task: test
-            test_backends: yugabyte
-            yugabyte_database_url: postgresql://yugabyte@127.0.0.1:5433/yugabyte
+    timeout-minutes: 20
 
     services:
       mysql:
@@ -43,8 +28,70 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Run MySQL coverage gate
+        env:
+          DURABABBLE_DATABASE_URL: mysql://root@127.0.0.1:3306/sidekick_server_test
+          DURABABBLE_MYSQL_HOST: 127.0.0.1
+          DURABABBLE_TEST_BACKENDS: mysql
+          DURABABBLE_YUGABYTE_DATABASE_URL: ""
+        run: bundle exec rake test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: ignore
+          include-hidden-files: true
+
+  yugabyte-test:
+    name: test (yugabyte / ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: async-workflow
+            files: test/durababble/async_workflow_test.rb
+          - shard: store-conformance
+            files: test/durababble/store_backend_conformance_test.rb
+          - shard: cancellation-queue
+            files: >-
+              test/durababble/workflow_cancellation_test.rb
+              test/durababble/store_queue_correctness_test.rb
+          - shard: store-plans
+            files: >-
+              test/durababble/store_test.rb
+              test/durababble/query_plan_test.rb
+              test/durababble/documentation_test.rb
+              test/durababble/hardening_test.rb
+              test/durababble/public_workflow_api_test.rb
+              test/durababble/worker_lifecycle_test.rb
+          - shard: workflows-objects
+            files: >-
+              test/durababble/complete_test.rb
+              test/durababble/durable_object_test.rb
+              test/durababble/engine_test.rb
+              test/durababble/hatchet_inspired_test.rb
+              test/durababble/workflow_test.rb
+          - shard: waits-retries-heartbeats
+            files: >-
+              test/durababble/durable_wait_recovery_test.rb
+              test/durababble/heartbeat_test.rb
+              test/durababble/step_retry_test.rb
+
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Start YugabyteDB
-        if: matrix.backend == 'yugabyte'
         run: |
           docker run \
             --detach \
@@ -53,6 +100,13 @@ jobs:
             yugabytedb/yugabyte:2.25.1.0-b381 \
             bin/yugabyted start --background=false
 
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Wait for YugabyteDB
+        run: |
           container_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' durababble-yugabyte)
           for attempt in {1..60}; do
             if docker exec durababble-yugabyte bin/ysqlsh \
@@ -69,27 +123,12 @@ jobs:
           docker logs durababble-yugabyte
           exit 1
 
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.4"
-          bundler-cache: true
-
-      - name: Run ${{ matrix.backend }} test suite
+      - name: Run Yugabyte shard
         env:
-          DURABABBLE_DATABASE_URL: ${{ matrix.database_url }}
-          DURABABBLE_MYSQL_HOST: 127.0.0.1
-          DURABABBLE_TEST_BACKENDS: ${{ matrix.test_backends }}
-          DURABABBLE_YUGABYTE_DATABASE_URL: ${{ matrix.yugabyte_database_url }}
-        run: bundle exec rake ${{ matrix.rake_task }}
-
-      - name: Upload coverage report
-        if: always() && matrix.backend == 'mysql'
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage/
-          if-no-files-found: ignore
-          include-hidden-files: true
+          DURABABBLE_DATABASE_URL: postgresql://yugabyte@127.0.0.1:5433/yugabyte
+          DURABABBLE_TEST_BACKENDS: yugabyte
+          DURABABBLE_YUGABYTE_DATABASE_URL: postgresql://yugabyte@127.0.0.1:5433/yugabyte
+        run: bundle exec ruby -Ilib -Itest ${{ matrix.files }}
 
   lint-typecheck:
     runs-on: ubuntu-latest
