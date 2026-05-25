@@ -174,7 +174,11 @@ module Durababble
     #: (Integer) -> Integer
     def attempt_number_for(command_id)
       count = synchronize_store do
-        @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
+        if @store.respond_to?(:step_attempt_count_for)
+          @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
+        else
+          @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
+        end
       end
       count = count #: as untyped
       count.to_i

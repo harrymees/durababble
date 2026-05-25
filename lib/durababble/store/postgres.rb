@@ -249,6 +249,13 @@ module Durababble
       end
     end
 
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      row = execute_store_query(:step_attempt_count_for, [workflow_id, command_id]).first
+      row.fetch("count").to_i
+    end
+
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
     def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
@@ -537,10 +544,10 @@ module Durababble
       ["AND #{filters.join(" AND ")}", params]
     end
 
-    #: (Time) -> Integer
-    def complete_timer_waits(now)
+    #: (Time, Integer) -> Integer
+    def complete_timer_waits(now, batch_size)
       @connection.transaction(requires_new: true) do
-        returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({})])
+        returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
         finish_completed_waits(returning, {})
       end
     end

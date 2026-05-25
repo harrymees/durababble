@@ -176,7 +176,7 @@ module Durababble
     def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
-    def wake_due_timers: (?now: Time) -> Integer
+    def wake_due_timers: (?now: Time, ?batch_size: Integer) -> Integer
     def waits_for: (String workflow_id) -> Array[workflow_row]
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload
     def enqueue_outbox: (workflow_id: String, topic: String, payload: serialized_payload, key: String) -> String
@@ -197,6 +197,7 @@ module Durababble
     def workflow: (String workflow_id) -> workflow_row
     def steps_for: (String workflow_id) -> Array[workflow_row]
     def step_attempts_for: (String workflow_id) -> Array[workflow_row]
+    def step_attempt_count_for: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
     def object_state: (object_type: String, object_id: String) -> serialized_payload
     def save_object_state: (object_type: String, object_id: String, state: serialized_payload) -> serialized_payload
     def enqueue_object_command: (object_type: String, object_id: String, method_name: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?) -> String
