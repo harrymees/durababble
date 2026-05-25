@@ -98,14 +98,18 @@ module Durababble
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do
-        workflows = execute_store_query(:count_workflow_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_workflow_leases, [worker_id])
-        outbox = execute_store_query(:count_outbox_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_outbox_leases, [worker_id])
-        inbox = execute_store_query(:count_inbox_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_inbox_leases, [worker_id])
-        target_activations = execute_store_query(:count_target_activation_leases, [worker_id]).first.fetch("count").to_i
-        execute_store_query(:release_target_activation_leases, [worker_id])
+        workflow_index = index_name("workflows", "worker_lease")
+        workflows = execute_store_query(:count_workflow_leases, [worker_id], index: workflow_index).first.fetch("count").to_i
+        execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index)
+        outbox_index = index_name("outbox", "worker_lease")
+        outbox = execute_store_query(:count_outbox_leases, [worker_id], index: outbox_index).first.fetch("count").to_i
+        execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index)
+        inbox_index = index_name("inbox", "worker_lease")
+        inbox = execute_store_query(:count_inbox_leases, [worker_id], index: inbox_index).first.fetch("count").to_i
+        execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index)
+        target_activation_index = index_name("target_activations", "worker_lease")
+        target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
+        execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
