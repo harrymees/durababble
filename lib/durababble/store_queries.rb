@@ -620,6 +620,10 @@ module Durababble
       "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES ($1, $2, 'running', $3::bytea)"
     end
 
+    define(:pg_create_workflow_with_worker, backend: :postgres) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES ($1, $2, 'running', $3::bytea, $4, now() + ($5::int * interval '1 second'))"
+    end
+
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
       "UPDATE #{table(store, "workflows")}\n" \
         "SET status = 'running', error = NULL, locked_by = $2,\n    " \
@@ -974,6 +978,10 @@ module Durababble
 
     define(:mysql_create_workflow, backend: :mysql) do |store|
       "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES (?, ?, 'running', ?)"
+    end
+
+    define(:mysql_create_workflow_with_worker, backend: :mysql) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES (?, ?, 'running', ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|

@@ -127,28 +127,34 @@ class DurababbleStoreTest < DurababbleTestCase
     connection = ScriptedPgConnection.new
     store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
 
-    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
 
     assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
     assert_equal 1, connection.exec_params_calls.length
     sql, params = connection.exec_params_calls.first
     assert_includes sql, "INSERT INTO"
     assert_includes sql, "'running'"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
     refute_includes sql, "UPDATE"
     assert_equal "demo", params[1]
+    assert_equal "worker-a", params[3]
+    assert_equal 9, params[4]
   end
 
   test "mysql create_workflow inserts the initial running row in one statement" do
     connection = ScriptedMysqlConnection.new
     store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
 
-    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
 
     assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
     assert_equal 1, connection.queries.length
     sql = connection.queries.first
     assert_includes sql, "INSERT INTO"
     assert_includes sql, "'running'"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
     refute_includes sql, "UPDATE"
   end
 

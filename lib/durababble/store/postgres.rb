@@ -18,10 +18,14 @@ module Durababble
       id
     end
 
-    #: (name: String, input: Object?) -> Object?
-    def create_workflow(name:, input:)
+    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
+    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60)
       id = SecureRandom.uuid
-      execute_store_query(:create_workflow, [id, name, dump_serialized(input)])
+      if worker_id
+        execute_store_query(:create_workflow_with_worker, [id, name, dump_serialized(input), worker_id, lease_seconds])
+      else
+        execute_store_query(:create_workflow, [id, name, dump_serialized(input)])
+      end
       id
     end
 
