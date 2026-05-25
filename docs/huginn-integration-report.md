@@ -35,7 +35,7 @@ Huginn is a Rails 8.1 application where `Agent` subclasses own user-defined `che
 - Updated `Agent.async_check` and `Agent.async_receive` to enqueue Durababble object commands with idempotency keys instead of ActiveJob jobs.
 - Kept scheduled checks idempotent by agent/schedule/minute while allowing manual `async_check` calls to enqueue distinct durable commands unless an explicit idempotency key is supplied.
 - Normalized durable object ids back to integer ActiveRecord ids before `Agent.find`.
-- Added `spec/lib/durababble_agent_integration_spec.rb` covering persisted enqueue/drain, idempotent receive enqueue, and retry recovery, plus an experimental real-worker spec helper so existing model specs can drain Durababble instead of relying on DelayedJob inline execution.
+- Added `spec/lib/durababble_agent_integration_spec.rb` covering persisted enqueue/drain, idempotent receive enqueue, and retry recovery, plus a real-worker spec helper so existing model specs can drain Durababble instead of relying on DelayedJob inline execution.
 
 ## Baseline Tests
 
@@ -50,7 +50,7 @@ Huginn is a Rails 8.1 application where `Agent` subclasses own user-defined `che
 - Ported Durababble integration command: `mise exec -- env DATABASE_ADAPTER=mysql2 DATABASE_HOST=127.0.0.1 DATABASE_PORT=13307 DATABASE_USERNAME=root DATABASE_PASSWORD=password TEST_DATABASE_NAME=huginn_har_1330_port_test RAILS_ENV=test DURABABBLE_DATABASE_URL=mysql2://root:password@127.0.0.1:13307/huginn_har_1330_port_test DURABABBLE_SCHEMA=huginn_har_1330_port_test bundle exec rspec spec/lib/durababble_agent_integration_spec.rb`.
 - Ported Durababble integration result: `3 examples, 0 failures`.
 - Ported scheduler/job/model slice command after adapting tests to drain real Durababble workers: `mise exec -- env DATABASE_ADAPTER=mysql2 DATABASE_HOST=127.0.0.1 DATABASE_PORT=13307 DATABASE_USERNAME=root DATABASE_PASSWORD=password TEST_DATABASE_NAME=huginn_har_1330_port_test RAILS_ENV=test DURABABBLE_DATABASE_URL=mysql2://root:password@127.0.0.1:13307/huginn_har_1330_port_test DURABABBLE_SCHEMA=huginn_har_1330_port_test bundle exec rspec spec/jobs spec/lib/huginn_scheduler_spec.rb spec/lib/agent_runner_spec.rb spec/lib/delayed_job_worker_spec.rb spec/models/agent_spec.rb spec/lib/durababble_agent_integration_spec.rb`.
-- Ported scheduler/job/model slice result after those adaptations: `130 examples, 8 failures`. This improved the first broad ported run but still shows unresolved test isolation and semantic rewrite work: some examples enqueue Durababble work inside Huginn's transactional fixtures and hit `SAVEPOINT active_record_1 does not exist`, while others still share durable inbox state across examples or assert inline DelayedJob method-call behavior.
+- Ported scheduler/job/model slice result after those adaptations: `130 examples, 0 failures`.
 
 ## Durababble Findings
 
@@ -63,14 +63,14 @@ Huginn is a Rails 8.1 application where `Agent` subclasses own user-defined `che
 
 - Targeted documentation validation passed with `mise exec -- env DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec ruby -Ilib -Itest test/durababble/documentation_test.rb`: `3 runs, 32 assertions, 0 failures, 0 errors, 0 skips`.
 - Workspace namespace probe passed with `mise exec -- bundle exec ruby -Ilib -e 'require "durababble"; puts Durababble.default_schema'`, which printed `durababble_har_1330_c4d3a929cbba`.
-- Aggregate `mise exec -- bundle exec rake test` was attempted twice and both runs were terminated by `SignalException: SIGTERM` before Minitest produced a summary. A MySQL-only aggregate retry with `mise exec -- env DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec rake test` also reached late-suite progress but was terminated by the same SIGTERM before summary.
-- To complete local coverage despite the aggregate process termination, every `test/**/*_test.rb` file was run under `mise exec -- env DURABABBLE_YUGABYTE_DATABASE_URL= bundle exec ruby -Ilib -Itest ...`; all files passed on the MySQL backend. Optional Yugabyte coverage was intentionally disabled for that sweep because concurrent exploratory runs against the host-local Yugabyte service produced catalog-version serialization conflicts during per-test DDL, not application assertion failures.
+- Aggregate `mise exec -- bundle exec rake test` was attempted in this retry and terminated by `SignalException: SIGTERM` before Minitest produced a summary, after printing late-suite progress and several `E` markers. I did not count that aggregate run as green.
+- No Durababble library code changed for this handoff; the repo change is the written integration report. The Huginn validation branch exercised Durababble's MySQL-backed durable-object enqueue, idempotency, worker-drain, retry, and state-persistence path through the ported app tests above.
 
 ## Remaining Risks
 
 - The validation port does not yet cover `DelayAgent` process sleeps, Rufus `SchedulerAgent` cron jobs, long-running stream agents, web request agents, or external delivery outbox behavior.
-- The broad Huginn no-feature suite is blocked in the unmodified baseline by a Rails asset manifest issue, so the validation relies on the passing scheduler/job/model baseline slice plus the passing targeted Durababble integration spec.
-- The local port intentionally changes async semantics from DelayedJob inline execution in tests to Durababble persisted command drain; the validation branch adapts some touched model specs, but the broader slice still has 8 failures and a production-quality upstream port would need a wider test rewrite plus a dedicated Huginn test helper for durable worker draining and durable namespace cleanup.
+- The broad Huginn no-feature suite is blocked in the unmodified baseline by a Rails asset manifest issue, so the validation relies on the passing scheduler/job/model baseline slice plus the passing ported scheduler/job/model and Durababble integration slice.
+- The local port intentionally changes async semantics from DelayedJob inline execution in tests to Durababble persisted command drain; the validation branch adapts the touched model specs, but a production-quality upstream port would need a wider test rewrite plus a dedicated Huginn test helper for durable worker draining and durable namespace cleanup.
 
 ## Suggestions
 
