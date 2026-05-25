@@ -90,6 +90,7 @@ module Durababble
         quick = @profile == "smoke"
         selected = [
           Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
+          Operation.new(name: "inline_run_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "create, lease, and complete an inline workflow run", block: method(:bench_inline_run_workflow)),
           Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
           Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
           Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
@@ -209,6 +210,11 @@ module Durababble
         @store.enqueue_workflow(name: "bench_claim", input: { "i" => i, "warmup" => warmup })
         claimed = @store.claim_runnable_workflow(worker_id: "claim-worker", lease_seconds: 30)
         raise "workflow not claimed" unless claimed
+      end
+
+      def bench_inline_run_workflow(i, warmup:)
+        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30, migrate: false).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+        raise "inline workflow did not complete" unless run.status == "completed"
       end
 
       def bench_heartbeat(i, warmup:)
@@ -463,6 +469,35 @@ module Durababble
 
           step def double(ctx)
             ctx.merge("value" => ctx.fetch("value") * 2)
+          end
+        end
+      end
+
+      def noop_workflow
+        @noop_workflow ||= Class.new(Durababble::Workflow) do
+          workflow_name "bench_inline_run"
+
+          def execute(input)
+            input
+          end
+        end
+      end
+
+      def event_resume_workflow(event_key)
+        Class.new(Durababble::Workflow) do
+          workflow_name "bench_event_resume"
+
+          define_method(:execute) do |input|
+            finish_after_event(wait_for_event(input))
+          end
+
+          define_method(:wait_for_event) do |ctx|
+            Durababble.wait_event(event_key, context: ctx)
+          end
+          step :wait_for_event
+
+          step def finish_after_event(ctx)
+            ctx.merge("finished" => true)
           end
         end
       end

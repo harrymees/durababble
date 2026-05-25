@@ -61,6 +61,48 @@ class DurababbleEngineTest < DurababbleTestCase
     end
   end
 
+  class InlineRunStore
+    attr_reader :created_workflows
+
+    def initialize
+      @created_workflows = []
+      @workflows = {}
+    end
+
+    def create_workflow(name:, input:, worker_id:, lease_seconds:)
+      @created_workflows << { name:, input:, worker_id:, lease_seconds: }
+      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id }
+      "wf-inline"
+    end
+
+    def enqueue_workflow(name:, input:)
+      raise "Engine#run should create the leased running workflow directly"
+    end
+
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      raise "Engine#run should not claim a workflow it just created"
+    end
+
+    def workflow_history_for(_workflow_id)
+      []
+    end
+
+    def workflow_owned?(workflow_id:, worker_id:)
+      row = @workflows.fetch(workflow_id)
+      row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
+    end
+
+    def workflow_cancellation(_workflow_id) = nil
+
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      @workflows[workflow_id] = @workflows.fetch(workflow_id).merge("status" => "completed", "result" => result, "locked_by" => nil)
+    end
+
+    def workflow(workflow_id)
+      @workflows.fetch(workflow_id)
+    end
+  end
+
   class MigrationTrackingStore
     attr_reader :migrations, :enqueued
 
@@ -194,6 +236,24 @@ class DurababbleEngineTest < DurababbleTestCase
     assert_empty store.completed
     assert_equal "msg-missing", store.failed.fetch(0).fetch(:message_id)
     assert_match(/UnknownCommand: missing/, store.failed.fetch(0).fetch(:error))
+  end
+
+  test "run creates a leased running workflow directly instead of enqueueing then claiming" do
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "inline-run"
+
+      def execute(input)
+        input.merge("done" => true)
+      end
+    end
+    store = InlineRunStore.new
+    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9, migrate: false)
+
+    run = engine.run(workflow, input: { "count" => 2 })
+
+    assert_equal "completed", run.status
+    assert_equal({ "count" => 2, "done" => true }, run.result)
+    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9 }], store.created_workflows
   end
 
   durababble_store_backends.each do |backend|

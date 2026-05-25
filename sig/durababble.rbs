@@ -150,7 +150,7 @@ module Durababble
     def close: () -> void
     def current_time: () -> Time
     def enqueue_workflow: (name: String, input: serialized_payload) -> String
-    def create_workflow: (name: String, input: serialized_payload) -> String
+    def create_workflow: (name: String, input: serialized_payload, ?worker_id: String?, ?lease_seconds: Numeric) -> String
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
     def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
