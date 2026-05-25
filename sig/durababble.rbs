@@ -329,28 +329,6 @@ module Durababble
     def delay_for_attempt: (Integer attempt_number) -> Float
   end
 
-  class RpcClient
-    class Error < Durababble::Error
-    end
-
-    class RemoteError < Error
-    end
-
-    class ConnectionError < Error
-    end
-
-    class EOFError < ConnectionError
-    end
-
-    class TimeoutError < ConnectionError
-    end
-
-    def self.spawn: (command: Array[String], ?env: Hash[String, String], ?timeout: Numeric) -> RpcClient
-
-    def request: (String command, ?payload_map payload) -> serialized_payload
-    def close: () -> void
-  end
-
   module WorkflowRpc
     class Error < Durababble::Error
     end
@@ -399,6 +377,9 @@ module Durababble
     end
 
     class Unauthenticated < Error
+    end
+
+    class RemoteError < Error
     end
 
     class NodeDirectory

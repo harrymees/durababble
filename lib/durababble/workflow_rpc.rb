@@ -119,7 +119,7 @@ module Durababble
           "command" => command,
           "payload" => payload,
         })
-      rescue Durababble::RpcClient::RemoteError => e
+      rescue Durababble::Rpc::RemoteError => e
         raise translate_remote_error(e)
       end
 

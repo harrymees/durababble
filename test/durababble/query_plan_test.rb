@@ -7,6 +7,10 @@ require "json"
 
 class DurababbleQueryPlanTest < DurababbleTestCase
   class RecordingConnection < SimpleDelegator
+    class RecordedResult < SimpleDelegator
+      def affected_rows = __getobj__.cmd_tuples
+    end
+
     attr_reader :recorded_queries
 
     def initialize(connection)
@@ -14,6 +18,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       @recorded_queries = []
       @recording = false
     end
+
+    def adapter_name = "PostgreSQL"
 
     def record
       @recorded_queries.clear
@@ -33,7 +39,17 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       __getobj__.exec_params(sql, params)
     end
 
-    def transaction
+    def exec_query(sql, _name = nil, binds = [], prepare: false)
+      params = binds.map { |bind| bind.respond_to?(:value_for_database) ? bind.value_for_database : bind }
+      record_query(sql, params)
+      RecordedResult.new(__getobj__.exec_params(sql, params))
+    end
+
+    def quote_column_name(identifier)
+      PG::Connection.quote_ident(identifier.to_s)
+    end
+
+    def transaction(requires_new: false)
       if __getobj__.transaction_status == PG::Constants::PQTRANS_IDLE
         __getobj__.transaction { yield(self) }
       else
@@ -194,12 +210,12 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "record_step_started" => {
         call: -> { store.record_step_started(workflow_id: "running-owned", position: 1, name: "next") },
-        allowed_indexes: ["step_attempts_workflow_position_status_started_idx", "steps_pkey"],
+        allowed_indexes: ["workflows_pkey", "workflow_history_pkey", "step_attempts_workflow_position_status_started_idx", "steps_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "record_step_completed" => {
         call: -> { store.record_step_completed(workflow_id: "running-owned", position: 0, result: { "ok" => true }) },
-        allowed_indexes: ["steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["workflows_pkey", "workflow_history_pkey", "waits_workflow_created_idx", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "record_wait" => {
@@ -216,12 +232,12 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["workflow_history_pkey", "waits_workflow_created_idx", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
-        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["workflow_history_pkey", "waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {

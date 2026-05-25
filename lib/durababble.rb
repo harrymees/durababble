@@ -129,6 +129,5 @@ require_relative "durababble/run"
 require_relative "durababble/worker"
 require_relative "durababble/worker_runtime"
 
-require_relative "durababble/rpc_client"
 require_relative "durababble/workflow_rpc"
 require_relative "durababble/rpc_transport"
