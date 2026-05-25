@@ -66,7 +66,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          candidate = candidates.min_by { |candidate_row| time_value(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -190,7 +190,14 @@ module Durababble
 
     #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
     def suspend_workflow(workflow_id:, worker_id: nil)
-      result = execute_params(<<~SQL, [workflow_id, worker_id])
+      params = [workflow_id]
+      owner_filter = ""
+      if worker_id
+        params << worker_id
+        owner_filter = "AND locked_by = $2"
+      end
+
+      result = execute_params(<<~SQL, params)
         UPDATE #{table("workflows")}
         SET status = CASE
               WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
@@ -200,7 +207,7 @@ module Durababble
             locked_by = NULL,
             locked_until = NULL,
             updated_at = now()
-        WHERE id = $1 AND status = 'running' AND ($2 IS NULL OR locked_by = $2)
+        WHERE id = $1 AND status = 'running' #{owner_filter}
       SQL
       return true if result.affected_rows == 1
 
@@ -527,7 +534,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          candidate = candidates.min_by { |candidate_row| time_value(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -584,7 +591,7 @@ module Durababble
             LIMIT 1
             FOR UPDATE SKIP LOCKED
           SQL
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = candidates.min_by { |candidate_row| time_value(candidate_row.fetch("created_at")) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
@@ -617,6 +624,13 @@ module Durababble
     end
 
     private
+
+    #: (untyped) -> untyped
+    def time_value(value)
+      return value.to_time if value.respond_to?(:to_time)
+
+      Time.parse(value.to_s)
+    end
 
     #: (untyped) -> bool
     def terminal_for_cancellation?(row)

@@ -245,24 +245,40 @@ module Durababble
 
     #: () -> untyped
     def create_performance_indexes!
-      execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
-      execute("CREATE INDEX IF NOT EXISTS workflow_history_command_idx ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
-      execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, scope, kind, event_key, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, scope, kind, wake_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
-      execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
-      execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
-      execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
-      execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_target_idempotency_idx ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
-      execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
-      execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
-      execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS target_activations_queue_idx ON #{table("target_activations")} (status, ready_at, created_at)")
-      execute("CREATE INDEX IF NOT EXISTS target_activations_expired_idx ON #{table("target_activations")} (status, locked_until, created_at)")
+      retry_migration_serialization_failures do
+        execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS workflows_expired_lease_idx ON #{table("workflows")} (status, locked_until)")
+        execute("CREATE INDEX IF NOT EXISTS workflow_history_command_idx ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
+        execute("CREATE INDEX IF NOT EXISTS waits_event_pending_idx ON #{table("waits")} (status, scope, kind, event_key, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS waits_timer_pending_idx ON #{table("waits")} (status, scope, kind, wake_at, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS waits_workflow_created_idx ON #{table("waits")} (workflow_id, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_started_position_idx ON #{table("step_attempts")} (workflow_id, started_at, position)")
+        execute("CREATE INDEX IF NOT EXISTS step_attempts_workflow_position_status_started_idx ON #{table("step_attempts")} (workflow_id, position, status, started_at DESC)")
+        execute("CREATE INDEX IF NOT EXISTS outbox_queue_idx ON #{table("outbox")} (status, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS outbox_expired_lease_idx ON #{table("outbox")} (status, locked_until)")
+        execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS inbox_target_idempotency_idx ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL")
+        execute("CREATE INDEX IF NOT EXISTS inbox_target_status_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
+        execute("CREATE INDEX IF NOT EXISTS inbox_target_sequence_idx ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
+        execute("CREATE INDEX IF NOT EXISTS inbox_ready_idx ON #{table("inbox")} (status, ready_at, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS target_activations_queue_idx ON #{table("target_activations")} (status, ready_at, created_at)")
+        execute("CREATE INDEX IF NOT EXISTS target_activations_expired_idx ON #{table("target_activations")} (status, locked_until, created_at)")
+      end
+    end
+
+    #: () { (?) -> untyped } -> untyped
+    def retry_migration_serialization_failures(&block)
+      attempts = 0
+      begin
+        block.call
+      rescue ActiveRecord::SerializationFailure
+        attempts += 1
+        Kernel.raise if attempts >= 20
+
+        Kernel.sleep(0.001 * attempts)
+        retry
+      end
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped

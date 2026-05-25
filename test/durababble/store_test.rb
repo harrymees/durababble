@@ -982,6 +982,19 @@ class DurababbleStoreTest < DurababbleTestCase
       pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise ActiveRecord::Deadlocked } }))
         .send(:execute, "SELECT 1")
     end
+    index_failures = 5
+    index_result = lambda do |sql|
+      if sql.include?("workflows_queue_idx") && index_failures.positive?
+        index_failures -= 1
+        raise ActiveRecord::SerializationFailure, "PG::TRSerializationFailure: Catalog Version Mismatch"
+      end
+
+      sql_result
+    end
+    index_connection = ScriptedPgConnection.new(exec_results: Array.new(30) { index_result })
+    pg_store(index_connection).send(:create_performance_indexes!)
+    assert_equal 0, index_failures
+    assert_operator index_connection.exec_calls.count { |sql| sql.include?("workflows_queue_idx") }, :>=, 6
 
     migration_connection = ScriptedPgConnection.new(
       params_results: [
