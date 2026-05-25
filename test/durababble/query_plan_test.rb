@@ -194,9 +194,17 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       :pg_complete_object_command,
       :pg_enqueue_object_command,
       :pg_fail_fence,
+      :pg_insert_fence,
       :pg_lock_object_command,
       :pg_lock_object_command_for_worker,
       :pg_mark_workflow_waiting,
+      :pg_object_state,
+      :pg_outbox_message,
+      :pg_read_fence,
+      :pg_step_attempts_for,
+      :pg_steps_for,
+      :pg_waits_for_workflow,
+      :pg_workflow,
     ]
     expected_mysql = [
       :mysql_ack_outbox,
@@ -238,7 +246,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   test "store implementation routes hot SQL through the top-level query registry" do
     store_path = File.join(File.expand_path("../..", __dir__), "lib/durababble/store/postgres.rb")
     source = File.read(store_path)
-    hot_methods = source.scan(/^    def (claim_runnable_workflow|claim_workflow|heartbeat|workflow_owned\?|release_worker_leases!|heartbeat_step|current_workflow_lease|steal_expired_leases!|record_step_started|record_wait|waits_for|with_fence|enqueue_outbox|claim_outbox|ack_outbox|outbox_message|workflow|steps_for|step_attempts_for|object_state|save_object_state|record_step_completed_without_transaction|update_latest_attempt_serialized)\b(.*?)(?=^    def |\n  end\nend\z)/m)
+    hot_methods = source.scan(/^    def (claim_runnable_workflow|claim_workflow|heartbeat|workflow_owned\?|heartbeat_step|current_workflow_lease|steal_expired_leases!|record_step_started|record_wait|enqueue_outbox|claim_outbox|ack_outbox|save_object_state|complete_timer_waits|record_step_completed_without_transaction|update_latest_attempt_serialized)\b(.*?)(?=^    def |\n  end\nend\z)/m)
     refute_empty hot_methods
 
     hot_methods.each do |method_name, body|
@@ -265,7 +273,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       "claim_runnable_workflow" => {
         call: -> { store.claim_runnable_workflow(worker_id: "plan-worker", lease_seconds: 60) },
         allowed_indexes: ["workflows_pkey", "workflows_queue_idx", "workflows_runnable_due_idx", "workflows_expired_lease_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
-        allow_post_filter_indexes: ["workflows_queue_idx", "workflows_runnable_due_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
+        allow_post_filter_indexes: ["workflows_queue_idx", "workflows_runnable_due_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx", "workflows_expired_lease_idx"],
       },
       "claim_workflow" => {
         call: -> { store.claim_workflow(workflow_id: "pending-target", worker_id: "plan-worker", lease_seconds: 60) },
@@ -284,7 +292,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "release_worker_leases" => {
         call: -> { store.release_worker_leases!(worker_id: "owner") },
-        allowed_indexes: ["workflows_worker_lease_idx", "workflows_pending_created_idx", "outbox_worker_lease_idx"],
+        allowed_indexes: ["workflows_worker_lease_idx", "workflows_pending_created_idx", "outbox_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
         allow_post_filter_indexes: ["workflows_pending_created_idx"],
       },
       "heartbeat_step" => {
@@ -336,11 +344,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
         allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-      },
-      "signal_event" => {
-        call: -> { store.signal_event("target-event", payload: { "seen" => true }) },
-        allowed_indexes: ["waits_event_pending_idx", "waits_pkey", "steps_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "workflows_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {

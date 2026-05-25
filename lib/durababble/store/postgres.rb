@@ -2,12 +2,12 @@
 # frozen_string_literal: true
 
 module Durababble
-  class PostgresStore < Store
+  class PostgresStore < SqlStore
     include PostgresMigrations
 
     #: () -> untyped
     def drop_schema!
-      retry_serialization_failures(max_attempts: 20) { execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE") }
+      execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE")
       @migrated = false
     end
 
@@ -18,13 +18,6 @@ module Durababble
         "INSERT INTO #{table("workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::bytea)",
         [id, name, dump_serialized(input)],
       )
-      id
-    end
-
-    #: (name: untyped, input: untyped) -> untyped
-    def create_workflow(name:, input:)
-      id = enqueue_workflow(name:, input:)
-      mark_workflow_running(id)
       id
     end
 
@@ -48,6 +41,7 @@ module Durababble
           execute_params(store_query_sql(:pg_claim_selected_workflow), [candidate.fetch("id"), worker_id, lease_seconds]).first
         end
       end
+      observe_claim_latency(row, "workflow") if row
       decode_row(row) if row
     end
 
@@ -85,7 +79,13 @@ module Durababble
 
     #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-      execute_params(store_query_sql(:pg_heartbeat_workflow), [workflow_id, worker_id, lease_seconds])
+      result = execute_params(store_query_sql(:pg_heartbeat_workflow), [workflow_id, worker_id, lease_seconds])
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
+      end
+      result
     end
 
     #: (workflow_id: untyped, worker_id: untyped) -> untyped
@@ -98,21 +98,34 @@ module Durababble
       @connection.transaction(requires_new: true) do
         workflows = execute_params(store_query_sql(:pg_release_workflow_leases), [worker_id]).affected_rows
         outbox = execute_params(store_query_sql(:pg_release_outbox_leases), [worker_id]).affected_rows
-        { "workflows" => workflows, "outbox" => outbox }
+        inbox = execute_params(<<~SQL, [worker_id]).affected_rows
+          UPDATE #{table("inbox")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE status = 'running' AND locked_by = $1
+        SQL
+        target_activations = execute_params(<<~SQL, [worker_id]).affected_rows
+          UPDATE #{table("target_activations")}
+          SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE status = 'running' AND locked_by = $1
+        SQL
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
+        released
       end
     end
 
     #: (workflow_id: untyped, worker_id: untyped, run_at: untyped) -> untyped
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
-      execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
+      result = execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
         UPDATE #{table("workflows")}
         SET status = CASE
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, runnable_immediately = false, updated_at = now()
-        WHERE id = $1 AND status = 'running' AND locked_by = $2
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
       SQL
+      result.affected_rows.to_i == 1 ? result : nil
     end
 
     #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
@@ -128,11 +141,12 @@ module Durababble
             locked_until = NULL,
             runnable_immediately = true,
             updated_at = now()
-        WHERE id = $1 AND status = 'running' AND ($2::text IS NULL OR locked_by = $2::text)
+        WHERE id = $1 AND status = 'running'
+          AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
       SQL
       return true if result.affected_rows == 1
 
-      ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
+      WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
     end
 
     #: (untyped, ?now: untyped) -> untyped
@@ -159,7 +173,7 @@ module Durababble
         end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
-        if first_request && decoded.fetch("status") != "running"
+        if first_request && !WorkflowStatus.running?(decoded)
           execute_params(<<~SQL, [workflow_id])
             UPDATE #{table("workflows")}
             SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
@@ -221,9 +235,23 @@ module Durababble
       row&.transform_values(&:itself)
     end
 
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      row = execute_params(<<~SQL, [object_type, object_id]).first
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table("inbox")}
+        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= now()
+        ORDER BY sequence
+        LIMIT 1
+      SQL
+      row&.transform_values(&:itself)
+    end
+
     #: (?now: untyped) -> untyped
     def steal_expired_leases!(now: Time.now)
       result = execute_params(store_query_sql(:pg_steal_expired_leases), [timestamp(now)])
+      Observability.count("durababble.leases.expired_recovery", by: result.affected_rows.to_i)
       result.affected_rows
     end
 
@@ -240,34 +268,59 @@ module Durababble
       end
     end
 
-    #: (untyped, result: untyped) -> untyped
-    def complete_workflow(workflow_id, result:)
-      execute_params(
-        "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
-        [workflow_id, dump_serialized(result)],
-      )
+    #: (untyped, result: untyped, ?worker_id: untyped) -> untyped
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      update = if worker_id
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
+          [workflow_id, dump_serialized(result), worker_id],
+        )
+      else
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
+          [workflow_id, dump_serialized(result)],
+        )
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
     end
 
-    #: (untyped, reason: untyped, ?result: untyped) -> untyped
-    def cancel_workflow(workflow_id, reason:, result: nil)
-      execute_params(
-        "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
-        [workflow_id, dump_serialized(result), reason],
-      )
+    #: (untyped, reason: untyped, ?result: untyped, ?worker_id: untyped) -> untyped
+    def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
+      update = if worker_id
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()",
+          [workflow_id, dump_serialized(result), reason, worker_id],
+        )
+      else
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
+          [workflow_id, dump_serialized(result), reason],
+        )
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
-    #: (untyped, error: untyped) -> untyped
-    def fail_workflow(workflow_id, error:)
-      execute_params(
-        "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
-        [workflow_id, error],
-      )
+    #: (untyped, error: untyped, ?worker_id: untyped) -> untyped
+    def fail_workflow(workflow_id, error:, worker_id: nil)
+      update = if worker_id
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
+          [workflow_id, error, worker_id],
+        )
+      else
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
+          [workflow_id, error],
+        )
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
     end
 
-    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped) -> untyped
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {})
+    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped, ?worker_id: untyped) -> untyped
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
         execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, updated_at)
@@ -277,10 +330,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped) -> untyped
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, ?worker_id: untyped) -> untyped
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(store_query_sql(:pg_supersede_running_step_attempts), [workflow_id, command_id])
         execute_params(store_query_sql(:pg_upsert_step_running), [workflow_id, command_id, name])
         attempt_id = SecureRandom.uuid
@@ -290,22 +344,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, result: untyped) -> untyped
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) { record_step_completed_without_transaction(workflow_id:, command_id:, result:) }
-    end
-
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) { record_step_failed_without_transaction(workflow_id:, command_id:, error:) }
-    end
-
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
-    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(
           "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('scheduled', 'running', 'waiting')",
           [workflow_id, command_id, error],
@@ -315,59 +358,63 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped, ?worker_id: untyped) -> untyped
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       @connection.transaction(requires_new: true) do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_params(store_query_sql(:pg_upsert_waiting_step), [workflow_id, command_id, name, dump_serialized(wait_request.context)])
         wait_id = SecureRandom.uuid
         execute_params(store_query_sql(:pg_insert_wait), [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
+        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
+          raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
+        end
+
+        Observability.count(
+          "durababble.waits.started",
+          "durababble.workflow.id" => workflow_id,
+          "durababble.step.index" => command_id,
+          "durababble.step.name" => name,
+          "durababble.wait.kind" => wait_request.kind,
+          "durababble.wait.event_key" => wait_request.event_key,
+        )
         wait_id
       end
-    end
-
-    #: (untyped) -> untyped
-    def workflow_history_for(workflow_id)
-      execute_params("SELECT * FROM #{table("workflow_history")} WHERE workflow_id = $1 ORDER BY event_index", [workflow_id]).map { |row| decode_row(row) }
-    end
-
-    #: (?now: untyped) -> untyped
-    def wake_due_timers(now: Time.now)
-      complete_timer_waits(timestamp(now))
-    end
-
-    #: (untyped, ?payload: untyped) -> untyped
-    def signal_event(event_key, payload: {})
-      complete_event_waits(event_key, payload)
-    end
-
-    #: (untyped) -> untyped
-    def waits_for(workflow_id)
-      execute_params(store_query_sql(:pg_waits_for_workflow), [workflow_id]).map { |row| decode_row(row) }
     end
 
     #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
       token = SecureRandom.uuid
-      inserted = execute_params(store_query_sql(:pg_insert_fence), [workflow_id, key, token, timeout])
+      inserted = execute_params(<<~SQL, [workflow_id, key, token, timeout])
+        INSERT INTO #{table("fences")} (workflow_id, key, status, locked_by, locked_until)
+        VALUES ($1, $2, 'running', $3, now() + ($4::int * interval '1 second'))
+        ON CONFLICT (workflow_id, key) DO NOTHING
+      SQL
 
       if inserted.affected_rows == 1
         begin
           result = block.call
-          execute_params(store_query_sql(:pg_complete_fence), [workflow_id, key, token, dump_serialized(result)])
+          execute_params(<<~SQL, [workflow_id, key, token, dump_serialized(result)])
+            UPDATE #{table("fences")}
+            SET status = 'completed', result = $4::bytea, error = NULL, completed_at = now()
+            WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
+          SQL
           return result
         rescue StandardError => e
-          execute_params(store_query_sql(:pg_fail_fence), [workflow_id, key, token, "#{e.class}: #{e.message}"])
+          execute_params(<<~SQL, [workflow_id, key, token, "#{e.class}: #{e.message}"])
+            UPDATE #{table("fences")}
+            SET status = 'failed', error = $4, completed_at = now()
+            WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
+          SQL
           raise
         end
       end
 
       deadline = Time.now + timeout
       loop do
-        row = execute_params(store_query_sql(:pg_read_fence), [workflow_id, key]).first
+        row = execute_params("SELECT status, result, error FROM #{table("fences")} WHERE workflow_id = $1 AND key = $2", [workflow_id, key]).first
         decoded = decode_row(row) if row
         case decoded&.fetch("status")
         when "completed"
@@ -388,6 +435,7 @@ module Durababble
 
       id = SecureRandom.uuid
       execute_params(store_query_sql(:pg_insert_outbox), [id, workflow_id, topic, dump_serialized(payload), key])
+      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
       execute_params(store_query_sql(:pg_outbox_by_key), [key]).first.fetch("id")
     end
 
@@ -405,122 +453,21 @@ module Durababble
           execute_params(store_query_sql(:pg_claim_selected_outbox), [candidate.fetch("id"), worker_id, lease_seconds]).first
         end
       end
+      observe_claim_latency(row, "outbox") if row
       decode_row(row) if row
     end
 
     #: (untyped, worker_id: untyped) -> untyped
     def ack_outbox(outbox_id, worker_id:)
-      execute_params(store_query_sql(:pg_ack_outbox), [outbox_id, worker_id])
-    end
-
-    #: (untyped) -> untyped
-    def outbox_message(outbox_id)
-      decode_row(execute_params(store_query_sql(:pg_outbox_message), [outbox_id]).first)
-    end
-
-    #: (untyped) -> untyped
-    def workflow(workflow_id)
-      result = execute_params(store_query_sql(:pg_workflow), [workflow_id])
-      row = result.first
-      raise KeyError, "workflow not found: #{workflow_id}" unless row
-
-      decode_row(row)
-    end
-
-    #: (untyped) -> untyped
-    def steps_for(workflow_id)
-      execute_params(store_query_sql(:pg_steps_for), [workflow_id]).map { |row| with_command_id(decode_row(row)) }
-    end
-
-    #: (untyped) -> untyped
-    def step_attempts_for(workflow_id)
-      execute_params(store_query_sql(:pg_step_attempts_for), [workflow_id]).map { |row| with_command_id(decode_row(row)) }
-    end
-
-    #: (object_type: untyped, object_id: untyped) -> untyped
-    def object_state(object_type:, object_id:)
-      row = execute_params(store_query_sql(:pg_object_state), [object_type, object_id]).first
-      decode_row(row)&.fetch("state") if row
+      result = execute_params(store_query_sql(:pg_ack_outbox), [outbox_id, worker_id])
+      Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
+      result
     end
 
     #: (object_type: untyped, object_id: untyped, state: untyped) -> untyped
     def save_object_state(object_type:, object_id:, state:)
       execute_params(store_query_sql(:pg_save_object_state), [object_type, object_id, dump_serialized(state)])
       state
-    end
-
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, ?method_name: untyped, ?payload: untyped, ?idempotency_key: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped
-    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil)
-      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
-      retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
-          existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
-          if existing
-            raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
-
-            upsert_target_activation_without_transaction(
-              target_kind: existing.fetch("target_kind"),
-              target_type: existing.fetch("target_type"),
-              target_id: existing.fetch("target_id"),
-              ready_at: existing["ready_at"],
-            ) if activatable_inbox_status?(existing.fetch("status"))
-            next existing.fetch("id")
-          end
-
-          sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
-          id = SecureRandom.uuid
-          operation_id = id
-          execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts])
-            INSERT INTO #{table("inbox")} (
-              id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-              operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
-          SQL
-          upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
-          id
-        end
-      end
-    end
-
-    #: (workflow_id: untyped, workflow_name: untyped, method_name: untyped, payload: untyped, ?idempotency_key: untyped) -> untyped
-    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
-      target_kind = "workflow"
-      message_kind = "workflow_command"
-      shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
-      retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
-          existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id)
-          if existing
-            raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
-
-            upsert_target_activation_without_transaction(
-              target_kind: existing.fetch("target_kind"),
-              target_type: existing.fetch("target_type"),
-              target_id: existing.fetch("target_id"),
-              ready_at: existing["ready_at"],
-            ) if activatable_inbox_status?(existing.fetch("status"))
-            next existing.fetch("id")
-          end
-
-          workflow = execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
-          raise KeyError, "workflow not found: #{workflow_id}" unless workflow
-
-          raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decode_row(workflow))
-
-          sequence = allocate_mailbox_sequence(target_kind:, target_type: workflow_name, target_id: workflow_id)
-          id = SecureRandom.uuid
-          execute_params(<<~SQL, [id, target_kind, workflow_name, workflow_id, sequence, message_kind, method_name, id, idempotency_key, shape_hash, dump_serialized(payload)])
-            INSERT INTO #{table("inbox")} (
-              id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-              operation_id, idempotency_key, shape_hash, payload, status
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending')
-          SQL
-          upsert_target_activation_without_transaction(target_kind:, target_type: workflow_name, target_id: workflow_id)
-          id
-        end
-      end
     end
 
     #: (worker_id: untyped, lease_seconds: untyped, ?target_kinds: untyped, ?target_types: untyped, ?now: untyped) -> untyped
@@ -579,173 +526,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
-    def target_activation(target_kind:, target_type:, target_id:)
-      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-        SELECT * FROM #{table("target_activations")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-      SQL
-      decode_row(row) if row
-    end
-
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped) -> untyped
-    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now)
-      @connection.transaction(requires_new: true) do
-        rows = execute_params(<<~SQL, [target_kind, target_type, target_id, limit])
-          SELECT *
-          FROM #{table("inbox")}
-          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
-          ORDER BY sequence
-          LIMIT $4
-          FOR UPDATE
-        SQL
-        claimable = contiguous_claimable_inbox_rows(rows, now:)
-        claimable.each do |row|
-          execute_params(<<~SQL, [row.fetch("id"), worker_id, lease_seconds])
-            UPDATE #{table("inbox")}
-            SET status = 'running',
-                attempts = attempts + 1,
-                locked_by = $2,
-                locked_until = now() + ($3::int * interval '1 second'),
-                updated_at = now()
-            WHERE id = $1
-          SQL
-        end
-        claimable.map { |row| decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [row.fetch("id")]).first) }
-      end
-    end
-
-    #: (untyped) -> untyped
-    def inbox_message(message_id)
-      row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first
-      decode_row(row) if row
-    end
-
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
-    def inbox_messages_for(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
-        SELECT * FROM #{table("inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-        ORDER BY sequence
-      SQL
-    end
-
-    #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
-    def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
-      row = inbox_message(command_id)
-      return unless object_command_message?(row)
-      return object_command_row(row) unless row.key?("target_kind")
-
-      claimed = claim_inbox_message_by_id(
-        message_id: command_id,
-        target_kind: row.fetch("target_kind"),
-        target_type: row.fetch("target_type"),
-        target_id: row.fetch("target_id"),
-        worker_id:,
-        lease_seconds:,
-      )
-      return unless claimed
-
-      object_command_row(claimed)
-    end
-
-    #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?worker_id: untyped) -> untyped
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: NO_OBJECT_STATE, worker_id: nil)
-      @connection.transaction(requires_new: true) do
-        command = lock_object_command_for_completion(command_id:, worker_id:)
-        next nil unless command
-
-        save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
-        updated = execute_params(
-          "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
-          [command_id, dump_serialized(result)],
-        )
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
-        updated
-      end
-    end
-
-    #: (command_id: untyped, error: untyped, ?worker_id: untyped) -> untyped
-    def fail_object_command(command_id:, error:, worker_id: nil)
-      @connection.transaction(requires_new: true) do
-        command = lock_inbox_message_for_failure(command_id:, worker_id:)
-        next nil unless command
-
-        updated = execute_params(<<~SQL, [command_id, error])
-          UPDATE #{table("inbox")}
-          SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END,
-              error = $2,
-              locked_by = NULL,
-              locked_until = NULL,
-              dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
-              updated_at = now()
-          WHERE id = $1
-        SQL
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
-        updated
-      end
-    end
-
-    #: (message_id: untyped, workflow_id: untyped, result: untyped, worker_id: untyped) -> untyped
-    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
-      @connection.transaction(requires_new: true) do
-        command = lock_inbox_message_for_completion(message_id:, worker_id:)
-        next nil unless command
-
-        append_workflow_history_without_transaction(
-          workflow_id:,
-          kind: "workflow_command_completed",
-          name: command["method_name"],
-          attempt_id: message_id,
-          payload: { "message_id" => message_id, "result" => result },
-        )
-        updated = execute_params(
-          "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
-          [message_id, dump_serialized(result)],
-        )
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
-        updated
-      end
-    end
-
-    #: (message_id: untyped, workflow_id: untyped, error: untyped, worker_id: untyped) -> untyped
-    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
-      @connection.transaction(requires_new: true) do
-        command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
-        next nil unless command
-
-        append_workflow_history_without_transaction(
-          workflow_id:,
-          kind: "workflow_command_failed",
-          name: command["method_name"],
-          attempt_id: message_id,
-          payload: { "message_id" => message_id },
-          error:,
-        )
-        updated = execute_params(<<~SQL, [message_id, error])
-          UPDATE #{table("inbox")}
-          SET status = 'dead_lettered',
-              error = $2,
-              locked_by = NULL,
-              locked_until = NULL,
-              dead_lettered_at = now(),
-              updated_at = now()
-          WHERE id = $1
-        SQL
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
-        updated
-      end
-    end
-
     private
-
-    #: (untyped) -> bool
-    def terminal_for_cancellation?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
-    end
 
     #: (untyped) -> untyped
     def cancel_pending_waits_for_workflow(workflow_id)
@@ -793,7 +574,7 @@ module Durababble
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
           SELECT * FROM #{table("inbox")}
-          WHERE id = $1 AND status = 'running' AND locked_by = $2
+          WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
           FOR UPDATE
         SQL
       else
@@ -829,7 +610,7 @@ module Durababble
         FOR UPDATE
       SQL
 
-      if head && head.fetch("status") != "dead_lettered"
+      if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
         set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       else
@@ -889,37 +670,119 @@ module Durababble
       SQL
     end
 
-    #: (message_id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, ?now: untyped) -> untyped
-    def claim_inbox_message_by_id(message_id:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
-      @connection.transaction(requires_new: true) do
-        head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-          SELECT *
-          FROM #{table("inbox")}
-          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-            AND status IN ('pending', 'failed', 'running', 'dead_lettered')
-          ORDER BY sequence
-          LIMIT 1
-          FOR UPDATE
-        SQL
-        next unless head&.fetch("id") == message_id
-        next unless inbox_row_claimable?(head, now:)
-
-        execute_params(<<~SQL, [message_id, worker_id, lease_seconds])
-          UPDATE #{table("inbox")}
-          SET status = 'running',
-              attempts = attempts + 1,
-              locked_by = $2,
-              locked_until = now() + ($3::int * interval '1 second'),
-              updated_at = now()
-          WHERE id = $1
-        SQL
-        decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first)
-      end
+    #: (untyped) -> untyped
+    def lock_workflow_for_update(workflow_id)
+      execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
     end
 
-    #: (untyped) -> bool
-    def activatable_inbox_status?(status)
-      ["pending", "failed", "running"].include?(status)
+    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
+      execute_params(<<~SQL, [workflow_id, worker_id]).first
+        SELECT 1
+        FROM #{table("workflows")}
+        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
+        FOR UPDATE
+      SQL
+    end
+
+    #: (id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, sequence: untyped, message_kind: untyped, method_name: untyped, operation_id: untyped, idempotency_key: untyped, shape_hash: untyped, payload: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped
+    def insert_inbox_message_without_transaction(id:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
+      execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts])
+        INSERT INTO #{table("inbox")} (
+          id, target_kind, target_type, target_id, sequence, message_kind, method_name,
+          operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
+      SQL
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, limit: untyped) -> untyped
+    def inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id, limit])
+        SELECT *
+        FROM #{table("inbox")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT $4
+        FOR UPDATE
+      SQL
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def inbox_head_for_update(target_kind:, target_type:, target_id:)
+      execute_params(<<~SQL, [target_kind, target_type, target_id]).first
+        SELECT *
+        FROM #{table("inbox")}
+        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT 1
+        FOR UPDATE
+      SQL
+    end
+
+    #: (message_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
+      execute_params(<<~SQL, [message_id, worker_id, lease_seconds])
+        UPDATE #{table("inbox")}
+        SET status = 'running',
+            attempts = attempts + 1,
+            locked_by = $2,
+            locked_until = now() + ($3::int * interval '1 second'),
+            updated_at = now()
+        WHERE id = $1
+      SQL
+    end
+
+    #: (message_id: untyped, result: untyped) -> untyped
+    def complete_inbox_message_without_transaction(message_id:, result:)
+      execute_params(
+        "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
+        [message_id, dump_serialized(result)],
+      )
+    end
+
+    #: (message_id: untyped, error: untyped) -> untyped
+    def fail_inbox_message_without_transaction(message_id:, error:)
+      execute_params(<<~SQL, [message_id, error])
+        UPDATE #{table("inbox")}
+        SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END,
+            error = $2,
+            locked_by = NULL,
+            locked_until = NULL,
+            dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
+            updated_at = now()
+        WHERE id = $1
+      SQL
+    end
+
+    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      execute_params(<<~SQL, [message_id, error, timestamp(ready_at)])
+        UPDATE #{table("inbox")}
+        SET status = 'pending',
+            error = $2,
+            ready_at = $3::timestamptz,
+            locked_by = NULL,
+            locked_until = NULL,
+            updated_at = now()
+        WHERE id = $1
+      SQL
+    end
+
+    #: (message_id: untyped, error: untyped) -> untyped
+    def dead_letter_inbox_message_without_transaction(message_id:, error:)
+      execute_params(<<~SQL, [message_id, error])
+        UPDATE #{table("inbox")}
+        SET status = 'dead_lettered',
+            error = $2,
+            locked_by = NULL,
+            locked_until = NULL,
+            dead_lettered_at = now(),
+            updated_at = now()
+        WHERE id = $1
+      SQL
     end
 
     #: (target_kinds: untyped, target_types: untyped, ?offset: untyped) -> untyped
@@ -939,14 +802,6 @@ module Durababble
       ["AND #{filters.join(" AND ")}", params]
     end
 
-    #: (untyped, untyped) -> untyped
-    def complete_event_waits(event_key, payload)
-      @connection.transaction(requires_new: true) do
-        returning = execute_params(store_query_sql(:pg_complete_waits, where_sql: "w.kind = 'event'\n    AND w.event_key = $1", payload_param: 2), [event_key, dump_serialized(payload)])
-        finish_completed_waits(returning, payload)
-      end
-    end
-
     #: (untyped) -> untyped
     def complete_timer_waits(now)
       @connection.transaction(requires_new: true) do
@@ -959,10 +814,12 @@ module Durababble
     def finish_completed_waits(returning, payload)
       rows = returning.map { |row| decode_row(row) }
       rows.each do |wait|
+        record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
         execute_params(store_query_sql(:pg_mark_wait_workflow_pending), [wait.fetch("workflow_id")])
       end
+      Observability.count("durababble.waits.completed", by: rows.length)
       rows.length
     end
 
@@ -1037,7 +894,7 @@ module Durababble
         @connection.exec_query(sql)
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
-        raise if attempts >= 20
+        raise if attempts >= 5
 
         sleep(0.01 * attempts)
         retry
@@ -1047,6 +904,11 @@ module Durababble
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
       @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+    end
+
+    #: () { (?) -> untyped } -> untyped
+    def transaction(&block)
+      retry_serialization_failures { @connection.transaction(requires_new: true, &block) }
     end
 
     #: (untyped) -> untyped
@@ -1059,6 +921,11 @@ module Durababble
     #: (untyped, untyped) -> untyped
     def postgres_placeholders(offset, count)
       count.times.map { |index| "$#{offset + index}" }.join(", ")
+    end
+
+    #: (untyped) -> untyped
+    def placeholder(index)
+      "$#{index}"
     end
 
     #: (untyped) -> untyped

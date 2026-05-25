@@ -1,0 +1,55 @@
+{{- $chunks := slice -}}
+{{- range .Site.AllPages -}}
+  {{- $pageTitle := .Title -}}
+  {{- $pageUrl := .RelPermalink -}}
+  {{- $plain := .Plain | replaceRE `\s+` " " | strings.TrimSpace -}}
+  {{- if not $plain -}}{{- continue -}}{{- end -}}
+  {{- $raw := .RawContent | replaceRE `\r\n` "\n" | replaceRE `\r` "\n" -}}
+  {{/* Strip fenced code blocks before detecting H2 boundaries. A line
+       starting with "## " inside a ``` fence (shell comments, Terraform,
+       etc.) would otherwise trigger a phantom section break with a bogus
+       anchor URL. We blank the fenced content for splitting purposes only;
+       the full .Plain text is still used as chunk body below. */}}
+  {{- $rawForSplit := $raw | replaceRE "(?s)```[^`]*```" "" -}}
+  {{- $sections := findRE `(?m)^## .+` $rawForSplit -}}
+  {{- if not $sections -}}
+    {{- $entry := dict "url" $pageUrl "pageUrl" $pageUrl "pageTitle" $pageTitle "section" $pageTitle "text" $plain "headings" (slice $pageTitle) -}}
+    {{- $chunks = $chunks | append $entry -}}
+  {{- else -}}
+    {{- $parts := split $raw "\n## " -}}
+    {{- $isFirst := true -}}
+    {{- range $i, $part := $parts -}}
+      {{- $part = strings.TrimSpace $part -}}
+      {{- if not $part -}}{{- continue -}}{{- end -}}
+      {{- $sectionTitle := "" -}}
+      {{- $sectionText := "" -}}
+      {{- $anchor := "" -}}
+      {{- if $isFirst -}}
+        {{- $sectionTitle = $pageTitle -}}
+        {{- $sectionText = $part | replaceRE `(?m)^#{1,6}\s+(.+)` "$1" | replaceRE `\s+` " " | strings.TrimSpace -}}
+        {{- $isFirst = false -}}
+      {{- else -}}
+        {{- $lines := split $part "\n" -}}
+        {{- $heading := index $lines 0 -}}
+        {{- $heading = $heading | replaceRE `^#+\s*` "" | strings.TrimSpace -}}
+        {{- $sectionTitle = $heading -}}
+        {{- $anchor = $heading | anchorize -}}
+        {{- $bodyParts := after 1 $lines -}}
+        {{- $sectionText = delimit $bodyParts "\n" | replaceRE `(?m)^#{1,6}\s+(.+)` "$1" | replaceRE `\s+` " " | strings.TrimSpace -}}
+      {{- end -}}
+      {{- if $sectionText -}}
+        {{- $url := $pageUrl -}}
+        {{- if $anchor -}}
+          {{- $url = printf "%s#%s" $pageUrl $anchor -}}
+        {{- end -}}
+        {{- $headings := slice $pageTitle -}}
+        {{- if and $sectionTitle (ne $sectionTitle $pageTitle) -}}
+          {{- $headings = $headings | append $sectionTitle -}}
+        {{- end -}}
+        {{- $entry := dict "url" $url "pageUrl" $pageUrl "pageTitle" $pageTitle "section" $sectionTitle "text" $sectionText "headings" $headings -}}
+        {{- $chunks = $chunks | append $entry -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $chunks | jsonify -}}

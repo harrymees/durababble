@@ -113,7 +113,7 @@ module Durababble
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped, ?client_factory: untyped) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
-      lease = current_target_lease(target_kind:, target_id:)
+      lease = current_target_lease(target_kind:, target_type:, target_id:)
       return false unless lease
 
       factory = client_factory || rpc_client_factory
@@ -126,7 +126,7 @@ module Durababble
 
     #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
     def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
-      deadline = Time.now + timeout
+      deadline = timeout && Time.now + timeout
       loop do
         message = inbox_message(message_id)
         raise KeyError, "inbox message not found: #{message_id}" unless message
@@ -137,21 +137,23 @@ module Durababble
         when "failed", "dead_lettered"
           raise Error, message["error"] || "inbox message #{message_id} failed"
         end
-        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
+        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if deadline && Time.now >= deadline
 
         sleep(poll_interval)
       end
     end
 
-    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped, ?message_kind: untyped, ?idempotency_key: untyped, ?max_attempts: untyped) -> untyped
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
       enqueue_inbox_message(
         target_kind: "object",
         target_type: object_type,
         target_id: object_id,
-        message_kind: "ask",
+        message_kind:,
         method_name: method_name.to_s,
         payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
+        idempotency_key:,
+        max_attempts:,
       )
     end
 
@@ -188,12 +190,19 @@ module Durababble
       StoreQueries.sql(id, self, locals)
     end
 
-    #: (target_kind: untyped, target_id: untyped) -> untyped
-    def current_target_lease(target_kind:, target_id:)
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def current_target_lease(target_kind:, target_type:, target_id:)
       case target_kind
       when "workflow"
         current_workflow_lease(target_id)
+      when "object"
+        current_object_lease(target_type, target_id)
       end
+    end
+
+    #: (untyped, untyped) -> untyped
+    def current_object_lease(object_type, object_id)
+      nil
     end
 
     #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
@@ -211,9 +220,7 @@ module Durababble
 
     #: (untyped) -> bool
     def terminal_for_cancellation?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
+      WorkflowStatus.terminal?(row)
     end
 
     #: (untyped, now: untyped) -> untyped
@@ -230,9 +237,9 @@ module Durababble
     #: (untyped, now: untyped) -> bool
     def inbox_row_claimable?(row, now:)
       status = row.fetch("status")
-      return false if status == "dead_lettered"
+      return false if InboxStatus.dead_lettered?(status)
 
-      if status == "running"
+      if InboxStatus.running?(status)
         locked_until = row["locked_until"]
         return false unless locked_until
 
@@ -245,7 +252,7 @@ module Durababble
 
     #: (untyped) -> bool
     def object_command_message?(row)
-      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && row.fetch("message_kind") == "ask"))
+      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && ["ask", "tell"].include?(row.fetch("message_kind"))))
     end
 
     #: (untyped) -> untyped
@@ -298,10 +305,43 @@ module Durababble
     def update_latest_attempt(workflow_id:, command_id:, status:, result:, error:)
       update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result: dump_serialized(result), error:)
     end
+
+    #: (untyped, untyped) -> untyped
+    def observe_claim_latency(row, queue)
+      return unless row&.key?("created_at")
+
+      created_at = row.fetch("created_at")
+      created_at = Time.parse(created_at.to_s) unless created_at.respond_to?(:to_time)
+      created_time = created_at.respond_to?(:to_time) ? created_at.to_time : created_at
+      Observability.record(
+        "durababble.queue.claim_latency",
+        [((Time.now - created_time) * 1000.0), 0].max,
+        "durababble.queue.name" => queue,
+        "durababble.store.backend" => Observability.store_backend(self),
+      )
+    rescue StandardError
+      nil
+    end
+
+    #: (untyped) -> untyped
+    def record_wait_latency(wait)
+      created_at = wait.fetch("created_at")
+      completed_at = wait["completed_at"] || Time.now
+      created_at = Time.parse(created_at.to_s) unless created_at.respond_to?(:to_time)
+      completed_at = Time.parse(completed_at.to_s) unless completed_at.respond_to?(:to_time)
+      Observability.record(
+        "durababble.wait.latency",
+        [((completed_at.to_time - created_at.to_time) * 1000.0), 0].max,
+        "durababble.wait.kind" => wait["kind"],
+      )
+    rescue StandardError
+      nil
+    end
   end
 end
 
 require_relative "store/postgres_migrations"
 require_relative "store/mysql_migrations"
+require_relative "store/sql_common"
 require_relative "store/postgres"
 require_relative "store/mysql"

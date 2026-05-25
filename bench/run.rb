@@ -2,7 +2,6 @@
 # typed: false
 # frozen_string_literal: true
 
-require "csv"
 require "fileutils"
 require "json"
 require "open3"
@@ -22,7 +21,7 @@ module Durababble
     Operation = Struct.new(:name, :iterations, :warmup, :description, :block, keyword_init: true)
 
     class Runner
-      def initialize(profile:, database_url:, schema:, output_dir:, fixture_size:, seed:, samples:, keep_schema:)
+      def initialize(profile:, database_url:, schema:, output_dir:, fixture_size:, seed:, samples:, keep_schema:, only: nil)
         @profile = profile
         @database_url = database_url
         @schema = schema
@@ -31,6 +30,7 @@ module Durababble
         @seed = seed
         @samples = samples
         @keep_schema = keep_schema
+        @only = only
         @rng = Random.new(seed)
         @store = Durababble::Store.connect(database_url:, schema:)
         @store.send(:execute, "SET client_min_messages TO warning") unless @store.is_a?(Durababble::MysqlStore)
@@ -87,11 +87,14 @@ module Durababble
 
       def operations
         quick = @profile == "smoke"
-        [
+        selected = [
           Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
           Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
           Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
           Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
+          Operation.new(name: "fenced_workflow_completion", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "complete running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_completion)),
+          Operation.new(name: "fenced_workflow_failure", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "fail running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_failure)),
+          Operation.new(name: "fenced_workflow_cancellation", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "cancel running workflows with a SQL lease-fenced status update", block: method(:bench_fenced_workflow_cancellation)),
           Operation.new(name: "signal_events", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "signal durable event waits and wake workflows", block: method(:bench_signal_event)),
           Operation.new(name: "event_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into event wait, signal it, and resume remaining workflow steps", block: method(:bench_event_wait_resume_workflow)),
           Operation.new(name: "timer_wait_resume_workflow", iterations: quick ? 25 : 500, warmup: quick ? 3 : 25, description: "run into due timer wait, wake it, and resume remaining workflow steps", block: method(:bench_timer_wait_resume_workflow)),
@@ -113,6 +116,7 @@ module Durababble
           Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
           Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
         ]
+        @only ? selected.select { |operation| operation.name.match?(@only) } : selected
       end
 
       def measure(operation)
@@ -214,6 +218,24 @@ module Durababble
         @store.claim_workflow(workflow_id: id, worker_id: "owner", lease_seconds: 30)
         claimed = @store.claim_workflow(workflow_id: id, worker_id: "intruder", lease_seconds: 30)
         raise "lease conflict unexpectedly claimed" if claimed
+      end
+
+      def bench_fenced_workflow_completion(i, warmup:)
+        id = @store.enqueue_workflow(name: "bench_fenced_complete", input: { "i" => i, "warmup" => warmup })
+        @store.claim_workflow(workflow_id: id, worker_id: "status-owner", lease_seconds: 30)
+        @store.complete_workflow(id, result: { "done" => true, "i" => i }, worker_id: "status-owner")
+      end
+
+      def bench_fenced_workflow_failure(i, warmup:)
+        id = @store.enqueue_workflow(name: "bench_fenced_failure", input: { "i" => i, "warmup" => warmup })
+        @store.claim_workflow(workflow_id: id, worker_id: "status-owner", lease_seconds: 30)
+        @store.fail_workflow(id, error: "synthetic failure", worker_id: "status-owner")
+      end
+
+      def bench_fenced_workflow_cancellation(i, warmup:)
+        id = @store.enqueue_workflow(name: "bench_fenced_cancel", input: { "i" => i, "warmup" => warmup })
+        @store.claim_workflow(workflow_id: id, worker_id: "status-owner", lease_seconds: 30)
+        @store.cancel_workflow(id, reason: "synthetic cancellation", result: { "canceled" => true }, worker_id: "status-owner")
       end
 
       def bench_signal_event(i, warmup:)
@@ -576,12 +598,20 @@ module Durababble
       end
 
       def csv(report)
-        CSV.generate do |csv|
-          csv << ["profile", "started_at", "git_sha", "operation", "iterations", "ops_per_second", "median_ms", "p95_ms", "p99_ms", "avg_allocations", "fixture_size"]
-          report.fetch(:operations).each do |op|
-            csv << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
-          end
+        rows = [
+          ["profile", "started_at", "git_sha", "operation", "iterations", "ops_per_second", "median_ms", "p95_ms", "p99_ms", "avg_allocations", "fixture_size"],
+        ]
+        report.fetch(:operations).each do |op|
+          rows << [report.fetch(:profile), report.fetch(:started_at), report.fetch(:environment).fetch(:git_sha), op.fetch(:name), op.fetch(:iterations), op.fetch(:ops_per_second), op.fetch(:median_ms), op.fetch(:p95_ms), op.fetch(:p99_ms), op.fetch(:avg_allocations), report.fetch(:fixture_size)]
         end
+        rows.map { |row| row.map { |field| csv_field(field) }.join(",") }.join("\n")
+      end
+
+      def csv_field(value)
+        field = value.to_s
+        return field unless field.match?(/[",\r\n]/)
+
+        "\"#{field.gsub("\"", "\"\"")}\""
       end
     end
   end
@@ -598,6 +628,7 @@ options = {
   seed: Integer(ENV.fetch("DURABABBLE_BENCH_SEED", "12345")),
   samples: Integer(ENV.fetch("DURABABBLE_BENCH_SAMPLES", "1")),
   keep_schema: ENV["DURABABBLE_BENCH_KEEP_SCHEMA"] == "1",
+  only: nil,
 }
 
 OptionParser.new do |parser|
@@ -609,6 +640,7 @@ OptionParser.new do |parser|
   parser.on("--fixture-size N", Integer, "large-table fixture rows") { |value| options[:fixture_size] = value }
   parser.on("--seed N", Integer, "fixture seed") { |value| options[:seed] = value }
   parser.on("--keep-schema", "do not drop benchmark schema at exit") { options[:keep_schema] = true }
+  parser.on("--only REGEX", "only run operations whose names match REGEX") { |value| options[:only] = Regexp.new(value) }
 end.parse!
 
 runner = Durababble::Benchmarks::Runner.new(**options)

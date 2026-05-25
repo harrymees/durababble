@@ -117,6 +117,15 @@ module GRPC
   end
 end
 
+module OpenTelemetry
+  def self.tracer_provider; end
+  def self.meter_provider; end
+
+  module Trace
+    class Span; end
+  end
+end
+
 module Paquito
   class SingleBytePrefixVersion
     def initialize(version, versions); end

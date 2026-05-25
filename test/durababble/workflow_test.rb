@@ -40,10 +40,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
 
     step def wait_for_approval(input)
-      Durababble.wait_event(
-        "workflow:#{step_context.workflow_id}:command:approve",
-        input.merge("waiting_for" => "approve"),
-      )
+      Durababble.wait_until(Time.now + 3600, input.merge("waiting_for" => "approve"))
     end
 
     expose_command def approve(reason:)
@@ -81,7 +78,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
       "raced-command"
     end
 
-    def wait_for_inbox_message(message_id)
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
       raise Durababble::CommandTimeout, "timed out waiting for inbox message #{message_id}"
     end
   end

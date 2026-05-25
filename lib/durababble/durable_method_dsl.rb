@@ -12,6 +12,12 @@ module Durababble
       subclass.instance_variable_set(:@exposed_commands, {})
     end
 
+    #: (untyped) -> untyped
+    def method_added(method_name)
+      super
+      apply_pending_durable_macro(method_name)
+    end
+
     #: (?untyped) -> untyped
     def expose(method_name = nil)
       return register_exposed_query(method_name) if method_name
@@ -48,11 +54,33 @@ module Durababble
       nil
     end
 
+    #: (untyped) -> bool
+    def apply_pending_durable_macro(method_name)
+      return false if @__durababble_wrapping
+
+      pending = consume_pending_durable_macro
+      return false unless pending
+
+      kind, options = pending
+      handle_pending_durable_macro(kind, method_name, options)
+      true
+    end
+
     #: () -> untyped
     def consume_pending_durable_macro
       pending = @pending_durable_macro
       @pending_durable_macro = nil if pending
       pending
+    end
+
+    #: (untyped, untyped, untyped) -> untyped
+    def handle_pending_durable_macro(kind, method_name, options)
+      case kind
+      when :expose
+        register_exposed_query(method_name)
+      when :expose_command
+        register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
+      end
     end
 
     #: (untyped) -> untyped

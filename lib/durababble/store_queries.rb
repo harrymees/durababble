@@ -70,7 +70,7 @@ module Durababble
       },
       "workflow lease lifecycle" => {
         methods: ["Store.claim_workflow", "Store.heartbeat", "Store.release_worker_leases!", "Store.steal_expired_leases!"],
-        indexes: ["workflows_pkey", "workflows_expired_lease_idx", "workflows_worker_lease_idx"],
+        indexes: ["workflows_pkey", "workflows_expired_lease_idx", "workflows_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
         assertions: ["primary-key lease updates", "expired lease index", "worker release index"],
         benchmarks: ["lease_heartbeat", "lease_conflict_check", "expired_workflow_lease_recovery"],
       },
@@ -102,9 +102,17 @@ module Durababble
       :pg_complete_object_command,
       :pg_enqueue_object_command,
       :pg_fail_fence,
+      :pg_insert_fence,
       :pg_lock_object_command,
       :pg_lock_object_command_for_worker,
       :pg_mark_workflow_waiting,
+      :pg_object_state,
+      :pg_outbox_message,
+      :pg_read_fence,
+      :pg_step_attempts_for,
+      :pg_steps_for,
+      :pg_waits_for_workflow,
+      :pg_workflow,
     ].freeze
 
     MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
@@ -134,7 +142,7 @@ module Durababble
         "WHERE status = 'pending'\n  " \
         "AND runnable_immediately\n  " \
         "#{name_filter}\n" \
-        "ORDER BY created_at\n" \
+        "ORDER BY status, runnable_immediately, created_at\n" \
         "LIMIT 1\n" \
         "FOR UPDATE SKIP LOCKED"
     end
@@ -270,7 +278,7 @@ module Durababble
         "WHEN cancel_requested_at IS NOT NULL THEN 'canceling'\n    " \
         "ELSE 'pending'\n  " \
         "END,\n  " \
-        "locked_by = NULL, locked_until = NULL, updated_at = now()\n" \
+        "locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()\n" \
         "WHERE status = 'running' AND locked_until < $1::timestamptz"
     end
 
@@ -439,7 +447,7 @@ module Durababble
     end
 
     define(:pg_mark_wait_workflow_pending, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = $1 AND status = 'waiting'"
+      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'waiting'"
     end
 
     define(:pg_complete_step, backend: :postgres) do |store|

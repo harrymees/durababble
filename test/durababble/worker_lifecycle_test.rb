@@ -118,22 +118,26 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   end
 
   test "records unexpected polling errors and closes owned stores" do
-    branch_store = RuntimeBranchStore.new(tick_results: [RuntimeError.new("boom")])
-    Durababble::Store.expects(:connect).returns(branch_store)
     runtime = Durababble::WorkerRuntime.new(
-      database_url: "postgresql://example.invalid/db",
+      database_url:,
+      schema:,
       workflows: {},
       worker_pool: "default",
       poll_interval: 0.01,
       migrate: false,
     )
+    runtime.store.define_singleton_method(:claim_runnable_workflow) do |**|
+      raise "boom"
+    end
+    owner = runtime.store.instance_variable_get(:@owner)
 
     runtime.start
-    runtime.wait(timeout: 1)
+    eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
     runtime.close
 
     assert_kind_of RuntimeError, runtime.last_error
-    assert_equal true, branch_store.closed
+    assert_equal "boom", runtime.last_error.message
+    refute owner.connection_pool.active_connection?
   end
 
   test "starts a background worker and gracefully completes in-flight work during shutdown" do
@@ -218,6 +222,69 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     row = store.workflow(workflow_id)
     assert_hash_includes row, "status" => "completed", "result" => { "attempt" => 2 }
     assert_equal ["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+  end
+
+  test "shutdown timeout revokes object inbox and activation leases for immediate recovery" do
+    entered = Queue.new
+    release_zombie = Queue.new
+    blocking_object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_timeout_object"
+
+      define_method(:record) do
+        entered << command_context.attempt_number
+        release_zombie.pop if command_context.attempt_number == 1
+        update_state({ "attempt" => command_context.attempt_number })
+      end
+      expose_command :record, retry: { maximum_attempts: 2, schedule: [0] }
+    end
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: {},
+      objects: [blocking_object],
+      worker_pool: "default",
+      poll_interval: 0.01,
+      lease_seconds: 60,
+      migrate: false,
+      rpc_host: "127.0.0.1",
+      rpc_port: 0,
+    )
+    runtime.start
+    message_id = blocking_object.tell("object-1", :record, store:)
+    assert_equal(1, entered.pop)
+    assert_hash_includes(store.inbox_message(message_id), "status" => "running", "locked_by" => runtime.worker_id)
+    assert_hash_includes(
+      store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
+      "status" => "running",
+      "locked_by" => runtime.worker_id,
+    )
+
+    assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
+    assert_hash_includes(store.inbox_message(message_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+    assert_hash_includes(
+      store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
+      "status" => "pending",
+      "locked_by" => nil,
+      "locked_until" => nil,
+    )
+
+    release_zombie << true
+    runtime.wait(timeout: 1)
+
+    recovery = Durababble::Worker.new(
+      store:,
+      workflows: {},
+      objects: [blocking_object],
+      worker_id: "object-recovery",
+      lease_seconds: 60,
+      migrate: false,
+    )
+    assert_equal(1, recovery.run_until_idle(max_ticks: 2))
+    assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "attempt" => 2 })
+    assert_equal({ "attempt" => 2 }, store.object_state(object_type: blocking_object.object_type, object_id: "object-1"))
+  ensure
+    release_zombie << true if runtime&.running?
+    runtime&.shutdown(timeout: 1)
   end
 
   test "only claims workflow names served by this runtime's worker pool" do
