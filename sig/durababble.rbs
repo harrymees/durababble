@@ -170,7 +170,6 @@ module Durababble
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool) -> String
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def wake_due_timers: (?now: Time) -> Integer
-    def signal_event: (String event_key, ?payload: serialized_payload) -> Integer
     def waits_for: (String workflow_id) -> Array[workflow_row]
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload
     def enqueue_outbox: (workflow_id: String, topic: String, payload: serialized_payload, key: String) -> String
@@ -219,7 +218,6 @@ module Durababble
     def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
     def sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
     def sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
-    def wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
   end
 
@@ -465,6 +463,5 @@ module Durababble
   def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
-  def self.wait_event: (String event_key, ?serialized_payload context) -> serialized_payload
   def self.wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
 end

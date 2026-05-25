@@ -70,7 +70,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
           end
 
           step def wait_for_release(input)
-            Durababble.wait_event("release:#{input.fetch("id")}", input.merge("waiting" => true))
+            Durababble.wait_until(Time.now + 3600, input.merge("waiting" => true, "released" => true))
           end
         end
         second_version = Class.new(Durababble::Workflow) do
@@ -88,7 +88,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         waiting = Durababble::Engine.new(store:, worker_id: "first-version", migrate: false).resume(first_version, workflow_id:)
         assert_equal "waiting", waiting.status
-        assert_equal 1, store.signal_event("release:suffix", payload: { "released" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
 
         run = Durababble::Engine.new(store:, worker_id: "second-version", migrate: false).resume(second_version, workflow_id:)
 
@@ -160,16 +160,16 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
       end
     end
 
-    test "runs a durable timer wait followed by an event wait with #{backend.name}" do
+    test "runs sequential durable timer waits with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
         wake_at = Time.utc(2026, 1, 1, 0, 0, 0)
-        workflow = durababble_test_workflow("sleep-then-event") do
+        workflow = durababble_test_workflow("sleep-then-sleep") do
           test_step("sleep") do |ctx|
             Durababble.wait_until(wake_at, ctx.merge("slept" => true))
           end
 
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("approval:#{ctx.fetch("id")}", ctx)
+          test_step("sleep_again") do |ctx|
+            Durababble.wait_until(Time.now + 3600, ctx.merge("approved" => true))
           end
 
           test_step("finish") do |ctx|
@@ -194,7 +194,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
         assert_equal ["completed", "pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
 
-        assert_equal 1, store.signal_event("approval:hatchet", payload: { "approved" => true })
+        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
         assert_equal :worked, worker.tick
 
         assert_hash_includes(
@@ -207,42 +207,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
           ["completed", "completed", "completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },
         )
-      end
-    end
-
-    test "fans out one external event to all matching durable waiters with #{backend.name}" do
-      with_durababble_store(backend, "hatchet_inspired") do |store|
-        workflow = durababble_test_workflow("event-fanout") do
-          test_step("wait_for_event") do |ctx|
-            Durababble.wait_event("broadcast:ready", ctx)
-          end
-
-          test_step("finish") do |ctx|
-            ctx.merge("finished" => true)
-          end
-        end
-        worker = Durababble::Worker.new(
-          store:,
-          workflows: { workflow.name => workflow },
-          worker_id: "fanout-worker",
-          migrate: false,
-        )
-        workflow_ids = 2.times.map { |index| store.enqueue_workflow(name: workflow.name, input: { "index" => index }) }
-
-        assert_equal :worked, worker.tick
-        assert_equal :worked, worker.tick
-        assert_equal ["waiting", "waiting"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") }
-
-        assert_equal 2, store.signal_event("broadcast:ready", payload: { "ready" => true })
-        assert_equal 2, worker.run_until_idle
-
-        assert_equal ["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") }
-        assert_equal(
-          [{ "index" => 0, "ready" => true, "finished" => true }, { "index" => 1, "ready" => true, "finished" => true }],
-          workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("result") },
-        )
-        assert_equal [1, 1], workflow_ids.map { |workflow_id| store.waits_for(workflow_id).count { |wait| wait.fetch("status") == "completed" } }
-        assert_equal 0, store.signal_event("broadcast:ready", payload: { "ready" => false })
       end
     end
 

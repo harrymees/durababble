@@ -33,10 +33,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           "SELECT id, created_at FROM #{table("outbox")} WHERE status = 'processing' AND locked_until < NOW(6) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
           "outbox_queue",
         ],
-        "event wait wake probe" => [
-          "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status = 'waiting' AND kind = 'event' AND event_key = 'target-event' FOR UPDATE SKIP LOCKED",
-          "waits_event_pending",
-        ],
         "timer wait wake probe" => [
           "SELECT w.* FROM #{table("waits")} AS w JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id WHERE w.status = 'pending' AND wf.status = 'waiting' AND kind = 'timer' AND wake_at <= NOW(6) FOR UPDATE SKIP LOCKED",
           "waits_timer_pending",
@@ -122,8 +118,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-expired-#{i}', 'demo', 'running', #{empty}, 'stale', #{mysql_literal(now - 300)}, #{created_at}, #{created_at})")
       timer_wake_at = i == 1 ? now - 60 : now + 3600
       execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('timer-wait-#{i}', 'waiting-#{i}', 0, 'timer', NULL, #{mysql_literal(timer_wake_at)}, #{wait_context}, 'pending', #{created_at})")
-      event_key = i == 1 ? "target-event" : "other-event"
-      execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('event-wait-#{i}', 'waiting-#{i}', 0, 'event', #{mysql_literal(event_key)}, NULL, #{wait_context}, 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, created_at) VALUES ('pending-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'pending-key-#{i}', 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, locked_by, locked_until, created_at) VALUES ('processing-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'processing-key-#{i}', 'processing', 'owner', #{mysql_literal(now - 60)}, #{created_at})")
     end

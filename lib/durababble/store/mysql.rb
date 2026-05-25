@@ -970,22 +970,6 @@ module Durababble
       id
     end
 
-    #: (untyped, untyped) -> untyped
-    def complete_event_waits(event_key, payload)
-      transaction do
-        waits = execute_params(<<~SQL, [event_key]).map { |row| decode_row(row) }
-          SELECT w.* FROM #{table("waits")} AS w
-          JOIN #{table("workflows")} AS wf ON wf.id = w.workflow_id
-          WHERE w.status = 'pending'
-            AND wf.status IN ('waiting', 'running')
-            AND w.kind = 'event'
-            AND w.event_key = ?
-          FOR UPDATE SKIP LOCKED
-        SQL
-        finish_completed_waits(waits, payload)
-      end
-    end
-
     #: (untyped) -> untyped
     def complete_timer_waits(now)
       transaction do

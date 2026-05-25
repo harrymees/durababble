@@ -101,16 +101,6 @@ module Durababble
       execution.call_wait(wait_request, name: "sleep", args: [duration, context])
     end
 
-    #: (untyped, ?untyped) -> untyped
-    def wait_event(event_key, context = {})
-      wait_request = WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
-      if (execution = WorkflowExecutionContext.current)
-        return execution.call_wait(wait_request, name: "wait_event", args: [event_key, context])
-      end
-
-      wait_request
-    end
-
     #: (?timeout: untyped) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
       execution = WorkflowExecutionContext.current

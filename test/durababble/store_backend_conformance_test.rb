@@ -75,41 +75,6 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "persists waits and wakes event waiters once with #{backend.name}" do
-      with_durababble_store(backend, "conformance") do |store|
-        workflow_id = store.create_workflow(name: "waiter", input: { "start" => true })
-        wait_id = store.record_wait(
-          workflow_id:,
-          position: 0,
-          name: "approval",
-          wait_request: Durababble.wait_event("approval:#{workflow_id}", { "before" => true }),
-        )
-
-        assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_hash_includes(
-          store.waits_for(workflow_id).first,
-          "id" => wait_id,
-          "status" => "pending",
-          "context" => { "before" => true },
-        )
-
-        assert_equal 1, store.signal_event("approval:#{workflow_id}", payload: { "approved" => true })
-        assert_equal 0, store.signal_event("approval:#{workflow_id}", payload: { "approved" => false })
-
-        assert_hash_includes store.workflow(workflow_id), "status" => "pending"
-        assert_hash_includes(
-          store.steps_for(workflow_id).first,
-          "status" => "completed",
-          "result" => { "before" => true, "approved" => true },
-        )
-        assert_hash_includes(
-          store.waits_for(workflow_id).first,
-          "status" => "completed",
-          "payload" => { "approved" => true },
-        )
-      end
-    end
-
     test "persists waits and wakes due timers once with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.create_workflow(name: "timer", input: {})

@@ -270,11 +270,6 @@ module Durababble
         complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "timer" && wait.fetch("wake_at") <= now }, {})
       end
 
-      #: (untyped, ?payload: untyped) -> untyped
-      def signal_event(event_key, payload: {})
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "event" && wait.fetch("event_key") == event_key }, payload)
-      end
-
       #: (untyped) -> untyped
       def waits_for(workflow_id)
         @waits.values.select { |wait| wait.fetch("workflow_id") == workflow_id }.sort_by { |wait| wait.fetch("id") }.map { |row| deep(row) }

@@ -43,7 +43,7 @@ Use a durable workflow when you want to describe a process from beginning to end
 
 Good workflow-shaped examples include charging then shipping an order, importing a large CSV across several API calls, running a complicated LLM agent turn with tool calls till completion, or an automated review process that sometimes has a human-in-the-loop approval step. The key sign is that the work has a start, an expected finish, and a sequence of durable side effects you do not want to accidentally repeat.
 
-Because they are durable, durable workflows can sleep for many days, or await some event that might take a long time to occur. Durable workflows can be cancelled mid execution, and can return a result to callers.
+Because they are durable, durable workflows can sleep for many days, accept durable command RPCs from other processes, be cancelled mid execution, and return a result to callers.
 
 <!-- README:workflow-example:start -->
 
@@ -161,12 +161,11 @@ handle.cancel(reason: "customer requested cancellation")
 
 ### Sleeping
 
-A workflow can park itself without keeping a worker thread busy. There are two different shapes:
+A workflow can park itself until a specific time without keeping a worker thread busy.
 
-- `wait_until(time, context)` is a timer wait. Use it when the workflow should resume at or after a known time.
-- `wait_event(event_key, context)` is an external event wait. Use it when the workflow should resume only after another process records a matching event with `store.signal_event`.
+Use `wait_until(time, context)` when the workflow should resume at or after a known time.
 
-Under the hood, Durababble stores the wait, releases the worker lease, and resumes the workflow later after the timer or event is completed.
+Under the hood, Durababble stores the timer wait, releases the worker lease, and resumes the workflow after the timer is due.
 
 Timer waits are useful for reminders, delayed retries that are part of business logic, cooling-off periods, scheduled followups, or "do not continue before this time" gates:
 
@@ -187,24 +186,35 @@ class SendReminderAfterDelay < Durababble::Workflow
 end
 ```
 
-Event waits are useful when the workflow cannot know its resume time up front: human approval, webhook delivery, a batch import finishing elsewhere, or another durable entity signaling that some state changed.
+When the workflow cannot know its next action up front because it depends on human approval, webhook delivery, a batch import finishing elsewhere, or another durable entity changing state, expose a workflow command RPC for that transition. The command is durable, routed to the workflow owner, and can warm the workflow on a worker before it runs; if the workflow does not exist or is terminal, the command fails instead of being buffered for a future target.
 
 ```ruby
 class AwaitOrderApproval < Durababble::Workflow
+  attr_reader :approval
+
   def execute(order)
-    approval = wait_event("approval:#{order.fetch("id")}", order)
+    approval = wait_for_approval
     apply_approval(order, approval)
+  end
+
+  def wait_for_approval
+    Durababble::Workflow.wait_condition { approval }
   end
 
   step def apply_approval(order, approval)
     order.merge("approved" => approval.fetch("approved"))
   end
+
+  expose_command def approve(approved:)
+    @approval = { "approved" => approved }
+  end
 end
 
-store.signal_event("approval:ord_123", payload: { "approved" => true })
+handle = AwaitOrderApproval.handle(run_id, store:)
+handle.approve(approved: true)
 ```
 
-The `context` you pass to `sleep_until`, `wait_until`, or `wait_event` is the base value Durababble resumes with when the wait completes. For event waits, the signal payload is merged into that resumed value, which is how the approval example receives `"approved" => true`. Direct waits are durable workflow yield points: they schedule replay-checked workflow history, persist a wait row, release the worker lease at a safe suspension point, and resume the waiting workflow fiber when the timer or event completes. Do not use `Thread.sleep` in workflow orchestration code, because that actually blocks the worker thread instead of durably parking the workflow.
+The `context` you pass to `sleep_until` or `wait_until` is the base value Durababble resumes with when the wait completes. Direct waits are durable workflow yield points: they schedule replay-checked workflow history, persist a wait row, release the worker lease at a safe suspension point, and resume the waiting workflow fiber when the timer completes. Do not use `Thread.sleep` in workflow orchestration code, because that actually blocks the worker thread instead of durably parking the workflow.
 
 ### Cancellation
 
@@ -283,9 +293,9 @@ end
 
 Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
-### Workflow event log length
+### Workflow History Length
 
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, and replay will take very long, and system performance will suffer.
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded history will grow to be very long, and replay will take very long, and system performance will suffer.
 
 Prefer durable objects for long-lived identities, and prefer splitting very large jobs into a workflow per bounded batch or phase.
 
@@ -445,14 +455,14 @@ The README describes the implemented prototype. The spec also records the intend
 - Durable workflow, step, wait, attempt, fence, outbox, durable-object, and durable-object-command persistence.
 - Worker polling with leased workflow claims.
 - Heartbeats, stale lease recovery, and lease-aware resume.
-- Timer waits, external event waits, side-effect fences, and durable outbox primitives.
+- Timer waits, side-effect fences, and durable outbox primitives.
 - Retry due-time claims distinguish retryable failures from terminal failed workflows.
 - Lease-routed workflow RPC helpers.
 - Deterministic simulation tests for workflow safety and crash-recovery scenarios.
 
 - `DurableObject.at` and `DurableObject.tell` are the preferred future durable-object spellings. The current durable-object implementation still uses `DurableObject.ref`; workflow code supports both `Workflow.start` / `Workflow.handle` and lower-level `Workflow.enqueue` / `Workflow.ref` / `Engine#run`.
-- Workflow command methods currently persist command events; executing command bodies through the workflow owner and returning command results is target runtime work.
-- Full durable workflow signals (`signal def`, `wait_condition`) are target work. Implemented today are lower-level timer waits, event waits, and event signaling.
+- Workflow command methods currently persist durable inbox rows, execute command bodies through the workflow owner, and return command results to synchronous callers.
+- Workflow `wait_condition` is implemented as a timer-backed durable wait. Broader broadcast-style delivery concepts are intentionally out of scope.
 - Durable-object commands persist command rows and execute inline in the current prototype. Per-object FIFO mailbox leasing, async `tell`, sleeps, and worker-driven object execution are target work.
 - Fences deduplicate side effects after a fence row is inserted, but fence-owner crash recovery is not complete.
 - The gRPC transport and workflow RPC routing are implemented for the prototype test matrix, but production mTLS/Spiffe policy, admin surfaces, metrics, tracing, and operator tooling are not yet implemented.
