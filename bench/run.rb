@@ -246,7 +246,7 @@ module Durababble
           workflow_id:,
           position: 0,
           name: "wait",
-          wait_request: Durababble.wait_event("bench:event:#{i}:#{warmup}", context: { "i" => i }),
+          wait_request: event_wait("bench:event:#{i}:#{warmup}", context: { "i" => i }),
         )
         woken = @store.signal_event("bench:event:#{i}:#{warmup}", payload: { "ok" => true })
         raise "wait not woken" unless woken == 1
@@ -469,7 +469,7 @@ module Durababble
           end
 
           define_method(:wait_for_event) do |ctx|
-            Durababble.wait_event(event_key, context: ctx)
+            Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key:, context: ctx)
           end
           step :wait_for_event
 
@@ -495,6 +495,10 @@ module Durababble
             ctx.merge("finished" => true)
           end
         end
+      end
+
+      def event_wait(event_key, context:)
+        Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key:, context:)
       end
 
       def state_read_ids

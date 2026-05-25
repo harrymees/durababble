@@ -6,6 +6,49 @@ require "delegate"
 require "json"
 
 class DurababbleQueryPlanTest < DurababbleTestCase
+  # Registered production queries not directly asserted by the large-fixture EXPLAIN suite.
+  # Adding a new registered query without plan coverage must create an intentional diff here.
+  POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
+    :pg_claim_object_command,
+    :pg_complete_fence,
+    :pg_complete_object_command,
+    :pg_enqueue_object_command,
+    :pg_fail_fence,
+    :pg_insert_fence,
+    :pg_lock_object_command,
+    :pg_lock_object_command_for_worker,
+    :pg_mark_workflow_waiting,
+    :pg_object_state,
+    :pg_outbox_message,
+    :pg_read_fence,
+    :pg_step_attempts_for,
+    :pg_steps_for,
+    :pg_waits_for_workflow,
+    :pg_workflow,
+  ].freeze
+
+  MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
+    :mysql_ack_outbox,
+    :mysql_claim_selected_outbox,
+    :mysql_claim_selected_workflow,
+    :mysql_claim_workflow_update,
+    :mysql_current_workflow_lease,
+    :mysql_heartbeat_latest_attempt,
+    :mysql_heartbeat_step_row,
+    :mysql_heartbeat_step_workflow,
+    :mysql_insert_outbox,
+    :mysql_insert_step_attempt,
+    :mysql_outbox_by_key,
+    :mysql_outbox_message,
+    :mysql_running_step_exists,
+    :mysql_step_attempts_for,
+    :mysql_steps_for,
+    :mysql_supersede_running_step_attempts,
+    :mysql_upsert_step_running,
+    :mysql_workflow,
+    :mysql_workflow_locked_until,
+  ].freeze
+
   class RecordingConnection < SimpleDelegator
     attr_reader :recorded_queries
 
@@ -188,50 +231,10 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   end
 
   test "uncovered query lists are explicit and reference registered queries" do
-    expected_postgres = [
-      :pg_claim_object_command,
-      :pg_complete_fence,
-      :pg_complete_object_command,
-      :pg_enqueue_object_command,
-      :pg_fail_fence,
-      :pg_insert_fence,
-      :pg_lock_object_command,
-      :pg_lock_object_command_for_worker,
-      :pg_mark_workflow_waiting,
-      :pg_object_state,
-      :pg_outbox_message,
-      :pg_read_fence,
-      :pg_step_attempts_for,
-      :pg_steps_for,
-      :pg_waits_for_workflow,
-      :pg_workflow,
-    ]
-    expected_mysql = [
-      :mysql_ack_outbox,
-      :mysql_claim_selected_outbox,
-      :mysql_claim_selected_workflow,
-      :mysql_claim_workflow_update,
-      :mysql_current_workflow_lease,
-      :mysql_heartbeat_latest_attempt,
-      :mysql_heartbeat_step_row,
-      :mysql_heartbeat_step_workflow,
-      :mysql_insert_outbox,
-      :mysql_insert_step_attempt,
-      :mysql_outbox_by_key,
-      :mysql_outbox_message,
-      :mysql_running_step_exists,
-      :mysql_step_attempts_for,
-      :mysql_steps_for,
-      :mysql_supersede_running_step_attempts,
-      :mysql_upsert_step_running,
-      :mysql_workflow,
-      :mysql_workflow_locked_until,
-    ]
-
-    assert_equal expected_postgres, Durababble::StoreQueries.uncovered_query_ids(:postgres)
-    assert_equal expected_mysql, Durababble::StoreQueries.uncovered_query_ids(:mysql)
-    assert_empty expected_postgres - Durababble::StoreQueries.query_ids(:postgres)
-    assert_empty expected_mysql - Durababble::StoreQueries.query_ids(:mysql)
+    assert_equal POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS.sort, POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS
+    assert_equal MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS.sort, MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS
+    assert_empty POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS - Durababble::StoreQueries.query_ids(:postgres)
+    assert_empty MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS - Durababble::StoreQueries.query_ids(:mysql)
   end
 
   test "hot query inventory names assertion and benchmark coverage" do
@@ -416,7 +419,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       end
     end
 
-    missing_query_ids = Durababble::StoreQueries.plan_required_ids(:postgres) - seen_query_ids.uniq
+    missing_query_ids = Durababble::StoreQueries.query_ids(:postgres) - POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS - seen_query_ids.uniq
     assert_empty(missing_query_ids, "query-plan operations did not exercise registered PostgreSQL/YSQL queries: #{missing_query_ids.join(", ")}")
   ensure
     @durababble_store&.drop_schema!

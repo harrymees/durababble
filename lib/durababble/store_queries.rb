@@ -27,25 +27,8 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def plan_required_ids(backend)
-        query_ids(backend) - uncovered_query_ids(backend)
-      end
-
-      #: (untyped) -> untyped
       def query_ids(backend)
         QUERIES.values.select { |query| query.backend == backend.to_sym }.map(&:id).sort
-      end
-
-      #: (untyped) -> untyped
-      def uncovered_query_ids(backend)
-        case backend.to_sym
-        when :postgres
-          POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS
-        when :mysql
-          MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS
-        else
-          []
-        end
       end
 
       #: () -> untyped
@@ -93,49 +76,6 @@ module Durababble
         benchmarks: ["durable_object_command_claim"],
       },
     }.freeze
-
-    # These registered production queries are not directly asserted by the large-fixture EXPLAIN suite.
-    # Keeping them here makes every newly uncovered query a visible source diff.
-    POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
-      :pg_claim_object_command,
-      :pg_complete_fence,
-      :pg_complete_object_command,
-      :pg_enqueue_object_command,
-      :pg_fail_fence,
-      :pg_insert_fence,
-      :pg_lock_object_command,
-      :pg_lock_object_command_for_worker,
-      :pg_mark_workflow_waiting,
-      :pg_object_state,
-      :pg_outbox_message,
-      :pg_read_fence,
-      :pg_step_attempts_for,
-      :pg_steps_for,
-      :pg_waits_for_workflow,
-      :pg_workflow,
-    ].freeze
-
-    MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
-      :mysql_ack_outbox,
-      :mysql_claim_selected_outbox,
-      :mysql_claim_selected_workflow,
-      :mysql_claim_workflow_update,
-      :mysql_current_workflow_lease,
-      :mysql_heartbeat_latest_attempt,
-      :mysql_heartbeat_step_row,
-      :mysql_heartbeat_step_workflow,
-      :mysql_insert_outbox,
-      :mysql_insert_step_attempt,
-      :mysql_outbox_by_key,
-      :mysql_outbox_message,
-      :mysql_running_step_exists,
-      :mysql_step_attempts_for,
-      :mysql_steps_for,
-      :mysql_supersede_running_step_attempts,
-      :mysql_upsert_step_running,
-      :mysql_workflow,
-      :mysql_workflow_locked_until,
-    ].freeze
 
     define(:pg_claim_pending_workflow, backend: :postgres) do |store, name_filter:|
       "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
