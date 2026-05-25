@@ -44,6 +44,25 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
   end
 
+  test "close removes generated active record connection constants" do
+    owner = nil
+    const_name = nil
+    owner = Durababble::Store.send(:active_record_class_for, "mysql://root@example.invalid/durababble_test")
+    const_name = owner.instance_variable_get(:@durababble_store_connection_const_name)
+    assert_kind_of(String, const_name)
+    assert_equal("Durababble::#{const_name}", owner.name)
+    assert(Durababble.const_defined?(const_name, false))
+
+    store = Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema", owner:)
+    store.close
+
+    refute(Durababble.const_defined?(const_name, false))
+    store.close
+  ensure
+    owner&.connection_pool&.disconnect!
+    Durababble.send(:remove_const, const_name) if const_name && Durababble.const_defined?(const_name, false)
+  end
+
   test "inbox_row_claimable? rejects blocked inbox statuses" do
     store = shared_store
     now = Time.utc(2024, 1, 1)
@@ -104,9 +123,104 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
+  test "postgres enqueue_workflow inserts the pending row in one statement" do
+    connection = ScriptedPgConnection.new
+    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    refute_includes sql, "UPDATE"
+    assert_equal "demo", params[1]
+    assert_equal "pending", params[2]
+  end
+
+  test "postgres create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedPgConnection.new
+    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
+    refute_includes sql, "UPDATE"
+    assert_equal "demo", params[1]
+    assert_equal "running", params[2]
+    assert_equal "worker-a", params[4]
+    assert_equal 9, params[5]
+  end
+
+  test "mysql enqueue_workflow inserts the pending row in one statement" do
+    connection = ScriptedMysqlConnection.new
+    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.queries.length
+    sql = connection.queries.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    refute_includes sql, "UPDATE"
+  end
+
+  test "mysql create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedMysqlConnection.new
+    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.queries.length
+    sql = connection.queries.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
+    refute_includes sql, "UPDATE"
+  end
+
+  test "postgres claim_runnable_workflow claims pending work with one update returning statement" do
+    connection = ScriptedPgConnection.new(params_results: [
+      sql_result([{
+        "id" => "workflow-1",
+        "name" => "demo",
+        "status" => "running",
+        "input" => pg_dump({ "count" => 1 }),
+        "created_at" => Time.utc(2026, 1, 1),
+        "locked_by" => "worker-a",
+        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+      }]),
+    ])
+    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+
+    claimed = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 9, workflow_names: ["demo"])
+
+    assert_equal "workflow-1", claimed.fetch("id")
+    assert_equal({ "count" => 1 }, claimed.fetch("input"))
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "WITH candidate AS"
+    assert_includes sql, "UPDATE"
+    assert_includes sql, "RETURNING workflows.*"
+    assert_includes sql, "FOR UPDATE SKIP LOCKED"
+    assert_equal ["worker-a", 9, "demo"], params
+  end
+
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+
+      assert_hash_includes store.workflow(workflow_id), "status" => "running", "input" => { "count" => 1 }
 
       store.record_step_started(workflow_id:, position: 0, name: "add_one")
       store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 })
@@ -258,11 +372,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending", "created_at" => "2024-01-02T00:00:00Z" }]),
-      sql_result([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
-      sql_result,
-      sql_result,
-      sql_result,
       sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
       sql_result,
@@ -907,7 +1016,9 @@ class DurababbleStoreTest < DurababbleTestCase
     store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
     assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
     assert_equal ["AND name IN (?, ?)", ["x'; DROP TABLE workflows; --", "safe"]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
+    assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))

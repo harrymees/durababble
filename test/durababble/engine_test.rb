@@ -61,6 +61,48 @@ class DurababbleEngineTest < DurababbleTestCase
     end
   end
 
+  class InlineRunStore
+    attr_reader :created_workflows
+
+    def initialize
+      @created_workflows = []
+      @workflows = {}
+    end
+
+    def create_workflow(name:, input:, worker_id:, lease_seconds:)
+      @created_workflows << { name:, input:, worker_id:, lease_seconds: }
+      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id }
+      "wf-inline"
+    end
+
+    def enqueue_workflow(name:, input:)
+      raise "Engine#run should create the leased running workflow directly"
+    end
+
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      raise "Engine#run should not claim a workflow it just created"
+    end
+
+    def workflow_history_for(_workflow_id)
+      []
+    end
+
+    def workflow_owned?(workflow_id:, worker_id:)
+      row = @workflows.fetch(workflow_id)
+      row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
+    end
+
+    def workflow_cancellation(_workflow_id) = nil
+
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      @workflows[workflow_id] = @workflows.fetch(workflow_id).merge("status" => "completed", "result" => result, "locked_by" => nil)
+    end
+
+    def workflow(workflow_id)
+      @workflows.fetch(workflow_id)
+    end
+  end
+
   class MigrationTrackingStore
     attr_reader :migrations, :enqueued
 
@@ -116,7 +158,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "still supports requested injected crash points" do
     no_lease_store = Object.new
-    crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
+    crashy_engine = Durababble::Engine.new(store: no_lease_store, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
   end
 
@@ -133,7 +175,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
     store = FencedCompletionStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "owner-a", lease_seconds: 17, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "owner-a", lease_seconds: 17)
 
     run = engine.resume(ImmediateWorkflow, workflow_id: "wf-1")
 
@@ -146,7 +188,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "drains workflow command inbox one message at a time so failed heads block followers" do
     store = CommandDrainStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_equal [1, 1], store.claim_limits
@@ -158,7 +200,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "does not drain workflow command inboxes for terminal workflows" do
     store = CommandDrainStore.new(workflow_status: "completed")
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 0, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.claim_limits
@@ -173,7 +215,7 @@ class DurababbleEngineTest < DurababbleTestCase
         { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
       ],
     )
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.completed
@@ -188,12 +230,30 @@ class DurababbleEngineTest < DurababbleTestCase
         { "id" => "msg-next", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
       ],
     )
-    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
     assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
     assert_empty store.completed
     assert_equal "msg-missing", store.failed.fetch(0).fetch(:message_id)
     assert_match(/UnknownCommand: missing/, store.failed.fetch(0).fetch(:error))
+  end
+
+  test "run creates a leased running workflow directly instead of enqueueing then claiming" do
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "inline-run"
+
+      def execute(input)
+        input.merge("done" => true)
+      end
+    end
+    store = InlineRunStore.new
+    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9, migrate: false)
+
+    run = engine.run(workflow, input: { "count" => 2 })
+
+    assert_equal "completed", run.status
+    assert_equal({ "count" => 2, "done" => true }, run.result)
+    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9 }], store.created_workflows
   end
 
   durababble_store_backends.each do |backend|

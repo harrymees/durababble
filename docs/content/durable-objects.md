@@ -104,6 +104,8 @@ account.balance       # query: reads latest persisted state
 
 Use `expose` for simple RPCs such as `balance`, `status`, `members`, or `current_cursor`. Use `expose_command` for changes such as `credit`, `join`, `append_message`, `advance_cursor`, or `close`. Command methods can use `command_context.idempotency_key` when calling external systems, and command retry policy is declared on the method the same way workflow step retry policy is.
 
+`Account.at("acct_123", worker_pool: "orders")` sends command wakeups to that worker pool, and `idempotency_key:` on `at` or `handle` becomes the default idempotency key for commands sent through that handle; passing `idempotency_key:` to an individual command overrides the handle default.
+
 ```ruby
 class Channel < Durababble::DurableObject
   object_type "channel"
@@ -131,4 +133,4 @@ channel.recent
 
 Durable workflows and durable objects share the same durable store, but they fit different shapes of work. Use a workflow when the work is a finite process with a start, a result, ordered durable steps, waits, retries, or cancellation: indexing pipelines, tool sequences, resumable imports, or fulfillment flows. Use a durable object when the work centers on an id that should keep mutable state over time, potentially indefinitely, and accept repeated queries or commands: sessions, carts, conversations, agent contexts, project state, or per-shop workers.
 
-Use a workflow to orchestrate a process; use a durable object to own an entity's state. Compose them when a process needs durable per-entity state, but avoid turning a long-lived entity into one never-ending workflow just to make it addressable, or turning a finite process into ad hoc object state just to make retries durable.
+Use a workflow to orchestrate a process; use a durable object to own an entity's state. Compose them when a process needs durable per-entity state, but avoid turning a long-lived entity into one never-ending workflow just to make it addressable, or turning a finite process into ad hoc object state just to make retries durable. See [Object Patterns](object-patterns.md) for executable examples of common object shapes.

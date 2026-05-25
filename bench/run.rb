@@ -18,7 +18,7 @@ module Durababble
   module Benchmarks
     DEFAULT_DATABASE_URL = Durababble.default_database_url
 
-    Operation = Struct.new(:name, :iterations, :warmup, :description, :block, keyword_init: true)
+    Operation = Struct.new(:name, :iterations, :warmup, :description, :block, :prepare, keyword_init: true)
 
     class Runner
       def initialize(profile:, database_url:, schema:, output_dir:, fixture_size:, seed:, samples:, keep_schema:, only: nil)
@@ -79,6 +79,7 @@ module Durababble
         report
       ensure
         @rpc&.close
+        @bulk_due_timer_stores&.each(&:close)
         @store&.drop_schema! unless @keep_schema
         @store&.close
       end
@@ -89,6 +90,7 @@ module Durababble
         quick = @profile == "smoke"
         selected = [
           Operation.new(name: "enqueue_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "insert pending workflows with Paquito input", block: method(:bench_enqueue)),
+          Operation.new(name: "inline_run_workflow", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "create, lease, and complete an inline workflow run", block: method(:bench_inline_run_workflow)),
           Operation.new(name: "claim_runnable_workflows", iterations: quick ? 100 : 2_000, warmup: quick ? 10 : 100, description: "claim pending workflows under distributed leases", block: method(:bench_claim)),
           Operation.new(name: "lease_heartbeat", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "renew active workflow leases", block: method(:bench_heartbeat)),
           Operation.new(name: "lease_conflict_check", iterations: quick ? 100 : 1_500, warmup: quick ? 10 : 100, description: "check/respect another worker's live lease", block: method(:bench_lease_conflict)),
@@ -109,6 +111,8 @@ module Durababble
           Operation.new(name: "durable_object_command_claim", iterations: quick ? 50 : 1_000, warmup: quick ? 5 : 50, description: "persist, claim, complete, and read durable object command state", block: method(:bench_durable_object_command_claim)),
           Operation.new(name: "large_table_claim_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "claim runnable rows with large completed/running table fixture", block: method(:bench_large_table_claim_scan)),
           Operation.new(name: "large_table_due_timer_scan", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "wake due timers with many unrelated wait rows", block: method(:bench_large_table_due_timer_scan)),
+          Operation.new(name: "bulk_due_timer_wake_parallel", iterations: quick ? 3 : 20, warmup: quick ? 1 : 3, description: "wake a large due timer set from two concurrent stores", prepare: method(:prepare_bulk_due_timer_wake), block: method(:bench_bulk_due_timer_wake_parallel)),
+          Operation.new(name: "step_attempt_number_lookup", iterations: quick ? 50 : 750, warmup: quick ? 5 : 50, description: "compute a step attempt number with many prior attempts", block: method(:bench_step_attempt_number_lookup)),
           Operation.new(name: "command_rpc_ping", iterations: quick ? 50 : 500, warmup: quick ? 5 : 50, description: "JSON-line command RPC roundtrip to a separate Ruby process", block: method(:bench_rpc_ping)),
           Operation.new(name: "command_rpc_enqueue_claim", iterations: quick ? 25 : 250, warmup: quick ? 3 : 25, description: "separate process enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim)),
           Operation.new(name: "command_rpc_enqueue_claim_batch", iterations: quick ? 10 : 100, warmup: quick ? 1 : 10, description: "separate process batched enqueue + lease claim command RPC", block: method(:bench_rpc_enqueue_claim_batch)),
@@ -117,10 +121,14 @@ module Durababble
       end
 
       def measure(operation)
-        operation.warmup.times { |i| operation.block.call(i, warmup: true) }
+        operation.warmup.times do |i|
+          operation.prepare&.call(i, warmup: true)
+          operation.block.call(i, warmup: true)
+        end
         GC.start(full_mark: true, immediate_sweep: true)
         samples = []
         operation.iterations.times do |i|
+          operation.prepare&.call(i, warmup: false)
           before_alloc = GC.stat.fetch(:total_allocated_objects)
           started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           operation.block.call(i, warmup: false)
@@ -202,6 +210,11 @@ module Durababble
         @store.enqueue_workflow(name: "bench_claim", input: { "i" => i, "warmup" => warmup })
         claimed = @store.claim_runnable_workflow(worker_id: "claim-worker", lease_seconds: 30)
         raise "workflow not claimed" unless claimed
+      end
+
+      def bench_inline_run_workflow(i, warmup:)
+        run = Durababble::Engine.new(store: @store, worker_id: "inline-runner", lease_seconds: 30, migrate: false).run(noop_workflow, input: { "i" => i, "warmup" => warmup, "payload" => "x" * 64 })
+        raise "inline workflow did not complete" unless run.status == "completed"
       end
 
       def bench_heartbeat(i, warmup:)
@@ -380,6 +393,42 @@ module Durababble
         @store.complete_workflow(workflow_id, result: { "woke" => true })
       end
 
+      def prepare_bulk_due_timer_wake(i, warmup:)
+        @bulk_due_timer_expected = bulk_due_timer_count
+        @bulk_due_timer_now = Time.now
+        prefix = "bulk-timer-#{warmup ? "warmup" : "sample"}-#{i}"
+        input = @store.send(:dump_serialized, {})
+        context = @store.send(:dump_serialized, { "bulk" => true })
+        rows = @bulk_due_timer_expected.times.map do |n|
+          workflow_id = "#{prefix}-workflow-#{n}"
+          {
+            workflow: [workflow_id, "bulk_due_timer", "waiting", input],
+            step: [workflow_id, 0, "timer", "waiting"],
+            attempt: ["#{prefix}-attempt-#{n}", workflow_id, 0, "timer", "waiting"],
+            wait: ["#{prefix}-wait-#{n}", workflow_id, 0, "timer", @bulk_due_timer_now - 1, context, "pending"],
+          }
+        end
+
+        bulk_insert_rows("workflows", ["id", "name", "status", "input"], rows.map { |row| row.fetch(:workflow) }, casts: { "input" => "::bytea" })
+        bulk_insert_rows("steps", ["workflow_id", "position", "name", "status"], rows.map { |row| row.fetch(:step) })
+        bulk_insert_rows("step_attempts", ["id", "workflow_id", "position", "name", "status"], rows.map { |row| row.fetch(:attempt) })
+        bulk_insert_rows("waits", ["id", "workflow_id", "position", "kind", "wake_at", "context", "status"], rows.map { |row| row.fetch(:wait) }, casts: { "wake_at" => "::timestamptz", "context" => "::bytea" })
+      end
+
+      def bench_bulk_due_timer_wake_parallel(i, warmup:)
+        counts = bulk_due_timer_stores.map do |store|
+          Thread.new { store.wake_due_timers(now: @bulk_due_timer_now) }
+        end.map(&:value)
+        woke = counts.sum
+        raise "bulk due timer wake missed rows: woke #{woke}, expected #{@bulk_due_timer_expected}, counts=#{counts.inspect}" unless woke == @bulk_due_timer_expected
+      end
+
+      def bench_step_attempt_number_lookup(i, warmup:)
+        ensure_step_attempt_fixture!
+        attempt_number = @step_attempt_fixture_runner.send(:attempt_number_for, 0)
+        raise "attempt number mismatch: #{attempt_number}" unless attempt_number == step_attempt_fixture_count
+      end
+
       def bench_rpc_ping(i, warmup:)
         rpc.request("ping", "i" => i, "warmup" => warmup)
       end
@@ -424,6 +473,35 @@ module Durababble
         end
       end
 
+      def noop_workflow
+        @noop_workflow ||= Class.new(Durababble::Workflow) do
+          workflow_name "bench_inline_run"
+
+          def execute(input)
+            input
+          end
+        end
+      end
+
+      def event_resume_workflow(event_key)
+        Class.new(Durababble::Workflow) do
+          workflow_name "bench_event_resume"
+
+          define_method(:execute) do |input|
+            finish_after_event(wait_for_event(input))
+          end
+
+          define_method(:wait_for_event) do |ctx|
+            Durababble.wait_event(event_key, context: ctx)
+          end
+          step :wait_for_event
+
+          step def finish_after_event(ctx)
+            ctx.merge("finished" => true)
+          end
+        end
+      end
+
       def timer_resume_workflow
         @timer_resume_workflow ||= Class.new(Durababble::Workflow) do
           workflow_name "bench_timer_resume"
@@ -453,6 +531,46 @@ module Durababble
         end
       end
 
+      def ensure_step_attempt_fixture!
+        return if @step_attempt_fixture_runner
+
+        workflow_id = "step-attempt-fixture"
+        bulk_insert_rows(
+          "workflows",
+          ["id", "name", "status", "input"],
+          [[workflow_id, "step_attempt_fixture", "running", @store.send(:dump_serialized, {})]],
+          casts: { "input" => "::bytea" },
+        )
+        rows = step_attempt_fixture_count.times.map do |n|
+          ["step-attempt-fixture-#{n}", workflow_id, 0, "flaky", n == step_attempt_fixture_count - 1 ? "running" : "failed"]
+        end
+        bulk_insert_rows("step_attempts", ["id", "workflow_id", "position", "name", "status"], rows)
+
+        @step_attempt_fixture_runner = Durababble::WorkflowStepRunner.new(
+          store: @store,
+          workflow_id:,
+          worker_id: "attempt-bench",
+          lease_seconds: 30,
+          root_task: Object.new,
+          futures: {},
+          step_contexts: {},
+          synchronize_store: ->(&block) { block.call },
+          raise_if_cancel_requested: -> {},
+          assert_workflow_lease: -> {},
+          suspend_workflow_immediately: -> { true },
+          retry_run_at: ->(delay) { Time.now + delay },
+          crash: ->(_point) {},
+        )
+      end
+
+      def bulk_due_timer_count
+        @fixture_size.clamp(100, 5_000)
+      end
+
+      def step_attempt_fixture_count
+        @fixture_size.clamp(100, 10_000)
+      end
+
       def expire_workflow_lease(workflow_id)
         if @store.is_a?(Durababble::MysqlStore)
           @store.send(:execute_params, "UPDATE #{@store.send(:table, "workflows")} SET locked_until = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE id = ?", [workflow_id])
@@ -471,6 +589,31 @@ module Durababble
 
       def quoted_schema
         PG::Connection.quote_ident(@schema)
+      end
+
+      def bulk_due_timer_stores
+        @bulk_due_timer_stores ||= 2.times.map { connect_store }
+      end
+
+      def connect_store
+        store = Durababble::Store.connect(database_url: @database_url, schema: @schema)
+        store.send(:execute, "SET client_min_messages TO warning") unless store.is_a?(Durababble::MysqlStore)
+        store
+      end
+
+      def bulk_insert_rows(table_name, columns, rows, casts: {})
+        rows.each_slice(100) do |slice|
+          params = []
+          values = slice.map do |row|
+            placeholders = row.each_with_index.map do |value, index|
+              params << value
+              placeholder = @store.is_a?(Durababble::MysqlStore) ? "?" : "$#{params.length}"
+              "#{placeholder}#{casts.fetch(columns.fetch(index), "") unless @store.is_a?(Durababble::MysqlStore)}"
+            end
+            "(#{placeholders.join(", ")})"
+          end
+          @store.send(:execute_params, "INSERT INTO #{@store.send(:table, table_name)} (#{columns.join(", ")}) VALUES #{values.join(", ")}", params)
+        end
       end
 
       def ensure_large_fixture!

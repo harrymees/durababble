@@ -33,8 +33,8 @@ module Durababble
       }
       Observability.trace("durababble.workflow.start", attributes) do
         Observability.count("durababble.workflow.starts", attributes)
-        workflow_id = enqueue(workflow_class, input:)
-        resume(workflow_class, workflow_id:)
+        workflow_id = @store.create_workflow(name: workflow_class.workflow_name, input:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+        execute(workflow_class, workflow_id:, initial_input: input)
       end
     end
 

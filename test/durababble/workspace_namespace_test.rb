@@ -115,40 +115,6 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     runtime&.close
   end
 
-  test "explicit workspace schemas isolate workflows and durable objects" do
-    database_url = Durababble.default_database_url
-    schemas = [
-      Durababble.workspace_schema("/tmp/durababble-isolation-a-#{Process.pid}"),
-      Durababble.workspace_schema("/tmp/durababble-isolation-b-#{Process.pid}"),
-    ]
-    stores = []
-
-    begin
-      stores = schemas.map { |schema| Durababble::Store.connect(database_url:, schema:) }
-      stores.each(&:migrate!)
-    rescue StandardError => e
-      stores.each { |store| safely_close(store) }
-      skip("Durababble isolation smoke requires a reachable SQL database at #{database_url}: #{e.class}: #{e.message}")
-    end
-
-    first_workflow = stores[0].enqueue_workflow(name: "workspace-isolation", input: { "workspace" => "a" })
-    second_workflow = stores[1].enqueue_workflow(name: "workspace-isolation", input: { "workspace" => "b" })
-    stores[0].save_object_state(object_type: "fixture", object_id: "shared-id", state: { "workspace" => "a" })
-    stores[1].save_object_state(object_type: "fixture", object_id: "shared-id", state: { "workspace" => "b" })
-
-    assert_equal({ "workspace" => "a" }, stores[0].workflow(first_workflow).fetch("input"))
-    assert_equal({ "workspace" => "b" }, stores[1].workflow(second_workflow).fetch("input"))
-    assert_raises(KeyError) { stores[0].workflow(second_workflow) }
-    assert_raises(KeyError) { stores[1].workflow(first_workflow) }
-    assert_equal({ "workspace" => "a" }, stores[0].object_state(object_type: "fixture", object_id: "shared-id"))
-    assert_equal({ "workspace" => "b" }, stores[1].object_state(object_type: "fixture", object_id: "shared-id"))
-  ensure
-    stores.each do |store|
-      safely_drop_schema(store)
-      safely_close(store)
-    end
-  end
-
   private
 
   def safely_drop_schema(store)

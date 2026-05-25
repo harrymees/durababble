@@ -120,6 +120,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
       id
     end
 
+    def create_workflow(name:, input:, worker_id:, lease_seconds:)
+      @next_id += 1
+      id = "wf-#{@next_id}"
+      @workflows[id] = { "id" => id, "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds, "created_at" => Time.now }
+      id
+    end
+
     def workflow(workflow_id) = @workflows.fetch(workflow_id)
 
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
