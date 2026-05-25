@@ -122,6 +122,34 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
       end
     end
 
+    test "direct wait_condition without a timeout polls until the block is true with #{backend.name}" do
+      with_durababble_store(backend, "workflow_wait_condition_poll") do |store|
+        store.migrate!
+        checks = 0
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "direct-wait-condition-poll"
+
+          define_method(:execute) do |_input|
+            ready = wait_condition do
+              checks += 1
+              checks > 1
+            end
+            { "ready" => ready, "checks" => checks }
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        waiting = Durababble::Engine.new(store:, worker_id: "condition-poll-wait", migrate: false).resume(workflow, workflow_id:)
+        assert_equal "waiting", waiting.status
+
+        assert_equal 1, store.wake_due_timers(now: Time.now + 2)
+        completed = Durababble::Engine.new(store:, worker_id: "condition-poll-resume", migrate: false).resume(workflow, workflow_id:)
+
+        assert_equal "completed", completed.status
+        assert_equal({ "ready" => true, "checks" => 2 }, completed.result)
+      end
+    end
+
     test "direct waits let already-started async sibling work finish before suspension with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_async") do |store|
         store.migrate!
