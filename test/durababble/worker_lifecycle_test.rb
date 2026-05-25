@@ -118,22 +118,26 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   end
 
   test "records unexpected polling errors and closes owned stores" do
-    branch_store = RuntimeBranchStore.new(tick_results: [RuntimeError.new("boom")])
-    Durababble::Store.expects(:connect).returns(branch_store)
     runtime = Durababble::WorkerRuntime.new(
-      database_url: "postgresql://example.invalid/db",
+      database_url:,
+      schema:,
       workflows: {},
       worker_pool: "default",
       poll_interval: 0.01,
       migrate: false,
     )
+    runtime.store.define_singleton_method(:claim_target_activation) do |**|
+      raise RuntimeError, "boom"
+    end
+    owner = runtime.store.instance_variable_get(:@owner)
 
     runtime.start
     runtime.wait(timeout: 1)
     runtime.close
 
     assert_kind_of RuntimeError, runtime.last_error
-    assert_equal true, branch_store.closed
+    assert_equal "boom", runtime.last_error.message
+    refute owner.connection_pool.active_connection?
   end
 
   test "starts a background worker and gracefully completes in-flight work during shutdown" do
