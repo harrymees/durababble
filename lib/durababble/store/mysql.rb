@@ -18,24 +18,6 @@ module Durababble
       @migrated = false
     end
 
-    #: (name: String, input: Object?) -> Object?
-    def enqueue_workflow(name:, input:)
-      id = SecureRandom.uuid
-      execute_store_query(:enqueue_workflow, [id, name, dump_serialized(input)])
-      id
-    end
-
-    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
-    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60)
-      id = SecureRandom.uuid
-      if worker_id
-        execute_store_query(:create_workflow_with_worker, [id, name, dump_serialized(input), worker_id, lease_seconds])
-      else
-        execute_store_query(:create_workflow, [id, name, dump_serialized(input)])
-      end
-      id
-    end
-
     #: (String, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
       if worker_id
@@ -455,6 +437,17 @@ module Durababble
     end
 
     private
+
+    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
+      id = SecureRandom.uuid
+      if worker_id
+        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
+      else
+        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
+      end
+      id
+    end
 
     #: (workflow_id: String, worker_id: String) -> bool
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)

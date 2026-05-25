@@ -83,61 +83,68 @@ module Durababble
       },
     }.freeze
 
-    define(:pg_claim_pending_workflow, backend: :postgres) do |store, name_filter:|
-      "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
-        "WHERE status = 'pending'\n  " \
-        "AND runnable_immediately\n  " \
-        "#{name_filter}\n" \
-        "ORDER BY status, runnable_immediately, created_at\n" \
+    define(:pg_claim_runnable_workflow, backend: :postgres) do |store, name_filter:|
+      workflows = table(store, "workflows")
+      "WITH candidate AS (\n  " \
+        "SELECT id FROM (\n    " \
+        "SELECT id, created_at FROM (\n      " \
+        "SELECT id, created_at FROM #{workflows}\n      " \
+        "WHERE status = 'pending'\n        " \
+        "AND runnable_immediately\n        " \
+        "#{name_filter}\n      " \
+        "ORDER BY status, runnable_immediately, created_at\n      " \
+        "LIMIT 1\n      " \
+        "FOR UPDATE SKIP LOCKED\n    " \
+        ") pending_candidate\n    " \
+        "UNION ALL\n    " \
+        "SELECT id, created_at FROM (\n      " \
+        "SELECT id, created_at FROM #{workflows}\n      " \
+        "WHERE status = 'pending'\n        " \
+        "AND next_run_at <= now()\n        " \
+        "#{name_filter}\n      " \
+        "ORDER BY next_run_at, created_at\n      " \
+        "LIMIT 1\n      " \
+        "FOR UPDATE SKIP LOCKED\n    " \
+        ") due_pending_candidate\n    " \
+        "UNION ALL\n    " \
+        "SELECT id, created_at FROM (\n      " \
+        "SELECT id, created_at FROM #{workflows}\n      " \
+        "WHERE status = 'failed'\n        " \
+        "AND next_run_at IS NOT NULL\n        " \
+        "AND next_run_at <= now()\n        " \
+        "#{name_filter}\n      " \
+        "ORDER BY created_at\n      " \
+        "LIMIT 1\n      " \
+        "FOR UPDATE SKIP LOCKED\n    " \
+        ") failed_candidate\n    " \
+        "UNION ALL\n    " \
+        "SELECT id, created_at FROM (\n      " \
+        "SELECT id, created_at FROM #{workflows}\n      " \
+        "WHERE status = 'canceling'\n        " \
+        "AND (next_run_at IS NULL OR next_run_at <= now())\n        " \
+        "#{name_filter}\n      " \
+        "ORDER BY created_at\n      " \
+        "LIMIT 1\n      " \
+        "FOR UPDATE SKIP LOCKED\n    " \
+        ") canceling_candidate\n    " \
+        "UNION ALL\n    " \
+        "SELECT id, created_at FROM (\n      " \
+        "SELECT id, created_at FROM #{workflows}\n      " \
+        "WHERE status = 'running' AND locked_until < now()\n        " \
+        "#{name_filter}\n      " \
+        "ORDER BY created_at\n      " \
+        "LIMIT 1\n      " \
+        "FOR UPDATE SKIP LOCKED\n    " \
+        ") expired_candidate\n  " \
+        ") candidates\n  " \
+        "ORDER BY created_at\n  " \
         "LIMIT 1\n" \
-        "FOR UPDATE SKIP LOCKED"
-    end
-
-    define(:pg_claim_due_pending_workflow, backend: :postgres) do |store, name_filter:|
-      "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
-        "WHERE status = 'pending'\n  " \
-        "AND next_run_at <= now()\n  " \
-        "#{name_filter}\n" \
-        "ORDER BY next_run_at, created_at\n" \
-        "LIMIT 1\n" \
-        "FOR UPDATE SKIP LOCKED"
-    end
-
-    define(:pg_claim_failed_workflow, backend: :postgres) do |store, name_filter:|
-      "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
-        "WHERE status = 'failed'\n  " \
-        "AND next_run_at IS NOT NULL\n  " \
-        "AND next_run_at <= now()\n  " \
-        "#{name_filter}\n" \
-        "ORDER BY created_at\n" \
-        "LIMIT 1\n" \
-        "FOR UPDATE SKIP LOCKED"
-    end
-
-    define(:pg_claim_canceling_workflow, backend: :postgres) do |store, name_filter:|
-      "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
-        "WHERE status = 'canceling'\n  " \
-        "AND (next_run_at IS NULL OR next_run_at <= now())\n  " \
-        "#{name_filter}\n" \
-        "ORDER BY created_at\n" \
-        "LIMIT 1\n" \
-        "FOR UPDATE SKIP LOCKED"
-    end
-
-    define(:pg_claim_expired_workflow, backend: :postgres) do |store, name_filter:|
-      "SELECT id, created_at FROM #{table(store, "workflows")}\n" \
-        "WHERE status = 'running' AND locked_until < now()\n  " \
-        "#{name_filter}\n" \
-        "ORDER BY created_at\n" \
-        "LIMIT 1\n" \
-        "FOR UPDATE SKIP LOCKED"
-    end
-
-    define(:pg_claim_selected_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")}\n" \
-        "SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()\n" \
-        "WHERE id = $1\n" \
-        "RETURNING *"
+        ")\n" \
+        "UPDATE #{workflows} AS workflows\n" \
+        "SET status = 'running', locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()\n" \
+        "FROM candidate\n" \
+        "WHERE workflows.id = candidate.id\n" \
+        "RETURNING workflows.*"
     end
 
     define(:pg_claim_workflow_already_owned, backend: :postgres) do |store|
@@ -612,16 +619,12 @@ module Durababble
       "DROP SCHEMA IF EXISTS #{store.send(:quoted_schema)} CASCADE"
     end
 
-    define(:pg_enqueue_workflow, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::bytea)"
+    define(:pg_insert_workflow, backend: :postgres) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES ($1, $2, $3, $4::bytea)"
     end
 
-    define(:pg_create_workflow, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES ($1, $2, 'running', $3::bytea)"
-    end
-
-    define(:pg_create_workflow_with_worker, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES ($1, $2, 'running', $3::bytea, $4, now() + ($5::int * interval '1 second'))"
+    define(:pg_insert_workflow_with_worker, backend: :postgres) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4::bytea, $5, now() + ($6::int * interval '1 second'))"
     end
 
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
@@ -972,16 +975,12 @@ module Durababble
       "DROP TABLE IF EXISTS #{table(store, table_name)}"
     end
 
-    define(:mysql_enqueue_workflow, backend: :mysql) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES (?, ?, 'pending', ?)"
+    define(:mysql_insert_workflow, backend: :mysql) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES (?, ?, ?, ?)"
     end
 
-    define(:mysql_create_workflow, backend: :mysql) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input) VALUES (?, ?, 'running', ?)"
-    end
-
-    define(:mysql_create_workflow_with_worker, backend: :mysql) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES (?, ?, 'running', ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
+    define(:mysql_insert_workflow_with_worker, backend: :mysql) do |store|
+      "INSERT INTO #{table(store, "workflows")} (id, name, status, input, locked_by, locked_until) VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|

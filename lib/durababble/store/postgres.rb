@@ -11,43 +11,13 @@ module Durababble
       @migrated = false
     end
 
-    #: (name: String, input: Object?) -> Object?
-    def enqueue_workflow(name:, input:)
-      id = SecureRandom.uuid
-      execute_store_query(:enqueue_workflow, [id, name, dump_serialized(input)])
-      id
-    end
-
-    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
-    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60)
-      id = SecureRandom.uuid
-      if worker_id
-        execute_store_query(:create_workflow_with_worker, [id, name, dump_serialized(input), worker_id, lease_seconds])
-      else
-        execute_store_query(:create_workflow, [id, name, dump_serialized(input)])
-      end
-      id
-    end
-
     #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?) -> Object?
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
       return if workflow_names&.empty?
 
-      name_filter, name_params = workflow_name_filter(workflow_names)
+      name_filter, name_params = workflow_name_filter(workflow_names, offset: 3)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
-          candidates = []
-          candidates.concat(execute_store_query(:claim_pending_workflow, name_params, name_filter:).to_a)
-          candidates.concat(execute_store_query(:claim_due_pending_workflow, name_params, name_filter:).to_a)
-          candidates.concat(execute_store_query(:claim_failed_workflow, name_params, name_filter:).to_a)
-          candidates.concat(execute_store_query(:claim_canceling_workflow, name_params, name_filter:).to_a)
-          candidates.concat(execute_store_query(:claim_expired_workflow, name_params, name_filter:).to_a)
-
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
-          next nil unless candidate
-
-          execute_store_query(:claim_selected_workflow, [candidate.fetch("id"), worker_id, lease_seconds]).first
-        end
+        execute_store_query(:claim_runnable_workflow, [worker_id, lease_seconds] + name_params, name_filter:).first
       end
       typed_row = row #: as untyped
       observe_claim_latency(typed_row, "workflow") if typed_row
@@ -418,6 +388,17 @@ module Durababble
 
     private
 
+    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
+    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
+      id = SecureRandom.uuid
+      if worker_id
+        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
+      else
+        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
+      end
+      id
+    end
+
     #: (String) -> Object?
     def cancel_pending_waits_for_workflow(workflow_id)
       execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
@@ -666,11 +647,11 @@ module Durababble
       retry_serialization_failures { @connection.transaction(requires_new: true, &block) }
     end
 
-    #: (Array[String]?) -> [String, Array[String]]
-    def workflow_name_filter(workflow_names)
+    #: (Array[String]?, ?offset: Integer) -> [String, Array[String]]
+    def workflow_name_filter(workflow_names, offset: 1)
       return ["", []] unless workflow_names
 
-      ["AND name IN (#{postgres_placeholders(1, workflow_names.length)})", workflow_names]
+      ["AND name IN (#{postgres_placeholders(offset, workflow_names.length)})", workflow_names]
     end
 
     #: (Integer, Integer) -> Object?
