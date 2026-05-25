@@ -68,6 +68,11 @@ module Durababble
       complete_timer_waits(timestamp_or_nil(now) || now)
     end
 
+    #: (untyped, ?payload: untyped) -> untyped
+    def signal_event(event_key, payload: {})
+      complete_event_waits(event_key, payload)
+    end
+
     #: (untyped) -> untyped
     def waits_for(workflow_id)
       execute_params("SELECT * FROM #{table("waits")} WHERE workflow_id = #{placeholder(1)} ORDER BY created_at", [workflow_id])
@@ -362,6 +367,11 @@ module Durababble
 
     #: (untyped) -> untyped
     def complete_timer_waits(now)
+      raise NotImplementedError
+    end
+
+    #: (untyped, untyped) -> untyped
+    def complete_event_waits(event_key, payload)
       raise NotImplementedError
     end
 

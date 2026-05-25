@@ -95,6 +95,26 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "persists waits and signals matching events once with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        workflow_id = store.create_workflow(name: "event", input: {})
+        wait_id = store.record_wait(
+          workflow_id:,
+          position: 0,
+          name: "event",
+          wait_request: Durababble::WaitRequest.new(kind: "event", wake_at: nil, event_key: "event:ready", context: { "event" => true }),
+        )
+
+        assert_equal 0, store.signal_event("event:other", payload: { "ignored" => true })
+        assert_hash_includes store.waits_for(workflow_id).first, "id" => wait_id, "status" => "pending"
+
+        assert_equal 1, store.signal_event("event:ready", payload: { "payload" => true })
+        assert_equal 0, store.signal_event("event:ready", payload: { "payload" => true })
+        assert_hash_includes store.workflow(workflow_id), "status" => "pending"
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "completed", "result" => { "event" => true, "payload" => true }
+      end
+    end
+
     test "deduplicates fenced work and replays completed or failed results with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.create_workflow(name: "fenced", input: {})

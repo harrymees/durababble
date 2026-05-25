@@ -811,6 +811,14 @@ module Durababble
     end
 
     #: (untyped, untyped) -> untyped
+    def complete_event_waits(event_key, payload)
+      @connection.transaction(requires_new: true) do
+        returning = execute_params(store_query_sql(:pg_complete_waits, where_sql: "w.kind = 'event'\n    AND w.event_key = $1", payload_param: 2), [event_key, dump_serialized(payload)])
+        finish_completed_waits(returning, payload)
+      end
+    end
+
+    #: (untyped, untyped) -> untyped
     def finish_completed_waits(returning, payload)
       rows = returning.map { |row| decode_row(row) }
       rows.each do |wait|
