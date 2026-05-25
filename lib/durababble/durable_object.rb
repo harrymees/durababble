@@ -27,24 +27,6 @@ module Durababble
       def ref(durable_id, store: Durababble.store)
         DurableObjectRef.new(self, String(durable_id), store:)
       end
-
-      #: (untyped) -> untyped
-      def method_added(method_name)
-        super
-
-        return if @__durababble_wrapping
-
-        pending = consume_pending_durable_macro
-        return unless pending
-
-        kind, options = pending
-        case kind
-        when :expose
-          register_exposed_query(method_name)
-        when :expose_command
-          register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
-        end
-      end
     end
 
     #: untyped

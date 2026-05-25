@@ -287,5 +287,6 @@ end
 
 require_relative "store/postgres_migrations"
 require_relative "store/mysql_migrations"
+require_relative "store/sql_common"
 require_relative "store/postgres"
 require_relative "store/mysql"
