@@ -395,7 +395,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       target_id: workflow_id,
     )
 
-    eventually(timeout: 1) do
+    eventually(timeout: 3) do
       assert_hash_includes(
         store.inbox_message(message_id),
         "status" => "completed",

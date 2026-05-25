@@ -15,7 +15,8 @@ module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
-  class NonDeterminismError < Error; end
+  class DeterminismError < Error; end
+  class NonDeterminismError < DeterminismError; end
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
