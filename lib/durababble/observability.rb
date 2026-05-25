@@ -122,16 +122,19 @@ module Durababble
 
       #: (untyped, ?untyped, **untyped) { (?) -> untyped } -> untyped
       def measure(name, attributes = nil, **keyword_attributes, &block)
-        return block.call unless configuration.enabled?
+        config = configuration
+        return block.call unless config.enabled?
 
         attributes = normalize_attribute_args(attributes, keyword_attributes)
         started_at = monotonic_ms
-        block.call
-      rescue StandardError
-        count("#{name}.errors", attributes)
-        raise
-      ensure
-        record("#{name}.duration", monotonic_ms - started_at, attributes)
+        begin
+          block.call
+        rescue StandardError
+          count("#{name}.errors", attributes)
+          raise
+        ensure
+          record("#{name}.duration", monotonic_ms - started_at, attributes)
+        end
       end
 
       #: (untyped) -> untyped
