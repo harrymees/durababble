@@ -32,6 +32,6 @@ run.result
 
 Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in your existing application database. Use it for work that might run for a long time and must survive process exits, retries, deploys, and changes in which process is running the code.
 
-Durababble exists for the middle ground where background jobs are too coarse but running a separate workflow system like Temporal is too much. It keeps orchestration in ordinary Ruby while making the important boundaries explicitly transacted database state: completed steps, wait requests, leases, retries, object commands, and outbox rows.
+Durababble exists for the middle ground where background jobs are too coarse but running a separate workflow system like Temporal is too much. It keeps orchestration in ordinary Ruby while making the important boundaries explicitly transacted database state. For bonus points, you also get cheap intra-cluster RPC, which allows you to frequently communicate with durable objects and workflows without burdening you with the usual scheduling and service discovery necessary to do this.
 
 New here? Jump to the [Quickstart](quickstart.md) for a tour of the features. Detailed guarantees live in [the spec](../spec.md) and [the architecture overview](architecture.md).
