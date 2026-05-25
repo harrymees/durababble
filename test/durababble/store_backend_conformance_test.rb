@@ -220,13 +220,13 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           result: { "count" => 999 },
           worker_id: "intruder",
         )
-        assert(intruder.nil? || intruder.cmd_tuples.to_i.zero?)
+        assert(intruder.nil? || intruder.affected_rows.to_i.zero?)
         owner = store.complete_object_command(
           command_id: fenced_command_id,
           result: { "count" => 4 },
           worker_id: "object-owner",
         )
-        assert_equal 1, owner.cmd_tuples
+        assert_equal 1, owner.affected_rows
       end
     end
 
@@ -559,7 +559,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal true, store.workflow_owned?(workflow_id:, worker_id: "worker-a")
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "worker-b")
         assert_hash_includes store.current_workflow_lease(workflow_id), "workflow_id" => workflow_id, "worker_id" => "worker-a"
-        assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).cmd_tuples
+        assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).affected_rows
 
         store.record_step_started(workflow_id:, position: 0, name: "heartbeat")
         assert_nil store.heartbeat_step(
@@ -605,7 +605,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           "locked_by" => "zombie",
         )
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
-        assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).cmd_tuples
+        assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).affected_rows
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
       end
     end

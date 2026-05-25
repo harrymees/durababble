@@ -14,23 +14,6 @@ module Durababble
     SERIALIZED_COLUMNS = ["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
-    VALUE_TYPE = ActiveModel::Type::Value.new
-
-    Result = Struct.new(:rows, :affected_rows) do
-      #: () -> untyped
-      def first = rows.first
-      #: () { (?) -> untyped } -> untyped
-      def map(&block) = rows.map(&block)
-      #: () -> untyped
-      def to_a = rows.to_a
-      #: () { (?) -> untyped } -> untyped
-      def each(&block) = rows.each(&block)
-      #: () -> untyped
-      def cmd_tuples = affected_rows
-      #: () -> untyped
-      def length = rows.length
-      alias_method :size, :length
-    end
 
     #: untyped
     attr_reader :schema, :connection
@@ -125,6 +108,9 @@ module Durababble
       @owner&.connection_pool&.disconnect!
     end
 
+    #: () -> untyped
+    def current_time = Time.now
+
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped, ?client_factory: untyped) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
       lease = current_target_lease(target_kind:, target_id:)
@@ -136,6 +122,37 @@ module Durababble
       true
     rescue Durababble::Rpc::Error, Durababble::WorkflowRpc::Error
       false
+    end
+
+    #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
+    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
+      deadline = Time.now + timeout
+      loop do
+        message = inbox_message(message_id)
+        raise KeyError, "inbox message not found: #{message_id}" unless message
+
+        case message.fetch("status")
+        when "completed"
+          return message["result"]
+        when "failed", "dead_lettered"
+          raise Error, message["error"] || "inbox message #{message_id} failed"
+        end
+        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
+
+        sleep(poll_interval)
+      end
+    end
+
+    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
+    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
+      enqueue_inbox_message(
+        target_kind: "object",
+        target_type: object_type,
+        target_id: object_id,
+        message_kind: "ask",
+        method_name: method_name.to_s,
+        payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
+      )
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
@@ -173,20 +190,6 @@ module Durababble
         retry if attempts < 2
 
         raise
-      end
-    end
-
-    #: (untyped) -> untyped
-    def affected_rows(result)
-      return result if result.is_a?(Integer)
-
-      result.affected_rows || result.to_a.length
-    end
-
-    #: (untyped) -> untyped
-    def bind_attributes(params)
-      params.each_with_index.map do |value, index|
-        ActiveRecord::Relation::QueryAttribute.new("durababble_#{index}", value, VALUE_TYPE)
       end
     end
 
@@ -256,14 +259,23 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def decode_inbox_row(row)
-      decode_row(row)
+    def decode_row(row)
+      row.each_with_object({}) do |(column, value), decoded|
+        decoded[column] = SERIALIZED_COLUMNS.include?(column) ? load_serialized(value) : value
+      end
     end
 
     #: (untyped) -> untyped
     def with_command_id(row)
       row["command_id"] = row["position"] if row.key?("position") && !row.key?("command_id")
       row
+    end
+
+    #: (untyped, now: untyped) -> untyped
+    def target_activation_ready_at_for(row, now:)
+      return now if inbox_row_claimable?(row, now:)
+
+      row["ready_at"] || row["locked_until"] || now
     end
 
     #: (workflow_id: untyped, command_id: untyped, status: untyped, result: untyped, error: untyped) -> untyped

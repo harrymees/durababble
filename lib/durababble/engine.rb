@@ -534,7 +534,6 @@ module Durababble
 
     #: () -> untyped
     def assert_workflow_lease!
-      return unless @store.respond_to?(:workflow_owned?)
       return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
 
       raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
@@ -542,8 +541,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def retry_run_at(delay)
-      base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
-      base + delay
+      @store.current_time + delay
     end
 
     #: () { -> untyped } -> untyped
@@ -706,7 +704,6 @@ module Durababble
 
     #: (untyped) -> untyped
     def assert_workflow_lease!(workflow_id)
-      return unless @store.respond_to?(:workflow_owned?)
       return if @store.workflow_owned?(workflow_id:, worker_id: @worker_id)
 
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"

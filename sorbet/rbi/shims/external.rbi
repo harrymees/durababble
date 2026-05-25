@@ -20,14 +20,6 @@ module Async
   end
 end
 
-module ActiveModel
-  module Type
-    class Value
-      def initialize; end
-    end
-  end
-end
-
 module ActiveRecord
   class ActiveRecordError < StandardError; end
   class Deadlocked < ActiveRecordError; end
@@ -41,10 +33,10 @@ module ActiveRecord
     def self.establish_connection(config); end
   end
 
-  class Relation
-    class QueryAttribute
-      def initialize(name, value, type); end
-    end
+  class Result
+    def self.empty(affected_rows: nil); end
+    def initialize(columns, rows, column_types = nil, affected_rows: nil); end
+    def affected_rows; end
   end
 
   module Sanitization
@@ -153,8 +145,14 @@ end
 
 module Durababble
   class Store
+    def current_workflow_lease(workflow_id); end
     def decode_row(row); end
     def dump_serialized(value); end
+    def enqueue_inbox_message(**kwargs); end
+    def inbox_message(message_id); end
+    def load_serialized(value); end
+    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:); end
+    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:); end
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:); end
   end
 

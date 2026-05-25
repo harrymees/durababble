@@ -56,7 +56,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   class BranchCommandStore
     attr_reader :completed, :failed
 
-    def initialize(complete_result: Durababble::Store::Result.new([], 1))
+    def initialize(complete_result: ActiveRecord::Result.empty(affected_rows: 1))
       @complete_result = complete_result
       @completed = []
       @failed = []
@@ -139,7 +139,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal "unchanged", clean_ref.read_only
     assert_equal 1, clean_command_store.completed.length
 
-    lost_lease_store = BranchCommandStore.new(complete_result: Durababble::Store::Result.new([], 0))
+    lost_lease_store = BranchCommandStore.new(complete_result: ActiveRecord::Result.empty(affected_rows: 0))
     assert_raises(Durababble::LeaseConflict) { CleanCommandObject.ref("lost", store: lost_lease_store).read_only }
     assert_equal 1, lost_lease_store.failed.length
   end

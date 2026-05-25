@@ -147,6 +147,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
       save_object_state(object_type:, object_id:, state:) unless state.equal?(Durababble::Store::NO_OBJECT_STATE)
       @completed_commands << [command_id, result]
+      ActiveRecord::Result.empty(affected_rows: 1)
     end
 
     def fail_object_command(command_id:, error:, worker_id: nil)

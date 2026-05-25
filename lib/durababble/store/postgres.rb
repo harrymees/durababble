@@ -155,7 +155,7 @@ module Durababble
     #: (worker_id: untyped) -> untyped
     def release_worker_leases!(worker_id:)
       @connection.transaction(requires_new: true) do
-        workflows = execute_params(<<~SQL, [worker_id]).cmd_tuples
+        workflows = execute_params(<<~SQL, [worker_id]).affected_rows
           UPDATE #{table("workflows")}
           SET status = CASE
               WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
@@ -164,7 +164,7 @@ module Durababble
             locked_by = NULL, locked_until = NULL, updated_at = now()
           WHERE status = 'running' AND locked_by = $1
         SQL
-        outbox = execute_params(<<~SQL, [worker_id]).cmd_tuples
+        outbox = execute_params(<<~SQL, [worker_id]).affected_rows
           UPDATE #{table("outbox")}
           SET status = 'pending', locked_by = NULL, locked_until = NULL
           WHERE status = 'processing' AND locked_by = $1
@@ -200,7 +200,7 @@ module Durababble
             updated_at = now()
         WHERE id = $1 AND status = 'running' AND ($2 IS NULL OR locked_by = $2)
       SQL
-      return true if result.cmd_tuples == 1
+      return true if result.affected_rows == 1
 
       ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
     end
@@ -325,7 +325,7 @@ module Durababble
             locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_until < $1::timestamptz
       SQL
-      result.cmd_tuples
+      result.affected_rows
     end
 
     #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped) -> untyped
@@ -479,7 +479,7 @@ module Durababble
         ON CONFLICT (workflow_id, key) DO NOTHING
       SQL
 
-      if inserted.cmd_tuples == 1
+      if inserted.affected_rows == 1
         begin
           result = block.call
           execute_params(<<~SQL, [workflow_id, key, token, dump_serialized(result)])
@@ -771,54 +771,23 @@ module Durababble
             WHERE id = $1
           SQL
         end
-        claimable.map { |row| decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [row.fetch("id")]).first) }
+        claimable.map { |row| decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [row.fetch("id")]).first) }
       end
     end
 
     #: (untyped) -> untyped
     def inbox_message(message_id)
       row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first
-      decode_inbox_row(row) if row
-    end
-
-    #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
-    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
-      deadline = Time.now + timeout
-      loop do
-        message = inbox_message(message_id)
-        raise KeyError, "inbox message not found: #{message_id}" unless message
-
-        case message.fetch("status")
-        when "completed"
-          return message["result"]
-        when "failed", "dead_lettered"
-          raise Error, message["error"] || "inbox message #{message_id} failed"
-        end
-        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
-
-        sleep(poll_interval)
-      end
+      decode_row(row) if row
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def inbox_messages_for(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_inbox_row(row) }
+      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
         SELECT * FROM #{table("inbox")}
         WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
         ORDER BY sequence
       SQL
-    end
-
-    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
-      enqueue_inbox_message(
-        target_kind: "object",
-        target_type: object_type,
-        target_id: object_id,
-        message_kind: "ask",
-        method_name: method_name.to_s,
-        payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
-      )
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
@@ -1045,13 +1014,6 @@ module Durababble
       SQL
     end
 
-    #: (untyped, now: untyped) -> untyped
-    def target_activation_ready_at_for(row, now:)
-      return now if inbox_row_claimable?(row, now:)
-
-      row["ready_at"] || row["locked_until"] || now
-    end
-
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
       execute_params(<<~SQL, [target_kind, target_type, target_id])
@@ -1110,7 +1072,7 @@ module Durababble
               updated_at = now()
           WHERE id = $1
         SQL
-        decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first)
+        decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1", [message_id]).first)
       end
     end
 
@@ -1269,8 +1231,7 @@ module Durababble
     def execute(sql)
       attempts = 0
       begin
-        result = @connection.exec_query(sql)
-        Result.new(result.to_a, affected_rows(result))
+        @connection.exec_query(sql)
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
         raise if attempts >= 5
@@ -1282,8 +1243,7 @@ module Durababble
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
-      result = @connection.exec_query(sql, "Durababble SQL", bind_attributes(params), prepare: false)
-      Result.new(result.to_a, affected_rows(result))
+      @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
     end
 
     #: (untyped) -> untyped
@@ -1323,13 +1283,6 @@ module Durababble
         value
       end
       SERIALIZER.load(bytes)
-    end
-
-    #: (untyped) -> untyped
-    def decode_row(row)
-      row.each_with_object({}) do |(column, value), decoded|
-        decoded[column] = SERIALIZED_COLUMNS.include?(column) ? load_serialized(value) : value
-      end
     end
 
     #: (untyped) -> untyped

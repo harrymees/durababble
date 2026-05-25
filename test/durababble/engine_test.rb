@@ -60,10 +60,10 @@ class DurababbleEngineTest < DurababbleTestCase
     end
   end
 
-  test "allows lease-free assertions and requested injected crash points" do
+  test "requires stores to implement lease assertions and still supports requested injected crash points" do
     no_lease_store = Object.new
     engine = Durababble::Engine.new(store: no_lease_store, migrate: false)
-    assert_nil engine.send(:assert_workflow_lease!, "wf")
+    assert_raises(NoMethodError) { engine.send(:assert_workflow_lease!, "wf") }
 
     crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }

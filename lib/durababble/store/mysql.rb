@@ -102,7 +102,7 @@ module Durababble
               OR (status = 'running' AND locked_until < NOW(6))
             )
         SQL
-        next unless updated.cmd_tuples == 1
+        next unless updated.affected_rows == 1
 
         workflow(candidate.fetch("id"))
       end
@@ -176,7 +176,7 @@ module Durababble
         SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
         WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
       SQL
-      Result.new([], workflow_owned?(workflow_id:, worker_id:) ? 1 : 0)
+      ActiveRecord::Result.empty(affected_rows: workflow_owned?(workflow_id:, worker_id:) ? 1 : 0)
     end
 
     #: (workflow_id: untyped, worker_id: untyped) -> untyped
@@ -238,7 +238,7 @@ module Durababble
             updated_at = NOW(6)
         WHERE id = ? AND status = 'running' AND (? IS NULL OR locked_by = ?)
       SQL
-      return true if result.cmd_tuples == 1
+      return true if result.affected_rows == 1
 
       ["pending", "waiting", "canceling"].include?(workflow(workflow_id).fetch("status"))
     end
@@ -816,54 +816,23 @@ module Durababble
             WHERE id = ?
           SQL
         end
-        claimable.map { |row| decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [row.fetch("id")]).first) }
+        claimable.map { |row| decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [row.fetch("id")]).first) }
       end
     end
 
     #: (untyped) -> untyped
     def inbox_message(message_id)
       row = execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [message_id]).first
-      decode_inbox_row(row) if row
-    end
-
-    #: (untyped, ?poll_interval: untyped, ?timeout: untyped) -> untyped
-    def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
-      deadline = Time.now + timeout
-      loop do
-        message = inbox_message(message_id)
-        raise KeyError, "inbox message not found: #{message_id}" unless message
-
-        case message.fetch("status")
-        when "completed"
-          return message["result"]
-        when "failed", "dead_lettered"
-          raise Error, message["error"] || "inbox message #{message_id} failed"
-        end
-        raise CommandTimeout, "timed out waiting for inbox message #{message_id}" if Time.now >= deadline
-
-        sleep(poll_interval)
-      end
+      decode_row(row) if row
     end
 
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def inbox_messages_for(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_inbox_row(row) }
+      execute_params(<<~SQL, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
         SELECT * FROM #{table("inbox")}
         WHERE target_kind = ? AND target_type = ? AND target_id = ?
         ORDER BY sequence
       SQL
-    end
-
-    #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
-      enqueue_inbox_message(
-        target_kind: "object",
-        target_type: object_type,
-        target_id: object_id,
-        message_kind: "ask",
-        method_name: method_name.to_s,
-        payload: { "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs },
-      )
     end
 
     #: (command_id: untyped, worker_id: untyped, ?lease_seconds: untyped) -> untyped
@@ -891,12 +860,12 @@ module Durababble
         next nil unless command
 
         save_object_state(object_type:, object_id:, state:) unless state.equal?(NO_OBJECT_STATE)
-        execute_params(
+        updated = execute_params(
           "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
           [dump_serialized(result), command_id],
         )
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
-        Result.new([], 1)
+        updated
       end
     end
 
@@ -927,12 +896,12 @@ module Durababble
           attempt_id: message_id,
           payload: { "message_id" => message_id, "result" => result },
         )
-        execute_params(
+        updated = execute_params(
           "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
           [dump_serialized(result), message_id],
         )
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
-        Result.new([], 1)
+        updated
       end
     end
 
@@ -1065,13 +1034,6 @@ module Durababble
       SQL
     end
 
-    #: (untyped, now: untyped) -> untyped
-    def target_activation_ready_at_for(row, now:)
-      return now if inbox_row_claimable?(row, now:)
-
-      row["ready_at"] || row["locked_until"] || now
-    end
-
     #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
     def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
       execute_params(<<~SQL, [target_kind, target_type, target_id])
@@ -1129,7 +1091,7 @@ module Durababble
               updated_at = NOW(6)
           WHERE id = ?
         SQL
-        decode_inbox_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [message_id]).first)
+        decode_row(execute_params("SELECT * FROM #{table("inbox")} WHERE id = ?", [message_id]).first)
       end
     end
 
@@ -1143,12 +1105,12 @@ module Durababble
       filters = []
       params = []
       if target_kinds
-        filters << "target_kind IN (?)"
-        params << target_kinds
+        filters << "target_kind IN (#{mysql_placeholders(target_kinds.length)})"
+        params.concat(target_kinds)
       end
       if target_types
-        filters << "target_type IN (?)"
-        params << target_types
+        filters << "target_type IN (#{mysql_placeholders(target_types.length)})"
+        params.concat(target_types)
       end
       return ["", []] if filters.empty?
 
@@ -1233,15 +1195,14 @@ module Durababble
 
     #: (untyped) -> untyped
     def execute(sql)
-      result = @connection.exec_query(sql)
-      Result.new(result.to_a, affected_rows(result))
+      @connection.exec_query(sql)
     end
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
-      sanitized_sql = sanitizer_class.send(:sanitize_sql_array, [sql, *params])
-      result = @connection.exec_query(sanitized_sql, "Durababble SQL")
-      Result.new(result.to_a, affected_rows(result))
+      return @connection.exec_query(sanitizer_class.send(:sanitize_sql_array, [sql, *params]), "Durababble SQL") if trilogy_connection?
+
+      @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
     end
 
     #: () { (?) -> untyped } -> untyped
@@ -1264,7 +1225,12 @@ module Durababble
     def workflow_name_filter(workflow_names)
       return ["", []] unless workflow_names
 
-      ["AND name IN (?)", [workflow_names]]
+      ["AND name IN (#{mysql_placeholders(workflow_names.length)})", workflow_names]
+    end
+
+    #: (untyped) -> untyped
+    def mysql_placeholders(count)
+      Array.new(count, "?").join(", ")
     end
 
     #: (untyped) -> untyped
@@ -1303,16 +1269,14 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def decode_row(row)
-      row.each_with_object({}) do |(column, value), decoded|
-        decoded[column] = SERIALIZED_COLUMNS.include?(column) ? load_serialized(value) : value
-      end
-    end
-
-    #: (untyped) -> untyped
     def retryable_mysql_error?(error)
       error.is_a?(ActiveRecord::Deadlocked) ||
         error.class.name == "ActiveRecord::LockWaitTimeout"
+    end
+
+    #: () -> bool
+    def trilogy_connection?
+      @connection.adapter_name.to_s.downcase.include?("trilogy")
     end
 
     #: () -> untyped

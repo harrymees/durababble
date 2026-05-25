@@ -6,12 +6,10 @@ require_relative "../test_helper"
 require "pg"
 
 class DurababbleStoreTest < DurababbleTestCase
-  class PgResult < Array
-    attr_reader :affected_rows
-
-    def initialize(rows = [], cmd_tuples: rows.length)
-      super(rows)
-      @affected_rows = cmd_tuples
+  class << self
+    def sql_result(rows = [], affected_rows: rows.length)
+      columns = rows.flat_map(&:keys).uniq
+      ActiveRecord::Result.new(columns, rows.map { |row| columns.map { |column| row[column] } }, affected_rows:)
     end
   end
 
@@ -30,15 +28,15 @@ class DurababbleStoreTest < DurababbleTestCase
     def adapter_name = "PostgreSQL"
 
     def exec_query(sql, name = nil, binds = [], prepare: false)
-      params = binds.map { |bind| bind.respond_to?(:value_before_type_cast) ? bind.value_before_type_cast : bind.value }
+      params = binds
       if name == "Durababble SQL"
         @exec_params_calls << [sql, params]
-        result = @params_results.shift || PgResult.new
-        result.respond_to?(:call) ? result.call(sql, params) : result
+        result = @params_results.shift || DurababbleStoreTest.sql_result
+        result.is_a?(Proc) ? result.call(sql, params) : result
       else
         @exec_calls << sql
-        result = @exec_results.shift || PgResult.new
-        result.respond_to?(:call) ? result.call(sql) : result
+        result = @exec_results.shift || DurababbleStoreTest.sql_result
+        result.is_a?(Proc) ? result.call(sql) : result
       end
     end
 
@@ -82,7 +80,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     def exec_query(sql, name = nil, binds = [], prepare: false)
       @queries << sql
-      @result_for_query&.call(sql) || MysqlResultLike.new([])
+      @result_for_query&.call(sql) || DurababbleStoreTest.sql_result
     end
 
     def transaction(requires_new: true)
@@ -124,19 +122,6 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  class MysqlResultLike
-    attr_reader :affected_rows
-
-    def initialize(rows, affected_rows: nil)
-      @rows = rows
-      @affected_rows = affected_rows
-    end
-
-    def to_a
-      @rows
-    end
-  end
-
   class FlakyDeliveryClient
     attr_reader :deliveries
 
@@ -174,13 +159,17 @@ class DurababbleStoreTest < DurababbleTestCase
       else
         []
       end
-      Durababble::Store::Result.new(rows, rows.length)
+      DurababbleStoreTest.sql_result(rows)
     end
 
     def execute(sql)
       @executed << [:execute, sql]
-      Durababble::Store::Result.new([], 0)
+      DurababbleStoreTest.sql_result
     end
+  end
+
+  def sql_result(rows = [], affected_rows: rows.length)
+    self.class.sql_result(rows, affected_rows:)
   end
 
   test "routes active record connections through mysql and postgres adapters" do
@@ -208,13 +197,9 @@ class DurababbleStoreTest < DurababbleTestCase
     unsupported.define_singleton_method(:adapter_name) { "SQLite" }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection: unsupported, schema: "schema") }
     assert_equal "postgresql", Durababble::Store.send(:active_record_config_for, "postgres://user:pass@example.test:5432/db").fetch(:adapter)
+    assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "mysql://user:pass@example.test:3306/db").fetch(:adapter)
+    assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "trilogy://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
-  end
-
-  test "affected_rows returns integers and falls back to result row count" do
-    store = shared_store
-    assert_equal 7, store.send(:affected_rows, 7)
-    assert_equal 1, store.send(:affected_rows, MysqlResultLike.new([{ "id" => "row" }]))
   end
 
   test "inbox_row_claimable? rejects blocked inbox statuses" do
@@ -431,35 +416,35 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "pending", "created_at" => "2024-01-02T00:00:00Z" }]),
-      PgResult.new([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
-      PgResult.new([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new([{ "locked_until" => "future" }]),
-      PgResult.new,
-      PgResult.new([{ "locked_until" => "future" }]),
-      PgResult.new([{ "heartbeat_cursor" => pg_dump({ "cursor" => 1 }) }]),
-      PgResult.new,
-      PgResult.new([{ "workflow_id" => "wf", "worker_id" => "other", "locked_until" => "future" }]),
-      PgResult.new,
-      PgResult.new([{ "state" => pg_dump({ "value" => 3 }) }]),
-      PgResult.new([{ "id" => "cmd" }]),
-      PgResult.new,
-      PgResult.new([{ "id" => "cmd", "args" => pg_dump([]), "kwargs" => pg_dump({}) }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
-      PgResult.new([{ "id" => "outbox-old" }]),
-      PgResult.new,
-      PgResult.new([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
-      PgResult.new([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
-      PgResult.new([{ "id" => "wf", "input" => pg_dump({}) }]),
-      PgResult.new,
+      sql_result([{ "id" => "pending", "created_at" => "2024-01-02T00:00:00Z" }]),
+      sql_result([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
+      sql_result,
+      sql_result,
+      sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
+      sql_result([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
+      sql_result,
+      sql_result,
+      sql_result([{ "locked_until" => "future" }]),
+      sql_result,
+      sql_result([{ "locked_until" => "future" }]),
+      sql_result([{ "heartbeat_cursor" => pg_dump({ "cursor" => 1 }) }]),
+      sql_result,
+      sql_result([{ "workflow_id" => "wf", "worker_id" => "other", "locked_until" => "future" }]),
+      sql_result,
+      sql_result([{ "state" => pg_dump({ "value" => 3 }) }]),
+      sql_result([{ "id" => "cmd" }]),
+      sql_result,
+      sql_result([{ "id" => "cmd", "args" => pg_dump([]), "kwargs" => pg_dump({}) }]),
+      sql_result,
+      sql_result,
+      sql_result,
+      sql_result,
+      sql_result([{ "id" => "outbox-old" }]),
+      sql_result,
+      sql_result([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
+      sql_result([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
+      sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
+      sql_result,
     ])
     store = pg_store(connection)
 
@@ -494,11 +479,11 @@ class DurababbleStoreTest < DurababbleTestCase
       payload: { "approved" => true },
     )
     new_connection = ScriptedPgConnection.new(params_results: [
-      PgResult.new,
-      PgResult.new,
-      PgResult.new([{ "last_sequence" => "0" }]),
-      PgResult.new,
-      PgResult.new,
+      sql_result,
+      sql_result,
+      sql_result([{ "last_sequence" => "0" }]),
+      sql_result,
+      sql_result,
     ])
     new_id = pg_store(new_connection).enqueue_inbox_message(
       target_kind: "workflow",
@@ -516,7 +501,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "signal:wf-1", inbox_insert.fetch(1)[8]
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_inbox_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -528,8 +513,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
-      PgResult.new,
+      sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result,
     ])).enqueue_inbox_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -542,7 +527,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_inbox_message(
         target_kind: "workflow",
         target_type: "approval",
@@ -567,13 +552,13 @@ class DurababbleStoreTest < DurababbleTestCase
       payload:,
     )
     new_connection = ScriptedPgConnection.new(params_results: [
-      PgResult.new,
-      PgResult.new([{ "id" => "wf-1", "status" => "running", "next_run_at" => nil }]),
-      PgResult.new,
-      PgResult.new([{ "last_sequence" => "0" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
+      sql_result,
+      sql_result([{ "id" => "wf-1", "status" => "running", "next_run_at" => nil }]),
+      sql_result,
+      sql_result([{ "last_sequence" => "0" }]),
+      sql_result,
+      sql_result,
+      sql_result,
     ])
     new_id = pg_store(new_connection).enqueue_workflow_command(
       workflow_id: "wf-1",
@@ -587,7 +572,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
       workflow_name: "approval",
@@ -598,8 +583,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-command", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "pending-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
-      PgResult.new,
+      sql_result([{ "id" => "pending-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result,
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
       workflow_name: "approval",
@@ -611,7 +596,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_workflow_command(
         workflow_id: "wf-1",
         workflow_name: "approval",
@@ -622,12 +607,12 @@ class DurababbleStoreTest < DurababbleTestCase
     end
 
     assert_raises(KeyError) do
-      pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+      pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
         .enqueue_workflow_command(workflow_id: "missing", workflow_name: "approval", method_name: "approve", payload:)
     end
     assert_raises_matching(Durababble::Error, /terminal/) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "wf-1", "status" => "completed", "next_run_at" => nil }]),
+        sql_result([{ "id" => "wf-1", "status" => "completed", "next_run_at" => nil }]),
       ])).enqueue_workflow_command(workflow_id: "wf-1", workflow_name: "approval", method_name: "approve", payload:)
     end
   end
@@ -644,7 +629,7 @@ class DurababbleStoreTest < DurababbleTestCase
       payload: { "approved" => true },
     )
     new_connection = ScriptedMysqlConnection.new do |sql|
-      MysqlResultLike.new([{ "last_sequence" => 0 }]) if sql.include?("SELECT last_sequence")
+      sql_result([{ "last_sequence" => 0 }]) if sql.include?("SELECT last_sequence")
     end
     new_id = mysql_store(new_connection).enqueue_inbox_message(
       target_kind: "workflow",
@@ -664,7 +649,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     duplicate = mysql_store(ScriptedMysqlConnection.new do |sql|
       if sql.include?("idempotency_key =")
-        MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
+        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end).enqueue_inbox_message(
       target_kind: "workflow",
@@ -678,7 +663,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     pending_duplicate_connection = ScriptedMysqlConnection.new do |sql|
       if sql.include?("idempotency_key =")
-        MysqlResultLike.new([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
+        sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end
     pending_duplicate = mysql_store(pending_duplicate_connection).enqueue_inbox_message(
@@ -695,7 +680,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(Durababble::IdempotencyKeyConflict) do
       mysql_store(ScriptedMysqlConnection.new do |sql|
         if sql.include?("idempotency_key =")
-          MysqlResultLike.new([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
+          sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
         end
       end).enqueue_inbox_message(
         target_kind: "workflow",
@@ -715,45 +700,45 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal(
       { "id" => "wf", "input" => {} },
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "wf", "input" => pg_dump({}) }]),
+        sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
       ])).claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5),
     )
     assert_equal(
       { "id" => "wf", "input" => { "claimed" => true } },
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new,
-        PgResult.new([{ "id" => "wf", "input" => pg_dump({ "claimed" => true }) }]),
+        sql_result,
+        sql_result([{ "id" => "wf", "input" => pg_dump({ "claimed" => true }) }]),
       ])).claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5),
     )
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
       .claim_workflow_for_activation(workflow_id: "wf", worker_id: "w", lease_seconds: 5)
 
     activation = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "target_kind" => "workflow", "target_type" => "late", "target_id" => "wf-late", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-02T00:00:00Z" }]),
-      PgResult.new([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-01T00:00:00Z" }]),
-      PgResult.new([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early" }]),
+      sql_result([{ "target_kind" => "workflow", "target_type" => "late", "target_id" => "wf-late", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-02T00:00:00Z" }]),
+      sql_result([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early", "ready_at" => "2024-01-01T00:00:00Z", "created_at" => "2024-01-01T00:00:00Z" }]),
+      sql_result([{ "target_kind" => "workflow", "target_type" => "early", "target_id" => "wf-early" }]),
     ])).claim_target_activation(worker_id: "w", lease_seconds: 5, target_kinds: ["workflow"], target_types: ["early"])
     assert_hash_includes activation, "target_type" => "early", "target_id" => "wf-early"
 
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
       .claim_target_activation(worker_id: "w", lease_seconds: 5)
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "present" => 1 }]),
-      PgResult.new([{ "status" => "pending", "ready_at" => nil }]),
-      PgResult.new,
+      sql_result([{ "present" => 1 }]),
+      sql_result([{ "status" => "pending", "ready_at" => nil }]),
+      sql_result,
     ])).complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "present" => 1 }]),
-      PgResult.new([{ "status" => "dead_lettered", "ready_at" => nil }]),
-      PgResult.new,
+      sql_result([{ "present" => 1 }]),
+      sql_result([{ "status" => "dead_lettered", "ready_at" => nil }]),
+      sql_result,
     ])).complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf", worker_id: "w")
 
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert_hash_includes(
-      pg_store(ScriptedPgConnection.new(params_results: [PgResult.new([{ "target_id" => "wf" }])]))
+      pg_store(ScriptedPgConnection.new(params_results: [sql_result([{ "target_id" => "wf" }])]))
         .target_activation(target_kind: "workflow", target_type: "approval", target_id: "wf"),
       "target_id" => "wf",
     )
@@ -785,45 +770,45 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(Durababble::CommandTimeout) { helper.wait_for_inbox_message("msg", poll_interval: 0, timeout: 0) }
 
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
+      sql_result([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
+      sql_result,
+      sql_result,
+      sql_result,
     ])).complete_object_command(command_id: "cmd", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
+      sql_result([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
+      sql_result,
+      sql_result,
+      sql_result,
     ])).fail_object_command(command_id: "cmd", error: "boom", worker_id: "w")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
-      PgResult.new,
-      PgResult.new([{ "event_index" => "0" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
+      sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result,
+      sql_result([{ "event_index" => "0" }]),
+      sql_result,
+      sql_result,
+      sql_result,
+      sql_result,
     ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
-      PgResult.new,
-      PgResult.new([{ "event_index" => "1" }]),
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
-      PgResult.new,
+      sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result,
+      sql_result([{ "event_index" => "1" }]),
+      sql_result,
+      sql_result,
+      sql_result,
+      sql_result,
     ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
   end
 
   test "handles advisory target delivery retry and fallback branches" do
     pg_client = FlakyDeliveryClient.new(failures: 1)
     pg_delivered = pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
+      sql_result([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
     ])).deliver_target_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -845,7 +830,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     pg_down_client = FlakyDeliveryClient.new(failures: 2)
     assert_equal false, pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
+      sql_result([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:12345", "locked_until" => Time.now + 60 }]),
     ])).deliver_target_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -857,7 +842,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_client = FlakyDeliveryClient.new(failures: 1)
     mysql_connection = ScriptedMysqlConnection.new do |sql|
       if sql.include?("SELECT id AS workflow_id")
-        MysqlResultLike.new([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:23456", "locked_until" => Time.now + 60 }])
+        sql_result([{ "workflow_id" => "wf", "worker_id" => "127.0.0.1:23456", "locked_until" => Time.now + 60 }])
       end
     end
     mysql_delivered = mysql_store(mysql_connection).deliver_target_message(
@@ -884,22 +869,22 @@ class DurababbleStoreTest < DurababbleTestCase
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }
     connection = ScriptedPgConnection.new(
       params_results: [
-        PgResult.new([], cmd_tuples: 1),
-        PgResult.new([], cmd_tuples: 1),
-        PgResult.new([], cmd_tuples: 0),
-        PgResult.new([completed]),
-        PgResult.new([], cmd_tuples: 0),
-        PgResult.new([failed]),
-        PgResult.new([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        PgResult.new([{ "column_name" => "id" }]),
-        PgResult.new,
-        PgResult.new,
-        PgResult.new([{ "data_type" => "bytea", "is_nullable" => "YES" }]),
-        PgResult.new,
+        sql_result([], affected_rows: 1),
+        sql_result([], affected_rows: 1),
+        sql_result([], affected_rows: 0),
+        sql_result([completed]),
+        sql_result([], affected_rows: 0),
+        sql_result([failed]),
+        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
+        sql_result([{ "column_name" => "id" }]),
+        sql_result,
+        sql_result,
+        sql_result([{ "data_type" => "bytea", "is_nullable" => "YES" }]),
+        sql_result,
       ],
       exec_results: [
-        PgResult.new,
-        PgResult.new([
+        sql_result,
+        sql_result([
           { "id" => "one", "payload" => "{\"ok\":true}" },
           { "id" => "two", "payload" => nil },
         ]),
@@ -941,56 +926,56 @@ class DurababbleStoreTest < DurababbleTestCase
     migrated.instance_variable_set(:@migrated, true)
     assert_same migrated, migrated.migrate!
 
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new, PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result, sql_result]))
       .claim_runnable_workflow(worker_id: "w", lease_seconds: 5)
     assert_equal(
       { "id" => "wf", "input" => { "fresh" => true } },
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new,
-        PgResult.new([{ "id" => "wf", "input" => pg_dump({ "fresh" => true }) }]),
+        sql_result,
+        sql_result([{ "id" => "wf", "input" => pg_dump({ "fresh" => true }) }]),
       ])).claim_workflow(workflow_id: "wf", worker_id: "w", lease_seconds: 5),
     )
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .heartbeat_step(workflow_id: "wf", position: 0, worker_id: "w", lease_seconds: 5, cursor: {})
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .current_workflow_lease("wf")
 
-    pg_store(ScriptedPgConnection.new(params_results: [PgResult.new([{ "id" => "wf" }])]))
+    pg_store(ScriptedPgConnection.new(params_results: [sql_result([{ "id" => "wf" }])]))
       .mark_workflow_running("wf", worker_id: "w")
-    pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .mark_workflow_running("wf")
 
     assert_raises(Durababble::FenceTimeout) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([], cmd_tuples: 0),
-        PgResult.new,
+        sql_result([], affected_rows: 0),
+        sql_result,
       ])).with_fence(workflow_id: "wf", key: "slow", timeout: 0)
     end
     assert_equal "new-outbox", pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new,
-      PgResult.new,
-      PgResult.new([{ "id" => "new-outbox" }]),
+      sql_result,
+      sql_result,
+      sql_result([{ "id" => "new-outbox" }]),
     ])).enqueue_outbox(workflow_id: "wf", topic: "email", payload: {}, key: "new")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new, PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
       .claim_outbox(worker_id: "w", lease_seconds: 5)
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .claim_object_command(command_id: "cmd", worker_id: "w")
     assert_equal(
       { "id" => "cmd", "args" => [], "kwargs" => {} },
       pg_store(ScriptedPgConnection.new(params_results: [
-        PgResult.new([{ "id" => "cmd", "args" => pg_dump([]), "kwargs" => pg_dump({}) }]),
+        sql_result([{ "id" => "cmd", "args" => pg_dump([]), "kwargs" => pg_dump({}) }]),
       ])).claim_object_command(command_id: "cmd", worker_id: "w"),
     )
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [PgResult.new]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .complete_object_command(command_id: "cmd", result: "ignored", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
-      PgResult.new([{ "id" => "cmd" }]),
-      PgResult.new,
+      sql_result([{ "id" => "cmd" }]),
+      sql_result,
     ])).complete_object_command(command_id: "cmd", result: "ok")
 
     retry_connection = ScriptedPgConnection.new(exec_results: [
       ->(_sql) { raise ActiveRecord::Deadlocked },
-      PgResult.new,
+      sql_result,
     ])
     pg_store(retry_connection).send(:execute, "SELECT 1")
     assert_raises(ActiveRecord::Deadlocked) do
@@ -1000,14 +985,14 @@ class DurababbleStoreTest < DurababbleTestCase
 
     migration_connection = ScriptedPgConnection.new(
       params_results: [
-        PgResult.new([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        PgResult.new([{ "column_name" => "id" }]),
+        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
+        sql_result([{ "column_name" => "id" }]),
       ],
       exec_results: [
-        PgResult.new,
-        PgResult.new([{ "id" => "one", "payload" => "{\"ok\":true}" }]),
-        PgResult.new,
-        PgResult.new,
+        sql_result,
+        sql_result([{ "id" => "one", "payload" => "{\"ok\":true}" }]),
+        sql_result,
+        sql_result,
       ],
     )
     pg_store(migration_connection).send(:migrate_serialized_column!, "outbox", "payload")
@@ -1025,8 +1010,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "SELECT 'x''; DROP TABLE workflows; --'", connection.queries.last
     store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
     assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
-    assert_equal ["AND name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
-    assert_equal ["AND target_kind IN (?)", [["workflow'); DROP TABLE inbox; --"]]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
+    assert_equal ["AND name IN (?, ?)", ["x'; DROP TABLE workflows; --", "safe"]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))
@@ -1043,7 +1028,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     index_connection = ScriptedMysqlConnection.new do |sql|
       if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")
-        MysqlResultLike.new([{ "exists" => 1 }])
+        sql_result([{ "exists" => 1 }])
       end
     end
     index_store = mysql_store(index_connection)

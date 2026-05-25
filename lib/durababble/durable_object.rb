@@ -156,7 +156,7 @@ module Durababble
         else
           @store.complete_object_command(command_id:, result:, worker_id:)
         end
-        unless completed && (!completed.respond_to?(:cmd_tuples) || completed.cmd_tuples.to_i.positive?)
+        unless completed&.affected_rows.to_i.positive?
           raise LeaseConflict, "lost durable object command lease #{command_id}"
         end
 
