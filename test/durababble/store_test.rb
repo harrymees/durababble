@@ -14,6 +14,25 @@ class DurababbleStoreTest < DurababbleTestCase
   FlakyDeliveryClient = DurababbleScriptedSqlSupport::FlakyDeliveryClient
   MysqlMigrationProbeStore = DurababbleScriptedSqlSupport::MysqlMigrationProbeStore
 
+  RawPgResult = Data.define(:rows, :cmd_tuples) do
+    include Enumerable
+
+    def each(&block) = rows.each(&block)
+    def first = rows.first
+    def to_a = rows
+    def map(&block) = rows.map(&block)
+  end
+
+  RawPgConnection = Data.define(:result) do
+    def exec_params(_sql, _params) = result
+  end
+
+  ActiveRecordPgConnectionWithRawResult = Data.define(:result) do
+    def adapter_name = "PostgreSQL"
+    def raw_connection = RawPgConnection.new(result)
+    def quote_column_name(identifier) = %("#{identifier}")
+  end
+
   test "routes active record connections through mysql and postgres adapters" do
     assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema")
     assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection: ScriptedPgConnection.new, schema: "schema")
@@ -24,6 +43,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pool = Struct.new(:connection) do
       def lease_connection = connection
     end.new(ScriptedMysqlConnection.new)
+    legacy_pool = Struct.new(:connection).new(ScriptedPgConnection.new)
     owner_pool = Struct.new(:disconnected) do
       def disconnect!
         self.disconnected = true
@@ -32,6 +52,7 @@ class DurababbleStoreTest < DurababbleTestCase
     owner = Struct.new(:connection_pool).new(owner_pool)
     store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema", owner:)
     assert_kind_of Durababble::MysqlStore, store
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection_pool: legacy_pool, schema: "schema")
     store.close
     assert owner_pool.disconnected
 
@@ -42,6 +63,16 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "mysql://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "trilogy://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
+  end
+
+  test "postgres execute_params exposes affected rows across Active Record result versions" do
+    connection = ActiveRecordPgConnectionWithRawResult.new(RawPgResult.new([{ "ok" => "1" }], 2))
+    store = Durababble::PostgresStore.new(connection, schema: "schema")
+
+    result = store.send(:execute_params, "UPDATE workflows SET status = 'pending'", [])
+
+    assert_equal 2, result.affected_rows
+    assert_equal({ "ok" => "1" }, result.first)
   end
 
   test "inbox_row_claimable? rejects blocked inbox statuses" do

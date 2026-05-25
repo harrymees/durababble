@@ -5,6 +5,23 @@ module Durababble
   class PostgresStore < SqlStore
     include PostgresMigrations
 
+    PgResult = Data.define(:result) do
+      #: () -> untyped
+      def affected_rows = result.cmd_tuples
+
+      #: () { (untyped) -> untyped } -> untyped
+      def each(&block) = result.each(&block)
+
+      #: () -> untyped
+      def first = result.first
+
+      #: () -> untyped
+      def to_a = result.to_a
+
+      #: () { (untyped) -> untyped } -> untyped
+      def map(&block) = result.map(&block)
+    end
+
     #: () -> untyped
     def drop_schema!
       execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE")
@@ -1075,6 +1092,9 @@ module Durababble
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
+      raw_connection = @connection.raw_connection if @connection.respond_to?(:raw_connection)
+      return PgResult.new(raw_connection.exec_params(sql, params)) if raw_connection&.respond_to?(:exec_params)
+
       @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
     end
 

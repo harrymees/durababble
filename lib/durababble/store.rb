@@ -39,7 +39,7 @@ module Durababble
 
       #: (?connection: untyped, ?connection_pool: untyped, ?schema: untyped, ?owner: untyped) -> untyped
       def from_active_record(connection: nil, connection_pool: nil, schema: Durababble.default_schema, owner: nil)
-        connection ||= connection_pool&.lease_connection
+        connection ||= active_record_pool_connection(connection_pool)
         raise ArgumentError, "provide connection: or connection_pool:" unless connection
 
         adapter = connection.adapter_name.to_s.downcase
@@ -55,6 +55,14 @@ module Durababble
       end
 
       private
+
+      #: (untyped) -> untyped
+      def active_record_pool_connection(connection_pool)
+        return unless connection_pool
+        return connection_pool.lease_connection if connection_pool.respond_to?(:lease_connection)
+
+        connection_pool.connection
+      end
 
       #: (untyped) -> untyped
       def active_record_class_for(database_url)

@@ -1,6 +1,7 @@
 .
 --ignore=.git/
 --ignore=vendor/
+--ignore=tmp/
 --ignore=bench/
 --ignore=docs/
 --ignore=examples/
