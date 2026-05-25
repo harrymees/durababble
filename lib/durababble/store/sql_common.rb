@@ -307,7 +307,7 @@ module Durababble
         workflow = lock_workflow_for_update(workflow_id)
         if workflow && WorkflowStatus.terminal?(decode_row(workflow))
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
-          reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
           next updated
         end
 
@@ -333,7 +333,7 @@ module Durababble
         workflow = lock_workflow_for_update(workflow_id)
         if workflow && WorkflowStatus.terminal?(decode_row(workflow))
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
-          reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
           next updated
         end
 

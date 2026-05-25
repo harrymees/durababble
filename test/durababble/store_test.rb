@@ -132,7 +132,7 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "current_target_lease ignores unsupported target kinds" do
-    assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf")
+    assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf", worker_pool: "default")
   end
 
   test "postgres enqueue_workflow inserts the pending row in one statement" do
