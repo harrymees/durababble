@@ -72,7 +72,6 @@ module Durababble
 
     #: (untyped, step: untyped, wait_request: untyped) -> void
     def record_wait(command_id, step:, wait_request:)
-      assert_workflow_lease!
       suspend_workflow = @suspend_workflow_immediately.call
       synchronize_store do
         @store.record_wait(
@@ -81,6 +80,7 @@ module Durababble
           name: step.name,
           wait_request:,
           suspend_workflow:,
+          worker_id: @worker_id,
         )
       end
       crash!(:wait_recorded)
@@ -135,7 +135,8 @@ module Durababble
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
       synchronize_store do
-        @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: @retry_run_at.call(delay))
+        scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: @retry_run_at.call(delay))
+        raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
       end
       StepRetryScheduled.new(message)
     end

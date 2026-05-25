@@ -108,7 +108,7 @@ The durable-object contract is actor-like: commands for the same `(object_type, 
 - `Engine#resume` refuses to execute a workflow leased by another live worker.
 - Before a step runs, its current step row and a new attempt row are persisted transactionally.
 - After success/failure/wait, the related step and attempt rows are updated transactionally.
-- Before recording success/failure/wait or final workflow completion, the engine confirms the workflow lease is still owned by the current worker. This prevents a timed-out worker whose lease was explicitly released during process shutdown from committing stale output after another process has been allowed to retry.
+- Success/failure/wait suspension and final workflow status writes are fenced by SQL conditions on the active workflow lease. If the conditional update does not affect the expected row, the store raises `LeaseConflict` so a timed-out worker whose lease was explicitly released during process shutdown cannot commit stale output after another process has been allowed to retry.
 - After success, the current step and attempt are marked `completed` with a Paquito-serialized bytea result.
 - After retryable step failure, the current step/attempt record the error, the workflow lease is cleared, and `next_run_at` delays the next claim. After attempts are exhausted, or the error class is non-retryable, the workflow records the final error and becomes `failed`.
 - Terminal `failed` workflows clear `next_run_at` and are not returned by claim paths. Only failed rows with a non-null due `next_run_at` are treated as retryable queue work.

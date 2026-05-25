@@ -294,6 +294,14 @@ module Durababble
 
     private
 
+    #: (untyped, workflow_id: untyped, worker_id: untyped, operation: untyped) -> untyped
+    def require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)
+      return result unless worker_id
+      return result if result&.affected_rows.to_i == 1
+
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
+    end
+
     #: (name: untyped, input: untyped) -> untyped
     def enqueue_workflow(name:, input:)
       raise NotImplementedError

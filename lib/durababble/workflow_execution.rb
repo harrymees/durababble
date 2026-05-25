@@ -262,7 +262,6 @@ module Durababble
 
     #: (untyped, name: untyped, wait_request: untyped) -> void
     def record_wait_command!(command_id, name:, wait_request:)
-      assert_workflow_lease!
       suspend_workflow = suspend_workflow_immediately?
       synchronize_store do
         @store.record_wait(
@@ -271,6 +270,7 @@ module Durababble
           name:,
           wait_request:,
           suspend_workflow:,
+          worker_id: @worker_id,
         )
       end
       crash!(:wait_recorded)

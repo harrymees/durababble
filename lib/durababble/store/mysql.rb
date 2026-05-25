@@ -228,15 +228,16 @@ module Durababble
 
     #: (workflow_id: untyped, worker_id: untyped, run_at: untyped) -> untyped
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
-      execute_params(<<~SQL, [run_at, workflow_id, worker_id])
+      result = execute_params(<<~SQL, [run_at, workflow_id, worker_id])
         UPDATE #{table("workflows")}
         SET status = CASE
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, next_run_at = ?, updated_at = NOW(6)
-        WHERE id = ? AND status = 'running' AND locked_by = ?
+        WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
       SQL
+      result.affected_rows.to_i == 1 ? result : nil
     end
 
     #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
@@ -251,7 +252,8 @@ module Durababble
             locked_by = NULL,
             locked_until = NULL,
             updated_at = NOW(6)
-        WHERE id = ? AND status = 'running' AND (? IS NULL OR locked_by = ?)
+        WHERE id = ? AND status = 'running'
+          AND (? IS NULL OR (locked_by = ? AND locked_until >= NOW(6)))
       SQL
       return true if result.affected_rows == 1
 
@@ -443,33 +445,62 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (untyped, result: untyped) -> untyped
-    def complete_workflow(workflow_id, result:)
-      execute_params(<<~SQL, [dump_serialized(result), workflow_id])
-        UPDATE #{table("workflows")}
-        SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
-      SQL
+    #: (untyped, result: untyped, ?worker_id: untyped) -> untyped
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      update = if worker_id
+        execute_params(<<~SQL, [dump_serialized(result), workflow_id, worker_id])
+          UPDATE #{table("workflows")}
+          SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        SQL
+      else
+        execute_params(<<~SQL, [dump_serialized(result), workflow_id])
+          UPDATE #{table("workflows")}
+          SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
     end
 
-    #: (untyped, reason: untyped, ?result: untyped) -> untyped
-    def cancel_workflow(workflow_id, reason:, result: nil)
-      execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id])
-        UPDATE #{table("workflows")}
-        SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
-          cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
-          locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
-      SQL
+    #: (untyped, reason: untyped, ?result: untyped, ?worker_id: untyped) -> untyped
+    def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
+      update = if worker_id
+        execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id, worker_id])
+          UPDATE #{table("workflows")}
+          SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
+            cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
+            locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        SQL
+      else
+        execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id])
+          UPDATE #{table("workflows")}
+          SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
+            cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
+            locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
-    #: (untyped, error: untyped) -> untyped
-    def fail_workflow(workflow_id, error:)
-      execute_params(<<~SQL, [error, workflow_id])
-        UPDATE #{table("workflows")}
-        SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
-      SQL
+    #: (untyped, error: untyped, ?worker_id: untyped) -> untyped
+    def fail_workflow(workflow_id, error:, worker_id: nil)
+      update = if worker_id
+        execute_params(<<~SQL, [error, workflow_id, worker_id])
+          UPDATE #{table("workflows")}
+          SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        SQL
+      else
+        execute_params(<<~SQL, [error, workflow_id])
+          UPDATE #{table("workflows")}
+          SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
+          WHERE id = ?
+        SQL
+      end
+      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
     end
 
     #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped) -> untyped
@@ -550,8 +581,8 @@ module Durababble
       result
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped, ?worker_id: untyped) -> untyped
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         serialized_context = dump_serialized(wait_request.context)
@@ -573,7 +604,9 @@ module Durababble
           error: nil,
         )
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
+        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
+          raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
+        end
         Observability.count(
           "durababble.waits.started",
           "durababble.workflow.id" => workflow_id,

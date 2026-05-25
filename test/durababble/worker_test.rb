@@ -108,11 +108,11 @@ class DurababbleWorkerTest < DurababbleTestCase
       @resumed << [:failed, workflow_id, position, error]
     end
 
-    def complete_workflow(workflow_id, result:)
+    def complete_workflow(workflow_id, result:, worker_id: nil)
       @resumed << [:workflow_completed, workflow_id, result]
     end
 
-    def fail_workflow(workflow_id, error:)
+    def fail_workflow(workflow_id, error:, worker_id: nil)
       @resumed << [:workflow_failed, workflow_id, error]
     end
   end

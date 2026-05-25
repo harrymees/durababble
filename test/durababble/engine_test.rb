@@ -60,13 +60,58 @@ class DurababbleEngineTest < DurababbleTestCase
     end
   end
 
-  test "requires stores to implement lease assertions and still supports requested injected crash points" do
-    no_lease_store = Object.new
-    engine = Durababble::Engine.new(store: no_lease_store, migrate: false)
-    assert_raises(NoMethodError) { engine.send(:assert_workflow_lease!, "wf") }
+  class ImmediateWorkflow < Durababble::Workflow
+    workflow_name "immediate"
 
+    def execute(input)
+      input.merge("done" => true)
+    end
+  end
+
+  class FencedCompletionStore
+    attr_reader :completed_with
+
+    def initialize
+      @row = { "id" => "wf-1", "status" => "pending", "input" => { "seed" => 1 } }
+    end
+
+    def migrate! = nil
+
+    def workflow(workflow_id)
+      @row.merge("id" => workflow_id)
+    end
+
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      @row = @row.merge("id" => workflow_id, "status" => "running", "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds)
+    end
+
+    def workflow_history_for(_workflow_id) = []
+    def workflow_cancellation(_workflow_id) = nil
+    def workflow_owned?(workflow_id:, worker_id:) = raise("unexpected client-side lease check for #{workflow_id}/#{worker_id}")
+
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      @completed_with = { workflow_id:, result:, worker_id: }
+      @row = @row.merge("status" => "completed", "result" => result, "locked_by" => nil, "locked_until" => nil)
+    end
+  end
+
+  test "still supports requested injected crash points" do
+    no_lease_store = Object.new
     crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
+  end
+
+  test "passes worker ownership to terminal workflow status update without prechecking lease" do
+    store = FencedCompletionStore.new
+    engine = Durababble::Engine.new(store:, worker_id: "owner-a", lease_seconds: 17, migrate: false)
+
+    run = engine.resume(ImmediateWorkflow, workflow_id: "wf-1")
+
+    assert_equal "completed", run.status
+    assert_equal(
+      { workflow_id: "wf-1", result: { "seed" => 1, "done" => true }, worker_id: "owner-a" },
+      store.completed_with,
+    )
   end
 
   test "drains workflow command inbox one message at a time so failed heads block followers" do

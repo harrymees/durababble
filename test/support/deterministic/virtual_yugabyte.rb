@@ -147,6 +147,7 @@ module Durababble
         return true if row.fetch("status") == "pending"
         return false unless row.fetch("status") == "running"
         return false if worker_id && row.fetch("locked_by") != worker_id
+        return false if worker_id && expired?(row)
 
         row["status"] = @waits.values.any? { |wait| wait.fetch("workflow_id") == workflow_id && wait.fetch("status") == "pending" } ? "waiting" : "pending"
         row["locked_by"] = nil
@@ -156,8 +157,9 @@ module Durababble
       end
 
       #: (untyped, result: untyped) -> untyped
-      def complete_workflow(workflow_id, result:)
+      def complete_workflow(workflow_id, result:, worker_id: nil)
         row = @workflows.fetch(workflow_id)
+        require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow completion")
         row["status"] = "completed"
         row["result"] = deep(result)
         row["error"] = nil
@@ -168,8 +170,9 @@ module Durababble
       end
 
       #: (untyped, reason: untyped, ?result: untyped) -> untyped
-      def cancel_workflow(workflow_id, reason:, result: nil)
+      def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
         row = @workflows.fetch(workflow_id)
+        require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow cancellation")
         row["status"] = "canceled"
         row["result"] = deep(result)
         row["error"] = reason
@@ -180,8 +183,9 @@ module Durababble
       end
 
       #: (untyped, error: untyped) -> untyped
-      def fail_workflow(workflow_id, error:)
+      def fail_workflow(workflow_id, error:, worker_id: nil)
         row = @workflows.fetch(workflow_id)
+        require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow failure")
         row["status"] = "failed"
         row["error"] = error
         row["locked_by"] = nil
@@ -251,14 +255,16 @@ module Durababble
       end
 
       #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped) -> untyped
-      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true)
+      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
         command_id = normalize_command_id(command_id, position)
         @steps[workflow_id][command_id] = { "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "name" => name, "status" => "waiting", "result" => deep(wait_request.context), "error" => nil, "heartbeat_cursor" => @steps[workflow_id][command_id]&.fetch("heartbeat_cursor", nil) }
         wait_id = next_id("wait")
         @waits[wait_id] = { "id" => wait_id, "workflow_id" => workflow_id, "position" => command_id, "command_id" => command_id, "kind" => wait_request.kind, "event_key" => wait_request.event_key, "wake_at" => wait_request.wake_at, "context" => deep(wait_request.context), "payload" => nil, "status" => "pending" }
         update_latest_attempt(workflow_id, command_id, "waiting", wait_request.context, nil)
         append_history(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        suspend_workflow(workflow_id:) if suspend_workflow
+        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
+          raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
+        end
         trace("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
         wait_id
@@ -349,13 +355,14 @@ module Durababble
       #: (workflow_id: untyped, worker_id: untyped, run_at: untyped) -> untyped
       def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         row = @workflows.fetch(workflow_id)
-        return unless row.fetch("status") == "running" && row.fetch("locked_by") == worker_id
+        return unless row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
 
         row["status"] = @cancellations.key?(workflow_id) ? "canceling" : "pending"
         row["locked_by"] = nil
         row["locked_until"] = nil
         row["next_run_at"] = run_at
         trace("workflow_retry_scheduled", id: workflow_id, run_at:)
+        true
       end
 
       #: (workflow_id: untyped, reason: untyped) -> untyped
@@ -500,6 +507,14 @@ module Durababble
           attempt["status"] = "canceled"
           attempt["error"] = "workflow cancellation requested"
         end
+      end
+
+      #: (untyped, workflow_id: untyped, worker_id: untyped, operation: untyped) -> untyped
+      def require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation:)
+        return unless worker_id
+        return if row.fetch("status") == "running" && row.fetch("locked_by") == worker_id && !expired?(row)
+
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
       end
 
       #: (untyped, untyped, untyped, untyped, untyped) -> untyped
