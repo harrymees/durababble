@@ -129,7 +129,6 @@ module Durababble
       ensure
         @__durababble_wrapping = false
       end
-
     end
 
     #: (untyped) -> void

@@ -5,6 +5,7 @@ module Durababble
   class PostgresStore < Store
     include PostgresMigrations
 
+    #: () -> untyped
     def drop_schema!
       execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE")
       @migrated = false
@@ -1118,7 +1119,7 @@ module Durababble
       ["pending", "failed", "running"].include?(status)
     end
 
-    #: (target_kinds: untyped, target_types: untyped) -> untyped
+    #: (target_kinds: untyped, target_types: untyped, ?offset: untyped) -> untyped
     def target_activation_filter(target_kinds:, target_types:, offset: 1)
       filters = []
       params = []
@@ -1133,69 +1134,6 @@ module Durababble
       return ["", []] if filters.empty?
 
       ["AND #{filters.join(" AND ")}", params]
-    end
-
-    #: (untyped, now: untyped) -> untyped
-    def contiguous_claimable_inbox_rows(rows, now:)
-      claimable = []
-      rows.each do |row|
-        break unless inbox_row_claimable?(row, now:)
-
-        claimable << row
-      end
-      claimable
-    end
-
-    #: (untyped, now: untyped) -> bool
-    def inbox_row_claimable?(row, now:)
-      status = row.fetch("status")
-      return false if status == "dead_lettered"
-
-      if status == "running"
-        locked_until = row["locked_until"]
-        return false unless locked_until
-
-        return Time.parse(locked_until.to_s) < now
-      end
-
-      ready_at = row["ready_at"]
-      ready_at.nil? || Time.parse(ready_at.to_s) <= now
-    end
-
-    #: (untyped) -> bool
-    def object_command_message?(row)
-      row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && row.fetch("message_kind") == "ask"))
-    end
-
-    #: (untyped) -> untyped
-    def object_command_row(row)
-      return row unless row.key?("payload")
-
-      payload = row.fetch("payload")
-      row.merge(
-        "object_type" => row.fetch("target_type"),
-        "object_id" => row.fetch("target_id"),
-        "method_name" => row["method_name"] || payload.fetch("method_name"),
-        "args" => payload.fetch("args"),
-        "kwargs" => payload.fetch("kwargs"),
-      )
-    end
-
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, message_kind: untyped, method_name: untyped, payload: untyped) -> String
-    def inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
-      Digest::SHA256.hexdigest(SERIALIZER.dump({
-        "target_kind" => target_kind,
-        "target_type" => target_type,
-        "target_id" => target_id,
-        "message_kind" => message_kind,
-        "method_name" => method_name,
-        "payload" => payload,
-      }))
-    end
-
-    #: (untyped) -> untyped
-    def decode_inbox_row(row)
-      decode_row(row)
     end
 
     #: (untyped, untyped) -> untyped
@@ -1395,12 +1333,6 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def with_command_id(row)
-      row["command_id"] = row["position"] if row.key?("position") && !row.key?("command_id")
-      row
-    end
-
-    #: () -> untyped
     def timestamp(time)
       return time if time.is_a?(String)
 
@@ -1411,6 +1343,5 @@ module Durababble
     def timestamp_or_nil(time)
       time ? timestamp(time) : nil
     end
-
   end
 end

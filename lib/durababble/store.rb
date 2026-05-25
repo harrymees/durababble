@@ -38,7 +38,7 @@ module Durababble
     attr_accessor :rpc_client_factory
 
     class << self
-      #: (*untyped, **untyped) -> untyped
+      #: (*untyped, **untyped) { (?) -> untyped } -> untyped
       def new(*args, **kwargs, &block)
         return super unless equal?(Store)
 
@@ -89,6 +89,9 @@ module Durababble
       #: (untyped) -> untyped
       def active_record_config_for(database_url)
         uri = URI.parse(database_url)
+        username = uri.user
+        password = uri.password
+        path = uri.path || ""
         adapter = case uri.scheme
         when "mysql", "mysql2", "trilogy"
           "trilogy"
@@ -101,9 +104,9 @@ module Durababble
           adapter:,
           host: uri.host,
           port: uri.port,
-          username: uri.user && URI.decode_www_form_component(uri.user),
-          password: uri.password && URI.decode_www_form_component(uri.password),
-          database: uri.path.delete_prefix("/"),
+          username: username && URI.decode_www_form_component(username),
+          password: password && URI.decode_www_form_component(password),
+          database: path.delete_prefix("/"),
         }.compact
       end
     end

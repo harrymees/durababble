@@ -3,6 +3,7 @@
 
 module Durababble
   module MysqlMigrations
+    #: () -> untyped
     def migrate!
       return self if @migrated
 
@@ -165,11 +166,9 @@ module Durababble
       self
     end
 
-    #: () -> untyped
-
-
     private
 
+    #: (untyped, untyped, untyped) -> untyped
     def add_column_if_missing(table_name, column_name, column_type)
       exists = execute_params(<<~SQL, ["#{table_prefix}_#{table_name}", column_name]).first
         SELECT 1
@@ -185,7 +184,6 @@ module Durababble
     end
 
     #: () -> untyped
-
     def create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
@@ -249,8 +247,7 @@ module Durababble
       add_index_if_missing("inbox", index_name("inbox", "target_idempotency_unique"), "UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_idempotency_unique"))} (target_kind, target_type, target_id, idempotency_key)")
     end
 
-    #: (command_id: untyped, worker_id: untyped) -> untyped
-
+    #: (untyped, untyped, untyped) -> untyped
     def add_index_if_missing(table_name, index_name, index_definition)
       exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
         SELECT 1
@@ -266,7 +263,6 @@ module Durababble
     end
 
     #: (untyped, untyped) -> untyped
-
     def drop_index_if_present(table_name, index_name)
       exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
         SELECT 1
@@ -280,8 +276,5 @@ module Durababble
 
       execute("DROP INDEX #{@connection.quote_column_name(index_name.to_s)} ON #{table(table_name)}")
     end
-
-    #: (untyped) -> bool
-
   end
 end

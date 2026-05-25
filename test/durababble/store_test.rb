@@ -187,10 +187,74 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema")
     assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection: ScriptedPgConnection.new, schema: "schema")
     assert_kind_of Durababble::PostgresStore, Durababble::Store.new(ScriptedPgConnection.new, schema: "schema")
+    assert_raises(ArgumentError) { Durababble::Store.new(schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::Store.from_active_record(schema: "schema") }
+
+    pool = Struct.new(:connection) do
+      def lease_connection = connection
+    end.new(ScriptedMysqlConnection.new)
+    owner_pool = Struct.new(:disconnected) do
+      def disconnect!
+        self.disconnected = true
+      end
+    end.new(false)
+    owner = Struct.new(:connection_pool).new(owner_pool)
+    store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema", owner:)
+    assert_kind_of Durababble::MysqlStore, store
+    store.close
+    assert owner_pool.disconnected
 
     unsupported = Object.new
     unsupported.define_singleton_method(:adapter_name) { "SQLite" }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection: unsupported, schema: "schema") }
+    assert_equal "postgresql", Durababble::Store.send(:active_record_config_for, "postgres://user:pass@example.test:5432/db").fetch(:adapter)
+    assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
+  end
+
+  test "covers shared store helper edge cases" do
+    store = Durababble::Store.allocate
+    store.send(:initialize, ScriptedPgConnection.new, schema: "schema")
+
+    assert_equal 7, store.send(:affected_rows, 7)
+    assert_equal 1, store.send(:affected_rows, MysqlResultLike.new([{ "id" => "row" }]))
+    store.close
+
+    now = Time.utc(2024, 1, 1)
+    refute store.send(:inbox_row_claimable?, { "status" => "dead_lettered" }, now:)
+    refute store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => nil }, now:)
+    refute store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2024-01-02T00:00:00Z" }, now:)
+    assert store.send(:inbox_row_claimable?, { "status" => "running", "locked_until" => "2023-12-31T00:00:00Z" }, now:)
+    refute store.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => "2024-01-02T00:00:00Z" }, now:)
+    assert store.send(:inbox_row_claimable?, { "status" => "pending", "ready_at" => nil }, now:)
+
+    refute store.send(:object_command_message?, nil)
+    assert store.send(:object_command_message?, { "message_kind" => "ask" })
+    assert store.send(:object_command_message?, { "target_kind" => "object", "message_kind" => "ask" })
+    refute store.send(:object_command_message?, { "target_kind" => "workflow", "message_kind" => "ask" })
+    legacy = { "id" => "legacy" }
+    assert_same legacy, store.send(:object_command_row, legacy)
+    assert_equal(
+      {
+        "target_kind" => "object",
+        "target_type" => "Cart",
+        "target_id" => "cart-1",
+        "method_name" => "checkout",
+        "payload" => { "method_name" => "checkout", "args" => [1], "kwargs" => { "fast" => true } },
+        "object_type" => "Cart",
+        "object_id" => "cart-1",
+        "args" => [1],
+        "kwargs" => { "fast" => true },
+      },
+      store.send(:object_command_row, {
+        "target_kind" => "object",
+        "target_type" => "Cart",
+        "target_id" => "cart-1",
+        "payload" => { "method_name" => "checkout", "args" => [1], "kwargs" => { "fast" => true } },
+      }),
+    )
+    assert_equal({ "id" => "no-position" }, store.send(:with_command_id, { "id" => "no-position" }))
+    assert_equal({ "position" => 3, "command_id" => 9 }, store.send(:with_command_id, { "position" => 3, "command_id" => 9 }))
+    assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
   test "migrates and persists workflow plus step state" do
@@ -848,6 +912,11 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "handles isolated postgres adapter migration and retry edge paths" do
+    migrated_connection = ScriptedPgConnection.new
+    migration_store = pg_store(migrated_connection)
+    assert_same migration_store, migration_store.migrate!
+    assert migrated_connection.exec_calls.any? { |sql| sql.include?("CREATE TABLE IF NOT EXISTS") }
+
     migrated = pg_store
     migrated.instance_variable_set(:@migrated, true)
     assert_same migrated, migrated.migrate!

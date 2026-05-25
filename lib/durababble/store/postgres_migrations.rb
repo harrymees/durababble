@@ -3,6 +3,7 @@
 
 module Durababble
   module PostgresMigrations
+    #: () -> untyped
     def migrate!
       return self if @migrated
 
@@ -161,11 +162,9 @@ module Durababble
       self
     end
 
-    #: () -> untyped
-
-
     private
 
+    #: () -> untyped
     def migrate_serialized_columns!
       migrate_serialized_column!("workflows", "input", not_null: true)
       migrate_serialized_column!("workflows", "result")
@@ -187,7 +186,6 @@ module Durababble
     end
 
     #: () -> untyped
-
     def create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
@@ -244,7 +242,6 @@ module Durababble
     end
 
     #: () -> untyped
-
     def create_performance_indexes!
       execute("CREATE INDEX IF NOT EXISTS workflows_queue_idx ON #{table("workflows")} (status, created_at)")
       execute("CREATE INDEX IF NOT EXISTS workflows_runnable_due_idx ON #{table("workflows")} (status, next_run_at, created_at)")
@@ -267,7 +264,6 @@ module Durababble
     end
 
     #: (untyped, untyped, ?not_null: untyped) -> untyped
-
     def migrate_serialized_column!(table_name, column_name, not_null: false)
       column = execute_params(<<~SQL, [schema, table_name, column_name]).first
         SELECT data_type, is_nullable
@@ -302,7 +298,6 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-
     def primary_key_columns(table_name)
       execute_params(<<~SQL, [schema, table_name]).map { |row| row.fetch("column_name") }
         SELECT a.attname AS column_name
@@ -312,8 +307,5 @@ module Durababble
         ORDER BY array_position(i.indkey, a.attnum)
       SQL
     end
-
-    #: (untyped) -> untyped
-
   end
 end

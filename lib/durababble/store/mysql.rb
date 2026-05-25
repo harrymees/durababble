@@ -31,11 +31,6 @@ module Durababble
       @migrated = false
     end
 
-    #: () -> untyped
-    def close
-      @connection.close
-    end
-
     #: (name: untyped, input: untyped) -> untyped
     def enqueue_workflow(name:, input:)
       id = SecureRandom.uuid
@@ -997,7 +992,7 @@ module Durababble
       SQL
     end
 
-    #: (untyped, untyped, untyped) -> untyped
+    #: (command_id: untyped, worker_id: untyped) -> untyped
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
@@ -1151,7 +1146,7 @@ module Durababble
       end
     end
 
-    #: (untyped, untyped, untyped) -> untyped
+    #: (untyped) -> bool
     def activatable_inbox_status?(status)
       ["pending", "failed", "running"].include?(status)
     end
@@ -1335,16 +1330,14 @@ module Durababble
 
     #: () -> untyped
     def sanitizer_class
+      durababble_connection = @connection
       @sanitizer_class ||= Class.new do
         extend ActiveRecord::Sanitization::ClassMethods
 
-        singleton_class.attr_accessor :durababble_connection
-
-        def self.with_connection
-          yield durababble_connection
+        define_singleton_method(:with_connection) do |&block|
+          block.call(durababble_connection)
         end
-      end.tap { |klass| klass.durababble_connection = @connection }
+      end
     end
   end
-
 end

@@ -20,6 +20,41 @@ module Async
   end
 end
 
+module ActiveModel
+  module Type
+    class Value
+      def initialize; end
+    end
+  end
+end
+
+module ActiveRecord
+  class ActiveRecordError < StandardError; end
+  class Deadlocked < ActiveRecordError; end
+  class PreparedStatementInvalid < ActiveRecordError; end
+  class SerializationFailure < ActiveRecordError; end
+
+  class Base
+    def self.abstract_class=(value); end
+    def self.connection_class=(value); end
+    def self.connection_pool; end
+    def self.establish_connection(config); end
+  end
+
+  class Relation
+    class QueryAttribute
+      def initialize(name, value, type); end
+    end
+  end
+
+  module Sanitization
+    module ClassMethods
+      def sanitize_sql_array(array); end
+      def with_connection(&block); end
+    end
+  end
+end
+
 module Kernel
   def Async(&blk); end
 end
@@ -117,6 +152,31 @@ class Trilogy
 end
 
 module Durababble
+  class Store
+    def decode_row(row); end
+    def dump_serialized(value); end
+    def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:); end
+  end
+
+  module MysqlMigrations
+    def dump_serialized(value); end
+    def execute(sql); end
+    def execute_params(sql, params); end
+    def index_name(table_name, suffix); end
+    def raw_table_name(name); end
+    def table(name); end
+    def table_prefix; end
+  end
+
+  module PostgresMigrations
+    def dump_serialized(value); end
+    def execute(sql); end
+    def execute_params(sql, params); end
+    def quoted_schema; end
+    def schema; end
+    def table(name); end
+  end
+
   module Rpc
     module Proto
       class Message
