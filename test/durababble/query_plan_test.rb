@@ -7,6 +7,30 @@ require "json"
 
 class DurababbleQueryPlanTest < DurababbleTestCase
   class RecordingConnection < SimpleDelegator
+    class Result
+      include Enumerable
+
+      def initialize(result)
+        @result = result
+      end
+
+      def each(&block)
+        to_a.each(&block)
+      end
+
+      def to_a
+        @result.to_a
+      end
+
+      def first
+        @result.first
+      end
+
+      def affected_rows
+        @result.cmd_tuples
+      end
+    end
+
     attr_reader :recorded_queries
 
     def initialize(connection)
@@ -33,7 +57,19 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       __getobj__.exec_params(sql, params)
     end
 
-    def transaction
+    def exec_query(sql, _name = nil, params = [], prepare: false)
+      Result.new(exec_params(sql, params))
+    end
+
+    def adapter_name
+      "PostgreSQL"
+    end
+
+    def quote_column_name(name)
+      PG::Connection.quote_ident(name.to_s)
+    end
+
+    def transaction(*_args, **_kwargs)
       if __getobj__.transaction_status == PG::Constants::PQTRANS_IDLE
         __getobj__.transaction { yield(self) }
       else
