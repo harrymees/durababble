@@ -184,11 +184,6 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def rows_for(result)
-      result.to_a.map { |row| row.transform_keys(&:to_s) }
-    end
-
-    #: (untyped) -> untyped
     def bind_attributes(params)
       params.each_with_index.map do |value, index|
         ActiveRecord::Relation::QueryAttribute.new("durababble_#{index}", value, VALUE_TYPE)

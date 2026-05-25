@@ -5,19 +5,6 @@ module Durababble
   class MysqlStore < Store
     include MysqlMigrations
 
-    MysqlResult = Struct.new(:rows, :affected_rows) do
-      #: () -> untyped
-      def first = rows.first
-      #: () { (?) -> untyped } -> untyped
-      def map(&block) = rows.map(&block)
-      #: () -> untyped
-      def to_a = rows.to_a
-      #: () { (?) -> untyped } -> untyped
-      def each(&block) = rows.each(&block)
-      #: () -> untyped
-      def cmd_tuples = affected_rows
-    end
-
     class << self
       #: (uri: untyped, schema: untyped) -> untyped
       def connect(uri:, schema:)
@@ -189,7 +176,7 @@ module Durababble
         SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
         WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
       SQL
-      MysqlResult.new([], workflow_owned?(workflow_id:, worker_id:) ? 1 : 0)
+      Result.new([], workflow_owned?(workflow_id:, worker_id:) ? 1 : 0)
     end
 
     #: (workflow_id: untyped, worker_id: untyped) -> untyped
@@ -909,7 +896,7 @@ module Durababble
           [dump_serialized(result), command_id],
         )
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
-        MysqlResult.new([], 1)
+        Result.new([], 1)
       end
     end
 
@@ -945,7 +932,7 @@ module Durababble
           [dump_serialized(result), message_id],
         )
         reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
-        MysqlResult.new([], 1)
+        Result.new([], 1)
       end
     end
 
@@ -1247,14 +1234,14 @@ module Durababble
     #: (untyped) -> untyped
     def execute(sql)
       result = @connection.exec_query(sql)
-      MysqlResult.new(rows_for(result), affected_rows(result))
+      Result.new(result.to_a, affected_rows(result))
     end
 
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
       sanitized_sql = sanitizer_class.send(:sanitize_sql_array, [sql, *params])
       result = @connection.exec_query(sanitized_sql, "Durababble SQL")
-      MysqlResult.new(rows_for(result), affected_rows(result))
+      Result.new(result.to_a, affected_rows(result))
     end
 
     #: () { (?) -> untyped } -> untyped

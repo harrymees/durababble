@@ -174,12 +174,12 @@ class DurababbleStoreTest < DurababbleTestCase
       else
         []
       end
-      Durababble::MysqlStore::MysqlResult.new(rows, rows.length)
+      Durababble::Store::Result.new(rows, rows.length)
     end
 
     def execute(sql)
       @executed << [:execute, sql]
-      Durababble::MysqlStore::MysqlResult.new([], 0)
+      Durababble::Store::Result.new([], 0)
     end
   end
 

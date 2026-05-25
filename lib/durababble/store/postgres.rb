@@ -1270,7 +1270,7 @@ module Durababble
       attempts = 0
       begin
         result = @connection.exec_query(sql)
-        Result.new(rows_for(result), affected_rows(result))
+        Result.new(result.to_a, affected_rows(result))
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
         raise if attempts >= 5
@@ -1283,7 +1283,7 @@ module Durababble
     #: (untyped, untyped) -> untyped
     def execute_params(sql, params)
       result = @connection.exec_query(sql, "Durababble SQL", bind_attributes(params), prepare: false)
-      Result.new(rows_for(result), affected_rows(result))
+      Result.new(result.to_a, affected_rows(result))
     end
 
     #: (untyped) -> untyped
