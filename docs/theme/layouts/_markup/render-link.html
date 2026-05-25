@@ -1,0 +1,17 @@
+{{- $link := .Destination -}}
+{{- if strings.HasSuffix $link ".md" -}}
+  {{- $cleanLink := strings.TrimPrefix "./" (strings.TrimSuffix ".md" $link) -}}
+  {{- with .Page.GetPage $cleanLink -}}
+    {{- $link = .RelPermalink -}}
+  {{- end -}}
+{{- else if strings.Contains $link "/static/" -}}
+  {{- $parts := split $link "/static/" -}}
+  {{- if gt (len $parts) 1 -}}
+    {{- $link = printf "/%s" (index $parts 1) | relURL -}}
+  {{- end -}}
+{{- else if strings.HasPrefix $link "/" -}}
+  {{- $link = $link | relURL -}}
+{{- end -}}
+<a href="{{ $link }}"{{ with .Title }} title="{{ . }}"{{ end }}{{ if strings.HasPrefix $link "http" }} target="_blank" rel="noopener"{{ end }}>
+  {{ .Text | safeHTML }}
+</a>

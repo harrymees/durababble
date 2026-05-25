@@ -1,0 +1,33 @@
+<nav aria-label="breadcrumb" class="td-breadcrumbs">
+  <ol class="breadcrumb">
+    {{ $ctx := . }}
+    {{/* Home icon */}}
+    <li class="breadcrumb-item"><a href="{{ .Site.Home.RelPermalink }}" aria-label="Home"><span class="breadcrumb-home" aria-hidden="true">🏠</span></a></li>
+
+    {{/* Build directory crumbs from the file path without requiring _index.md */}}
+    {{ $rel := "" }}
+    {{ if .File }}
+      {{ $rel = .File.Path }}
+    {{ end }}
+    {{ if ne $rel "" }}
+      {{ $dir := path.Dir $rel }}
+      {{ $segments := cond (ne $dir ".") (split $dir "/") (slice) }}
+      {{ $acc := "" }}
+      {{ range $i, $seg := $segments }}
+        {{ $acc = printf "%s%s/" $acc $seg }}
+        {{ $accTrim := strings.TrimSuffix "/" $acc }}
+        {{ $section := $ctx.Site.GetPage "section" $accTrim }}
+        {{ if $section }}
+          <li class="breadcrumb-item"><a href="{{ $section.RelPermalink }}">{{ replace $seg `-` ` ` | title }}</a></li>
+        {{ else }}
+          <li class="breadcrumb-item">{{ replace $seg `-` ` ` | title }}</li>
+        {{ end }}
+      {{ end }}
+    {{ end }}
+
+    {{/* Current page (skip on home to avoid duplicate label) */}}
+    {{ if not .IsHome }}
+      <li class="breadcrumb-item active" aria-current="page">{{ .LinkTitle }}</li>
+    {{ end }}
+  </ol>
+</nav>
