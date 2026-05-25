@@ -26,14 +26,13 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
             store:,
             worker_id: "crasher",
             crash_after: :wait_recorded,
-            migrate: false,
           ).resume(workflow, workflow_id:)
         end
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "locked_by" => nil
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
 
         assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-        run = Durababble::Engine.new(store:, worker_id: "recover", migrate: false).resume(workflow, workflow_id:)
+        run = Durababble::Engine.new(store:, worker_id: "recover").resume(workflow, workflow_id:)
 
         assert_equal "completed", run.status
         assert_equal({ "id" => "timer-crash", "slept" => true, "done" => true }, run.result)

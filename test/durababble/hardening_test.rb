@@ -111,13 +111,13 @@ class DurababbleHardeningTest < DurababbleTestCase
     end.new(store)
 
     assert_raises_matching(Durababble::LeaseConflict, /expired or moved/) do
-      Durababble::Engine.new(store: stale_store, worker_id: "zombie", migrate: false).resume(workflow, workflow_id:)
+      Durababble::Engine.new(store: stale_store, worker_id: "zombie").resume(workflow, workflow_id:)
     end
     assert_equal true, stale_store.moved
     assert_equal ["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
     refute_includes store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "step_completed"
 
-    recovered = Durababble::Engine.new(store:, worker_id: "recovery", migrate: false).resume(workflow, workflow_id:)
+    recovered = Durababble::Engine.new(store:, worker_id: "recovery").resume(workflow, workflow_id:)
 
     assert_equal "completed", recovered.status
     assert_equal({ "attempt" => 2 }, recovered.result)

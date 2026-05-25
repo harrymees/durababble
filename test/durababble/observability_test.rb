@@ -365,7 +365,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_equal :worked, Durababble::Worker.new(store: runtime_store, workflows: [workflow], worker_id: "worker-observed").tick
 
     object_store = ObjectStore.new
-    counter = ObservedCounter.ref("counter-1", store: object_store)
+    counter = ObservedCounter.handle("counter-1", store: object_store)
     assert_equal({ "count" => 5 }, counter.add(5))
     assert_equal 5, counter.count
 

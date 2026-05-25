@@ -5,7 +5,7 @@ weight: 80
 
 # Comparisons
 
-Durababble overlaps with three different kinds of systems: Ruby background job servers, big durable execution platforms like Temporal, and minimalist database-resident projects like Absurd. This page sketches where Durababble fits relative to each.
+Durababble overlaps with a few different kinds of systems: Ruby background job servers, Rails job continuations, big durable execution platforms like Temporal, and minimalist database-resident projects like Absurd. This page sketches where Durababble fits relative to each.
 
 ## Beyond Background Jobs
 
@@ -28,6 +28,22 @@ Where the model breaks is in jobs that are not really one unit of work:
 - **In-flight RPC.** Asking a running job "what is your status?" or "apply this update" usually requires writing to a side table and waiting for the worker to notice. Durababble routes simple RPCs and durable commands to the worker that currently owns the workflow or object lease.
 
 A reasonable rule of thumb: if a unit of work is short enough that "restart from scratch on failure" is acceptable, a job server is the right tool. If you keep wishing you could checkpoint inside a job, address it by id from elsewhere, or pause it for a day, Durababble exists for that. The two coexist happily — most apps that use Durababble still have a Sidekiq or SolidQueue for the cheap, single-shot work.
+
+## Versus ActiveJob::Continuation
+
+Rails' continuation API is `ActiveJob::Continuation`, enabled by including `ActiveJob::Continuable` in a job.
+
+Active Job continuations are a useful fit when the thing you have is still fundamentally one background job. They let a job declare ordered steps, persist completed-step and cursor progress in the serialized job payload, skip completed steps after interruption, and resume a step from its last cursor. That is a solid upgrade over hand-written `last_processed_id` columns for long batch jobs.
+
+Durababble aims at a larger durable-execution surface:
+
+- **Durable state model.** Active Job continuations persist progress with the job payload and the queue backend. Durababble persists workflows, steps, waits, attempts, cancellations, fences, outbox records, durable objects, and object inboxes in application database tables.
+- **Side-effect boundaries.** Active Job continuation steps are about resuming job progress. Durababble steps also persist return values, retry attempts, idempotency keys, and replay history so completed side effects are reused rather than re-executed.
+- **Waits and external signals.** Active Job continuations can resume interrupted jobs, but they are not a workflow wait or command system. Durababble has durable timer waits and workflow commands for "pause until time/event/human approval" shapes.
+- **Addressability.** Active Job continuations are still jobs. Durababble workflows have handles, cancellation, status/result lookup, and RPC-style commands; durable objects add long-lived id-addressed state for carts, accounts, sessions, channels, and similar entities.
+- **Coordination model.** Active Job continuations depend on the queue backend's execution and retry model. Durababble owns SQL leases, stale lease recovery, replay checks, object mailboxes, and worker-to-worker RPC routing.
+
+Use Active Job continuations when you want an incremental Rails-native way to make a long job restartable. Use Durababble when the work is a durable process or durable entity: it needs persisted step results, waits, cancellation cleanup, id-addressed state, or communication with a running workflow/object.
 
 ## Versus Temporal
 

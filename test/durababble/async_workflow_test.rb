@@ -512,6 +512,61 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
       end
     end
 
+    test "host fibers keep normal Ruby semantics while workflow execute waits on a step with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        step_started = Async::Condition.new
+        host_finished = Async::Condition.new
+        host_done = false
+        host_result = nil
+
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "async-host-fiber-interleaving"
+
+          def execute(input)
+            wait_for_host(input)
+          end
+
+          define_method(:wait_for_host) do |input|
+            step_started.signal
+            host_finished.wait until host_done
+            input.merge("step_read_byte" => File.read("README.md", 1))
+          end
+          step :wait_for_host
+        end
+
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "host-ok" })
+
+        run = Async do |task|
+          engine_task = task.async do
+            Durababble::Engine.new(store:, worker_id: "host-fiber-worker").resume(workflow, workflow_id:)
+          end
+
+          host_task = task.async do
+            step_started.wait
+            Kernel.sleep(0)
+            host_result = {
+              "time_class" => Time.now.class.name,
+              "random_integer" => rand(1_000_000).is_a?(Integer),
+              "read_byte" => File.read("README.md", 1),
+            }
+            host_done = true
+            host_finished.signal
+          end
+
+          host_task.wait
+          engine_task.wait
+        end.wait
+
+        assert_equal "completed", run.status
+        assert_equal({ "id" => "host-ok", "step_read_byte" => "#" }, run.result)
+        assert_equal(
+          { "time_class" => "Time", "random_integer" => true, "read_byte" => "#" },
+          host_result,
+        )
+        assert_equal ["step_scheduled", "step_started", "step_completed"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+      end
+    end
+
     test "suspended raw Async branch does not release the lease before root work completes with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
         workflow = Class.new(Durababble::Workflow) do

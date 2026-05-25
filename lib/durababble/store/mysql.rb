@@ -6,26 +6,26 @@ module Durababble
     include MysqlMigrations
 
     class << self
-      #: (uri: untyped, schema: untyped) -> untyped
+      #: (uri: Object, schema: String) -> Store
       def connect(uri:, schema:)
         Store.connect(database_url: uri.to_s, schema:)
       end
     end
 
-    #: () -> untyped
+    #: () -> Object?
     def drop_schema!
       ["durable_object_commands", "target_activations", "inbox", "mailbox_sequences", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute("DROP TABLE IF EXISTS #{table(name)}") }
       @migrated = false
     end
 
-    #: (name: untyped, input: untyped) -> untyped
+    #: (name: String, input: Object?) -> Object?
     def enqueue_workflow(name:, input:)
       id = SecureRandom.uuid
       execute_params("INSERT INTO #{table("workflows")} (id, name, status, input) VALUES (?, ?, 'pending', ?)", [id, name, dump_serialized(input)])
       id
     end
 
-    #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped) -> untyped
+    #: (String, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
       if worker_id
         execute_params(<<~SQL, [worker_id, lease_seconds, workflow_id])
@@ -38,7 +38,7 @@ module Durababble
       end
     end
 
-    #: (worker_id: untyped, lease_seconds: untyped, ?workflow_names: untyped) -> untyped
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?) -> Object?
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
       return if workflow_names&.empty?
 
@@ -103,7 +103,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> Object?
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
       already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
         SELECT * FROM #{table("workflows")}
@@ -134,7 +134,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> Object?
     def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
       already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
         SELECT * FROM #{table("workflows")}
@@ -164,7 +164,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
       execute_params(<<~SQL, [lease_seconds, workflow_id, worker_id])
         UPDATE #{table("workflows")}
@@ -180,7 +180,7 @@ module Durababble
       ActiveRecord::Result.empty(affected_rows: owned ? 1 : 0)
     end
 
-    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String) -> bool
     def workflow_owned?(workflow_id:, worker_id:)
       !!execute_params(<<~SQL, [workflow_id, worker_id]).first
         SELECT 1
@@ -189,7 +189,7 @@ module Durababble
       SQL
     end
 
-    #: (worker_id: untyped) -> untyped
+    #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do
         workflows = execute_params("SELECT COUNT(*) AS count FROM #{table("workflows")} WHERE status = 'running' AND locked_by = ?", [worker_id]).first.fetch("count").to_i
@@ -226,7 +226,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, worker_id: untyped, run_at: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
       result = execute_params(<<~SQL, [run_at, workflow_id, worker_id])
         UPDATE #{table("workflows")}
@@ -240,7 +240,7 @@ module Durababble
       result.affected_rows.to_i == 1 ? result : nil
     end
 
-    #: (workflow_id: untyped, ?worker_id: untyped) -> untyped
+    #: (workflow_id: String, ?worker_id: String?) -> bool
     def suspend_workflow(workflow_id:, worker_id: nil)
       result = execute_params(<<~SQL, [workflow_id, workflow_id, worker_id, worker_id])
         UPDATE #{table("workflows")}
@@ -260,12 +260,12 @@ module Durababble
       WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
     end
 
-    #: (untyped, ?now: untyped) -> untyped
+    #: (String, ?now: Time) -> Object?
     def make_workflow_due!(workflow_id, now: Time.now)
       execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, updated_at = ? WHERE id = ?", [now, workflow_id])
     end
 
-    #: (workflow_id: untyped, reason: untyped) -> untyped
+    #: (workflow_id: String, reason: String) -> Object?
     def request_workflow_cancellation(workflow_id:, reason:)
       transaction do
         row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id]).first
@@ -296,7 +296,7 @@ module Durababble
       end
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def workflow_cancellation(workflow_id)
       execute_params(<<~SQL, [workflow_id]).first
         SELECT id AS workflow_id, cancel_reason AS reason,
@@ -306,7 +306,7 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped) -> untyped
+    #: (workflow_id: String) -> Object?
     def mark_workflow_cancellation_delivered(workflow_id:)
       execute_params(<<~SQL, [workflow_id])
         UPDATE #{table("workflows")}
@@ -315,7 +315,7 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, worker_id: untyped, lease_seconds: untyped, cursor: untyped) -> untyped
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       renewed = transaction do
@@ -346,17 +346,18 @@ module Durababble
         SQL
         execute_params("SELECT locked_until FROM #{table("workflows")} WHERE id = ?", [workflow_id]).first
       end
+      renewed = renewed #: as untyped
       renewed&.fetch("locked_until")
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = ? AND position = ?", [workflow_id, command_id]).first
       decode_row(row).fetch("heartbeat_cursor") if row
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def current_workflow_lease(workflow_id)
       execute_params(<<~SQL, [workflow_id]).first
         SELECT id AS workflow_id, locked_by AS worker_id, locked_until
@@ -365,7 +366,7 @@ module Durababble
       SQL
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (Object?, Object?) -> Object?
     def current_object_lease(object_type, object_id)
       execute_params(<<~SQL, [object_type, object_id]).first
         SELECT target_id AS object_id, locked_by AS worker_id, locked_until
@@ -377,7 +378,7 @@ module Durababble
       SQL
     end
 
-    #: (?now: untyped) -> untyped
+    #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
       expired = execute_params(<<~SQL, [now]).first.fetch("count").to_i
         SELECT COUNT(*) AS count
@@ -397,7 +398,7 @@ module Durababble
       expired
     end
 
-    #: (workflow_id: untyped, command_id: untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?metadata: untyped, ?worker_id: untyped) -> untyped
+    #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       transaction do
@@ -410,7 +411,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, ?worker_id: untyped) -> untyped
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
     def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
@@ -423,7 +424,11 @@ module Durababble
         execute_params(<<~SQL, [workflow_id, command_id, name])
           INSERT INTO #{table("steps")} (workflow_id, position, name, status, started_at, updated_at)
           VALUES (?, ?, ?, 'running', NOW(6), NOW(6))
-          ON DUPLICATE KEY UPDATE status = 'running', error = NULL, updated_at = NOW(6)
+          ON DUPLICATE KEY UPDATE
+            status = 'running',
+            error = NULL,
+            started_at = COALESCE(#{table("steps")}.started_at, NOW(6)),
+            updated_at = NOW(6)
         SQL
         attempt_id = SecureRandom.uuid
         execute_params(<<~SQL, [attempt_id, workflow_id, command_id, name])
@@ -435,7 +440,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, command_id: untyped, result: untyped) -> untyped
+    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
     def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
       serialized = dump_serialized(result)
       execute_params(<<~SQL, [serialized, workflow_id, command_id])
@@ -447,7 +452,7 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (untyped, result: untyped, ?worker_id: untyped) -> untyped
+    #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       update = if worker_id
         execute_params(<<~SQL, [dump_serialized(result), workflow_id, worker_id])
@@ -465,7 +470,7 @@ module Durababble
       require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
     end
 
-    #: (untyped, reason: untyped, ?result: untyped, ?worker_id: untyped) -> untyped
+    #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
       update = if worker_id
         execute_params(<<~SQL, [dump_serialized(result), reason, reason, workflow_id, worker_id])
@@ -487,7 +492,7 @@ module Durababble
       require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
-    #: (untyped, error: untyped, ?worker_id: untyped) -> untyped
+    #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
       transaction do
         update = if worker_id
@@ -508,7 +513,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
     def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
@@ -523,7 +528,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, command_id: untyped, error: untyped) -> untyped
+    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
     def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
       execute_params(<<~SQL, [error, workflow_id, command_id])
         UPDATE #{table("steps")}
@@ -534,7 +539,7 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
     end
 
-    #: (workflow_id: untyped, error: untyped) -> untyped
+    #: (workflow_id: String, error: String) -> Object?
     def fail_incomplete_workflow_steps_without_transaction(workflow_id:, error:)
       # [DURABABBLE-WF-1] A workflow failure closes active running step rows in the same transaction.
       execute_params(<<~SQL, [error, workflow_id])
@@ -549,7 +554,7 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, topic: untyped, payload: untyped, key: untyped) -> untyped
+    #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
       existing = execute_params("SELECT id FROM #{table("outbox")} WHERE `key` = ?", [key]).first
       return existing.fetch("id") if existing
@@ -563,7 +568,7 @@ module Durababble
       execute_params("SELECT id FROM #{table("outbox")} WHERE `key` = ?", [key]).first.fetch("id")
     end
 
-    #: (worker_id: untyped, lease_seconds: untyped) -> untyped
+    #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox(worker_id:, lease_seconds:)
       transaction do
         candidates = []
@@ -595,7 +600,7 @@ module Durababble
       end
     end
 
-    #: (untyped, worker_id: untyped) -> untyped
+    #: (String, worker_id: String) -> Object?
     def ack_outbox(outbox_id, worker_id:)
       result = execute_params(<<~SQL, [outbox_id, worker_id])
         UPDATE #{table("outbox")}
@@ -609,7 +614,7 @@ module Durababble
       result
     end
 
-    #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, name: untyped, wait_request: untyped, ?suspend_workflow: untyped, ?worker_id: untyped) -> untyped
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
@@ -649,7 +654,7 @@ module Durababble
       end
     end
 
-    #: (workflow_id: untyped, key: untyped, ?poll_interval: untyped, ?timeout: untyped) { (?) -> untyped } -> untyped
+    #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
       token = SecureRandom.uuid
       execute_params(<<~SQL, [workflow_id, key, token, timeout])
@@ -680,7 +685,14 @@ module Durababble
       loop do
         row = execute_params("SELECT status, result, error FROM #{table("fences")} WHERE workflow_id = ? AND `key` = ?", [workflow_id, key]).first
         decoded = decode_row(row) if row
-        case decoded&.fetch("status")
+        unless decoded
+          raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
+
+          sleep(poll_interval)
+          next
+        end
+
+        case decoded.fetch("status")
         when "completed"
           return decoded.fetch("result")
         when "failed"
@@ -692,7 +704,7 @@ module Durababble
       end
     end
 
-    #: (object_type: untyped, object_id: untyped, state: untyped) -> untyped
+    #: (object_type: String, object_id: String, state: Object?) -> Object?
     def save_object_state(object_type:, object_id:, state:)
       execute_params(<<~SQL, [object_type, object_id, dump_serialized(state)])
         INSERT INTO #{table("durable_objects")} (object_type, object_id, state)
@@ -702,7 +714,7 @@ module Durababble
       state
     end
 
-    #: (worker_id: untyped, lease_seconds: untyped, ?target_kinds: untyped, ?target_types: untyped, ?now: untyped) -> untyped
+    #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time) -> Object?
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now)
       return if target_kinds&.empty? || target_types&.empty?
 
@@ -740,7 +752,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?now: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now)
       transaction do
         activation = execute_params(<<~SQL, [target_kind, target_type, target_id, worker_id]).first
@@ -757,7 +769,7 @@ module Durababble
 
     private
 
-    #: (workflow_id: untyped, worker_id: untyped) -> untyped
+    #: (workflow_id: String, worker_id: String) -> bool
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_params(<<~SQL, [workflow_id, worker_id]).first
         SELECT 1
@@ -767,7 +779,7 @@ module Durababble
       SQL
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def cancel_pending_waits_for_workflow(workflow_id)
       execute_params(<<~SQL, [workflow_id])
         UPDATE #{table("waits")}
@@ -786,7 +798,7 @@ module Durababble
       SQL
     end
 
-    #: (command_id: untyped, worker_id: untyped) -> untyped
+    #: (command_id: String, worker_id: String?) -> Object?
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
@@ -799,7 +811,7 @@ module Durababble
       end
     end
 
-    #: (message_id: untyped, worker_id: untyped) -> untyped
+    #: (message_id: String, worker_id: String) -> Object?
     def lock_inbox_message_for_completion(message_id:, worker_id:)
       execute_params(<<~SQL, [message_id, worker_id]).first
         SELECT * FROM #{table("inbox")}
@@ -808,7 +820,7 @@ module Durababble
       SQL
     end
 
-    #: (command_id: untyped, worker_id: untyped) -> untyped
+    #: (command_id: String, worker_id: String?) -> Object?
     def lock_inbox_message_for_failure(command_id:, worker_id:)
       if worker_id
         execute_params(<<~SQL, [command_id, worker_id]).first
@@ -821,7 +833,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?ready_at: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
       ready_time = ready_at || Time.now.utc
       execute_params(<<~SQL, [target_kind, target_type, target_id, ready_time])
@@ -834,7 +846,7 @@ module Durababble
       SQL
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?now: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
     def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
       head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
         SELECT *
@@ -857,7 +869,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ready_at: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
     def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
       ready_time = ready_at || Time.now.utc
       execute_params(<<~SQL, [target_kind, target_type, target_id, ready_time])
@@ -872,7 +884,7 @@ module Durababble
       SQL
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String) -> Object?
     def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
       execute_params(<<~SQL, [target_kind, target_type, target_id])
         INSERT IGNORE INTO #{table("mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
@@ -893,7 +905,7 @@ module Durababble
       sequence
     end
 
-    #: (untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
     def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       return unless idempotency_key
 
@@ -905,12 +917,12 @@ module Durababble
       SQL
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def lock_workflow_for_update(workflow_id)
       execute_params("SELECT * FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id]).first
     end
 
-    #: (id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, sequence: untyped, message_kind: untyped, method_name: untyped, operation_id: untyped, idempotency_key: untyped, shape_hash: untyped, payload: untyped, ?ready_at: untyped, ?max_attempts: untyped) -> untyped
+    #: (id: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), ready_at, max_attempts])
         INSERT INTO #{table("inbox")} (
@@ -921,7 +933,7 @@ module Durababble
       SQL
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, limit: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
     def inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
       # ActiveRecord quotes MySQL sanitized numeric binds, which is invalid in LIMIT.
       execute_params(<<~SQL, [target_kind, target_type, target_id]).to_a
@@ -935,7 +947,7 @@ module Durababble
       SQL
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String) -> Object?
     def inbox_head_for_update(target_kind:, target_type:, target_id:)
       execute_params(<<~SQL, [target_kind, target_type, target_id]).first
         SELECT *
@@ -948,7 +960,7 @@ module Durababble
       SQL
     end
 
-    #: (message_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
+    #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
     def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
       execute_params(<<~SQL, [worker_id, lease_seconds, message_id])
         UPDATE #{table("inbox")}
@@ -961,7 +973,7 @@ module Durababble
       SQL
     end
 
-    #: (message_id: untyped, result: untyped) -> untyped
+    #: (message_id: String, result: Object?) -> Object?
     def complete_inbox_message_without_transaction(message_id:, result:)
       execute_params(
         "UPDATE #{table("inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
@@ -969,7 +981,7 @@ module Durababble
       )
     end
 
-    #: (message_id: untyped, error: untyped) -> untyped
+    #: (message_id: String, error: String) -> Object?
     def fail_inbox_message_without_transaction(message_id:, error:)
       execute_params(
         "UPDATE #{table("inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?",
@@ -977,7 +989,7 @@ module Durababble
       )
     end
 
-    #: (message_id: untyped, error: untyped, ready_at: untyped) -> untyped
+    #: (message_id: String, error: String, ready_at: Object?) -> Object?
     def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
       execute_params(
         "UPDATE #{table("inbox")} SET status = 'pending', error = ?, ready_at = ?, locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?",
@@ -985,7 +997,7 @@ module Durababble
       )
     end
 
-    #: (message_id: untyped, error: untyped) -> untyped
+    #: (message_id: String, error: String) -> Object?
     def dead_letter_inbox_message_without_transaction(message_id:, error:)
       execute_params(
         "UPDATE #{table("inbox")} SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?",
@@ -993,7 +1005,7 @@ module Durababble
       )
     end
 
-    #: (target_kinds: untyped, target_types: untyped) -> untyped
+    #: (target_kinds: Array[String]?, target_types: Array[String]?) -> [String, Array[String]]
     def target_activation_filter_sql(target_kinds:, target_types:)
       filters = []
       params = []
@@ -1010,7 +1022,7 @@ module Durababble
       ["AND #{filters.join(" AND ")}", params]
     end
 
-    #: (workflow_id: untyped, command_id: untyped, status: untyped, serialized_result: untyped, error: untyped) -> untyped
+    #: (workflow_id: String, command_id: Integer, status: String, serialized_result: Object?, error: String?) -> Object?
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
       execute_params(<<~SQL, [status, serialized_result, error, workflow_id, command_id])
         UPDATE #{table("step_attempts")}
@@ -1021,7 +1033,7 @@ module Durababble
       SQL
     end
 
-    #: (workflow_id: untyped, kind: untyped, ?command_id: untyped, ?name: untyped, ?attempt_id: untyped, ?payload: untyped, ?error: untyped) -> untyped
+    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: String?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
       execute_params("SELECT id FROM #{table("workflows")} WHERE id = ? FOR UPDATE", [workflow_id])
       event_index = execute_params(
@@ -1035,15 +1047,15 @@ module Durababble
       event_index
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (Integer?, Integer?) -> Integer
     def normalize_command_id(command_id, position)
       id = command_id.nil? ? position : command_id
       raise ArgumentError, "command_id is required" if id.nil?
 
-      id
+      id.to_i
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def complete_timer_waits(now)
       transaction do
         waits = execute_params(<<~SQL, [now]).map { |row| decode_row(row) }
@@ -1059,9 +1071,10 @@ module Durababble
       end
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (Array[Hash[String, Object?]], Hash[String, Object?]) -> Integer
     def finish_completed_waits(waits, payload)
       waits.each do |wait|
+        wait = wait #: as untyped
         execute_params("UPDATE #{table("waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?", [dump_serialized(payload), wait.fetch("id")])
         record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
@@ -1072,12 +1085,12 @@ module Durababble
       waits.length
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> untyped
     def execute(sql)
       @connection.exec_query(sql)
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (String, Array[Object?]) -> untyped
     def execute_params(sql, params)
       if trilogy_connection?
         @connection.exec_query(sanitizer_class.send(:sanitize_sql_array, [sql, *params]), "Durababble SQL")
@@ -1086,7 +1099,7 @@ module Durababble
       end
     end
 
-    #: () { (?) -> untyped } -> untyped
+    #: () { () -> Object? } -> Object?
     def transaction(&block)
       attempts = 0
       begin
@@ -1102,39 +1115,39 @@ module Durababble
       end
     end
 
-    #: (untyped) -> untyped
+    #: (Array[String]?) -> [String, Array[String]]
     def workflow_name_filter(workflow_names)
       return ["", []] unless workflow_names
 
       ["AND name IN (#{mysql_placeholders(workflow_names.length)})", workflow_names]
     end
 
-    #: (untyped) -> untyped
+    #: (Integer) -> Object?
     def mysql_placeholders(count)
       Array.new(count, "?").join(", ")
     end
 
-    #: (untyped) -> untyped
+    #: (Integer) -> Object?
     def placeholder(_index)
       "?"
     end
 
-    #: (untyped) -> untyped
+    #: (Time?) -> Time?
     def timestamp_or_nil(time)
       time
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def table(name)
       @connection.quote_column_name("#{table_prefix}_#{name}")
     end
 
-    #: (untyped) -> untyped
+    #: (String) -> Object?
     def raw_table_name(name)
       "#{table_prefix}_#{name}"
     end
 
-    #: () -> untyped
+    #: () -> Object?
     def table_prefix
       prefix = schema.to_s.gsub(/[^a-zA-Z0-9_]/, "_")
       return prefix if prefix.length <= 32
@@ -1142,24 +1155,25 @@ module Durababble
       "dura_#{Digest::SHA1.hexdigest(prefix)[0, 10]}"
     end
 
-    #: (untyped, untyped) -> untyped
+    #: (String, String) -> String
     def index_name(table_name, suffix)
-      "#{table_prefix}_#{table_name}_#{suffix}_idx"[0, 64]
+      name = "#{table_prefix}_#{table_name}_#{suffix}_idx"
+      name[0, 64] || name
     end
 
-    #: (untyped) -> untyped
+    #: (Object?) -> Object?
     def dump_serialized(value)
       SERIALIZER.dump(value)
     end
 
-    #: (untyped) -> untyped
+    #: (Object?) -> Object?
     def load_serialized(value)
       return if value.nil?
 
       SERIALIZER.load(value)
     end
 
-    #: (untyped) -> untyped
+    #: (StandardError) -> bool
     def retryable_mysql_error?(error)
       error.is_a?(ActiveRecord::Deadlocked) ||
         error.class.name == "ActiveRecord::LockWaitTimeout"
@@ -1170,7 +1184,7 @@ module Durababble
       @connection.adapter_name.to_s.downcase.include?("trilogy")
     end
 
-    #: () -> untyped
+    #: () -> Class
     def sanitizer_class
       durababble_connection = @connection
       @sanitizer_class ||= Class.new do

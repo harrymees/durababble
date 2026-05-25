@@ -36,7 +36,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
             store:,
             worker_id: "first-version",
             crash_after: :step_completed,
-            migrate: false,
           ).resume(first_version, workflow_id:)
         end
         store.steal_expired_leases!(now: Time.now + 120)
@@ -44,7 +43,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         run = Durababble::Engine.new(
           store:,
           worker_id: "second-version",
-          migrate: false,
         ).resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
@@ -86,11 +84,11 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         end
         workflow_id = store.enqueue_workflow(name: first_version.workflow_name, input: { "id" => "suffix" })
 
-        waiting = Durababble::Engine.new(store:, worker_id: "first-version", migrate: false).resume(first_version, workflow_id:)
+        waiting = Durababble::Engine.new(store:, worker_id: "first-version").resume(first_version, workflow_id:)
         assert_equal "waiting", waiting.status
         assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
 
-        run = Durababble::Engine.new(store:, worker_id: "second-version", migrate: false).resume(second_version, workflow_id:)
+        run = Durababble::Engine.new(store:, worker_id: "second-version").resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
         assert_match(/NonDeterminismError/, run.error)
@@ -190,7 +188,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
             store:,
             worker_id: "first-version",
             crash_after: :step_completed,
-            migrate: false,
           ).resume(first_version, workflow_id:)
         end
         store.steal_expired_leases!(now: Time.now + 120)
@@ -198,7 +195,6 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         run = Durababble::Engine.new(
           store:,
           worker_id: "reordered-version",
-          migrate: false,
         ).resume(reordered_version, workflow_id:)
 
         assert_equal "failed", run.status

@@ -5,23 +5,12 @@
     <span class="navbar-brand__name">DURABABBLE</span>
   </a>
   <div class="navbar-actions">
-    {{ $dest := .Site.Home.RelPermalink }}
-    {{ $sections := .Site.Sections.ByWeight.ByTitle }}
-    {{ if gt (len $sections) 0 }}
-      {{ $dest = (index $sections 0).RelPermalink }}
-    {{ else }}
-      {{ $pages := .Site.RegularPages.ByWeight.ByTitle }}
-      {{ if gt (len $pages) 0 }}
-        {{ $dest = (index $pages 0).RelPermalink }}
-      {{ end }}
-    {{ end }}
     <div class="navbar-search">
       <span class="navbar-search__icon" aria-hidden="true">⌕</span>
       <input id="navbar-search-input" class="navbar-search__input" type="search" placeholder="Search docs…" aria-label="Search documentation" autocomplete="off" data-search-index="{{ "search-index.json" | relURL }}" />
       <kbd class="navbar-search__kbd" aria-label="Shortcut">⌘K</kbd>
       <div id="navbar-search-results" class="navbar-search__results d-none" role="listbox" aria-label="Search results"></div>
     </div>
-    <a class="btn btn-docs" href="{{ $dest }}">Documentation</a>
     <div class="theme-toggle">
       <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">
         <span class="theme-icon">🌙</span>

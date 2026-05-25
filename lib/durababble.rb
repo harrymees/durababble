@@ -15,16 +15,19 @@ module Durababble
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
-  class NonDeterminismError < Error; end
+  class DeterminismError < Error; end
+  class NonDeterminismError < DeterminismError; end
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
 
   class CancellationError < Error
-    #: untyped
-    attr_reader :workflow_id, :reason
+    #: String?
+    attr_reader :workflow_id
+    #: Object?
+    attr_reader :reason
 
-    #: (?untyped, ?workflow_id: untyped) -> void
+    #: (?Object?, ?workflow_id: String?) -> void
     def initialize(reason = nil, workflow_id: nil)
       @workflow_id = workflow_id
       @reason = reason
@@ -34,8 +37,23 @@ module Durababble
   end
 
   class << self
-    #: (untyped) -> untyped
-    attr_accessor :default_store
+    #: Store?
+    attr_reader :default_store
+    #: Engine?
+    attr_reader :default_engine
+
+    #: (Store?) -> Engine?
+    def default_store=(store)
+      @default_store = store
+      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+    end
+
+    #: (Engine?) -> Store?
+    def default_engine=(engine)
+      @default_engine = engine
+      engine = engine #: as untyped
+      @default_store = engine&.store
+    end
 
     #: () -> String
     def default_database_url
@@ -59,28 +77,55 @@ module Durababble
       "#{trimmed_base}_#{suffix}"
     end
 
-    #: (database_url: untyped, ?schema: untyped) -> untyped
+    #: (database_url: String, ?schema: String) -> Store
     def configure(database_url:, schema: default_schema)
       @default_store&.close
-      @default_store = Store.connect(database_url:, schema:)
+      self.default_store = Store.connect(database_url:, schema:)
     end
 
-    #: (?enabled: untyped, ?attributes: untyped) -> untyped
+    #: (?enabled: bool, ?attributes: Hash[String | Symbol, Object?]) -> Observability::Configuration
     def configure_observability(enabled: false, attributes: {})
       Observability.configure(enabled:, attributes:)
     end
 
-    #: () -> untyped
+    #: () -> Observability::Configuration
     def observability
       Observability.configuration
     end
 
-    #: () -> untyped
+    #: () -> Store
     def store
       @default_store || raise(Error, "Durababble.store is not configured; pass store: or call Durababble.configure")
     end
 
-    #: (untyped, ?untyped) -> untyped
+    #: () -> Engine
+    def engine
+      @default_engine ||= Engine.new(store:, migrate: false)
+    end
+
+    #: (?engine: Engine?, ?store: Store?) -> Engine
+    def engine_for(engine: nil, store: nil)
+      raise ArgumentError, "pass store: or engine:, not both" if store && engine
+
+      return engine if engine
+      return Engine.new(store:, migrate: false) if store
+
+      self.engine
+    end
+
+    #: (?engine: Engine?, ?store: Store?) -> Store
+    def store_for(engine: nil, store: nil)
+      raise ArgumentError, "pass store: or engine:, not both" if store && engine
+
+      return store if store
+
+      engine = engine #: as untyped
+      return engine.store if engine
+
+      self.engine.store
+    end
+
+    #: (Time, ?Object?) -> (WaitRequest | Object?)
     def wait_until(time, context = {})
       wait_request = WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
       if (execution = WorkflowExecutionContext.current)
@@ -92,7 +137,7 @@ module Durababble
 
     alias_method :sleep_until, :wait_until
 
-    #: (untyped, ?untyped) -> untyped
+    #: (Numeric, ?Object?) -> Object?
     def sleep(duration, context = {})
       execution = WorkflowExecutionContext.current
       return Kernel.sleep(duration) unless execution
@@ -101,7 +146,7 @@ module Durababble
       execution.call_wait(wait_request, name: "sleep", args: [duration, context])
     end
 
-    #: (?timeout: untyped) { -> bool } -> bool
+    #: (?timeout: Numeric?) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
       execution = WorkflowExecutionContext.current
       raise Error, "wait_condition must run inside workflow orchestration" unless execution
@@ -111,7 +156,7 @@ module Durababble
 
     private
 
-    #: (untyped) -> String
+    #: (Object?) -> String
     def schema_component(value)
       component = value.to_s.downcase.gsub(/[^a-z0-9_]+/, "_").gsub(/\A_+|_+\z/, "")
       component.empty? ? "workspace" : component
@@ -123,12 +168,12 @@ require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
+require_relative "durababble/store_queries"
 require_relative "durababble/store"
 require_relative "durababble/engine"
 require_relative "durababble/run"
 require_relative "durababble/worker"
 require_relative "durababble/worker_runtime"
 
-require_relative "durababble/rpc_client"
 require_relative "durababble/workflow_rpc"
 require_relative "durababble/rpc_transport"

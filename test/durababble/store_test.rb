@@ -262,6 +262,7 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
       sql_result,
       sql_result,
+      sql_result,
       sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
       sql_result,

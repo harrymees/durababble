@@ -5,14 +5,14 @@ weight: 10
 
 # Quickstart
 
-A tour of Durababble's core features in a handful of small snippets. See [Install Instructions](install.md) for the gem and database setup, then follow along. Every snippet assumes:
+A tour of Durababble's core features in a handful of small snippets. See [Installation](install.md) for the gem and database setup, then follow along. Every snippet assumes:
 
 ```ruby
 require "durababble"
 
-store = Durababble::Store.connect(database_url: Durababble.default_database_url)
+Durababble.configure(database_url: Durababble.default_database_url)
+store = Durababble.store
 store.migrate!
-engine = Durababble::Engine.new(store:)
 ```
 
 ## A Workflow With Retries
@@ -37,8 +37,9 @@ class FulfillOrder < Durababble::Workflow
   end
 end
 
-run = engine.run(FulfillOrder, input: order)
-run.result
+handle = FulfillOrder.start(order)
+Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1", migrate: false).run_until_idle
+handle.result
 ```
 
 ## Enqueue Now, Run Later On A Worker
@@ -46,11 +47,11 @@ run.result
 In a real application, web requests enqueue and long-running workers claim work under SQL leases. The handle is portable across processes — anything with the workflow id and a store can query or cancel.
 
 ```ruby
-handle = FulfillOrder.start(order, store:)
+handle = FulfillOrder.start(order)
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
 
-Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1").run_until_idle
+Durababble::Worker.new(store:, workflows: [FulfillOrder], worker_id: "orders-1", migrate: false).run_until_idle
 ```
 
 ## Sleeping
@@ -60,12 +61,8 @@ Workflows can park themselves without holding a worker thread. `wait_until` is a
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    delayed = sleep_until_reminder_time(reminder)
+    delayed = sleep_until(reminder.fetch("send_at"), reminder)
     send_reminder(delayed)
-  end
-
-  step def sleep_until_reminder_time(reminder)
-    wait_until(reminder.fetch("send_at"), reminder)
   end
 
   step def send_reminder(reminder) = Reminders.send(reminder.fetch("user_id"), reminder.fetch("message"))
@@ -74,16 +71,17 @@ end
 
 To resume a workflow on an external signal rather than a clock (human approval, webhook delivery, a batch finishing elsewhere), send it a workflow command from the signaling process — see Workflow RPC below.
 
-## Parallel Steps With Async
+## Using `async` for parallelism
 
-Workflow orchestration plays nicely with the `async` gem. Branches run concurrently and Durababble records each scheduled step, completion, and failure in history, so scatter/gather is replay-safe.
+Workflow orchestration plays nicely with the `async` gem. `Sync` gives you a structured concurrency scope, and Durababble records each scheduled step, completion, and failure in history, so scatter/gather is replay-safe.
 
 ```ruby
 class FetchProfiles < Durababble::Workflow
   def execute(user_ids)
-    Async do |task|
-      user_ids.map { |id| task.async { score_profile(fetch_profile(id)) } }.map(&:wait)
-    end.wait
+    Sync do |task|
+      tasks = user_ids.map { |id| task.async { score_profile(fetch_profile(id)) } }
+      tasks.map(&:result)
+    end
   end
 
   step def fetch_profile(user_id) = Profiles.fetch(user_id)
@@ -109,14 +107,14 @@ class Account < Durababble::DurableObject
   expose def balance = current_state.fetch("balance_cents")
 end
 
-account = Account.ref("acct_123", store:)
+account = Account.at("acct_123")
 account.credit(1_000)   # durable command: written to the database, processed exactly once
 account.balance         # simple RPC: reads the latest persisted state
 ```
 
 ## Workflow RPC
 
-Workflows can expose methods too. `expose` is a parallel-safe read; `expose_command` is a serialized, durable mutation.
+Workflows can expose methods too! This is the "babble" part of durababble -- you can chatter freely amongst your entities with cheap internal RPCs. `expose` your read-only methods and `expose_command` your methods that mutate state for serialized, durable mutations:
 
 ```ruby
 class ReviewWorkflow < Durababble::Workflow
@@ -124,7 +122,7 @@ class ReviewWorkflow < Durababble::Workflow
   expose_command def note(message:) = message
 end
 
-handle = ReviewWorkflow.handle(run_id, store:)
+handle = ReviewWorkflow.handle(run_id)
 handle.label
 handle.note(message: "approved by legal")
 ```

@@ -11,7 +11,7 @@ Durababble exposes two durable primitives:
 | Primitive | Class | Public handle API | Best for | Mental model |
 | --- | --- | --- | --- | --- |
 | Durable workflow | `Durababble::Workflow` | `Workflow.start` / `Workflow.handle` | Finite executions with a start, result, steps, waits, retries, cancellation, and recovery | A function or process that survives restarts |
-| Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.tell` | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
+| Durable object | `Durababble::DurableObject` | `DurableObject.at` / `DurableObject.handle` typed handle calls | Sessions, carts, conversations, agents, per-shop workers, or other id-addressed state | A SQL-backed actor/mailbox object with a lease owner |
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
@@ -22,6 +22,8 @@ Storage works through PostgreSQL/YSQL (`postgresql://` / `postgres://`) and MySQ
 Runtime values are serialized with Paquito into binary columns. PostgreSQL/YSQL stores runtime payloads as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. Runtime payloads include workflow inputs/results/errors, step args/results, wait contexts, inbox payloads, durable object state, command args/results/errors, idempotency fingerprints, and heartbeat cursors.
 
 The default storage namespace is `DURABABBLE_SCHEMA` when set. Otherwise it is derived from `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)` so concurrent worktrees do not share internal tables by accident. PostgreSQL/YSQL uses the selected namespace as a SQL schema; MySQL/MariaDB uses it as the durable table prefix inside the configured database.
+
+Store migrations are an explicit setup/deploy responsibility. Runtime workflow engines, class helpers, and object/workflow handles do not run `migrate!` on demand before enqueueing, querying, or dispatching work; callers must migrate the selected namespace before handing the store to runtime paths.
 
 The contract specifies behavior, not a mandatory internal isolation technology. Workflow execution must be deterministic, workflow-local, and free of process-wide monkeypatching, but the implementation may choose the isolation mechanism that provides those guarantees.
 
@@ -66,7 +68,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.start(input, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns a workflow handle. `Workflow.handle(workflow_id)` returns a query/management handle for status, result, cancellation, resume, and exposed methods.
+`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -84,7 +86,7 @@ Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_
 
 ### Durable objects
 
-A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, worker_pool: nil, idempotency_key: nil)` for proxy calls and by `Class.tell(id, :method, **args, idempotency_key: nil)` for asynchronous durable commands. Durable object methods are not workflow steps.
+A durable object subclasses `Durababble::DurableObject`. It is addressed by `Class.at(id, engine: nil, worker_pool: nil, idempotency_key: nil)` or `Class.handle(id, engine: nil, worker_pool: nil, idempotency_key: nil)` for typed handle calls such as `account.credit(1_000)`. When `engine:` is omitted, these helpers use Durababble's configured default engine. Durable object methods are not workflow steps.
 
 ```ruby
 class Account < Durababble::DurableObject
@@ -119,7 +121,7 @@ Durababble does not provide a block-form durable-object `.with(id) { ... }` API.
 
 ### Typing
 
-The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output]` and `Durababble::DurableObject[Id, State]` generics for static tooling only; runtime serialization remains Paquito-based.
+The runtime does not load or validate user RBS. The gem ships `sig/durababble.rbs` with `Durababble::Workflow[Input, Output, Dispatch = Object]` and `Durababble::DurableObject[Id, State, Dispatch = Object]` generics for static tooling only; the third generic is the type-level RPC dispatch surface exposed on handles returned by `start`, `at`, and `handle`, while runtime serialization remains Paquito-based.
 
 ## Workflow execution semantics
 
@@ -129,9 +131,9 @@ Workflow orchestration runs on a Durababble-managed deterministic scheduler. Wor
 
 Durababble integrates with Async task creation and waiting so ordinary non-transient Async child tasks inherit workflow execution context and may call durable steps. Workflow authors must not need Durababble-specific async helpers. `transient: true` Async tasks do not inherit workflow execution context and must not call durable steps.
 
-Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
+Workflow orchestration code must not perform direct blocking or nondeterministic I/O. It may schedule durable steps, sleeps, timer waits, durable commands, child workflows, and deterministic local computation. The runtime rejects unsafe direct host calls such as wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO operations with `Durababble::DeterminismError`. Step bodies run outside the deterministic scheduler and may perform process-local side effects.
 
-The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers. The implementation must not rely on process-wide monkeypatching to create determinism.
+The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers, or reject unsafe host APIs with `Durababble::DeterminismError` until a durable deterministic API exists. The implementation must not rely on process-wide monkeypatching to create determinism.
 
 Durable commands called from any workflow fiber are assigned command ids when the workflow fiber reaches the call, before the side-effecting implementation runs. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes.
 
@@ -386,6 +388,8 @@ Query-shape and transaction requirements:
 - Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
 - Explicit idempotency rows cover workflow starts and any public durable operation not deduped by the inbox itself.
 - Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
+- Worker lease release, cancellation wait cleanup, and durable-object command paths have explicit indexes and query-plan coverage where they can become hot at scale.
+- New production Store SQL must be added to `Durababble::StoreQueries`; each new registered query must be covered by plan assertions, benchmark coverage, backend conformance coverage, or an explicit uncovered-query list entry reviewed in the query-plan suite.
 - High-risk transactional pieces such as `enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, and object state plus message completion may be implemented with database functions to reduce lock-order drift, provided the common backend contract is preserved.
 - Retention and partitioning must be planned for high-volume history, step attempts, inbox, and idempotency rows before production scale.
 - Runtime value decoding only decodes known serialized binary columns.

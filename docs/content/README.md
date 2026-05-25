@@ -26,8 +26,8 @@ class FulfillOrder < Durababble::Workflow
   end
 end
 
-run = engine.run(FulfillOrder, input: order)
-run.result
+handle = FulfillOrder.start(order)
+handle.result
 ```
 
 Durababble is a Ruby durable execution library for workflows and durable objects that persist progress in your existing application database. Use it for work that might run for a long time and must survive process exits, retries, deploys, and changes in which process is running the code.
