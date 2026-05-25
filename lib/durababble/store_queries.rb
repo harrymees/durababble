@@ -846,12 +846,23 @@ module Durababble
       SQL
     end
 
+    define(:pg_lock_workflow_for_termination, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
+    end
+
+    define(:pg_terminate_workflow, backend: :postgres) do |store|
+      "UPDATE #{table(store, "workflows")}\n" \
+        "SET status = 'terminated', result = $2::bytea, error = $3,\n  " \
+        "locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()\n" \
+        "WHERE id = $1"
+    end
+
     define(:pg_complete_workflow_with_worker, backend: :postgres) do |store|
       "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
     end
 
     define(:pg_complete_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1"
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
     end
 
     define(:pg_cancel_workflow_with_worker, backend: :postgres) do |store|
@@ -859,7 +870,7 @@ module Durababble
     end
 
     define(:pg_cancel_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1"
+      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
     end
 
     define(:pg_fail_workflow_with_worker, backend: :postgres) do |store|
@@ -867,7 +878,29 @@ module Durababble
     end
 
     define(:pg_fail_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1"
+      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
+    end
+
+    define(:pg_terminate_workflow_waits, backend: :postgres) do |store|
+      "UPDATE #{table(store, "waits")} SET status = 'canceled', completed_at = now() WHERE workflow_id = $1 AND status = 'pending'"
+    end
+
+    define(:pg_terminate_workflow_steps, backend: :postgres) do |store|
+      "UPDATE #{table(store, "steps")} SET status = 'canceled', error = $2, updated_at = now() WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')"
+    end
+
+    define(:pg_terminate_workflow_step_attempts, backend: :postgres) do |store|
+      "UPDATE #{table(store, "step_attempts")} SET status = 'canceled', error = $2, completed_at = now() WHERE workflow_id = $1 AND status IN ('running', 'waiting')"
+    end
+
+    define(:pg_terminate_workflow_inbox, backend: :postgres) do |store|
+      "UPDATE #{table(store, "inbox")}\n" \
+        "SET status = 'dead_lettered', error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = now(), updated_at = now()\n" \
+        "WHERE target_kind = 'workflow' AND target_id = $1 AND status IN ('pending', 'failed', 'running')"
+    end
+
+    define(:pg_terminate_workflow_target_activations, backend: :postgres) do |store|
+      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = 'workflow' AND target_id = $1"
     end
 
     define(:pg_insert_scheduled_step, backend: :postgres) do |store|
@@ -1341,6 +1374,16 @@ module Durababble
       SQL
     end
 
+    define(:mysql_lock_workflow_for_termination, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE id = ? FOR UPDATE"
+    end
+
+    define(:mysql_terminate_workflow, backend: :mysql) do |store|
+      "UPDATE #{table(store, "workflows")}\n" \
+        "SET status = 'terminated', result = ?, error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)\n" \
+        "WHERE id = ?"
+    end
+
     define(:mysql_complete_workflow_with_worker, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
@@ -1353,7 +1396,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND status <> 'terminated'
       SQL
     end
 
@@ -1371,7 +1414,7 @@ module Durababble
         UPDATE #{table(store, "workflows")}
         SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
           cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND status <> 'terminated'
       SQL
     end
 
@@ -1387,8 +1430,30 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ?
+        WHERE id = ? AND status <> 'terminated'
       SQL
+    end
+
+    define(:mysql_terminate_workflow_waits, backend: :mysql) do |store|
+      "UPDATE #{table(store, "waits")} SET status = 'canceled', completed_at = NOW(6) WHERE workflow_id = ? AND status = 'pending'"
+    end
+
+    define(:mysql_terminate_workflow_steps, backend: :mysql) do |store|
+      "UPDATE #{table(store, "steps")} SET status = 'canceled', error = ?, updated_at = NOW(6) WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting')"
+    end
+
+    define(:mysql_terminate_workflow_step_attempts, backend: :mysql) do |store|
+      "UPDATE #{table(store, "step_attempts")} SET status = 'canceled', error = ?, completed_at = NOW(6) WHERE workflow_id = ? AND status IN ('running', 'waiting')"
+    end
+
+    define(:mysql_terminate_workflow_inbox, backend: :mysql) do |store|
+      "UPDATE #{table(store, "inbox")}\n" \
+        "SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6)\n" \
+        "WHERE target_kind = 'workflow' AND target_id = ? AND status IN ('pending', 'failed', 'running')"
+    end
+
+    define(:mysql_terminate_workflow_target_activations, backend: :mysql) do |store|
+      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = 'workflow' AND target_id = ?"
     end
 
     define(:mysql_cancel_step, backend: :mysql) do |store|

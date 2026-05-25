@@ -304,6 +304,13 @@ module Durababble
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
 
+        workflow = lock_workflow_for_update(workflow_id)
+        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          next updated
+        end
+
         append_workflow_history_without_transaction(
           workflow_id:,
           kind: "workflow_command_completed",
@@ -322,6 +329,13 @@ module Durababble
       transaction do
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
+
+        workflow = lock_workflow_for_update(workflow_id)
+        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          next updated
+        end
 
         append_workflow_history_without_transaction(
           workflow_id:,
@@ -388,6 +402,11 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object?
     def fail_workflow(workflow_id, error:, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
+    def request_workflow_termination(workflow_id:, reason: nil)
       raise NotImplementedError
     end
 

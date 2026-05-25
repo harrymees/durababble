@@ -63,6 +63,14 @@ class DurababbleStoreTest < DurababbleTestCase
     Durababble.send(:remove_const, const_name) if const_name && Durababble.const_defined?(const_name, false)
   end
 
+  test "generated active record cleanup ignores nil owners" do
+    assert_nil Durababble::Store.send(:remove_active_record_class_const, nil)
+  end
+
+  test "observe_claim_latency ignores missing rows" do
+    assert_nil shared_store.send(:observe_claim_latency, nil, "workflow")
+  end
+
   test "inbox_row_claimable? rejects blocked inbox statuses" do
     store = shared_store
     now = Time.utc(2024, 1, 1)
@@ -121,6 +129,10 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "id" => "no-position" }, store.send(:with_command_id, { "id" => "no-position" }))
     assert_equal({ "position" => 3, "command_id" => 9 }, store.send(:with_command_id, { "position" => 3, "command_id" => 9 }))
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
+  end
+
+  test "current_target_lease ignores unsupported target kinds" do
+    assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf", worker_pool: "default")
   end
 
   test "postgres enqueue_workflow inserts the pending row in one statement" do
@@ -749,6 +761,7 @@ class DurababbleStoreTest < DurababbleTestCase
       .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "0" }]),
       sql_result,
@@ -758,6 +771,7 @@ class DurababbleStoreTest < DurababbleTestCase
     ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "1" }]),
       sql_result,
@@ -1029,6 +1043,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
     assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
+    assert_raises(ArgumentError) { store.send(:normalize_command_id, nil, nil) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))

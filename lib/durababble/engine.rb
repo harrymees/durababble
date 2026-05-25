@@ -197,11 +197,21 @@ module Durababble
         workflow.__durababble_execution__ = nil if workflow
       end
     rescue WorkflowSuspended
-      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension" unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+      unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+        row = @store.workflow(workflow_id)
+        return run_from_row(row) if terminal_workflow_row?(row)
+
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension"
+      end
 
       snapshot(workflow_id)
     rescue StepRetryScheduled
       snapshot(workflow_id)
+    rescue LeaseConflict
+      row = @store.workflow(workflow_id)
+      return run_from_row(row) if terminal_workflow_row?(row)
+
+      raise
     rescue CancellationError => e
       @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
       Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
