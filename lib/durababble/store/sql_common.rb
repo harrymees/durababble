@@ -446,7 +446,7 @@ module Durababble
 
     #: (untyped) -> bool
     def activatable_inbox_status?(status)
-      ["pending", "failed", "running"].include?(status)
+      InboxStatus.activatable?(status)
     end
 
     #: (message_id: untyped, target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, ?now: untyped) -> untyped

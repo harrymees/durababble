@@ -40,7 +40,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.resume", attributes) do
         current = claimed || @store.workflow(workflow_id)
-        return run_from_row(current) if ["completed", "canceled"].include?(current.fetch("status"))
+        return run_from_row(current) if WorkflowStatus.completed?(current)
 
         owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
         unless owned_claim
@@ -86,9 +86,7 @@ module Durababble
 
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
+      WorkflowStatus.terminal?(row)
     end
 
     #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped

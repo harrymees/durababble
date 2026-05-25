@@ -204,9 +204,7 @@ module Durababble
 
     #: (untyped) -> bool
     def terminal_for_cancellation?(row)
-      return true if ["completed", "canceled"].include?(row.fetch("status"))
-
-      row.fetch("status") == "failed" && row["next_run_at"].nil?
+      WorkflowStatus.terminal?(row)
     end
 
     #: (untyped, now: untyped) -> untyped
@@ -223,9 +221,9 @@ module Durababble
     #: (untyped, now: untyped) -> bool
     def inbox_row_claimable?(row, now:)
       status = row.fetch("status")
-      return false if status == "dead_lettered"
+      return false if InboxStatus.dead_lettered?(status)
 
-      if status == "running"
+      if InboxStatus.running?(status)
         locked_until = row["locked_until"]
         return false unless locked_until
 
