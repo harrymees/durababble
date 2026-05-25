@@ -7,6 +7,10 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   class BranchTestWorkflow < Durababble::Workflow
     workflow_name "branch_test_workflow"
 
+    def execute(input)
+      [echo(input.fetch("plain")), kw_echo(value: input.fetch("keyword"))]
+    end
+
     expose def labeled_status(prefix:)
       "#{prefix}:#{@__durababble_ref_workflow_id}"
     end
@@ -67,149 +71,84 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
-  class BranchTestStore
-    attr_reader :events, :completed_commands, :failed_commands, :migrations, :closed
+  durababble_store_backends.each do |backend|
+    test "covers explicit and pending workflow macros plus keyword step invocation with #{backend.name}" do
+      with_durababble_store(backend, "public_api_branch_workflow") do |store|
+        run = Durababble::Engine.new(store:, migrate: false).run(
+          BranchTestWorkflow,
+          input: { "plain" => "plain", "keyword" => "keyword" },
+        )
 
-    def initialize
-      @state = nil
-      @commands = {}
-      @next_command_id = 0
-      @events = []
-      @completed_commands = []
-      @failed_commands = []
-      @migrations = 0
-      @closed = false
-    end
-
-    def migrate!
-      @migrations += 1
-    end
-
-    def close
-      @closed = true
-    end
-
-    def signal_event(event_key, payload:)
-      @events << [event_key, payload]
-      1
-    end
-
-    def workflow(workflow_id)
-      { "id" => workflow_id, "status" => "running" }
-    end
-
-    def enqueue_inbox_message(**kwargs)
-      @events << [:inbox, kwargs]
-      "inbox-1"
-    end
-
-    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key:)
-      @events << [:inbox, {
-        target_kind: "workflow",
-        target_type: workflow_name,
-        target_id: workflow_id,
-        message_kind: "workflow_command",
-        method_name:,
-        payload:,
-        idempotency_key:,
-      },]
-      "inbox-1"
-    end
-
-    def deliver_target_message(**kwargs)
-      @events << [:deliver, kwargs]
-      true
-    end
-
-    def wait_for_inbox_message(message_id)
-      "result:#{message_id}"
-    end
-
-    def object_state(object_type:, object_id:)
-      @state
-    end
-
-    def save_object_state(object_type:, object_id:, state:)
-      @state = state
-    end
-
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:)
-      @next_command_id += 1
-      command_id = "cmd-#{@next_command_id}"
-      @commands[command_id] = { object_type:, object_id:, method_name:, args:, kwargs: }
-      command_id
-    end
-
-    def claim_object_command(command_id:, worker_id:)
-      @commands.fetch(command_id).merge(worker_id:)
-    end
-
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
-      save_object_state(object_type:, object_id:, state:) unless state.equal?(Durababble::Store::NO_OBJECT_STATE)
-      @completed_commands << [command_id, result]
-      ActiveRecord::Result.empty(affected_rows: 1)
-    end
-
-    def fail_object_command(command_id:, error:, worker_id: nil)
-      @failed_commands << [command_id, error]
+        assert_equal "completed", run.status
+        assert_equal ["plain", "keyword"], run.result
+        assert_equal(
+          [
+            ["echo", "completed"],
+            ["kw_echo", "completed"],
+          ],
+          store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] },
+        )
+      end
     end
   end
 
-  class BranchTestExecution
-    attr_reader :step_context, :calls
-
-    def initialize
-      @step_context = :context
-      @calls = []
-    end
-
-    def call_step(instance, method_name:, args:, kwargs:)
-      @calls << [instance.class, method_name, args, kwargs]
-      yield
-    end
-  end
-
-  test "covers explicit and pending workflow macros plus keyword step invocation" do
+  test "registers explicit and pending workflow macros" do
     assert_hash_includes BranchTestPendingWorkflow.exposed_queries, query_with_pending_macro: true
     assert_includes BranchTestPendingWorkflow.exposed_commands, :command_with_pending_macro
     assert_includes BranchTestPendingWorkflow.step_order, :step_with_pending_macro
-
-    workflow = BranchTestWorkflow.new
-    execution = BranchTestExecution.new
-    workflow.__durababble_execution__ = execution
-
-    assert_equal "plain", workflow.echo("plain")
-    assert_equal "keyword", workflow.kw_echo(value: "keyword")
-    assert_equal [:echo, :kw_echo], execution.calls.map { |(_klass, method_name, _args, _kwargs)| method_name }
   end
 
-  test "exposes workflow refs for keyword queries and command events and rejects missing methods" do
-    store = BranchTestStore.new
-    ref = BranchTestWorkflow.ref("wf-123", store:)
+  durababble_store_backends.each do |backend|
+    test "exposes workflow refs for keyword queries and command events with #{backend.name}" do
+      with_durababble_store(backend, "public_api_branch_workflow_ref") do |store|
+        workflow_id = store.enqueue_workflow(name: BranchTestWorkflow.workflow_name, input: { "plain" => "plain", "keyword" => "keyword" })
+        store.mark_workflow_running(workflow_id, worker_id: "command-worker", lease_seconds: 60)
+        ref = BranchTestWorkflow.ref(workflow_id, store:)
 
-    assert_respond_to ref, :labeled_status
-    assert_equal "status:wf-123", ref.labeled_status(prefix: "status")
-    assert_equal "result:inbox-1", ref.note(message: "hello", idempotency_key: "note:hello")
-    assert_equal(
-      [
-        [:inbox, {
+        assert_respond_to(ref, :labeled_status)
+        assert_equal("status:#{workflow_id}", ref.labeled_status(prefix: "status"))
+
+        result_queue = Queue.new
+        caller = Thread.new do
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+          begin
+            result_queue << [:ok, BranchTestWorkflow.ref(workflow_id, store: caller_store).note(message: "hello", idempotency_key: "note:hello")]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          ensure
+            caller_store.close
+          end
+        end
+
+        wait_until { store.target_activation(target_kind: "workflow", target_type: BranchTestWorkflow.workflow_name, target_id: workflow_id) }
+        messages = store.inbox_messages_for(
           target_kind: "workflow",
-          target_type: "branch_test_workflow",
-          target_id: "wf-123",
-          message_kind: "workflow_command",
-          method_name: "note",
-          payload: { "method" => "note", "args" => [], "kwargs" => { message: "hello" } },
-          idempotency_key: "note:hello",
-        },],
-        [:deliver, {
-          target_kind: "workflow",
-          target_type: "branch_test_workflow",
-          target_id: "wf-123",
-        },],
-      ],
-      store.events,
-    )
-    assert_raises(NoMethodError) { ref.not_exposed }
+          target_type: BranchTestWorkflow.workflow_name,
+          target_id: workflow_id,
+        )
+        assert_equal(1, messages.length)
+        assert_hash_includes(
+          messages.first,
+          "message_kind" => "workflow_command",
+          "method_name" => "note",
+          "payload" => { "method" => "note", "args" => [], "kwargs" => { message: "hello" } },
+          "idempotency_key" => "note:hello",
+        )
+
+        drained = Durababble::Engine.new(store:, worker_id: "command-worker", migrate: false)
+          .drain_workflow_inbox(BranchTestWorkflow, workflow_id:)
+        status, value = result_queue.pop
+        caller.join
+
+        assert_equal(1, drained)
+        assert_equal(:ok, status)
+        assert_equal("hello", value)
+        assert_hash_includes(store.inbox_message(messages.first.fetch("id")), "status" => "completed", "result" => "hello")
+        assert_raises(NoMethodError) { ref.not_exposed }
+      ensure
+        caller&.kill if caller&.alive?
+      end
+    end
   end
 
   test "raises when a workflow step is called outside workflow execution" do
@@ -218,45 +157,83 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
-  test "covers durable object query, command, retry, nil-store update, and missing methods" do
-    store = BranchTestStore.new
-    account = BranchTestDurableObject.ref("acct-1", store:)
+  durababble_store_backends.each do |backend|
+    test "covers durable object query, command, retry, and missing methods with #{backend.name}" do
+      with_durababble_store(backend, "public_api_branch_object") do |store|
+        account = BranchTestDurableObject.ref("acct-1", store:)
 
-    assert_equal "branch_account", BranchTestDurableObject.object_type
-    assert_respond_to account, :formatted
-    assert_equal "balance:0", account.formatted(prefix: "balance")
-    assert_equal({ "value" => 3 }, account.add(amount: 3))
-    assert_equal({ "value" => 7, "attempts" => 1 }, account.flaky_add(amount: 4))
-    assert_equal "balance:7", account.formatted(prefix: "balance")
-    assert_equal 1, store.failed_commands.length
-    assert_equal 2, store.completed_commands.length
-    assert_raises(NoMethodError) { account.not_exposed }
+        assert_equal "branch_account", BranchTestDurableObject.object_type
+        assert_respond_to account, :formatted
+        assert_equal "balance:0", account.formatted(prefix: "balance")
+        assert_equal({ "value" => 3 }, account.add(amount: 3))
+        assert_equal({ "value" => 7, "attempts" => 1 }, account.flaky_add(amount: 4))
+        assert_equal "balance:7", account.formatted(prefix: "balance")
+        assert_equal({ "value" => 7, "attempts" => 1 }, store.object_state(object_type: "branch_account", object_id: "acct-1"))
+        assert_equal(
+          [
+            ["add", "completed", 1],
+            ["flaky_add", "completed", 2],
+          ],
+          store.inbox_messages_for(target_kind: "object", target_type: "branch_account", target_id: "acct-1").map do |message|
+            [message.fetch("method_name"), message.fetch("status"), message.fetch("attempts")]
+          end,
+        )
+        assert_raises(NoMethodError) { account.not_exposed }
+      end
+    end
+  end
 
+  test "updates transient durable object state without a store" do
     transient = BranchTestDurableObject.new
     assert_equal({ "value" => 9 }, transient.update_state("value" => 9))
   end
 
   test "configures a default store when no previous store exists" do
-    Durababble::Store.expects(:connect).returns(BranchTestStore.new)
+    backend = durababble_store_backends.first
+    schema_name = "#{backend.default_schema_prefix}_configure_#{Process.pid}_#{SecureRandom.hex(4)}"
     Durababble.default_store = nil
 
-    Durababble.configure(database_url: "postgresql://example.invalid/db", schema: "branch_test")
+    configured = Durababble.configure(database_url: backend.database_url, schema: schema_name)
 
-    assert_kind_of(BranchTestStore, Durababble.default_store)
+    assert_same(configured, Durababble.default_store)
+    assert_equal(schema_name, Durababble.default_store.schema)
+    assert_kind_of(Durababble::Store, Durababble.default_store)
   ensure
+    Durababble.default_store&.drop_schema!
+    Durababble.default_store&.close
     Durababble.default_store = nil
   end
 
   test "closes a previously configured default store before replacing it" do
-    old_store = BranchTestStore.new
-    Durababble::Store.expects(:connect).returns(BranchTestStore.new)
-    Durababble.default_store = old_store
+    backend = durababble_store_backends.first
+    old_schema = "#{backend.default_schema_prefix}_configure_old_#{Process.pid}_#{SecureRandom.hex(4)}"
+    new_schema = "#{backend.default_schema_prefix}_configure_new_#{Process.pid}_#{SecureRandom.hex(4)}"
+    old_store = Durababble.configure(database_url: backend.database_url, schema: old_schema)
+    old_pool = old_store.instance_variable_get(:@owner).connection_pool
 
-    Durababble.configure(database_url: "postgresql://example.invalid/db", schema: "branch_test")
+    new_store = Durababble.configure(database_url: backend.database_url, schema: new_schema)
 
-    assert(old_store.closed)
-    assert_kind_of(BranchTestStore, Durababble.default_store)
+    refute(old_pool.active_connection?)
+    assert_same(new_store, Durababble.default_store)
+    assert_equal(new_schema, Durababble.default_store.schema)
   ensure
+    old_store&.drop_schema!
+    old_store&.close
+    Durababble.default_store&.drop_schema!
+    Durababble.default_store&.close
     Durababble.default_store = nil
+  end
+
+  private
+
+  def wait_until(timeout: 2)
+    deadline = Time.now + timeout
+    loop do
+      value = yield
+      return value if value
+      raise "condition not met before timeout" if Time.now >= deadline
+
+      sleep(0.01)
+    end
   end
 end

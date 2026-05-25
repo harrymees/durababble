@@ -66,7 +66,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -200,7 +200,7 @@ module Durababble
             locked_by = NULL,
             locked_until = NULL,
             updated_at = now()
-        WHERE id = $1 AND status = 'running' AND ($2 IS NULL OR locked_by = $2)
+        WHERE id = $1 AND status = 'running' AND ($2::text IS NULL OR locked_by = $2::text)
       SQL
       return true if result.affected_rows == 1
 
@@ -528,7 +528,7 @@ module Durababble
             FOR UPDATE SKIP LOCKED
           SQL
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at")) }
+          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
           execute_params(<<~SQL, [candidate.fetch("id"), worker_id, lease_seconds]).first
