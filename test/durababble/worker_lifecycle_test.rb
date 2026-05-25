@@ -117,7 +117,26 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_empty store.released
   end
 
-  test "records unexpected polling errors and closes owned stores" do
+  test "records unexpected polling errors without closing caller stores" do
+    store = RuntimeBranchStore.new(tick_results: [RuntimeError.new("boom")])
+    runtime = Durababble::WorkerRuntime.new(
+      store:,
+      workflows: {},
+      worker_pool: "default",
+      poll_interval: 0.01,
+      migrate: false,
+    )
+
+    runtime.start
+    eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
+    runtime.close
+
+    assert_kind_of RuntimeError, runtime.last_error
+    assert_equal "boom", runtime.last_error.message
+    assert_equal false, store.closed
+  end
+
+  test "uses isolated store connections for worker and rpc paths when it owns the store" do
     runtime = Durababble::WorkerRuntime.new(
       database_url:,
       schema:,
@@ -126,18 +145,24 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.store.define_singleton_method(:claim_runnable_workflow) do |**|
-      raise "boom"
-    end
-    owner = runtime.store.instance_variable_get(:@owner)
-
     runtime.start
-    eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
-    runtime.close
+    worker_store = runtime.instance_variable_get(:@worker_store)
+    rpc_store = runtime.instance_variable_get(:@rpc_store)
 
-    assert_kind_of RuntimeError, runtime.last_error
-    assert_equal "boom", runtime.last_error.message
-    refute owner.connection_pool.active_connection?
+    refute_nil(worker_store)
+    refute_nil(rpc_store)
+    refute_same(runtime.store, worker_store)
+    refute_same(runtime.store, rpc_store)
+    refute_same(worker_store, rpc_store)
+    assert_equal(true, worker_store.pooled_connections?)
+    assert_equal(true, rpc_store.pooled_connections?)
+    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(worker_store))
+    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(rpc_store))
+    owner = runtime.store.instance_variable_get(:@owner)
+    runtime.close
+    refute(owner.connection_pool.active_connection?)
+  ensure
+    runtime&.close
   end
 
   test "starts a background worker and gracefully completes in-flight work during shutdown" do
@@ -472,6 +497,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
   def runtime_store
     @runtime_store ||= Durababble::Store.connect(database_url:, schema:)
+  end
+
+  def connection_id_from_thread(store)
+    ids = Queue.new
+    Thread.new { ids << store.connection.object_id }.join
+    ids.pop
   end
 
   def eventually(timeout:)
