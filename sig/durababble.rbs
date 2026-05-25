@@ -159,16 +159,16 @@ module Durababble
     def release_worker_leases!: (worker_id: String) -> lease_release_counts
     def schedule_workflow_retry: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
     def suspend_workflow: (workflow_id: String, ?worker_id: String?) -> bool
-    def make_workflow_due!: (String workflow_id, ?now: Time) -> void
-    def heartbeat_step: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> bool
+    def make_workflow_due!: (String workflow_id, ?now: Time) -> Object?
+    def heartbeat_step: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> Object?
     def step_heartbeat_cursor: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> serialized_payload
     def current_workflow_lease: (String workflow_id) -> workflow_row?
     def deliver_target_message: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: _RpcClientFactory?) -> bool
     def steal_expired_leases!: (?now: Time) -> Integer
-    def mark_workflow_running: (String workflow_id, ?worker_id: String?, ?lease_seconds: Numeric) -> workflow_row?
-    def complete_workflow: (String workflow_id, result: serialized_payload, ?worker_id: String?) -> void
-    def cancel_workflow: (String workflow_id, reason: String?, ?result: serialized_payload, ?worker_id: String?) -> void
-    def fail_workflow: (String workflow_id, error: String, ?worker_id: String?) -> void
+    def mark_workflow_running: (String workflow_id, ?worker_id: String?, ?lease_seconds: Numeric) -> Object?
+    def complete_workflow: (String workflow_id, result: serialized_payload, ?worker_id: String?) -> Object
+    def cancel_workflow: (String workflow_id, reason: String?, ?result: serialized_payload, ?worker_id: String?) -> Object
+    def fail_workflow: (String workflow_id, error: String, ?worker_id: String?) -> Object
     def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
     def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
     def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
@@ -181,7 +181,7 @@ module Durababble
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload
     def enqueue_outbox: (workflow_id: String, topic: String, payload: serialized_payload, key: String) -> String
     def claim_outbox: (worker_id: String, lease_seconds: Numeric) -> workflow_row?
-    def ack_outbox: (String outbox_id, worker_id: String) -> bool
+    def ack_outbox: (String outbox_id, worker_id: String) -> Object
     def outbox_message: (String outbox_id) -> workflow_row?
     def enqueue_inbox_message: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: serialized_payload, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?) -> String
     def enqueue_workflow_command: (workflow_id: String, workflow_name: String, method_name: String, payload: serialized_payload, ?idempotency_key: String?) -> String
@@ -198,7 +198,7 @@ module Durababble
     def steps_for: (String workflow_id) -> Array[workflow_row]
     def step_attempts_for: (String workflow_id) -> Array[workflow_row]
     def object_state: (object_type: String, object_id: String) -> serialized_payload
-    def save_object_state: (object_type: String, object_id: String, state: serialized_payload) -> void
+    def save_object_state: (object_type: String, object_id: String, state: serialized_payload) -> serialized_payload
     def enqueue_object_command: (object_type: String, object_id: String, method_name: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?) -> String
     def claim_object_command: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
     def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?worker_id: String?) -> Object?
