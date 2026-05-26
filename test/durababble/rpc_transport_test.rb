@@ -295,6 +295,59 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     server&.stop
   end
 
+  test "enforces RPC argument byte limits before sending or dispatching" do
+    args = { "body" => "x" * 64 }
+    size = Durababble::Rpc::SERIALIZER.dump(args).bytesize
+    calls = []
+    server = start_rpc_server(
+      node_id: "node-a",
+      store:,
+      transient_handler: lambda do |request:, args:|
+        calls << [request["method"], args]
+        { "ok" => true }
+      end,
+    )
+    client = Durababble::Rpc::Client.new(address: server.address)
+
+    with_payload_limit(:rpc_argument, size + 1) do
+      assert_equal(
+        { "ok" => true },
+        client.call_transient(worker_pool: "default", method: "status", args:),
+      )
+    end
+    assert_equal([["status", args]], calls)
+
+    with_payload_limit(:rpc_argument, size) do
+      assert_equal(
+        { "ok" => true },
+        client.call_transient(worker_pool: "default", method: "status", args:),
+      )
+    end
+    assert_equal([["status", args], ["status", args]], calls)
+
+    error = with_payload_limit(:rpc_argument, size - 1) do
+      assert_raises(Durababble::PayloadTooLarge) do
+        client.call_transient(worker_pool: "default", method: "status", args:)
+      end
+    end
+    assert_equal(:rpc_argument, error.surface)
+    assert_match(/CallTransient status args/, error.message)
+    assert_equal(2, calls.length)
+
+    raw_args = Durababble::Rpc::SERIALIZER.dump(args)
+    raw_stub = Durababble::Rpc::Proto::Stub.new(server.address, :this_channel_is_insecure)
+    response = with_payload_limit(:rpc_argument, size - 1) do
+      raw_stub.call_transient(
+        Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", method: "status", args: raw_args),
+        deadline: Time.now + 5,
+      )
+    end
+    assert_equal("Durababble::PayloadTooLarge", response.err.klass)
+    assert_equal(2, calls.length)
+  ensure
+    server&.stop
+  end
+
   test "decodes transport payloads and typed transient response branches" do
     assert_nil Durababble::Rpc.load(nil)
     assert_nil Durababble::Rpc.load("")
@@ -492,5 +545,18 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   def complete_workflow
     store.complete_workflow(workflow_id, result: {})
+  end
+
+  def with_payload_limit(surface, value)
+    configured = Durababble.instance_variable_defined?(:@payload_limits)
+    previous = Durababble.instance_variable_get(:@payload_limits) if configured
+    Durababble.payload_limits = { surface => value }
+    yield
+  ensure
+    if configured
+      Durababble.instance_variable_set(:@payload_limits, previous)
+    elsif Durababble.instance_variable_defined?(:@payload_limits)
+      Durababble.remove_instance_variable(:@payload_limits)
+    end
   end
 end

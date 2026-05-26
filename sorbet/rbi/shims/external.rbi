@@ -193,7 +193,7 @@ module Durababble
   class Store
     def current_workflow_lease(workflow_id, worker_pool: nil); end
     def decode_row(row); end
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def enqueue_inbox_message(**kwargs); end
     def inbox_message(message_id); end
     def load_serialized(value); end
@@ -203,7 +203,7 @@ module Durababble
   end
 
   module MysqlMigrations
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def execute(sql); end
     def execute_params(sql, params); end
     def index_name(table_name, suffix); end
@@ -214,7 +214,7 @@ module Durababble
   end
 
   module PostgresMigrations
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def execute(sql); end
     def execute_params(sql, params); end
     def quote_column_name(identifier); end

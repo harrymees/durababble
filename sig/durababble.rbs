@@ -104,6 +104,14 @@ module Durababble
   class IdempotencyKeyConflict < Error
   end
 
+  class PayloadTooLarge < Error
+    attr_reader surface: Symbol
+    attr_reader context: String?
+    attr_reader bytesize: Integer
+    attr_reader max_bytes: Integer
+    def initialize: ((Symbol | String) surface, bytesize: Integer, max_bytes: Integer, ?context: String?) -> void
+  end
+
   class WorkflowAlreadyExists < Error
   end
 
@@ -168,8 +176,11 @@ module Durababble
   def self.max_workflow_history_events=: ((Integer | String) value) -> (Integer | String)
   def self.workflow_history_warning_events: () -> Integer
   def self.workflow_history_warning_events=: ((Integer | String) value) -> (Integer | String)
+  def self.payload_limits: () -> Hash[Symbol, Integer]
+  def self.payload_limits=: (Hash[Symbol | String, Integer | String] limits) -> Hash[Symbol | String, Integer | String]
   def self.logger: () -> Object?
   def self.logger=: (Object? logger) -> Object?
+  def self.enforce_payload_limit!: (surface: Symbol | String, bytesize: Integer, ?context: String?) -> true
   def self.warn_workflow_history_events: (workflow_id: String, history_events: Integer, max_history_events: Integer) -> bool
 
   class Store
@@ -430,6 +441,9 @@ module Durababble
 
   module Rpc
     type credentials = Object
+
+    def self.dump: (serialized_payload value, ?surface: Symbol?, ?context: String?) -> String
+    def self.load: (String? bytes) -> serialized_payload
 
     class Error < Durababble::Error
     end
