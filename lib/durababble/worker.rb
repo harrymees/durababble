@@ -19,6 +19,7 @@ module Durababble
       @lease_seconds = lease_seconds
       @worker_pool = worker_pool
       @workflow_query_registry = workflow_query_registry
+      @engines = {} #: Hash[String, Engine]
       @store.migrate! if migrate
     end
 
@@ -40,7 +41,7 @@ module Durababble
         end
 
         workflow = @workflows.fetch(claimed.fetch("name"))
-        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool, workflow_query_registry: @workflow_query_registry).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        engine_for(@worker_pool).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
         Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
         :worked
       end
@@ -79,6 +80,21 @@ module Durababble
 
     private
 
+    # Engines hold only per-worker config (store, worker_id, lease_seconds,
+    # worker_pool) and build a fresh WorkflowExecution per call, so one instance
+    # per worker_pool is reusable across ticks. Memoize them rather than
+    # allocating a new Engine on every workflow claim and activation.
+    #: (String) -> Engine
+    def engine_for(worker_pool)
+      @engines[worker_pool] ||= Engine.new(
+        store: @store,
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        worker_pool:,
+        workflow_query_registry: @workflow_query_registry,
+      )
+    end
+
     #: (untyped, ?advisory: untyped) -> untyped
     def process_target_activation(activation, advisory: false)
       case activation.fetch("target_kind")
@@ -94,7 +110,7 @@ module Durababble
       workflow_id = activation.fetch("target_id")
       workflow = @workflows.fetch(activation.fetch("target_type"))
       worker_pool = activation_worker_pool(activation)
-      engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:, workflow_query_registry: @workflow_query_registry)
+      engine = engine_for(worker_pool)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
       engine.resume(workflow, workflow_id:, claimed:) if claimed
       target = activation_target(activation, worker_pool:)
