@@ -11,6 +11,8 @@ require_relative "agent_loop"
 module AgentLoopExample
   class Server
     TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
+    WORKFLOW_WORKER_POOL = "agent-loop-workflows"
+    OBJECT_WORKER_POOL = "agent-loop-objects"
 
     def initialize(host:, port:, database_url:, schema:)
       @host = host
@@ -19,13 +21,13 @@ module AgentLoopExample
       @schema = schema
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
-      AgentLoopExample.configure(database_url:, schema:)
+      AgentLoopExample.configure(database_url:, schema:, workflow_worker_pool: WORKFLOW_WORKER_POOL, object_worker_pool: OBJECT_WORKER_POOL)
       @workflow_runtime = Durababble::WorkerRuntime.start(
         workflows: [AgentLoopWorkflow],
         objects: [],
         database_url:,
         schema:,
-        worker_pool: "agent-loop-workflows",
+        worker_pool: AgentLoopExample.workflow_worker_pool,
         poll_interval: 0.05,
       )
       @object_runtime = Durababble::WorkerRuntime.start(
@@ -33,7 +35,7 @@ module AgentLoopExample
         objects: [VirtualFileSystem],
         database_url:,
         schema:,
-        worker_pool: "agent-loop-objects",
+        worker_pool: AgentLoopExample.object_worker_pool,
         poll_interval: 0.05,
       )
       @tcp_server = TCPServer.new(@host, @port)
@@ -120,6 +122,7 @@ module AgentLoopExample
       request = payload.fetch("request", "")
       workflow_id = @store.enqueue_workflow(
         name: AgentLoopWorkflow.workflow_name,
+        worker_pool: AgentLoopExample.workflow_worker_pool,
         input: {
           "session_id" => session_id,
           "request" => request,
@@ -149,7 +152,7 @@ module AgentLoopExample
       row = @store.workflow(workflow_id)
       input = row.fetch("input")
       session_id = input.fetch("session_id")
-      snapshot = VirtualFileSystem.at(session_id, store: @store).snapshot
+      snapshot = VirtualFileSystem.at(session_id, store: @store, worker_pool: AgentLoopExample.object_worker_pool).snapshot
       json(
         200,
         "workflow_id" => workflow_id,

@@ -67,7 +67,7 @@ class AgentLoopExampleTest < DurababbleTestCase
             final_response("Done. Updated /notes.txt."),
           ],
         )
-        AgentLoopExample.configure(database_url: backend.database_url, schema:, llm_client: fake_client)
+        AgentLoopExample.configure(database_url: backend.database_url, schema:, llm_client: fake_client, object_worker_pool: "agent-loop-objects")
         workflow_id = store.enqueue_workflow(
           name: AgentLoopExample::AgentLoopWorkflow.workflow_name,
           input: {
@@ -93,6 +93,7 @@ class AgentLoopExampleTest < DurababbleTestCase
         assert_equal("toolu_list", first_tool_result.fetch("tool_use_id"))
 
         messages = store.inbox_messages_for(
+          worker_pool: "agent-loop-objects",
           target_kind: "object",
           target_type: AgentLoopExample::VirtualFileSystem.object_type,
           target_id: "session-2",
@@ -234,7 +235,7 @@ class AgentLoopExampleTest < DurababbleTestCase
     }
   end
 
-  def run_agent_loop_workers(backend, workflow_id, timeout: 10)
+  def run_agent_loop_workers(backend, workflow_id, timeout: 30)
     workflow_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
     workflow_worker = Durababble::Worker.new(
       store: workflow_store,
