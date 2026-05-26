@@ -30,6 +30,7 @@ module ActiveRecord
   class Base
     def self.abstract_class=(value); end
     def self.connection_class=(value); end
+    sig { returns(ActiveRecord::ConnectionAdapters::ConnectionPool) }
     def self.connection_pool; end
     def self.establish_connection(config); end
   end
@@ -44,6 +45,41 @@ module ActiveRecord
     module ClassMethods
       def sanitize_sql_array(array); end
       def with_connection(&block); end
+    end
+  end
+
+  module ConnectionAdapters
+    class AbstractAdapter
+      sig { returns(String) }
+      def adapter_name; end
+
+      sig { params(sql: String, name: T.nilable(String), binds: T::Array[T.nilable(Object)], prepare: T::Boolean).returns(ActiveRecord::Result) }
+      def exec_query(sql, name = nil, binds = [], prepare: false); end
+
+      sig { params(identifier: String).returns(String) }
+      def quote_column_name(identifier); end
+
+      sig do
+        type_parameters(:Result)
+          .params(requires_new: T::Boolean, options: T.nilable(Object), block: T.proc.returns(T.type_parameter(:Result)))
+          .returns(T.type_parameter(:Result))
+      end
+      def transaction(requires_new: true, **options, &block); end
+    end
+
+    class ConnectionPool
+      sig do
+        type_parameters(:Result)
+          .params(block: T.proc.params(connection: AbstractAdapter).returns(T.type_parameter(:Result)))
+          .returns(T.type_parameter(:Result))
+      end
+      def with_connection(&block); end
+
+      sig { void }
+      def disconnect!; end
+
+      sig { returns(T::Boolean) }
+      def active_connection?; end
     end
   end
 end
@@ -171,6 +207,7 @@ module Durababble
     def execute(sql); end
     def execute_params(sql, params); end
     def index_name(table_name, suffix); end
+    def quote_column_name(identifier); end
     def raw_table_name(name); end
     def table(name); end
     def table_prefix; end
@@ -180,6 +217,7 @@ module Durababble
     def dump_serialized(value); end
     def execute(sql); end
     def execute_params(sql, params); end
+    def quote_column_name(identifier); end
     def quoted_schema; end
     def schema; end
     def table(name); end
