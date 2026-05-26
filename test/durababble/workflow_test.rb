@@ -315,7 +315,11 @@ class DurababbleWorkflowTest < DurababbleTestCase
           name: ApiTestQueryableWorkflow.workflow_name,
           input: { "state" => "local-owner" },
         )
-        wait_until { ApiTestQueryableWorkflow.step_started.pop(true) rescue nil }
+        wait_until do
+          ApiTestQueryableWorkflow.step_started.pop(true)
+        rescue
+          nil
+        end
         store.workflow_rpc_client_factory = ->(_worker_id, worker_pool:) { raise "local query should not open a gRPC client for #{worker_pool}" }
 
         before_history = store.workflow_history_for(workflow_id)
@@ -334,8 +338,8 @@ class DurababbleWorkflowTest < DurababbleTestCase
           },
           result,
         )
-        assert_equal before_history, store.workflow_history_for(workflow_id)
-        assert_equal before_inbox, store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id)
+        assert_equal(before_history, store.workflow_history_for(workflow_id))
+        assert_equal(before_inbox, store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
       ensure
         ApiTestQueryableWorkflow.release_step&.push(true)
         wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if store && workflow_id
@@ -358,7 +362,11 @@ class DurababbleWorkflowTest < DurababbleTestCase
           name: ApiTestQueryableWorkflow.workflow_name,
           input: { "state" => "remote-owner" },
         )
-        wait_until { ApiTestQueryableWorkflow.step_started.pop(true) rescue nil }
+        wait_until do
+          ApiTestQueryableWorkflow.step_started.pop(true)
+        rescue
+          nil
+        end
         caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
 
         result = ApiTestQueryableWorkflow.handle(workflow_id, store: caller_store).snapshot(
@@ -375,7 +383,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
           },
           result,
         )
-        assert_empty caller_store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id)
+        assert_empty(caller_store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
       ensure
         caller_store&.close
         ApiTestQueryableWorkflow.release_step&.push(true)
@@ -459,15 +467,18 @@ class DurababbleWorkflowTest < DurababbleTestCase
           raise Durababble::WorkflowRpc::StaleLease, "worker-a lost ownership"
         end
         clients["worker-b"] = WorkflowQueryFakeClient.new do |command, payload|
-          assert_equal "workflow_rpc", command
-          assert_equal "snapshot", payload.fetch("command")
+          assert_equal("workflow_rpc", command)
+          assert_equal("snapshot", payload.fetch("command"))
           assert_equal(
             { "workflow_id" => workflow_id, "method" => "snapshot", "args" => [], "kwargs" => { prefix: "handoff" } },
             payload.fetch("payload"),
           )
           { "owner" => "worker-b" }
         end
-        store.workflow_rpc_client_factory = ->(worker_id, worker_pool:) { clients.fetch(worker_id) }
+        store.workflow_rpc_client_factory = lambda do |worker_id, worker_pool:|
+          _ = worker_pool
+          clients.fetch(worker_id)
+        end
 
         assert_equal({ "owner" => "worker-b" }, ApiTestQueryableWorkflow.handle(workflow_id, store:).snapshot(prefix: "handoff"))
         assert_equal 1, clients.fetch("worker-a").requests.length
@@ -491,7 +502,11 @@ class DurababbleWorkflowTest < DurababbleTestCase
           name: ApiTestQueryableWorkflow.workflow_name,
           input: { "state" => "guard" },
         )
-        wait_until { ApiTestQueryableWorkflow.step_started.pop(true) rescue nil }
+        wait_until do
+          ApiTestQueryableWorkflow.step_started.pop(true)
+        rescue
+          nil
+        end
 
         assert_raises_matching(Durababble::Error, /cannot call workflow steps from an exposed query/) do
           ApiTestQueryableWorkflow.handle(workflow_id, store:).query_step_forbidden
