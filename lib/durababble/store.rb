@@ -497,8 +497,8 @@ module Durababble
         "durababble.store.backend" => Observability.store_backend(self),
       )
       nil
-    rescue StandardError
-      nil
+    rescue StandardError => e
+      log_swallowed_metric_error("durababble.queue.claim_latency", e)
     end
 
     #: (Hash[String, Object?]) -> nil
@@ -515,7 +515,23 @@ module Durababble
         "durababble.wait.kind" => wait["kind"],
       )
       nil
-    rescue StandardError
+    rescue StandardError => e
+      log_swallowed_metric_error("durababble.wait.latency", e)
+    end
+
+    # Latency metrics are best-effort: a malformed timestamp must not break the
+    # claim/wait path that produced it. But a silent rescue hides a real bug, so
+    # record the swallow on a counter and through the logger before returning.
+    #: (String, StandardError) -> nil
+    def log_swallowed_metric_error(metric, error)
+      Observability.count(
+        "durababble.metrics.record_errors",
+        "durababble.metric.name" => metric,
+        "error.type" => error.class.name,
+      )
+      Durababble.logger&.warn(
+        "Durababble failed to record #{metric}: #{error.class}: #{error.message}",
+      )
       nil
     end
   end

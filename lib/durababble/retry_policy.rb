@@ -60,8 +60,8 @@ module Durababble
       return explicit if explicit
 
       delay = initial_interval * (backoff_coefficient**(attempt_number - 1))
-      delay = [delay, maximum_interval].min if maximum_interval
-      delay || 0.0
+      cap = maximum_interval
+      cap && delay > cap ? cap : delay
     end
 
     private

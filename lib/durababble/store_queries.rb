@@ -3,7 +3,9 @@
 
 module Durababble
   module StoreQueries
-    Query = Struct.new(:id, :backend, :builder, keyword_init: true)
+    # Queries are stored in QUERIES keyed by their id, so the struct does not
+    # carry the id again — look it up through the hash key instead.
+    Query = Struct.new(:backend, :builder, keyword_init: true)
 
     QUERIES = {}
 
@@ -14,7 +16,6 @@ module Durababble
         raise ArgumentError, "duplicate store query id: #{query_id}" if QUERIES.key?(query_id)
 
         QUERIES[query_id] = Query.new(
-          id: query_id,
           backend: backend.to_sym,
           builder:,
         )
@@ -28,7 +29,7 @@ module Durababble
 
       #: (untyped) -> untyped
       def query_ids(backend)
-        QUERIES.values.select { |query| query.backend == backend.to_sym }.map(&:id).sort
+        QUERIES.select { |_id, query| query.backend == backend.to_sym }.keys.sort
       end
 
       #: () -> untyped

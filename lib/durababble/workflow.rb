@@ -75,11 +75,12 @@ module Durababble
 
       #: (?untyped, **untyped) -> untyped
       def step(method_name = nil, **options)
+        retry_policy = options.fetch(:retry_policy, options[:retry])
         if method_name
-          register_step(method_name, retry_policy: options[:retry])
+          register_step(method_name, retry_policy:)
           method_name
         else
-          set_pending_durable_macro(:step, retry_policy: options[:retry])
+          set_pending_durable_macro(:step, retry_policy:)
         end
       end
 
