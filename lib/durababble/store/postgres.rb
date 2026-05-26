@@ -206,7 +206,7 @@ module Durababble
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:supersede_running_step_attempts, [workflow_id, command_id])
         execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
-        attempt_id = SecureRandom.uuid
+        attempt_id = generate_uuid
         execute_store_query(:insert_step_attempt, [attempt_id, workflow_id, command_id, name])
         append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
@@ -230,7 +230,7 @@ module Durababble
       @connection.transaction(requires_new: true) do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
-        wait_id = SecureRandom.uuid
+        wait_id = generate_uuid
         execute_store_query(:insert_wait, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
@@ -252,7 +252,7 @@ module Durababble
 
     #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
-      token = SecureRandom.uuid
+      token = generate_uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
 
       if inserted.affected_rows == 1
@@ -297,7 +297,7 @@ module Durababble
           candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
           candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
 
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = claim_candidate(candidates)
           next nil unless candidate
 
           execute_store_query(:claim_selected_outbox, [candidate.fetch("id"), worker_id, lease_seconds]).first
@@ -318,7 +318,7 @@ module Durababble
           candidates = []
           candidates.concat(execute_store_query(:claim_pending_target_activation, [timestamp(now)] + filter_params, filter_sql:).to_a)
           candidates.concat(execute_store_query(:claim_expired_target_activation, [timestamp(now)] + filter_params, filter_sql:).to_a)
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = claim_candidate(candidates)
           next nil unless candidate
 
           execute_store_query(:claim_selected_target_activation, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
@@ -339,6 +339,13 @@ module Durababble
     end
 
     private
+
+    # Postgres stores created_at as a timestamp string; parse before comparing so
+    # FIFO selection is chronological rather than lexical.
+    #: (Array[Hash[String, Object?]]) -> Hash[String, Object?]?
+    def claim_candidate(candidates)
+      candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+    end
 
     #: (target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)

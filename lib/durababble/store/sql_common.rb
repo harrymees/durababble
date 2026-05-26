@@ -118,7 +118,7 @@ module Durababble
         end
 
         sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
-        id = SecureRandom.uuid
+        id = generate_uuid
         insert_inbox_message_without_transaction(
           id:,
           target_kind:,
@@ -165,7 +165,7 @@ module Durababble
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decode_row(workflow))
 
         sequence = allocate_mailbox_sequence(target_kind:, target_type: workflow_name, target_id: workflow_id)
-        id = SecureRandom.uuid
+        id = generate_uuid
         insert_inbox_message_without_transaction(
           id:,
           target_kind:,
@@ -346,7 +346,7 @@ module Durababble
       existing = execute_store_query(:outbox_by_key, [key]).first
       return existing.fetch("id") if existing
 
-      id = SecureRandom.uuid
+      id = generate_uuid
       execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
       Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
       execute_store_query(:outbox_by_key, [key]).first.fetch("id")
@@ -402,7 +402,7 @@ module Durababble
 
     #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
     def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
-      id = SecureRandom.uuid
+      id = generate_uuid
       if worker_id
         execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
       else
@@ -422,6 +422,23 @@ module Durababble
       raise ArgumentError, "command_id is required" if id.nil?
 
       id.to_i
+    end
+
+    # Seam for unique identifiers (workflow/attempt/wait/fence/outbox/inbox ids).
+    # Production uses random UUIDs; the deterministic test store overrides this to
+    # draw monotonic ids from the seeded RNG so a seed replays byte-identically.
+    #: () -> String
+    def generate_uuid
+      SecureRandom.uuid
+    end
+
+    # Seam for FIFO selection among claim candidates gathered from several
+    # queries. The SQL adapters order by the textual created_at; the deterministic
+    # test store overrides this to compare integer ticks with a stable id
+    # tie-break (lexical ordering of small integer ticks is wrong).
+    #: (Array[Hash[String, Object?]]) -> Hash[String, Object?]?
+    def claim_candidate(candidates)
+      candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
     end
 
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?

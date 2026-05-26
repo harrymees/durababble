@@ -38,7 +38,7 @@ module Durababble
         candidates.concat(execute_store_query(:claim_failed_workflow, name_params, name_sql:).to_a)
         candidates.concat(execute_store_query(:claim_canceling_workflow, name_params, name_sql:).to_a)
         candidates.concat(execute_store_query(:claim_expired_workflow, name_params, name_sql:).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = claim_candidate(candidates)
         next unless candidate
 
         updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_seconds, candidate.fetch("id")])
@@ -214,7 +214,7 @@ module Durababble
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:supersede_running_step_attempts, [workflow_id, command_id])
         execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
-        attempt_id = SecureRandom.uuid
+        attempt_id = generate_uuid
         execute_store_query(:insert_step_attempt, [attempt_id, workflow_id, command_id, name])
         append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
@@ -283,7 +283,7 @@ module Durababble
         candidates = []
         candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
         candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = claim_candidate(candidates)
         next unless candidate
 
         execute_store_query(:claim_selected_outbox, [worker_id, lease_seconds, candidate.fetch("id")])
@@ -300,7 +300,7 @@ module Durababble
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         serialized_context = dump_serialized(wait_request.context)
         execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, serialized_context])
-        wait_id = SecureRandom.uuid
+        wait_id = generate_uuid
         execute_store_query(:insert_wait, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
         update_latest_attempt_serialized(
           workflow_id:,
@@ -328,7 +328,7 @@ module Durababble
 
     #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
-      token = SecureRandom.uuid
+      token = generate_uuid
       execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
 
       if execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first
@@ -374,7 +374,7 @@ module Durababble
         candidates = []
         candidates.concat(execute_store_query(:claim_pending_target_activation, [now] + filter_params, filter_sql:).to_a)
         candidates.concat(execute_store_query(:claim_expired_target_activation, [now] + filter_params, filter_sql:).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = claim_candidate(candidates)
         next unless candidate
 
         execute_store_query(:claim_selected_target_activation, [worker_id, lease_seconds, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
