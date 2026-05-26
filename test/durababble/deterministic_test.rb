@@ -37,6 +37,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "parallel_branch_failure_orphans_step",
     "parallel_wait_with_retrying_sibling",
     "wait_condition_command_wakeup",
+    "wait_condition_timer_command_race",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
     "stolen_lease_write_rejection",
@@ -515,6 +516,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("wait_condition_command_wakeup", seed: 1)
 
     assert_empty result.violations
+  end
+
+  test "reconciles a wait_condition timer wake racing a crashed command worker holding the lease" do
+    result = Durababble::Deterministic.prove("wait_condition_timer_command_race", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "claimed_then_crashed"
   end
 
   test "atomically terminates dependents when termination requests crash" do
