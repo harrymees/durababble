@@ -2885,7 +2885,6 @@ module Durababble
           # leases; a crash-free tail (guaranteed cancel + closer) drives it to a
           # terminal state so progress is assured regardless of which crashes fired.
           cleanup_runs = 0
-          workflow_id_for_cleanup = nil
           h.workflows["cancelable"] = workflow = Class.new(Durababble::Workflow) do
             workflow_name "cancelable"
 
@@ -2912,7 +2911,6 @@ module Durababble
           end
 
           id = h.store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => seed.to_s })
-          workflow_id_for_cleanup = id
 
           h.store.enable_write_crashes!(percent: 20)
 
@@ -3061,10 +3059,10 @@ module Durababble
             step && step.fetch("status") == "canceled"
           end
           h.check("exactly one step attempt is canceled") do
-            h.store.step_attempts_for(workflow_id).count { |attempt| attempt.fetch("status") == "canceled" } == 1
+            h.store.step_attempts_for(workflow_id).one? { |attempt| attempt.fetch("status") == "canceled" }
           end
           h.check("step_canceled history entry recorded exactly once (record_step_canceled atomic)") do
-            h.store.workflow_history_for(workflow_id).count { |entry| entry.fetch("kind") == "step_canceled" } == 1
+            h.store.workflow_history_for(workflow_id).one? { |entry| entry.fetch("kind") == "step_canceled" }
           end
           h.check("no running step attempt stranded") do
             h.store.step_attempts_for(workflow_id).none? { |attempt| attempt.fetch("status") == "running" }
