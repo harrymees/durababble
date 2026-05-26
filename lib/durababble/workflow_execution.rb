@@ -148,29 +148,15 @@ module Durababble
     #: (?timeout: untyped) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
       loop do
-        if scheduled_history_for_next_command?
-          wait_request = WaitRequest.new(
-            kind: "timer",
-            wake_at: wait_condition_wake_at(timeout),
-            event_key: nil,
-            context: {},
-          )
-          call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
-          return !!block.call if timeout
-
-          next
+        # During replay the scheduled timer must be re-issued before the
+        # condition is re-evaluated; live execution checks the condition first
+        # and only arms a timer when it is still false.
+        unless scheduled_history_for_next_command?
+          raise_if_cancel_requested!
+          return true if block.call
         end
 
-        raise_if_cancel_requested!
-        return true if block.call
-
-        wait_request = WaitRequest.new(
-          kind: "timer",
-          wake_at: wait_condition_wake_at(timeout),
-          event_key: nil,
-          context: {},
-        )
-        call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
+        issue_wait_condition_timer(timeout)
         return !!block.call if timeout
       end
     end
@@ -450,6 +436,17 @@ module Durababble
       WorkflowDeterminism.allow_host_operations do
         timeout ? @store.current_time + timeout : @store.current_time + 1
       end
+    end
+
+    #: (untyped) -> void
+    def issue_wait_condition_timer(timeout)
+      wait_request = WaitRequest.new(
+        kind: "timer",
+        wake_at: wait_condition_wake_at(timeout),
+        event_key: nil,
+        context: {},
+      )
+      call_wait(wait_request, name: "wait_condition", kwargs: { timeout: })
     end
 
     #: () -> bool
