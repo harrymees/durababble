@@ -32,6 +32,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "duplicate_delivery_timer_and_outbox",
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
+    "cancellation_cleanup_crash_fuzz",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
@@ -466,6 +467,15 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "terminal_failure_crashed"
+  end
+
+  test "atomically cancels waits steps and attempts when cancellation requests crash" do
+    result = Durababble::Deterministic.prove("cancellation_cleanup_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "cancel_request_crashed"
+    assert_includes result.trace, "cancellation_crashed"
+    assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
   test "dead-letters an object command once it exhausts its attempts" do
