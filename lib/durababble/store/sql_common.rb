@@ -7,12 +7,13 @@ module Durababble
 
     #: (name: String, input: Object?, ?id: String?, ?worker_pool: String) -> String
     def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      id ||= SecureRandom.uuid
       insert_workflow(name:, input:, status: "pending", id:, worker_pool:)
     end
 
     #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
     def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
-      insert_workflow(name:, input:, status: "running", worker_id:, lease_seconds:, worker_pool:)
+      insert_workflow(name:, input:, status: "running", id: SecureRandom.uuid, worker_id:, lease_seconds:, worker_pool:)
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
@@ -385,8 +386,8 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (name: String, input: Object?, status: String, ?id: String?, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, id: nil, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
       raise NotImplementedError
     end
 

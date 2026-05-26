@@ -466,9 +466,9 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?id: String?, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, id: nil, worker_id: nil, lease_seconds: nil, worker_pool: "default")
-      workflow_id = id || SecureRandom.uuid
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+      workflow_id = id
       if worker_id
         execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, dump_serialized(input), worker_id, lease_seconds || 60])
       else

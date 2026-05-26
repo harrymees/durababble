@@ -154,13 +154,14 @@ class DurababbleWorkflowTest < DurababbleTestCase
       assert_equal "wf-pool-one", ApiTestOrderWorkflow.enqueue({ "request_id" => "one" }, id: "wf-pool-one", store:, worker_pool: "critical")
       handle = ApiTestOrderWorkflow.start({ "request_id" => "two" }, store:, worker_pool: "bulk")
 
-      assert_equal "wf-2", handle.workflow_id
+      assert_match(/\A[0-9a-f-]{36}\z/, handle.workflow_id)
     end
 
+    generated_id = store.enqueued.fetch(1).fetch(:id)
     assert_equal(
       [
         { name: "api_test_order_workflow", input: { "request_id" => "one" }, id: "wf-pool-one", worker_pool: "critical" },
-        { name: "api_test_order_workflow", input: { "request_id" => "two" }, id: nil, worker_pool: "bulk" },
+        { name: "api_test_order_workflow", input: { "request_id" => "two" }, id: generated_id, worker_pool: "bulk" },
       ],
       store.enqueued,
     )

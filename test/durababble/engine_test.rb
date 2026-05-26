@@ -237,9 +237,9 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil, worker_pool: "default" }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "default" }], store.enqueued
   end
 
   test "passes explicit workflow ids to the store enqueue path" do
@@ -258,8 +258,8 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil, worker_pool: "critical" }], store.enqueued
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "critical" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do

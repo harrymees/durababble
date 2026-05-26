@@ -74,6 +74,26 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "completed workflows still reject duplicate explicit workflow ids with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id_completed") do |store|
+        workflow_id = "wf-completed-#{SecureRandom.hex(4)}"
+
+        assert_equal workflow_id, store.enqueue_workflow(name: "explicit-completed", input: { "count" => 1 }, id: workflow_id)
+        store.complete_workflow(workflow_id, result: { "count" => 2 })
+        assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "count" => 2 }
+
+        error = assert_raises(Durababble::WorkflowAlreadyExists) do
+          store.enqueue_workflow(name: "explicit-completed", input: { "count" => 3 }, id: workflow_id)
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
+
+        assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "completed", "result" => { "count" => 2 }
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+      end
+    end
+
     test "concurrent duplicate explicit workflow id enqueues create one workflow row with #{backend.name}" do
       with_durababble_store(backend, "explicit_workflow_id_race") do |store|
         workflow_id = "wf-race-#{SecureRandom.hex(4)}"

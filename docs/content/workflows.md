@@ -127,6 +127,12 @@ handle.cancel(reason: "customer requested cancellation")
 handle.terminate(reason: "operator hard stop")
 ```
 
+### Deduplicating Workflow Starts
+
+Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.
+
+Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or terminated workflow still counts as existing, so a later enqueue with the same deterministic id is rejected rather than starting a second run. Callers that want retry-after-completion semantics should choose a new workflow id, such as one that includes an attempt number or version.
+
 ## Replay
 
 Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
