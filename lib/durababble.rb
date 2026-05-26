@@ -268,6 +268,9 @@ module Durababble
       engine = engine #: as untyped
       return engine.store if engine
 
+      execution = WorkflowExecutionContext.current #: as untyped
+      return execution.store if execution&.respond_to?(:store)
+
       self.engine.store
     end
 
