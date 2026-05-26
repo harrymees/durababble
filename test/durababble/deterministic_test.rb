@@ -33,6 +33,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
     "cancellation_cleanup_crash_fuzz",
+    "record_step_canceled_crash_fuzz",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
@@ -476,6 +477,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "cancel_request_crashed"
     assert_includes result.trace, "cancellation_crashed"
     assert_equal 1, result.summary.fetch(:canceled_workflows)
+  end
+
+  test "records a running step cancellation exactly once across the three-write transaction through crashes" do
+    result = Durababble::Deterministic.prove("record_step_canceled_crash_fuzz", seed: 6)
+
+    assert_empty result.violations
+    assert_includes result.trace, "record_cancel_crashed"
   end
 
   test "dead-letters an object command once it exhausts its attempts" do
