@@ -37,6 +37,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "parallel_branch_failure_orphans_step",
     "parallel_wait_with_retrying_sibling",
     "wait_condition_command_wakeup",
+    "wait_condition_sequential_command_wakeups",
     "wait_condition_timer_command_race",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
@@ -523,6 +524,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "claimed_then_crashed"
+  end
+
+  test "replays a leftover waiting wait across resumes for sequential command-satisfied wait_conditions" do
+    result = Durababble::Deterministic.prove("wait_condition_sequential_command_wakeups", seed: 1)
+
+    assert_empty result.violations
   end
 
   test "atomically terminates dependents when termination requests crash" do
