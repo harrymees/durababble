@@ -669,20 +669,17 @@ module Durababble
         end
         bulk_insert_rows("step_attempts", ["id", "workflow_id", "position", "name", "status"], rows)
 
+        # The benchmark only exercises #attempt_number_for, whose sole
+        # collaborator dependency is #synchronize_store (which just yields).
+        execution = Object.new
+        execution.define_singleton_method(:synchronize_store) { |&block| block.call }
         @step_attempt_fixture_runner = Durababble::WorkflowStepRunner.new(
           store: @store,
           workflow_id:,
           worker_id: "attempt-bench",
           lease_seconds: 30,
           root_task: Object.new,
-          futures: {},
-          step_contexts: {},
-          synchronize_store: ->(&block) { block.call },
-          raise_if_cancel_requested: -> {},
-          assert_workflow_lease: -> {},
-          suspend_workflow_immediately: -> { true },
-          retry_run_at: ->(delay) { Time.now + delay },
-          crash: ->(_point) {},
+          execution:,
         )
       end
 
