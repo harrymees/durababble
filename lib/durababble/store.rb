@@ -12,7 +12,10 @@ require_relative "worker_identity"
 
 module Durababble
   class Store
-    SERIALIZED_COLUMNS = ["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
+    # Columns whose values are Paquito-serialized blobs. decode_row probes this
+    # set once per column per row, so it is a Set for O(1) membership rather than
+    # a linear array scan.
+    SERIALIZED_COLUMNS = Set["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
     GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
