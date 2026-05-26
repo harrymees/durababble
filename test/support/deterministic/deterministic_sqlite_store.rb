@@ -69,6 +69,7 @@ module Durababble
         @injected_waits = {} #: Hash[String, Hash[String, Object?]]
         @injected_outbox = {} #: Hash[String, Hash[String, Object?]]
         @injected_fences = [] #: Array[Hash[String, Object?]]
+        @injected_inbox = {} #: Hash[String, Hash[String, Object?]]
         @write_crash_percent = 0
         @txn_depth = 0
         @crashes_armed = false
@@ -445,6 +446,11 @@ module Durababble
         @injected_fences << row
       end
 
+      #: (Hash[String, Object?]) -> void
+      def inject_inbox(row)
+        @injected_inbox[row.fetch("id").to_s] = row
+      end
+
       # --- StoreInspection ---------------------------------------------------
 
       #: () -> Hash[String, Hash[String, Object?]]
@@ -503,6 +509,12 @@ module Durababble
       #: () -> Array[Hash[String, Object?]]
       def all_fences
         select_all("fences", order: "workflow_id, `key`") + @injected_fences
+      end
+
+      #: () -> Hash[String, Hash[String, Object?]]
+      def all_inbox
+        base = select_all("inbox").to_h { |row| [row.fetch("id"), row] }
+        base.merge(@injected_inbox)
       end
 
       #: () -> Hash[Symbol, Object?]

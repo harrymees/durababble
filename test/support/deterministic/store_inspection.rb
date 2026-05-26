@@ -23,6 +23,9 @@ module Durababble
     #   all_fences    -> [ fence_row, ... ]   each with "workflow_id","key","status",
     #                                         and (where the backend models leases)
     #                                         "locked_by"/"locked_until"
+    #   all_inbox     -> { inbox_id => message_row }   target-oriented (no workflow_id);
+    #                                         "status","locked_by"/"locked_until" where
+    #                                         the backend models leases
     module StoreInspection
       #: () -> untyped
       def all_workflows = raise(NotImplementedError, "#{self.class}#all_workflows")
@@ -36,6 +39,8 @@ module Durababble
       def all_outbox = raise(NotImplementedError, "#{self.class}#all_outbox")
       #: () -> untyped
       def all_fences = raise(NotImplementedError, "#{self.class}#all_fences")
+      #: () -> untyped
+      def all_inbox = raise(NotImplementedError, "#{self.class}#all_inbox")
     end
   end
 end

@@ -79,14 +79,39 @@ module Durababble
         waits_state = store.all_waits
         outbox_state = store.all_outbox
         fences_state = store.all_fences
+        inbox_state = store.all_inbox
 
         verify_workflow_invariants!(workflows_state)
         verify_step_invariants!(workflows_state, steps_state, attempts_state)
         verify_wait_invariants!(workflows_state, steps_state, waits_state)
         verify_outbox_invariants!(workflows_state, outbox_state)
         verify_fence_invariants!(fences_state)
+        verify_inbox_invariants!(inbox_state)
         verify_liveness!(workflows_state, waits_state) if @expect_settled
         verify_effect_expectations!
+      end
+
+      # An inbox message claimed (`running`) by a worker that then crashed leaves
+      # the row leased; once the scheduler drains, no worker remains to reclaim
+      # it past `locked_until`. Symmetric to the stuck-fence/stuck-outbox checks:
+      # the same crashed-holder-never-reclaimed bug class applied to the inbox
+      # lease. Only judged when the backend models a lease (`locked_until`).
+      #: (untyped) -> untyped
+      def verify_inbox_invariants!(inbox_state)
+        final_time = scheduler.time
+        inbox_state.each_value do |message|
+          inbox_id = message.fetch("id")
+          status = message.fetch("status")
+          violations << "inbox #{inbox_id} has unknown status #{status.inspect}" unless INBOX_STATUSES.include?(status)
+          next unless status == InboxStatus::RUNNING
+
+          locked_until = message["locked_until"]
+          next if locked_until.nil?
+
+          if locked_until < final_time
+            violations << "stuck inbox #{inbox_id} held by #{message["locked_by"].inspect} with expired lease never reclaimed"
+          end
+        end
       end
 
       # A fence still `running` at end of run whose lease has expired and was
@@ -170,6 +195,8 @@ module Durababble
       ATTEMPT_STATUSES = AttemptStatus::ALL
       WAIT_STATUSES = WaitStatus::ALL
       OUTBOX_STATUSES = OutboxStatus::ALL
+      # InboxStatus has no ALL constant; enumerate its states for validation.
+      INBOX_STATUSES = [InboxStatus::PENDING, InboxStatus::FAILED, InboxStatus::RUNNING, InboxStatus::DEAD_LETTERED].freeze
       TERMINAL_WORKFLOW_STATUSES = [WorkflowStatus::COMPLETED, WorkflowStatus::CANCELED, WorkflowStatus::TERMINATED, WorkflowStatus::FAILED].freeze
 
       #: (untyped) -> untyped
