@@ -43,6 +43,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "object_command_claim_contention",
     "object_command_crash_fuzz",
     "object_command_state_crash_fuzz",
+    "object_command_retry_then_apply_crash_fuzz",
     "object_command_activation_driven_drain",
     "object_command_idempotent_enqueue",
     "object_command_multi_target_isolation",
@@ -485,6 +486,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "object_state_crashed"
+  end
+
+  test "applies object state exactly once when commands retry transiently before completing through crashes" do
+    result = Durababble::Deterministic.prove("object_command_retry_then_apply_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_retry_crashed"
   end
 
   test "delivers object commands exactly once through the activation-driven loop with head handoff" do
