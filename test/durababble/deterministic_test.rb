@@ -43,6 +43,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "object_command_claim_contention",
     "object_command_crash_fuzz",
     "object_command_state_crash_fuzz",
+    "object_command_activation_driven_drain",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -482,6 +483,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "object_state_crashed"
+  end
+
+  test "delivers object commands exactly once through the activation-driven loop with head handoff" do
+    result = Durababble::Deterministic.prove("object_command_activation_driven_drain", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_delivery_crashed"
   end
 
   test "dead-letters queued commands when their workflow terminated before delivery" do
