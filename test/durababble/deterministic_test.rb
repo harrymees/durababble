@@ -34,6 +34,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "cooperative_cancellation_cleanup",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
+    "workflow_command_delivery_crash_matrix",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -418,6 +419,14 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "delivery_worker_crashed"
+  end
+
+  test "resumes command delivery after an injected post-commit crash without losing or re-delivering" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_crash_matrix", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "fault.injected"
+    assert_includes result.trace, "delivery_crashed_after_commit"
   end
 
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do

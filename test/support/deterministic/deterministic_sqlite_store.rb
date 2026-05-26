@@ -290,6 +290,23 @@ module Durababble
         result
       end
 
+      # The async command-delivery completion (#69). super runs the full
+      # transaction (mark the inbox message completed + reconcile the wakeup row),
+      # so the delivery is durably committed before `fault_plan.after` can raise.
+      # A crash here therefore models a worker that crashed *after* a command was
+      # durably delivered but before it moved on to the next command / cleaned up
+      # its activation lease — recovery must resume the remaining mailbox without
+      # re-delivering the committed command.
+      #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
+      def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+        out = super
+        if out
+          trace_event("workflow_command_completed", id: workflow_id, message_id:)
+          fault_plan.after(:complete_workflow_command)
+        end
+        out
+      end
+
       #: (workflow_id: String, worker_id: String, run_at: Object?) -> Object?
       def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         result = super
