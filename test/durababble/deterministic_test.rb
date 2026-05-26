@@ -36,6 +36,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
     "workflow_command_claim_window_crash_matrix",
+    "workflow_command_retry_then_complete",
     "workflow_command_delivery_to_terminal_workflow",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
@@ -429,6 +430,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "fault.injected"
     assert_includes result.trace, "delivery_crashed_after_commit"
+  end
+
+  test "re-delivers and completes a command exactly once after a transient retry" do
+    result = Durababble::Deterministic.prove("workflow_command_retry_then_complete", seed: 7)
+
+    assert_empty result.violations
   end
 
   test "dead-letters queued commands when their workflow terminated before delivery" do
