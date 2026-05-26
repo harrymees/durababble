@@ -187,6 +187,38 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
       end
     end
 
+    test "replay reuses a completed in-workflow handle RPC step without duplicating the outbound command with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_step_completed_replay") do |store|
+        workflow_id = store.enqueue_workflow(name: HandleRpcCrashCaller.workflow_name, input: { "object_id" => "counter-step-replay" })
+        assert_raises(Durababble::InjectedCrash) do
+          resume_with_worker(backend, HandleRpcCrashCaller, workflow_id, objects: [HandleRpcCounter], crash_after: :step_completed)
+        end
+
+        assert_equal ["completed"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+        assert_equal 1, store.inbox_messages_for(target_kind: "object", target_type: HandleRpcCounter.object_type, target_id: "counter-step-replay").length
+
+        store.steal_expired_leases!(now: Time.now + 61)
+        recovered = Durababble::Engine.new(store:, worker_id: "replaying-caller", migrate: false).resume(HandleRpcCrashCaller, workflow_id:)
+
+        assert_equal "completed", recovered.status
+        assert_equal 1, recovered.result
+        assert_equal 1, store.inbox_messages_for(target_kind: "object", target_type: HandleRpcCounter.object_type, target_id: "counter-step-replay").length
+        assert_equal 1, HandleRpcCounter.at("counter-step-replay", store:).count
+      end
+    end
+
+    test "cancellation before an in-workflow handle RPC prevents outbound commands with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_cancel_before_send") do |store|
+        workflow_id = store.enqueue_workflow(name: HandleRpcCrashCaller.workflow_name, input: { "object_id" => "counter-canceled" })
+        HandleRpcCrashCaller.handle(workflow_id, store:).cancel(reason: "stop before handle RPC")
+        canceled = Durababble::Engine.new(store:, worker_id: "cancel-before-handle-rpc", migrate: false).resume(HandleRpcCrashCaller, workflow_id:)
+
+        assert_equal "canceled", canceled.status
+        assert_empty store.steps_for(workflow_id)
+        assert_empty store.inbox_messages_for(target_kind: "object", target_type: HandleRpcCounter.object_type, target_id: "counter-canceled")
+      end
+    end
+
     test "object command retry and terminal errors propagate through in-workflow handle RPCs with #{backend.name}" do
       with_durababble_store(backend, "workflow_handle_rpc_errors") do |store|
         retry_id = store.enqueue_workflow(name: HandleRpcRetryCaller.workflow_name, input: { "object_id" => "counter-retry" })
