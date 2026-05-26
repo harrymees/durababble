@@ -14,6 +14,12 @@ module Durababble
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
   DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000
   DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS = 8_000
+  DEFAULT_MAX_WORKFLOW_INPUT_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_WORKFLOW_RESULT_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_STEP_OUTPUT_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_OBJECT_STATE_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_INBOX_PAYLOAD_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_RPC_ARGUMENT_BYTES = 4 * 1024 * 1024
 
   class Error < StandardError; end
   class InjectedCrash < Error; end
@@ -37,6 +43,34 @@ module Durababble
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
+
+  class PayloadTooLarge < Error
+    #: Symbol
+    attr_reader :surface
+    #: String?
+    attr_reader :context
+    #: Integer
+    attr_reader :bytesize
+    #: Integer
+    attr_reader :max_bytes
+
+    #: (Symbol | String surface, bytesize: Integer, max_bytes: Integer, ?context: String?) -> void
+    def initialize(surface, bytesize:, max_bytes:, context: nil)
+      @surface = surface.to_sym
+      @context = context
+      @bytesize = bytesize
+      @max_bytes = max_bytes
+      context_suffix = context.to_s.empty? ? "" : " for #{context}"
+      super("#{surface_name(@surface)} payload#{context_suffix} is #{bytesize} bytes, exceeding max #{max_bytes} bytes")
+    end
+
+    private
+
+    #: (Symbol) -> String
+    def surface_name(surface)
+      surface.to_s.tr("_", " ")
+    end
+  end
 
   class CancellationError < Error
     #: String?
@@ -64,6 +98,18 @@ module Durababble
     attr_writer :max_workflow_history_events
     #: untyped
     attr_writer :workflow_history_warning_events
+    #: untyped
+    attr_writer :max_workflow_input_bytes
+    #: untyped
+    attr_writer :max_workflow_result_bytes
+    #: untyped
+    attr_writer :max_step_output_bytes
+    #: untyped
+    attr_writer :max_object_state_bytes
+    #: untyped
+    attr_writer :max_inbox_payload_bytes
+    #: untyped
+    attr_writer :max_rpc_argument_bytes
 
     #: (Store?) -> Engine?
     def default_store=(store)
@@ -124,6 +170,44 @@ module Durababble
       end
     end
 
+    #: () -> Integer
+    def max_workflow_input_bytes
+      payload_limit(:@max_workflow_input_bytes, "DURABABBLE_MAX_WORKFLOW_INPUT_BYTES", DEFAULT_MAX_WORKFLOW_INPUT_BYTES, "max workflow input bytes", fallback_env: "DURABABBLE_MAX_WORKFLOW_ARGS_BYTES")
+    end
+
+    #: () -> Integer
+    def max_workflow_args_bytes = max_workflow_input_bytes
+
+    #: ((Integer | String) value) -> (Integer | String)
+    def max_workflow_args_bytes=(value)
+      self.max_workflow_input_bytes = value
+    end
+
+    #: () -> Integer
+    def max_workflow_result_bytes
+      payload_limit(:@max_workflow_result_bytes, "DURABABBLE_MAX_WORKFLOW_RESULT_BYTES", DEFAULT_MAX_WORKFLOW_RESULT_BYTES, "max workflow result bytes")
+    end
+
+    #: () -> Integer
+    def max_step_output_bytes
+      payload_limit(:@max_step_output_bytes, "DURABABBLE_MAX_STEP_OUTPUT_BYTES", DEFAULT_MAX_STEP_OUTPUT_BYTES, "max step output bytes")
+    end
+
+    #: () -> Integer
+    def max_object_state_bytes
+      payload_limit(:@max_object_state_bytes, "DURABABBLE_MAX_OBJECT_STATE_BYTES", DEFAULT_MAX_OBJECT_STATE_BYTES, "max object state bytes")
+    end
+
+    #: () -> Integer
+    def max_inbox_payload_bytes
+      payload_limit(:@max_inbox_payload_bytes, "DURABABBLE_MAX_INBOX_PAYLOAD_BYTES", DEFAULT_MAX_INBOX_PAYLOAD_BYTES, "max inbox payload bytes")
+    end
+
+    #: () -> Integer
+    def max_rpc_argument_bytes
+      payload_limit(:@max_rpc_argument_bytes, "DURABABBLE_MAX_RPC_ARGUMENT_BYTES", DEFAULT_MAX_RPC_ARGUMENT_BYTES, "max rpc argument bytes")
+    end
+
     #: () -> untyped
     def logger
       return @logger if instance_variable_defined?(:@logger)
@@ -141,6 +225,15 @@ module Durababble
           "warning threshold is #{warning_events}, max is #{max_history_events}",
       )
       true
+    end
+
+    #: (surface: Symbol | String, bytesize: Integer, ?context: String?) -> true
+    def enforce_payload_limit!(surface:, bytesize:, context: nil)
+      surface = surface.to_sym
+      max_bytes = payload_limit_for_surface(surface)
+      return true if bytesize <= max_bytes
+
+      raise PayloadTooLarge.new(surface, bytesize:, max_bytes:, context:)
     end
 
     #: (database_url: String, ?schema: String) -> Store
@@ -221,6 +314,42 @@ module Durababble
     end
 
     private
+
+    #: (Symbol, String, Integer, String, ?fallback_env: String?) -> Integer
+    def payload_limit(ivar, env_name, default_value, label, fallback_env: nil)
+      configured = if instance_variable_defined?(ivar)
+        instance_variable_get(ivar)
+      elsif ENV.key?(env_name)
+        ENV.fetch(env_name)
+      elsif fallback_env && ENV.key?(fallback_env)
+        ENV.fetch(fallback_env)
+      else
+        default_value
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "#{label} must be positive" unless value.positive?
+      end
+    end
+
+    #: (Symbol) -> Integer
+    def payload_limit_for_surface(surface)
+      case surface
+      when :workflow_input, :workflow_args
+        max_workflow_input_bytes
+      when :workflow_result, :workflow_error
+        max_workflow_result_bytes
+      when :step_output
+        max_step_output_bytes
+      when :object_state
+        max_object_state_bytes
+      when :inbox_payload
+        max_inbox_payload_bytes
+      when :rpc_argument
+        max_rpc_argument_bytes
+      else
+        raise ArgumentError, "unknown payload limit surface: #{surface}"
+      end
+    end
 
     #: (Object?) -> String
     def schema_component(value)

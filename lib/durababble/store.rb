@@ -443,6 +443,13 @@ module Durababble
       row.fetch(key).to_s
     end
 
+    #: (Object?, ?surface: Symbol?, ?context: String?) -> String
+    def dump_serialized_bytes(value, surface: nil, context: nil)
+      serialized = SERIALIZER.dump(value)
+      Durababble.enforce_payload_limit!(surface:, bytesize: serialized.bytesize, context:) if surface
+      serialized
+    end
+
     #: (Hash[String, Object?]) -> String
     def row_worker_pool(row)
       row.fetch("worker_pool", "default").to_s
