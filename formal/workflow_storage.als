@@ -289,6 +289,7 @@ pred waitSame[w: Wait, t: Time, tnext: Time] {
 
 pred fenceSame[f: Fence, t: Time, tnext: Time] {
   fenceStatus[f, tnext] = fenceStatus[f, t]
+  ((fence_row.f) & (fence_time.tnext)).fence_owner = ((fence_row.f) & (fence_time.t)).fence_owner
 }
 
 pred outboxSame[o: OutboxMessage, t: Time, tnext: Time] {
@@ -869,7 +870,18 @@ pred completeFence[f: Fence, token: FenceToken, worker: Worker, t: Time, tnext: 
   one r: FenceRow | r.fence_row = f and r.fence_time = t and r.fence_owner = token
   workflowSame[f.fence_workflow, t, tnext]
   fenceStatus[f, tnext] = FenceCompleted
+  one r: FenceRow | r.fence_row = f and r.fence_time = tnext and r.fence_owner = token
   one c: DurableCommit | c.commit_workflow = f.fence_workflow and c.commit_worker = worker and c.commit_kind = FenceCommit and c.commit_time = t
+  unchangedExcept[f.fence_workflow, none, none, none, f, none, none, none, t, tnext]
+  preserveLeasesExcept[none, t, tnext]
+}
+
+pred failFence[f: Fence, token: FenceToken, worker: Worker, t: Time, tnext: Time] {
+  fenceStatus[f, t] = FenceRunning
+  one r: FenceRow | r.fence_row = f and r.fence_time = t and r.fence_owner = token
+  workflowSame[f.fence_workflow, t, tnext]
+  fenceStatus[f, tnext] = FenceFailed
+  one r: FenceRow | r.fence_row = f and r.fence_time = tnext and r.fence_owner = token
   unchangedExcept[f.fence_workflow, none, none, none, f, none, none, none, t, tnext]
   preserveLeasesExcept[none, t, tnext]
 }
@@ -1044,6 +1056,7 @@ pred step[t: Time, tnext: Time] {
   or some wf: Workflow, st: Step, worker: Worker | resumeReplayCompletedStep[wf, st, worker, t, tnext]
   or some f: Fence, wf: Workflow, token: FenceToken | acquireFence[f, wf, token, t, tnext]
   or some f: Fence, token: FenceToken, worker: Worker | completeFence[f, token, worker, t, tnext]
+  or some f: Fence, token: FenceToken, worker: Worker | failFence[f, token, worker, t, tnext]
   or some o: OutboxMessage, wf: Workflow | enqueueOutbox[o, wf, t, tnext]
   or some o: OutboxMessage, worker: Worker | claimOutbox[o, worker, t, tnext]
   or some o: OutboxMessage, worker: Worker | ackOutbox[o, worker, t, tnext]
@@ -1190,19 +1203,24 @@ assert workflowInboxCommandCommitsNeedWorkflowLease {
 
 /**
  * [DURABABBLE-FENCE-1] A side-effect fence has one running owner and one
- * completed result.
+ * terminal result. Completed fences replay the committed result; failed fences
+ * replay the stored error without committing the side effect.
  */
 assert idempotencyFencesPreventDuplicateSideEffects {
   all f: Fence, t: Time | lone r: FenceRow | r.fence_row = f and r.fence_time = t and r.fence_status = FenceRunning
-  all f: Fence | lone t: Time - last | fenceStatus[f, t] = FenceRunning and fenceStatus[f, t.next] = FenceCompleted
+  all f: Fence | lone t: Time - last | fenceStatus[f, t] = FenceRunning and (fenceStatus[f, t.next] = FenceCompleted or fenceStatus[f, t.next] = FenceFailed)
+  all f: Fence, t: Time - last | (fenceStatus[f, t] = FenceCompleted or fenceStatus[f, t] = FenceFailed) implies fenceStatus[f, t.next] = fenceStatus[f, t]
 }
 
-assert staleFenceTokensCannotComplete {
+assert staleFenceTokensCannotFinish {
   all f: Fence, token: FenceToken, worker: Worker, t: Time - last |
     {
       fenceStatus[f, t] = FenceRunning
       no r: FenceRow | r.fence_row = f and r.fence_time = t and r.fence_owner = token
-    } implies not completeFence[f, token, worker, t, t.next]
+    } implies {
+      not completeFence[f, token, worker, t, t.next]
+      not failFence[f, token, worker, t, t.next]
+    }
 }
 
 /**
@@ -1539,6 +1557,20 @@ pred exampleAbandonedFenceRemainsRunningAfterCrashReplay {
   }
 }
 
+pred exampleFenceFailureReplaysError {
+  some wf: Workflow, worker: Worker, originalToken, replayToken: FenceToken, f: Fence | {
+    originalToken != replayToken
+    enqueueWorkflow[wf, first, first.next]
+    acquireFence[f, wf, originalToken, first.next, first.next.next]
+    failFence[f, originalToken, worker, first.next.next, first.next.next.next]
+    fenceStatus[f, first.next.next.next] = FenceFailed
+    no c: DurableCommit | c.commit_kind = FenceCommit
+    stutter[first.next.next.next, first.next.next.next.next]
+    fenceStatus[f, first.next.next.next.next] = FenceFailed
+    no r: FenceRow | r.fence_row = f and r.fence_time = first.next.next.next.next and r.fence_owner = replayToken
+  }
+}
+
 pred exampleOutboxExpiryReclaimAndAck {
   some wf: Workflow, o: OutboxMessage, worker1, worker2: Worker | {
     worker1 != worker2
@@ -1751,6 +1783,7 @@ run exampleStepStartSupersedesRunningAttempt for 8 but exactly 1 Workflow, 2 Wor
 run exampleParallelCommandSchedules for 8 but exactly 1 Workflow, 1 Worker, 2 Step, 2 WorkflowCommand, 2 CommandShape, 6 Time expect 1
 run exampleFenceOutbox for 9 but exactly 1 Workflow, 1 Worker, 1 FenceToken, 1 Fence, 1 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleAbandonedFenceRemainsRunningAfterCrashReplay for 8 but exactly 1 Workflow, 1 Worker, exactly 1 Step, 2 FenceToken, 1 Fence, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 5 Time expect 1
+run exampleFenceFailureReplaysError for 8 but exactly 1 Workflow, 1 Worker, exactly 1 Step, 2 FenceToken, 1 Fence, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 5 Time expect 1
 run exampleOutboxExpiryReclaimAndAck for 10 but exactly 1 Workflow, 2 Worker, 1 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleScheduledCommandReplayBeforeStepStart for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
 run exampleTerminalCommandHistoryCanResolveOutOfScheduleOrder for 4 but exactly 1 Workflow, exactly 1 Worker, exactly 2 Step, exactly 2 Attempt, exactly 2 WorkflowCommand, exactly 2 CommandShape, exactly 8 WorkflowRow, exactly 11 StepRow, exactly 7 AttemptRow, exactly 7 LeaseRow, exactly 21 CommandHistoryRow, exactly 2 DurableCommit, 0 Wait, 0 WaitTrigger, 0 Fence, 0 FenceToken, 0 OutboxMessage, 0 InboxTarget, 0 InboxCommand, 0 WakeEvent, 0 OutboxAck, 0 WaitRow, 0 FenceRow, 0 OutboxRow, 0 CommandRow, 0 TargetActivationRow, 9 Time expect 1
@@ -1777,7 +1810,7 @@ check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 A
 check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check staleFenceTokensCannotComplete for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
+check staleFenceTokensCannotFinish for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check durableInboxCommandSerializationHolds for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check workflowInboxCommandCommitsNeedWorkflowLease for 4 but 2 Workflow, 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
