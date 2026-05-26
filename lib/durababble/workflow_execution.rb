@@ -12,12 +12,13 @@ require_relative "workflow_step_runner"
 
 module Durababble
   class WorkflowExecution
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, workflow_class: untyped, workflow: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, crash_after: nil, history_warning_logged: false)
+    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, workflow_class: untyped, workflow: untyped, worker_pool: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
+      @worker_pool = worker_pool
       @root_task = root_task
       @workflow_class = workflow_class
       @workflow = workflow
@@ -34,6 +35,7 @@ module Durababble
       @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
       @delivering_workflow_command = false
+      @workflow_commands_delivered_count = 0
       @step_runner = WorkflowStepRunner.new(
         store: @store,
         workflow_id: @workflow_id,
@@ -121,13 +123,7 @@ module Durababble
         dispatch_command!(command_id, step:, attributes:, &block)
       end
       deliver_recorded_resolutions!
-      result = begin
-        await_command_future(future, command_id)
-      rescue WorkflowSuspended
-        deliver_workflow_commands_at_safe_point!
-        raise
-      end
-      deliver_workflow_commands_at_safe_point!
+      result = await_with_command_delivery(future, command_id)
       raise_if_cancel_requested!
       result
     end
@@ -154,19 +150,28 @@ module Durababble
         record_wait_command!(command_id, name:, wait_request:)
       end
       deliver_recorded_resolutions!
+      result = await_with_command_delivery(future, command_id, interrupt_on_command:)
+      raise_if_cancel_requested!
+      result
+    end
+
+    # Awaits a command future, delivering pending workflow commands at the resulting
+    # safe point. When the wait suspends, commands are still delivered; with
+    # interrupt_on_command the caller is told (via WorkflowCommandDelivered) to retry
+    # instead of suspending so a freshly-delivered command can re-evaluate its condition.
+    #: (untyped, untyped, ?interrupt_on_command: bool) -> untyped
+    def await_with_command_delivery(future, command_id, interrupt_on_command: false)
       result = begin
         await_command_future(future, command_id, interrupt_on_command:)
       rescue WorkflowSuspended
-        if interrupt_on_command
-          delivered = deliver_workflow_commands_at_safe_point!
-          raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}" if delivered.positive?
+        delivered = deliver_workflow_commands_at_safe_point!
+        if interrupt_on_command && delivered.positive?
+          raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}"
         end
 
-        deliver_workflow_commands_at_safe_point!
         raise
       end
       deliver_workflow_commands_at_safe_point!
-      raise_if_cancel_requested!
       result
     end
 
@@ -175,39 +180,32 @@ module Durababble
       loop do
         deliver_workflow_commands_at_safe_point!
         if scheduled_history_for_next_command?
-          wait_request = WaitRequest.new(
-            kind: "timer",
-            wake_at: wait_condition_wake_at(timeout),
-            event_key: nil,
-            context: {},
-          )
-          begin
-            call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
-          rescue WorkflowCommandDelivered
-            next
-          end
+          next if wait_condition_command_delivered?(timeout)
           return !!block.call if timeout
 
           next
         end
 
         raise_if_cancel_requested!
-        deliver_workflow_commands_at_safe_point!
         return true if block.call
 
-        wait_request = WaitRequest.new(
-          kind: "timer",
-          wake_at: wait_condition_wake_at(timeout),
-          event_key: nil,
-          context: {},
-        )
-        begin
-          call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
-        rescue WorkflowCommandDelivered
-          next
-        end
+        next if wait_condition_command_delivered?(timeout)
         return !!block.call if timeout
       end
+    end
+
+    #: (untyped) -> bool
+    def wait_condition_command_delivered?(timeout)
+      wait_request = WaitRequest.new(
+        kind: "timer",
+        wake_at: wait_condition_wake_at(timeout),
+        event_key: nil,
+        context: {},
+      )
+      call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
+      false
+    rescue WorkflowCommandDelivered
+      true
     end
 
     #: (untyped) -> untyped
@@ -384,11 +382,19 @@ module Durababble
 
     #: (untyped, untyped, ?interrupt_on_command: bool) -> untyped
     def await_command_future(future, command_id, interrupt_on_command: false)
+      deliveries_seen = @workflow_commands_delivered_count
       loop do
         deliver_recorded_resolutions!
-        if interrupt_on_command && deliver_workflow_commands_at_safe_point!.positive?
-          raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}"
+        if interrupt_on_command
+          deliver_workflow_commands_at_safe_point!
+          # Interrupt when any command has been delivered since this wait began — including
+          # one delivered by a concurrent task — so a satisfied condition is re-evaluated
+          # rather than left parked behind this wait's already-rejected future.
+          if @workflow_commands_delivered_count > deliveries_seen
+            raise WorkflowCommandDelivered, "workflow #{@workflow_id} command delivered while waiting at command #{command_id}"
+          end
         end
+
         return future.value if future.done?
 
         missing_command_id = @replay_history.next_undeliverable_command_id(@futures)
@@ -413,8 +419,14 @@ module Durababble
           cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
           if cancellation
             future.reject(cancellation_error_from(cancellation))
-          else
+          elsif suspend_workflow_immediately?
             future.reject(WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}"))
+          else
+            # On the original run this wait deferred suspension behind concurrent tasks. Replay
+            # it the same way rather than rejecting outright: a workflow command recorded after
+            # this step_waiting may still satisfy the condition before the workflow goes
+            # quiescent. Quiescence (or the satisfying command) resolves the future from here.
+            defer_workflow_suspension(command_id)
           end
         when "step_canceled"
           cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
@@ -443,10 +455,11 @@ module Durababble
           dispatch_workflow_command_message(message)
           delivered += 1
         end
+        delivered
       ensure
         @delivering_workflow_command = false
+        @workflow_commands_delivered_count += delivered
       end
-      delivered
     end
 
     #: () -> Integer
@@ -458,40 +471,24 @@ module Durababble
 
     #: () -> Hash[String, Object?]?
     def claim_next_workflow_command_message
-      row = synchronize_store { @store.workflow(@workflow_id) }
-      return unless row.fetch("status") == "running"
-
-      worker_pool = row.fetch("worker_pool", "default")
-      activation = synchronize_store do
-        @store.target_activation(
-          worker_pool:,
-          target_kind: "workflow",
-          target_type: @workflow_class.workflow_name,
-          target_id: @workflow_id,
-        )
-      end
-      return unless activation
-
-      begin
-        assert_workflow_lease!
-      rescue LeaseConflict
-        latest = synchronize_store { @store.workflow(@workflow_id) }
-        return unless latest.fetch("status") == "running"
-
-        raise
-      end
-      messages = synchronize_store do
-        @store.claim_inbox_messages(
-          worker_pool:,
-          target_kind: "workflow",
-          target_type: @workflow_class.workflow_name,
-          target_id: @workflow_id,
+      synchronize_store do
+        @store.claim_next_workflow_command(
+          worker_pool: @worker_pool,
+          workflow_name: @workflow_class.workflow_name,
+          workflow_id: @workflow_id,
           worker_id: @worker_id,
           lease_seconds: @lease_seconds,
-          limit: 1,
         )
       end
-      messages.first
+    rescue LeaseConflict
+      return unless workflow_running?
+
+      raise
+    end
+
+    #: () -> bool
+    def workflow_running?
+      WorkflowStatus.running?(synchronize_store { @store.workflow(@workflow_id) })
     end
 
     #: (Hash[String, Object?]) -> void
@@ -536,6 +533,8 @@ module Durababble
       case event.fetch("kind")
       when "workflow_command_completed"
         result = invoke_workflow_command(method_name, args:, kwargs:)
+        # History recorded before result persistence omits "result"; tolerate it
+        # rather than failing replay, since there is nothing recorded to diverge from.
         return unless payload.key?("result")
         return if result == payload.fetch("result")
 

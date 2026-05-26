@@ -154,6 +154,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default") = nil
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default") = []
 
+    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
+      return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
+      raise Durababble::LeaseConflict, "workflow #{workflow_id} lease lost" unless workflow_owned?(workflow_id:, worker_id:)
+
+      claim_inbox_messages(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id, worker_id:, lease_seconds:, limit: 1).first
+    end
+
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]
     def workflow_history_count_for(workflow_id) = history[workflow_id].length

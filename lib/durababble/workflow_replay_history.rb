@@ -22,6 +22,11 @@ module Durababble
       events.each { |event| index_event(event) }
       @terminal_events = @terminal.values.sort_by { |event| event.fetch("event_index").to_i }
       @workflow_command_events.sort_by! { |event| event.fetch("event_index").to_i }
+      # Scheduled events remembered mid-replay carry no "event_index", so the set of
+      # blocking indexes is fixed by the recorded history and can be computed once.
+      @blocking_event_indexes = (@scheduled.values + @terminal_events)
+        .filter_map { |event| event["event_index"]&.to_i }
+        .sort
     end
 
     #: (Integer) -> bool
@@ -89,7 +94,7 @@ module Durababble
 
     #: () -> bool
     def blocked_by_replay_history?
-      blocking_event_indexes.any? { |index| !@consumed_event_indexes[index] }
+      @blocking_event_indexes.any? { |index| !@consumed_event_indexes[index] }
     end
 
     #: (Integer) -> void
@@ -172,12 +177,7 @@ module Durababble
 
     #: (Integer) -> Array[Integer]
     def blocking_event_indexes_before(event_index)
-      blocking_event_indexes.select { |index| index < event_index }
-    end
-
-    #: () -> Array[Integer]
-    def blocking_event_indexes
-      (@scheduled.values + @terminal_events).filter_map { |event| event["event_index"]&.to_i }
+      @blocking_event_indexes.select { |index| index < event_index }
     end
 
     #: (Hash[String, Object?]) -> void

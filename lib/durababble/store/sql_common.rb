@@ -223,6 +223,27 @@ module Durababble
       result #: as Array[Hash[String, Object?]]
     end
 
+    #: (workflow_id: String, worker_id: String) -> bool
+    def workflow_owned?(workflow_id:, worker_id:)
+      !!execute_store_query(:workflow_owned, [workflow_id, worker_id]).first
+    end
+
+    #: (worker_pool: String, workflow_name: String, workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
+      return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow command claim" unless workflow_owned?(workflow_id:, worker_id:)
+
+      claim_inbox_messages(
+        worker_pool:,
+        target_kind: "workflow",
+        target_type: workflow_name,
+        target_id: workflow_id,
+        worker_id:,
+        lease_seconds:,
+        limit: 1,
+      ).first
+    end
+
     #: (String) -> Hash[String, Object?]?
     def inbox_message(message_id)
       row = execute_store_query(:inbox_message, [message_id]).first

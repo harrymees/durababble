@@ -77,6 +77,21 @@ class DurababbleEngineTest < DurababbleTestCase
       @messages.first(limit)
     end
 
+    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
+      return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
+      raise Durababble::LeaseConflict, "workflow #{workflow_id} lease lost" unless workflow_owned?(workflow_id:, worker_id:)
+
+      claim_inbox_messages(
+        worker_pool:,
+        target_kind: "workflow",
+        target_type: workflow_name,
+        target_id: workflow_id,
+        worker_id:,
+        lease_seconds:,
+        limit: 1,
+      ).first
+    end
+
     def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
       @completed << { message_id:, workflow_id:, result:, worker_id: }
     end
@@ -308,8 +323,9 @@ class DurababbleEngineTest < DurababbleTestCase
     store = CommandDrainStore.new
     engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
-    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
-    assert_equal [1, 1, 1], store.claim_limits
+    claimed = store.claim_workflow_for_activation(workflow_id: "wf-1", worker_id: "worker-a", lease_seconds: 9)
+    engine.resume(CommandDrainWorkflow, workflow_id: "wf-1", claimed:)
+    assert_equal [1, 1], store.claim_limits
     assert_empty store.completed
     assert_equal "msg-1", store.failed.fetch(0).fetch(:message_id)
     assert_match(/RuntimeError: stop/, store.failed.fetch(0).fetch(:error))
@@ -320,7 +336,7 @@ class DurababbleEngineTest < DurababbleTestCase
     store = CommandDrainStore.new(workflow_status: "completed")
     engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
-    assert_equal 0, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    engine.resume(CommandDrainWorkflow, workflow_id: "wf-1")
     assert_empty store.claim_limits
     assert_empty store.failed
     assert_equal false, store.suspended
@@ -335,7 +351,8 @@ class DurababbleEngineTest < DurababbleTestCase
     )
     engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
-    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    claimed = store.claim_workflow_for_activation(workflow_id: "wf-1", worker_id: "worker-a", lease_seconds: 9)
+    engine.resume(CommandDrainWorkflow, workflow_id: "wf-1", claimed:)
     assert_empty store.completed
     assert_equal "msg-bad", store.failed.fetch(0).fetch(:message_id)
     assert_match(/unsupported workflow inbox message object_command/, store.failed.fetch(0).fetch(:error))
@@ -350,7 +367,8 @@ class DurababbleEngineTest < DurababbleTestCase
     )
     engine = Durababble::Engine.new(store:, worker_id: "worker-a", lease_seconds: 9)
 
-    assert_equal 1, engine.drain_workflow_inbox(CommandDrainWorkflow, workflow_id: "wf-1", limit: 10)
+    claimed = store.claim_workflow_for_activation(workflow_id: "wf-1", worker_id: "worker-a", lease_seconds: 9)
+    engine.resume(CommandDrainWorkflow, workflow_id: "wf-1", claimed:)
     assert_empty store.completed
     assert_equal "msg-missing", store.failed.fetch(0).fetch(:message_id)
     assert_match(/UnknownCommand: missing/, store.failed.fetch(0).fetch(:error))

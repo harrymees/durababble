@@ -90,11 +90,6 @@ module Durababble
       ActiveRecord::Result.empty(affected_rows: owned ? 1 : 0)
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
-    def workflow_owned?(workflow_id:, worker_id:)
-      !!execute_store_query(:workflow_owned, [workflow_id, worker_id]).first
-    end
-
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do

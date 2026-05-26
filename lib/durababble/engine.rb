@@ -62,18 +62,6 @@ module Durababble
       end
     end
 
-    #: (untyped, workflow_id: untyped, ?claimed: untyped, ?limit: untyped) -> untyped
-    def drain_workflow_inbox(workflow_class, workflow_id:, claimed: nil, limit: 10)
-      current = claimed || @store.workflow(workflow_id)
-      return 0 if terminal_workflow_row?(current)
-
-      claimed ||= @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool)
-      raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
-
-      resume(workflow_class, workflow_id:, claimed:)
-      1
-    end
-
     private
 
     #: (untyped) -> bool
@@ -127,6 +115,7 @@ module Durababble
             root_task:,
             workflow_class:,
             workflow:,
+            worker_pool: @worker_pool,
             crash_after: @crash_after,
             history_warning_logged:,
           )
