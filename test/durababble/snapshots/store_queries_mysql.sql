@@ -42,6 +42,11 @@ ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
+-- mysql_claim_expired_fence
+UPDATE `durababble_mysql_snapshot_fences`
+SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND)
+WHERE workflow_id = ? AND `key` = ? AND status = 'running' AND locked_until < NOW(6)
+
 -- mysql_claim_expired_outbox
 SELECT id, created_at FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_expired_lease_idx)
 WHERE status = 'processing' AND locked_until < NOW(6)

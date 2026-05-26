@@ -25,6 +25,11 @@ UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2
 -- pg_cancel_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()
 
+-- pg_claim_expired_fence
+UPDATE "durababble_pg_snapshot"."fences"
+SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < now()
+
 -- pg_claim_expired_outbox
 SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
 WHERE status = 'processing' AND locked_until < now()

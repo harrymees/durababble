@@ -357,6 +357,18 @@ module Durababble
       "SELECT status, result, error FROM #{table(store, "fences")} WHERE workflow_id = $1 AND key = $2"
     end
 
+    # Atomically take over a fence whose holder crashed: only a 'running' fence
+    # whose lease has already expired is reclaimable. Stamps our token + a fresh
+    # lease so a subsequent lock_fence_for_worker succeeds. Params (canonical):
+    # [token, timeout, workflow_id, key].
+    define(:pg_claim_expired_fence, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "fences")}
+        SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+        WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < now()
+      SQL
+    end
+
     define(:pg_outbox_by_key, backend: :postgres) do |store|
       "SELECT id FROM #{table(store, "outbox")} WHERE key = $1"
     end
@@ -1441,6 +1453,18 @@ module Durababble
 
     define(:mysql_read_fence, backend: :mysql) do |store|
       "SELECT status, result, error FROM #{table(store, "fences")} WHERE workflow_id = ? AND `key` = ?"
+    end
+
+    # Atomically take over a fence whose holder crashed: only a 'running' fence
+    # whose lease has already expired is reclaimable. Stamps our token + a fresh
+    # lease so a subsequent lock_fence_for_worker succeeds. Params (canonical):
+    # [token, timeout, workflow_id, key].
+    define(:mysql_claim_expired_fence, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "fences")}
+        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND)
+        WHERE workflow_id = ? AND `key` = ? AND status = 'running' AND locked_until < NOW(6)
+      SQL
     end
 
     define(:mysql_save_object_state, backend: :mysql) do |store|

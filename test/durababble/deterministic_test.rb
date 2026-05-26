@@ -23,6 +23,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
     "fenced_side_effect_once",
+    "fence_holder_crash_and_reclaim",
     "outbox_lease_expiry",
     "store_fault_after_step_completed",
     "store_fault_after_wait_recorded",
@@ -356,6 +357,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 1, failures.length
     assert_includes failures.first.last.join("\n"), "stuck fence"
+  end
+
+  test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
+    result = Durababble::Deterministic.prove("fence_holder_crash_and_reclaim", seed: 7)
+
+    assert_empty result.violations
+    assert_equal 1, result.summary.fetch(:side_effects)
+    assert_includes result.trace, "crashed_holding_fence"
+    assert_includes result.trace, "fence_reclaimed"
+    assert_includes result.trace, "fence_completed"
   end
 
   test "flags abandoned-but-runnable workflows under an expect_settled scenario" do

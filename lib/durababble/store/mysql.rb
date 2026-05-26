@@ -332,32 +332,24 @@ module Durababble
       execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
 
       if execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first
-        begin
-          result = block.call
-          execute_store_query(:complete_fence, [dump_serialized(result), workflow_id, key, token])
-          return result
-        rescue StandardError => e
-          execute_store_query(:fail_fence, ["#{e.class}: #{e.message}", workflow_id, key, token])
-          raise
-        end
+        return run_fenced_block(workflow_id:, key:, token:, &block)
       end
 
       deadline = Time.now + timeout
       loop do
         row = execute_store_query(:read_fence, [workflow_id, key]).first
         decoded = decode_row(row) if row
-        unless decoded
-          raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
-
-          sleep(poll_interval)
-          next
-        end
-
-        case decoded.fetch("status")
-        when "completed"
-          return decoded.fetch("result")
-        when "failed"
-          raise Error, decoded.fetch("error")
+        if decoded
+          case decoded.fetch("status")
+          when "completed"
+            return decoded.fetch("result")
+          when "failed"
+            raise Error, decoded.fetch("error")
+          when "running"
+            if reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+              return run_fenced_block(workflow_id:, key:, token:, &block)
+            end
+          end
         end
         raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
 
@@ -393,6 +385,22 @@ module Durababble
     end
 
     private
+
+    #: (workflow_id: String, key: String, token: String) { () -> Object? } -> Object?
+    def run_fenced_block(workflow_id:, key:, token:, &block)
+      result = block.call
+      execute_store_query(:complete_fence, [dump_serialized(result), workflow_id, key, token])
+      result
+    rescue StandardError => e
+      execute_store_query(:fail_fence, ["#{e.class}: #{e.message}", workflow_id, key, token])
+      raise
+    end
+
+    #: (workflow_id: String, key: String, token: String, timeout: Numeric) -> bool
+    def reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+      execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key])
+      !execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first.nil?
+    end
 
     #: (target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)

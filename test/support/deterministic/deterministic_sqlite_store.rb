@@ -238,12 +238,18 @@ module Durababble
         result
       end
 
-      # Virtual-time fence: identical SQL state machine to MysqlStore#with_fence,
-      # but with the wall-clock polling loop removed. Under a single-threaded
-      # virtual clock a holder cannot make progress while we sleep, so a fence we
-      # cannot immediately acquire is either already resolved (return/raise its
-      # outcome) or held by a crashed worker — which, until claim_expired_fence
-      # exists, surfaces as a FenceTimeout (and the harness's stuck-fence check).
+      # Virtual-time fence: same SQL state machine as MysqlStore#with_fence, but
+      # with the wall-clock polling loop removed. Under a single-threaded virtual
+      # clock a holder cannot make progress while we sleep, so a fence we cannot
+      # immediately acquire is either already resolved (return/raise its outcome)
+      # or held by a worker that crashed mid-block. The latter leaves the row
+      # `running`; once its lease (`locked_until`) is past the virtual clock we
+      # reclaim it atomically via claim_expired_fence and run the block ourselves.
+      #
+      # A holder can be made to crash *while holding* the fence via
+      # `fault_plan.after(:fence_acquired)`: it raises after the row is locked but
+      # before the side effect runs, so the row stays `running` for a reclaimer to
+      # take over — exercising the bug-2 reclaim path without foreknowledge.
       #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
       def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
         token = generate_uuid
@@ -251,16 +257,8 @@ module Durababble
 
         if execute_store_query(:lock_fence_for_worker, [workflow_id, key, token]).first
           trace_event("fence_acquired", id: workflow_id, key:)
-          begin
-            @side_effects += 1
-            result = block.call
-            execute_store_query(:complete_fence, [dump_serialized(result), workflow_id, key, token])
-            trace_event("fence_completed", id: workflow_id, key:, result:)
-            return result
-          rescue StandardError => e
-            execute_store_query(:fail_fence, ["#{e.class}: #{e.message}", workflow_id, key, token])
-            raise
-          end
+          fault_plan.after(:fence_acquired)
+          return run_fenced_block(workflow_id:, key:, token:, &block)
         end
 
         row = execute_store_query(:read_fence, [workflow_id, key]).first
@@ -270,9 +268,35 @@ module Durababble
           decoded.fetch("result")
         when "failed"
           raise Durababble::Error, decoded.fetch("error")
+        when "running"
+          unless reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+            raise Durababble::FenceTimeout, "fence #{key} for #{workflow_id} held by another worker and not yet reclaimable"
+          end
+
+          trace_event("fence_reclaimed", id: workflow_id, key:)
+          run_fenced_block(workflow_id:, key:, token:, &block)
         else
           raise Durababble::FenceTimeout, "fence #{key} for #{workflow_id} held by another worker and not yet reclaimable"
         end
+      end
+
+      # Runs the fenced side effect and records its outcome. Mirrors the inherited
+      # helper but counts the (exactly-once) side effect and emits the trace events
+      # the scenarios assert on. An InjectedCrash is a process death, not a block
+      # failure: it must propagate without marking the fence `failed`, so the row
+      # stays `running` and reclaimable.
+      #: (workflow_id: String, key: String, token: String) { () -> Object? } -> Object?
+      def run_fenced_block(workflow_id:, key:, token:, &block)
+        @side_effects += 1
+        result = block.call
+        execute_store_query(:complete_fence, [dump_serialized(result), workflow_id, key, token])
+        trace_event("fence_completed", id: workflow_id, key:, result:)
+        result
+      rescue Durababble::InjectedCrash
+        raise
+      rescue StandardError => e
+        execute_store_query(:fail_fence, ["#{e.class}: #{e.message}", workflow_id, key, token])
+        raise
       end
 
       # Single-shot, non-blocking: the production loop sleeps wall-clock until the

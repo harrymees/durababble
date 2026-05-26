@@ -255,33 +255,23 @@ module Durababble
       token = generate_uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
 
-      if inserted.affected_rows == 1
-        begin
-          result = block.call
-          execute_store_query(:complete_fence, [workflow_id, key, token, dump_serialized(result)])
-          return result
-        rescue StandardError => e
-          execute_store_query(:fail_fence, [workflow_id, key, token, "#{e.class}: #{e.message}"])
-          raise
-        end
-      end
+      return run_fenced_block(workflow_id:, key:, token:, &block) if inserted.affected_rows == 1
 
       deadline = Time.now + timeout
       loop do
         row = execute_store_query(:read_fence, [workflow_id, key]).first
         decoded = decode_row(row) if row
-        unless decoded
-          raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
-
-          sleep(poll_interval)
-          next
-        end
-
-        case decoded.fetch("status")
-        when "completed"
-          return decoded.fetch("result")
-        when "failed"
-          raise Error, decoded.fetch("error")
+        if decoded
+          case decoded.fetch("status")
+          when "completed"
+            return decoded.fetch("result")
+          when "failed"
+            raise Error, decoded.fetch("error")
+          when "running"
+            if reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+              return run_fenced_block(workflow_id:, key:, token:, &block)
+            end
+          end
         end
         raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
 
@@ -339,6 +329,21 @@ module Durababble
     end
 
     private
+
+    #: (workflow_id: String, key: String, token: String) { () -> Object? } -> Object?
+    def run_fenced_block(workflow_id:, key:, token:, &block)
+      result = block.call
+      execute_store_query(:complete_fence, [workflow_id, key, token, dump_serialized(result)])
+      result
+    rescue StandardError => e
+      execute_store_query(:fail_fence, [workflow_id, key, token, "#{e.class}: #{e.message}"])
+      raise
+    end
+
+    #: (workflow_id: String, key: String, token: String, timeout: Numeric) -> bool
+    def reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+      execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
+    end
 
     # Postgres stores created_at as a timestamp string; parse before comparing so
     # FIFO selection is chronological rather than lexical.
