@@ -1,12 +1,13 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "error_formatting"
 require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, retry_run_at:, crash:)
+    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, retry_run_at:, crash:)
       @store = store #: as untyped
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -18,6 +19,7 @@ module Durababble
       @raise_if_cancel_requested = raise_if_cancel_requested
       @assert_workflow_lease = assert_workflow_lease
       @suspend_workflow_immediately = suspend_workflow_immediately
+      @defer_workflow_suspension = defer_workflow_suspension
       @retry_run_at = retry_run_at
       @crash = crash
     end
@@ -86,8 +88,12 @@ module Durababble
         )
       end
       crash!(:wait_recorded)
-      error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-      future(command_id).reject(error)
+      if suspend_workflow
+        error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
+        future(command_id).reject(error)
+      else
+        @defer_workflow_suspension.call(command_id)
+      end
     end
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void
@@ -122,7 +128,7 @@ module Durababble
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
     def handle_step_error(error, command_id:, step:, attributes:)
       step = step #: as untyped
-      message = "#{error.class}: #{error.message}"
+      message = ErrorFormatting.format_error(error)
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
@@ -140,19 +146,13 @@ module Durababble
       )
       synchronize_store do
         run_at = @retry_run_at.call(delay)
-        if @store.respond_to?(:record_step_failed_and_schedule_retry)
-          @store.record_step_failed_and_schedule_retry(
-            workflow_id: @workflow_id,
-            command_id:,
-            error: message,
-            worker_id: @worker_id,
-            run_at:,
-          )
-        else
-          @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id)
-          scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at:)
-          raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
-        end
+        @store.record_step_failed_and_schedule_retry(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          run_at:,
+        )
       end
       crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
     end
@@ -210,11 +210,7 @@ module Durababble
     #: (Integer) -> Integer
     def attempt_number_for(command_id)
       count = synchronize_store do
-        if @store.respond_to?(:step_attempt_count_for)
-          @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
-        else
-          @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
-        end
+        @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
       end
       count = count #: as untyped
       count.to_i

@@ -77,7 +77,15 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
 
-      - name: Run RuboCop, RBS validation, and typecheck
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run RuboCop, RBS validation, typecheck, and Markdown format check
         run: bundle exec rake lint
 
   docs-build:

@@ -22,8 +22,7 @@ Ruby does not appear to have an equivalent to `mad-turmoil` that intercepts libc
 - `violations` — invariant violations detected after the run.
 - `summary` — stable counters for completed workflows, side effects, and processed outbox messages.
 
-The Minitest prover runs the same scenario twice with the same seed and asserts identical trace and digest.
-It also asserts different seeds produce different traces, proving the seed controls scheduling/fault order.
+The Minitest prover runs the same scenario twice with the same seed and asserts identical trace and digest. It also asserts different seeds produce different traces, proving the seed controls scheduling/fault order.
 
 ## Scenario set
 
@@ -56,8 +55,7 @@ Current scenarios:
 - `bug_duplicate_completion` — intentionally broken fixture used to prove invariant detection reports violations.
 - `bug_invalid_store_shape` — intentionally broken fixture used to prove DST catches invalid virtual-store row shape, missing cross-references, and missing leases.
 
-The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping.
-Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.
+The Minitest suite fuzzes each unique scenario target once per seed rather than maintaining a guarantee-to-scenario mapping. Fixed contract/fault-matrix scenarios run once because they already enumerate their cases.
 
 ## Spec gap found during workflow RPC review
 

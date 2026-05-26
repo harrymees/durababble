@@ -100,6 +100,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class RuntimeStore
+    include Durababble::TestSupport::FakeStoreCommandClaiming
+
     attr_reader :workflows, :steps, :attempts, :history
 
     def initialize
@@ -151,8 +153,16 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def workflow_cancellation(_workflow_id) = nil
+    def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default") = nil
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default") = []
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
+
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      position ||= command_id
+      attempts[workflow_id].count { |attempt| attempt.fetch("position").to_i == position.to_i }
+    end
+
     def workflow_history_for(workflow_id) = history[workflow_id]
     def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
@@ -217,6 +227,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def migrate! = self
     def object_state(object_type:, object_id:, worker_pool: "default") = @state[[worker_pool, object_type, object_id]]
+
+    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+      state = @state[[worker_pool, object_type, object_id]]
+      state.nil? ? Durababble::Store::NO_OBJECT_STATE : state
+    end
 
     def enqueue_object_command(worker_pool: "default", object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
       command_id = "cmd-#{@commands.length + 1}"

@@ -10,6 +10,7 @@ module Durababble
 
   class StepRetryScheduled < Error; end
   class WorkflowSuspended < Error; end
+  class WorkflowCommandDelivered < Error; end
 
   class Workflow
     extend DurableMethodDSL

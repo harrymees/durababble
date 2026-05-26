@@ -55,8 +55,7 @@ When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution
 5. invokes the original Ruby method body;
 6. persists success, wait, retryable failure, or final failure.
 
-This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites.
-If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
+This means step identity is based on deterministic call order. The method name is recorded as metadata, but callers do not pass step names at call sites. If replay reaches a completed position with a different current method name, or if workflow execution returns before all completed positions have been consumed, the engine fails the run with `Durababble::NonDeterminismError` so code changes cannot silently reuse stale results or drop a recorded durable suffix.
 
 Before loading replay payloads, `Engine#execute` asks the store for the workflow's `workflow_history` row count and compares it with `Durababble.max_workflow_history_events` (`DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS`, default `10_000`). It also logs through `Durababble.logger` once a run reaches `Durababble.workflow_history_warning_events` (`DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS`, default `8_000`). `WorkflowExecution` checks projected history growth before scheduling a new durable command, so a run that would cross either threshold is observed before more history rows are appended. The counted rows are the replay facts in `workflow_history`; latest-state tables such as `steps`, `step_attempts`, `waits`, `inbox`, and `outbox` are audited separately but are not replay input unless the operation appends a workflow-history row. If an open workflow is already over the bound, or a new command would push it over the bound, the engine records `Durababble::WorkflowHistoryLimitExceeded` as the workflow's terminal failed error instead of repeatedly claiming and replaying the oversized run. Terminal workflow target activations dead-letter pending workflow-command inbox rows and delete the coalesced activation, so terminal oversized workflows do not leave runnable activation tasks that workers claim forever. Terminal rows bypass the guard so prior completed/canceled/failed results are still readable.
 
@@ -73,7 +72,7 @@ workflow.cancel(reason: "user request")
 workflow.terminate(reason: "operator hard stop")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight handle instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
+In the current prototype, exposed workflow queries execute against a lightweight handle instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. The owner delivers those rows through the active `WorkflowExecution` at deterministic safe points, invoking the command method on the same workflow instance that is running or replaying `#execute`; workers poll coalesced target activations as the durable fallback rather than constructing a separate workflow object to drain the inbox.
 
 ### Durable objects
 

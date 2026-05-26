@@ -12,6 +12,7 @@ require "securerandom"
 require "durababble"
 require_relative "support/test_workflow_helper"
 require_relative "support/store_backends"
+require_relative "support/fake_store_command_claiming"
 
 module DurababbleMinitestHelper
   #: (untyped, String, ?migrate: bool) { (untyped) -> untyped } -> untyped

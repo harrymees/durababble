@@ -3,6 +3,16 @@
 require "bundler/gem_tasks"
 require "rake/testtask"
 
+desc "Format Markdown files with Prettier"
+task "format:markdown" do
+  sh("npm run format:markdown")
+end
+
+desc "Check Markdown files with Prettier"
+task "check:markdown" do
+  sh("npm run check:markdown")
+end
+
 task :rubocop do
   sh("bundle exec rubocop")
 end
@@ -21,7 +31,7 @@ task :typecheck do
   sh("bundle exec srb tc")
 end
 
-task lint: [:rubocop, :typecheck]
+task lint: [:rubocop, :typecheck, "check:markdown"]
 
 # The Deterministic Simulation Testing files. They run uninstrumented in their
 # own CI job (`rake dst`) rather than under the coverage gate: the seed sweeps
