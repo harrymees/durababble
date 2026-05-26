@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "durable_method_dsl"
+require_relative "error_formatting"
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
@@ -319,7 +320,7 @@ module Durababble
     rescue LeaseConflict
       raise
     rescue StandardError => e
-      terminal_failure(message, "#{e.class}: #{e.message}")
+      terminal_failure(message, ErrorFormatting.format_error(e))
     end
 
     #: (untyped, object_id: untyped, message: untyped) -> untyped
@@ -371,7 +372,7 @@ module Durababble
     #: (untyped, retry_policy: untyped, error: untyped, attributes: untyped) -> untyped
     def handle_command_error(message, retry_policy:, error:, attributes:)
       attempt_number = message.fetch("attempts").to_i
-      serialized_error = "#{error.class}: #{error.message}"
+      serialized_error = ErrorFormatting.format_error(error)
       Observability.count("durababble.object.command.failures", attributes.merge("error.type" => error.class.name))
       if retry_policy&.retryable?(error, attempt_number:)
         delay = retry_policy.delay_for_attempt(attempt_number)

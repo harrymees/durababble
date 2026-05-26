@@ -1,6 +1,7 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "error_formatting"
 require_relative "execution_context"
 
 module Durababble
@@ -122,7 +123,7 @@ module Durababble
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
     def handle_step_error(error, command_id:, step:, attributes:)
       step = step #: as untyped
-      message = "#{error.class}: #{error.message}"
+      message = ErrorFormatting.format_error(error)
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
