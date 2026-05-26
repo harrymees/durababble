@@ -44,6 +44,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "object_command_crash_fuzz",
     "object_command_state_crash_fuzz",
     "object_command_activation_driven_drain",
+    "object_command_idempotent_enqueue",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -490,6 +491,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "object_delivery_crashed"
+  end
+
+  test "collapses repeated idempotent enqueues to one exactly-once delivery through crashes" do
+    result = Durababble::Deterministic.prove("object_command_idempotent_enqueue", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "enqueue_crashed"
   end
 
   test "dead-letters queued commands when their workflow terminated before delivery" do
