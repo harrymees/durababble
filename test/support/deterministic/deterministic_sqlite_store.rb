@@ -119,22 +119,22 @@ module Durababble
 
       # --- Store contract, wrapped with trace + fault hooks ------------------
 
-      #: (name: String, input: Object?) -> String
-      def enqueue_workflow(name:, input:)
+      #: (name: String, input: Object?, ?id: String?, ?worker_pool: String) -> String
+      def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
         id = super
         trace_event("enqueue_workflow", id:, name:)
         id
       end
 
-      #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?) -> Object?
-      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+      #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
+      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
         claimed = super
         trace_event("workflow_claimed", id: claimed.fetch("id"), worker: worker_id) if claimed
         claimed
       end
 
-      #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> Object?
-      def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+      #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
+      def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
         # Re-affirming a lease we already hold is not a fresh claim; mirror
         # VirtualYugabyte and only trace the pending/expired -> running edge so
         # the per-seed workflow_claimed count stays stable.

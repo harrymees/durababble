@@ -7,6 +7,7 @@ require "logger"
 require_relative "durababble/version"
 require_relative "durababble/statuses"
 require_relative "durababble/observability"
+require_relative "durababble/backoff"
 
 module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
@@ -37,6 +38,7 @@ module Durababble
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
+  class WorkflowAlreadyExists < Error; end
 
   class CancellationError < Error
     #: String?
@@ -68,7 +70,7 @@ module Durababble
     #: (Store?) -> Engine?
     def default_store=(store)
       @default_store = store
-      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+      @default_engine = store ? Engine.new(store:) : nil
     end
 
     #: (Engine?) -> Store?
@@ -166,7 +168,7 @@ module Durababble
 
     #: () -> Engine
     def engine
-      @default_engine ||= Engine.new(store:, migrate: false)
+      @default_engine ||= Engine.new(store:)
     end
 
     #: (?engine: Engine?, ?store: Store?) -> Engine
@@ -174,7 +176,7 @@ module Durababble
       raise ArgumentError, "pass store: or engine:, not both" if store && engine
 
       return engine if engine
-      return Engine.new(store:, migrate: false) if store
+      return Engine.new(store:) if store
 
       self.engine
     end
@@ -234,6 +236,7 @@ require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
+require_relative "durababble/worker_identity"
 require_relative "durababble/store_queries"
 require_relative "durababble/store"
 require_relative "durababble/engine"

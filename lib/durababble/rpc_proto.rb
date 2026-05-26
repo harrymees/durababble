@@ -88,6 +88,7 @@ module Durababble
             field("target_kind", 2, :TYPE_STRING),
             field("target_class", 3, :TYPE_STRING),
             field("target_id", 4, :TYPE_STRING),
+            field("expected_worker_id", 5, :TYPE_STRING),
           )
         end
 
@@ -102,6 +103,7 @@ module Durababble
             field("method", 5, :TYPE_STRING),
             field("args", 6, :TYPE_BYTES),
             field("deadline_ms", 7, :TYPE_INT64),
+            field("expected_worker_id", 8, :TYPE_STRING),
           )
         end
 

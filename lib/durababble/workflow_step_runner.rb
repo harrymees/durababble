@@ -123,7 +123,6 @@ module Durababble
     def handle_step_error(error, command_id:, step:, attributes:)
       step = step #: as untyped
       message = "#{error.class}: #{error.message}"
-      assert_workflow_lease!
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
@@ -139,27 +138,25 @@ module Durababble
         "durababble.workflow.step.retries",
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
-      # Record the failed attempt and the retry scheduling in one transaction so a
-      # crash cannot strand a failed step under a still-leased workflow with no
-      # retry queued. crash!(:step_failed_recorded) then exposes the post-write
-      # crash window the matrix scenario drives.
       synchronize_store do
         run_at = @retry_run_at.call(delay)
-        @store.record_step_failed_and_schedule_retry(
-          workflow_id: @workflow_id,
-          command_id:,
-          error: message,
-          worker_id: @worker_id,
-          run_at:,
-        )
+        if @store.respond_to?(:record_step_failed_and_schedule_retry)
+          @store.record_step_failed_and_schedule_retry(
+            workflow_id: @workflow_id,
+            command_id:,
+            error: message,
+            worker_id: @worker_id,
+            run_at:,
+          )
+        else
+          @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id)
+          scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at:)
+          raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+        end
       end
       crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
     end
 
-    # Persists an exhausted step failure as terminal history (so crash recovery
-    # replays the recorded failure rather than re-running the step) and returns
-    # the original error for the engine to finalize the workflow — workflow code
-    # may still rescue it, run compensation, or observe sibling async branches.
     #: (Integer, message: String, fallback_error: StandardError) -> StandardError
     def record_final_step_failure(command_id, message:, fallback_error:)
       synchronize_store do
@@ -176,8 +173,6 @@ module Durababble
       crash_or(:step_failed_recorded, fallback_error)
     end
 
-    # Fires the crash point after a durable write; if a crash is injected there,
-    # surface it as the rejection so the worker dies with the outcome persisted.
     #: (Symbol, StandardError) -> StandardError
     def crash_or(point, error)
       crash!(point)

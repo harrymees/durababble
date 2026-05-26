@@ -5,14 +5,15 @@ module Durababble
   class SqlStore < Store
     TIMER_WAKE_BATCH_SIZE = 100
 
-    #: (name: String, input: Object?) -> String
-    def enqueue_workflow(name:, input:)
-      insert_workflow(name:, input:, status: "pending")
+    #: (name: String, input: Object?, ?id: String?, ?worker_pool: String) -> String
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      id ||= SecureRandom.uuid
+      insert_workflow(name:, input:, status: "pending", id:, worker_pool:)
     end
 
-    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric) -> String
-    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60)
-      insert_workflow(name:, input:, status: "running", worker_id:, lease_seconds:)
+    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
+    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+      insert_workflow(name:, input:, status: "running", id: SecureRandom.uuid, worker_id:, lease_seconds:, worker_pool:)
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
@@ -33,10 +34,6 @@ module Durababble
       end
     end
 
-    # Records a step failure and the workflow's retry scheduling in one
-    # transaction. A crash between the two writes used to leave the step `failed`
-    # while the workflow stayed `running`/leased with no retry queued —
-    # inconsistent and work-locking. Returns the retry-schedule result.
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Time) -> Object?
     def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
@@ -70,10 +67,16 @@ module Durababble
         .map { |row| with_command_id(decode_row(row)) }
     end
 
-    #: (object_type: String, object_id: String) -> Object?
-    def object_state(object_type:, object_id:)
-      row = execute_store_query(:object_state, [object_type, object_id]).first
-      decode_row(row).fetch("state") if row
+    #: (object_type: String, object_id: String, ?worker_pool: String) -> Object?
+    def object_state(object_type:, object_id:, worker_pool: "default")
+      state = object_state_entry(worker_pool:, object_type:, object_id:)
+      state.equal?(Store::NO_OBJECT_STATE) ? nil : state
+    end
+
+    #: (object_type: String, object_id: String, ?worker_pool: String) -> Object?
+    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+      row = execute_store_query(:object_state, [worker_pool, object_type, object_id]).first
+      row ? decode_row(row).fetch("state") : Store::NO_OBJECT_STATE
     end
 
     #: (String) -> Array[Hash[String, Object?]]
@@ -105,6 +108,17 @@ module Durababble
       total
     end
 
+    # Flip every workflow whose timer just fired back to pending in a single statement.
+    # Called once per wake batch instead of once per wait to avoid an N+1 of single-row UPDATEs.
+    #: (Array[Hash[String, Object?]]) -> void
+    def mark_waits_workflows_pending(waits)
+      workflow_ids = waits.map { |wait| wait.fetch("workflow_id") }.uniq
+      return if workflow_ids.empty?
+
+      placeholders = workflow_ids.each_index.map { |index| placeholder(index + 1) }.join(", ")
+      execute_store_query(:mark_waits_workflows_pending, workflow_ids, placeholders:)
+    end
+
     #: (String) -> Array[Hash[String, Object?]]
     def waits_for(workflow_id)
       execute_store_query(:waits_for_workflow, [workflow_id])
@@ -117,15 +131,16 @@ module Durababble
       decode_row(row) if row
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: Object?, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?) -> String
-    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil)
-      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+    #: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: Object?, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?, ?worker_pool: String) -> String
+    def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, worker_pool: "default")
+      shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       result = transaction do
-        existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
+        existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
         if existing
           raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
           upsert_target_activation_without_transaction(
+            worker_pool: row_worker_pool(existing),
             target_kind: existing.fetch("target_kind"),
             target_type: existing.fetch("target_type"),
             target_id: existing.fetch("target_id"),
@@ -134,10 +149,11 @@ module Durababble
           next existing.fetch("id")
         end
 
-        sequence = allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
-        id = generate_uuid
+        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+        id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
+          worker_pool:,
           target_kind:,
           target_type:,
           target_id:,
@@ -151,7 +167,7 @@ module Durababble
           ready_at:,
           max_attempts:,
         )
-        upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
         id
       end
       result #: as String
@@ -159,15 +175,21 @@ module Durababble
 
     #: (workflow_id: String, workflow_name: String, method_name: String, payload: Object?, ?idempotency_key: String?) -> String
     def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
-      target_kind = "workflow"
-      message_kind = "workflow_command"
-      shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
       result = transaction do
-        existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        workflow = lock_workflow_for_update(workflow_id)
+        raise KeyError, "workflow not found: #{workflow_id}" unless workflow
+
+        decoded_workflow = decode_row(workflow)
+        worker_pool = row_worker_pool(decoded_workflow)
+        target_kind = "workflow"
+        message_kind = "workflow_command"
+        shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
+        existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
         if existing
           raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
 
           upsert_target_activation_without_transaction(
+            worker_pool: row_worker_pool(existing),
             target_kind: existing.fetch("target_kind"),
             target_type: existing.fetch("target_type"),
             target_id: existing.fetch("target_id"),
@@ -176,15 +198,13 @@ module Durababble
           next existing.fetch("id")
         end
 
-        workflow = lock_workflow_for_update(workflow_id)
-        raise KeyError, "workflow not found: #{workflow_id}" unless workflow
+        raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
 
-        raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decode_row(workflow))
-
-        sequence = allocate_mailbox_sequence(target_kind:, target_type: workflow_name, target_id: workflow_id)
-        id = generate_uuid
+        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
+          worker_pool:,
           target_kind:,
           target_type: workflow_name,
           target_id: workflow_id,
@@ -196,16 +216,16 @@ module Durababble
           shape_hash:,
           payload:,
         )
-        upsert_target_activation_without_transaction(target_kind:, target_type: workflow_name, target_id: workflow_id)
+        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
         id
       end
       result #: as String
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time) -> Array[Hash[String, Object?]]
-    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now)
+    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time, ?worker_pool: String) -> Array[Hash[String, Object?]]
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
       result = transaction do
-        rows = inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
+        rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
         claimable = contiguous_claimable_inbox_rows(rows, now:)
         claimable.each do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
@@ -221,9 +241,9 @@ module Durababble
       decode_row(row) if row
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Array[Hash[String, Object?]]
-    def inbox_messages_for(target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
+    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Array[Hash[String, Object?]]
+    def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: "default")
+      execute_store_query(:inbox_messages_for, [worker_pool, target_kind, target_type, target_id]).map { |row| decode_row(row) }
     end
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
@@ -236,6 +256,7 @@ module Durababble
 
       claimed = claim_inbox_message_by_id(
         message_id: command_id,
+        worker_pool: row_worker_pool(row),
         target_kind: row.fetch("target_kind"),
         target_type: row.fetch("target_type"),
         target_id: row.fetch("target_id"),
@@ -254,9 +275,9 @@ module Durababble
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
 
-        save_object_state(object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
+        save_object_state(worker_pool: row_worker_pool(command), object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
         updated = complete_inbox_message_without_transaction(message_id: command_id, result:)
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         updated
       end
     end
@@ -272,7 +293,7 @@ module Durababble
         else
           fail_inbox_message_without_transaction(message_id: command_id, error:)
         end
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         updated
       end
     end
@@ -284,7 +305,7 @@ module Durababble
         next nil unless command
 
         updated = retry_inbox_message_without_transaction(message_id: command_id, error:, ready_at:)
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         updated
       end
     end
@@ -295,6 +316,13 @@ module Durababble
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
 
+        workflow = lock_workflow_for_update(workflow_id)
+        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          next updated
+        end
+
         append_workflow_history_without_transaction(
           workflow_id:,
           kind: "workflow_command_completed",
@@ -303,7 +331,7 @@ module Durababble
           payload: { "message_id" => message_id, "result" => result },
         )
         updated = complete_inbox_message_without_transaction(message_id:, result:)
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
         updated
       end
     end
@@ -314,6 +342,13 @@ module Durababble
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
 
+        workflow = lock_workflow_for_update(workflow_id)
+        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
+          reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+          next updated
+        end
+
         append_workflow_history_without_transaction(
           workflow_id:,
           kind: "workflow_command_failed",
@@ -323,83 +358,18 @@ module Durababble
           error:,
         )
         updated = dead_letter_inbox_message_without_transaction(message_id:, error:)
-        reconcile_target_activation_without_transaction(target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
+        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
         updated
       end
     end
 
-    #: (target_kind: Object?, target_type: Object?, target_id: Object?) -> Hash[String, Object?]?
-    def target_activation(target_kind:, target_type:, target_id:)
-      row = execute_store_query(:target_activation, [target_kind, target_type, target_id]).first
+    #: (target_kind: Object?, target_type: Object?, target_id: Object?, ?worker_pool: String) -> Hash[String, Object?]?
+    def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
+      row = execute_store_query(:target_activation, [worker_pool, target_kind, target_type, target_id]).first
       decode_row(row) if row
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
-    def workflow_owned?(workflow_id:, worker_id:)
-      !!execute_store_query(:workflow_owned, [workflow_id, worker_id]).first
-    end
-
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
-    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      row = execute_store_query(:step_heartbeat_cursor, [workflow_id, command_id]).first
-      decode_row(row).fetch("heartbeat_cursor") if row
-    end
-
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
-    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
-      command_id = normalize_command_id(command_id, position)
-      row = execute_store_query(:step_attempt_count_for, [workflow_id, command_id]).first
-      row.fetch("count").to_i
-    end
-
-    #: (workflow_id: String) -> Object?
-    def mark_workflow_cancellation_delivered(workflow_id:)
-      execute_store_query(:mark_workflow_cancellation_delivered, [workflow_id])
-    end
-
-    #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
-    def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-      existing = execute_store_query(:outbox_by_key, [key]).first
-      return existing.fetch("id") if existing
-
-      id = generate_uuid
-      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
-      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
-      execute_store_query(:outbox_by_key, [key]).first.fetch("id")
-    end
-
-    #: (String, worker_id: String) -> Object?
-    def ack_outbox(outbox_id, worker_id:)
-      result = execute_store_query(:ack_outbox, [outbox_id, worker_id])
-      Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
-      result
-    end
-
-    #: (object_type: String, object_id: String, state: Object?) -> Object?
-    def save_object_state(object_type:, object_id:, state:)
-      execute_store_query(:save_object_state, [object_type, object_id, dump_serialized(state)])
-      state
-    end
-
     private
-
-    #: (String) -> Object?
-    def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
-    end
-
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
-    end
-
-    #: (String, Array[Object?]) -> untyped
-    def execute_params(sql, params)
-      execute_store_query_sql(sql, params)
-    end
 
     #: (Object?, workflow_id: String, worker_id: String?, operation: String) -> Object?
     def require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)
@@ -427,54 +397,13 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil)
-      id = generate_uuid
-      if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, status, dump_serialized(input), worker_id, lease_seconds || 60])
-      else
-        execute_store_query(:insert_workflow, [id, name, status, dump_serialized(input)])
-      end
-      id
-    end
-
-    #: (String, ?worker_id: String?, ?lease_seconds: Numeric) -> Hash[String, Object?]?
-    def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
       raise NotImplementedError
     end
 
-    #: (Integer?, Integer?) -> Integer
-    def normalize_command_id(command_id, position)
-      id = command_id.nil? ? position : command_id
-      raise ArgumentError, "command_id is required" if id.nil?
-
-      id.to_i
-    end
-
-    # Seam for unique identifiers (workflow/attempt/wait/fence/outbox/inbox ids).
-    # Production uses random UUIDs; the deterministic test store overrides this to
-    # draw monotonic ids from the seeded RNG so a seed replays byte-identically.
-    #: () -> String
-    def generate_uuid
-      SecureRandom.uuid
-    end
-
-    # Seam for FIFO selection among claim candidates gathered from several
-    # queries. The SQL adapters order by the textual created_at; the deterministic
-    # test store overrides this to compare integer ticks with a stable id
-    # tie-break (lexical ordering of small integer ticks is wrong).
-    #: (Array[Hash[String, Object?]]) -> Hash[String, Object?]?
-    def claim_candidate(candidates)
-      candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
-    end
-
-    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
-    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
-      raise NotImplementedError
-    end
-
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
+    #: (String, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
+    def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
       raise NotImplementedError
     end
 
@@ -485,6 +414,26 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object?
     def fail_workflow(workflow_id, error:, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
+    def request_workflow_termination(workflow_id:, reason: nil)
+      raise NotImplementedError
+    end
+
+    #: (Integer?, Integer?) -> Integer
+    def normalize_command_id(command_id, position)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
+    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
       raise NotImplementedError
     end
 
@@ -508,46 +457,44 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (target_kind: Object?, target_type: Object?, target_id: Object?, ?ready_at: Object?) -> Object?
-    def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
+    #: (worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?, ?ready_at: Object?) -> Object?
+    def upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at: nil)
       raise NotImplementedError
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Integer
-    def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Integer
+    def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       raise NotImplementedError
     end
 
-    #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
-    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
-      return unless idempotency_key
-
-      execute_store_query(:existing_inbox_message_for_idempotency, [target_kind, target_type, target_id, idempotency_key]).first
+    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Hash[String, Object?]?
+    def existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      raise NotImplementedError
     end
 
-    #: (String) -> Object?
+    #: (String) -> Hash[String, Object?]?
     def lock_workflow_for_update(workflow_id)
-      execute_store_query(:lock_workflow_for_update, [workflow_id]).first
+      raise NotImplementedError
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
+    #: (workflow_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
-      execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
-    end
-
-    #: (id: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Time?, ?max_attempts: Integer?) -> Object?
-    def insert_inbox_message_without_transaction(id:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       raise NotImplementedError
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
-    def inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
+    #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Time?, ?max_attempts: Integer?) -> Object?
+    def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       raise NotImplementedError
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def inbox_head_for_update(target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
+    def inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
+      raise NotImplementedError
+    end
+
+    #: (worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?) -> Hash[String, Object?]?
+    def inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
+      raise NotImplementedError
     end
 
     #: (message_id: Object?, worker_id: String, lease_seconds: Numeric) -> Object?
@@ -555,13 +502,14 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (command_id: String, worker_id: String?) -> Object?
+    #: (command_id: String, worker_id: String?) -> Hash[String, Object?]?
     def lock_object_command_for_completion(command_id:, worker_id:)
-      if worker_id
-        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
-      else
-        execute_store_query(:lock_inbox_message, [command_id]).first
-      end
+      raise NotImplementedError
+    end
+
+    #: (object_type: String?, object_id: String?, state: Object?, ?worker_pool: String) -> Object?
+    def save_object_state(object_type:, object_id:, state:, worker_pool: "default")
+      raise NotImplementedError
     end
 
     #: (message_id: String, result: Object?) -> Object?
@@ -569,13 +517,9 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (command_id: String, worker_id: String?) -> Object?
+    #: (command_id: String, worker_id: String?) -> Hash[String, Object?]?
     def lock_inbox_message_for_failure(command_id:, worker_id:)
-      if worker_id
-        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
-      else
-        execute_store_query(:lock_inbox_message, [command_id]).first
-      end
+      raise NotImplementedError
     end
 
     #: (message_id: String, error: String) -> Object?
@@ -588,17 +532,14 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (message_id: String, worker_id: String) -> Object?
+    #: (message_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_inbox_message_for_completion(message_id:, worker_id:)
-      execute_store_query(:lock_inbox_message_for_worker, [message_id, worker_id]).first
+      raise NotImplementedError
     end
 
-    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: String?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
+    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-      execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
-      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-      event_index
+      raise NotImplementedError
     end
 
     #: (message_id: String, error: String) -> Object?
@@ -606,26 +547,9 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
-    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
-      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(target_id))
-        dead_letter_terminal_workflow_inbox_without_transaction(
-          target_type:,
-          target_id:,
-          error: terminal_error,
-        )
-        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-        return
-      end
-
-      head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
-
-      if head && !InboxStatus.dead_lettered?(head)
-        ready_at = target_activation_ready_at_for(head, now:)
-        set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
-      else
-        delete_target_activation_without_transaction(target_kind:, target_type:, target_id:)
-      end
+    #: (worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?, ?now: Time) -> Object?
+    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
+      raise NotImplementedError
     end
 
     #: (Object?) -> bool
@@ -634,10 +558,10 @@ module Durababble
       InboxStatus.activatable?(status)
     end
 
-    #: (message_id: String, target_kind: Object?, target_type: Object?, target_id: Object?, worker_id: String, lease_seconds: Numeric, ?now: Time) -> Object?
-    def claim_inbox_message_by_id(message_id:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
+    #: (message_id: String, worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?, worker_id: String, lease_seconds: Numeric, ?now: Time) -> Object?
+    def claim_inbox_message_by_id(message_id:, worker_pool:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
       transaction do
-        head = inbox_head_for_update(target_kind:, target_type:, target_id:)
+        head = inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
         next unless head&.fetch("id") == message_id
 
         head = head #: as Hash[String, Object?]

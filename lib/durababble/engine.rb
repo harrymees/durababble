@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "async"
+require "securerandom"
 
 require_relative "workflow_execution"
 
@@ -11,18 +12,22 @@ module Durababble
 
     #: untyped
     attr_reader :store
+    #: String
+    attr_reader :worker_pool
 
-    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped) -> void
-    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true)
+    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped, ?worker_pool: String) -> void
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true, worker_pool: "default")
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
+      @worker_pool = worker_pool
     end
 
-    #: (untyped, input: untyped) -> untyped
-    def enqueue(workflow_class, input:)
-      @store.enqueue_workflow(name: workflow_class.workflow_name, input:)
+    #: (untyped, input: untyped, ?id: untyped) -> untyped
+    def enqueue(workflow_class, input:, id: nil)
+      workflow_id = id || SecureRandom.uuid
+      @store.enqueue_workflow(name: workflow_class.workflow_name, input:, id: workflow_id, worker_pool: @worker_pool)
     end
 
     #: (untyped, input: untyped) -> untyped
@@ -33,7 +38,7 @@ module Durababble
       }
       Observability.trace("durababble.workflow.start", attributes) do
         Observability.count("durababble.workflow.starts", attributes)
-        workflow_id = @store.create_workflow(name: workflow_class.workflow_name, input:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+        workflow_id = @store.create_workflow(name: workflow_class.workflow_name, input:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool)
         execute(workflow_class, workflow_id:, initial_input: input)
       end
     end
@@ -49,7 +54,7 @@ module Durababble
         current = claimed || @store.workflow(workflow_id)
         return run_from_row(current) if terminal_workflow_row?(current)
 
-        owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+        owned_claim = claimed || @store.claim_workflow(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool)
         unless owned_claim
           Observability.count("durababble.leases.conflicts", attributes.merge("durababble.lease.owner" => @worker_id))
           raise LeaseConflict, "workflow #{workflow_id} is leased by another worker"
@@ -64,13 +69,14 @@ module Durababble
       current = claimed || @store.workflow(workflow_id)
       return 0 if terminal_workflow_row?(current)
 
-      claimed ||= @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+      claimed ||= @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool)
       raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
 
       workflow = workflow_class.new
       drained = 0
       while drained < limit
         messages = @store.claim_inbox_messages(
+          worker_pool: @worker_pool,
           target_kind: "workflow",
           target_type: workflow_class.workflow_name,
           target_id: workflow_id,
@@ -90,6 +96,23 @@ module Durababble
     end
 
     private
+
+    # Number of backtrace frames retained in a persisted failure. The innermost
+    # frames (where the error was raised) sit at the top, so capping the tail
+    # keeps the column bounded without losing the frames that matter for debugging.
+    ERROR_BACKTRACE_LIMIT = 50
+
+    # Render an exception into the single `error` string we persist on a failed
+    # workflow/command, embedding the backtrace so failures are diagnosable from
+    # storage alone instead of just `"Class: message"`.
+    #: (Exception) -> String
+    def format_error(error)
+      message = "#{error.class}: #{error.message}"
+      backtrace = error.backtrace
+      return message if backtrace.nil? || backtrace.empty?
+
+      [message, *backtrace.first(ERROR_BACKTRACE_LIMIT)].join("\n")
+    end
 
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
@@ -130,10 +153,10 @@ module Durababble
 
       args = payload.fetch("args", [])
       kwargs = payload.fetch("kwargs", {})
-      result = kwargs.empty? ? workflow.public_send(method_name, *args) : workflow.public_send(method_name, *args, **kwargs)
+      result = workflow.public_send(method_name, *args, **kwargs)
       @store.complete_workflow_command(message_id: message.fetch("id"), workflow_id:, result:, worker_id: @worker_id)
     rescue StandardError => e
-      @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: "#{e.class}: #{e.message}", worker_id: @worker_id)
+      @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: format_error(e), worker_id: @worker_id)
     end
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
@@ -193,11 +216,21 @@ module Durababble
         workflow.__durababble_execution__ = nil if workflow
       end
     rescue WorkflowSuspended
-      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension" unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+      unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+        row = @store.workflow(workflow_id)
+        return run_from_row(row) if terminal_workflow_row?(row)
+
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension"
+      end
 
       snapshot(workflow_id)
     rescue StepRetryScheduled
       snapshot(workflow_id)
+    rescue LeaseConflict
+      row = @store.workflow(workflow_id)
+      return run_from_row(row) if terminal_workflow_row?(row)
+
+      raise
     rescue CancellationError => e
       @store.cancel_workflow(workflow_id, reason: e.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
       Observability.count("durababble.workflow.cancellations", (attributes || {}).merge("durababble.workflow.status" => "canceled"))
@@ -205,7 +238,7 @@ module Durababble
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
-      message = "#{e.class}: #{e.message}"
+      message = format_error(e)
       @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)

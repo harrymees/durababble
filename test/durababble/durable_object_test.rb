@@ -82,7 +82,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       message ? [message] : []
     end
 
-    def object_state(object_type:, object_id:) = @state
+    def object_state(object_type:, object_id:, worker_pool: "default") = @state
 
     def complete_object_command(command_id:, result:, **kwargs)
       @completed << [command_id, result]
@@ -165,6 +165,18 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   class NoWakeTestObject < Durababble::DurableObject
+  end
+
+  class PersistedNilStateObject < Durababble::DurableObject
+    object_type "persisted_nil_state_object"
+
+    def initialize_state
+      { "initialized" => true }
+    end
+
+    expose def snapshot
+      current_state
+    end
   end
 
   class RetryStateTestCounter < Durababble::DurableObject
@@ -376,6 +388,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal(
       [
         {
+          worker_pool: "default",
           target_kind: "object",
           target_type: ClaimlessTestObject.object_type,
           target_id: "object-1",
@@ -401,7 +414,38 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     save_store.define_singleton_method(:save_object_state) { |**kwargs| saved << kwargs }
     object = anonymous_object.new(durable_id: "obj-1", store: save_store)
     object.update_state({ "saved" => true })
-    assert_equal [{ object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+    assert_equal [{ worker_pool: "default", object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+  end
+
+  test "memoizes nil initialized durable object state" do
+    nil_state_object = Class.new(Durababble::DurableObject) do
+      attr_reader :initializations
+
+      def initialize(*args, **kwargs)
+        @initializations = 0
+        super
+      end
+
+      def initialize_state
+        @initializations += 1
+        nil
+      end
+    end
+    object = nil_state_object.new
+
+    assert_nil object.current_state
+    assert_nil object.current_state
+    assert_equal 1, object.initializations
+  end
+
+  durababble_store_backends.each do |backend|
+    test "does not reinitialize persisted nil durable object state with #{backend.name}" do
+      with_durababble_store(backend, "nil_object_state") do |store|
+        store.save_object_state(object_type: PersistedNilStateObject.object_type, object_id: "nil-state", state: nil)
+
+        assert_nil PersistedNilStateObject.handle("nil-state", store:).snapshot
+      end
+    end
   end
 
   test "completes read-only commands and fails them when the completion lease is lost" do
@@ -520,26 +564,26 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   test "covers object at, unknown tell, and unbounded retry metadata branches" do
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", store: Object.new)
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.handle("clean", store: Object.new)
-    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new, migrate: false))
+    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new))
     assert_not_respond_to CleanCommandObject, :ref
     assert_raises(NoMethodError) { CleanCommandObject.tell("clean", :missing, store: Object.new) }
-    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new, migrate: false)) }
+    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new)) }
 
     unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
-    assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
-    assert_nil CleanCommandObject.handle("clean", store: Object.new).send(:inbox_max_attempts, unbounded)
+    assert_nil unbounded.maximum_attempts_limit
+    assert_equal 3, Durababble::RetryPolicy.new(maximum_attempts: 3).maximum_attempts_limit
   end
 
   test "durable object handles and tells use default and explicit engines" do
     explicit_store = AskWaitStore.new
-    explicit_engine = Durababble::Engine.new(store: explicit_store, migrate: false)
+    explicit_engine = Durababble::Engine.new(store: explicit_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-1", engine: explicit_engine).read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-1", :read_only, engine: explicit_engine))
     assert_equal(["ask", "tell"], explicit_store.enqueued.map { |command| command.fetch(:message_kind) })
     assert_equal(0, explicit_store.migrations)
 
     default_store = AskWaitStore.new
-    Durababble.default_engine = Durababble::Engine.new(store: default_store, migrate: false)
+    Durababble.default_engine = Durababble::Engine.new(store: default_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-2").read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-2", :read_only))
     assert_equal(["ask", "tell"], default_store.enqueued.map { |command| command.fetch(:message_kind) })

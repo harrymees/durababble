@@ -83,6 +83,19 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  class WorkerPoolEnqueueStore
+    attr_reader :enqueued
+
+    def initialize
+      @enqueued = []
+    end
+
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @enqueued << { name:, input:, id:, worker_pool: }
+      id || "wf-#{@enqueued.length}"
+    end
+  end
+
   test "registers class-oriented workflow steps and public exposed methods" do
     assert_equal "api_test_order_workflow", ApiTestOrderWorkflow.workflow_name
     assert_equal [:charge, :finish], ApiTestOrderWorkflow.step_order
@@ -132,6 +145,26 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
     assert_match(/terminal/, error.message)
     refute store.enqueued
+  end
+
+  test "worker pool class helpers enqueue through the store without per-pool engines" do
+    store = WorkerPoolEnqueueStore.new
+
+    Durababble::Engine.stub(:new, ->(*) { raise "unexpected engine construction" }) do
+      assert_equal "wf-pool-one", ApiTestOrderWorkflow.enqueue({ "request_id" => "one" }, id: "wf-pool-one", store:, worker_pool: "critical")
+      handle = ApiTestOrderWorkflow.start({ "request_id" => "two" }, store:, worker_pool: "bulk")
+
+      assert_match(/\A[0-9a-f-]{36}\z/, handle.workflow_id)
+    end
+
+    generated_id = store.enqueued.fetch(1).fetch(:id)
+    assert_equal(
+      [
+        { name: "api_test_order_workflow", input: { "request_id" => "one" }, id: "wf-pool-one", worker_pool: "critical" },
+        { name: "api_test_order_workflow", input: { "request_id" => "two" }, id: generated_id, worker_pool: "bulk" },
+      ],
+      store.enqueued,
+    )
   end
 
   durababble_store_backends.each do |backend|

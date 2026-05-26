@@ -8,13 +8,15 @@ module Durababble
     WAITING = "waiting"
     CANCELING = "canceling"
     CANCELED = "canceled"
+    TERMINATED = "terminated"
     FAILED = "failed"
     COMPLETED = "completed"
 
-    ALL = [PENDING, RUNNING, WAITING, CANCELING, CANCELED, FAILED, COMPLETED].freeze
+    ALL = [PENDING, RUNNING, WAITING, CANCELING, CANCELED, TERMINATED, FAILED, COMPLETED].freeze
     COMPLETED_STATUSES = [COMPLETED, CANCELED].freeze
+    TERMINAL_STATUSES = [COMPLETED, CANCELED, TERMINATED].freeze
     SUSPENDED_OR_RUNNABLE = [PENDING, WAITING, CANCELING].freeze
-    RPC_NOT_RUNNING = [COMPLETED, WAITING].freeze
+    RPC_NOT_RUNNING = [COMPLETED, TERMINATED, WAITING].freeze
 
     class << self
       #: (String | Hash[String, Object?]) -> bool
@@ -24,7 +26,7 @@ module Durababble
 
       #: (Hash[String, Object?]) -> bool
       def terminal?(row)
-        completed?(row) || final_failed?(row)
+        TERMINAL_STATUSES.include?(status_of(row)) || final_failed?(row)
       end
 
       #: (Hash[String, Object?]) -> bool

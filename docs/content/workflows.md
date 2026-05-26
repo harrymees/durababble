@@ -103,10 +103,11 @@ fulfillment.result
 
 ## Enqueuing And Workflow Handles
 
-`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `engine:` when you want an explicit engine instead of the configured default.
+`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `id:` when the caller needs to choose a stable workflow id; Durababble persists that exact id and raises `Durababble::WorkflowAlreadyExists` if it is already taken. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
 workflow_id = FulfillOrder.enqueue(order)
+workflow_id = FulfillOrder.enqueue(order, id: "fulfillment-order-123")
 
 # in some other long lived process, you'd do:
 worker = Durababble::Worker.new(
@@ -117,13 +118,20 @@ worker = Durababble::Worker.new(
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. It also accepts `id:` and returns a handle whose `workflow_id` is exactly that value. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
-handle = FulfillOrder.start(order)
+handle = FulfillOrder.start(order, id: "fulfillment-order-123")
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
+handle.terminate(reason: "operator hard stop")
 ```
+
+### Deduplicating Workflow Starts
+
+Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.
+
+Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or terminated workflow still counts as existing, so a later enqueue with the same deterministic id is rejected rather than starting a second run. Callers that want retry-after-completion semantics should choose a new workflow id, such as one that includes an attempt number or version.
 
 ## Replay
 
@@ -140,19 +148,11 @@ end
 
 Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
 
-### Replay Bounds
+### Workflow History Length
 
-Durababble bounds workflow replay by counting persisted `workflow_history` rows before loading replay payloads. The hard limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. The warning threshold defaults to `8_000` events and can be tuned with `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS` or `Durababble.workflow_history_warning_events = 8_000`; reaching it logs a warning through `Durababble.logger` and does not stop the run.
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. A workflow that never ends accumulates an ever-growing event log, and as that log grows replay takes longer and system performance suffers.
 
-When an open workflow exceeds the hard limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`. The terminal failure clears workflow leases and retry deadlines, and terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming it, so workers do not repeatedly claim the same oversized run. Completed, canceled, and failed workflows are returned as-is and remain inspectable.
-
-Treat warning logs or `WorkflowHistoryLimitExceeded` as workflow design or retention signals. Split very long workflows into child runs or smaller durable objects, compact completed history through a deliberate retention tool, or raise the hard limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.
-
-### Workflow Event Log Length
-
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. Otherwise, the recorded event history will grow to be very long, replay will take very long, and system performance will suffer.
-
-Prefer durable objects for long-lived identities, and prefer splitting very large jobs into a workflow per bounded batch or phase.
+Prefer durable objects for long-lived identities, and split very large jobs into a workflow per bounded batch or phase:
 
 ```ruby
 # Prefer this shape for ongoing per-shop state:
@@ -161,6 +161,12 @@ ShopSync.at(shop_id).record_cursor(cursor)
 # Prefer this shape for bounded work:
 SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
 ```
+
+To keep an unbounded run from degrading silently, Durababble bounds replay by counting persisted `workflow_history` rows before loading replay payloads. The hard limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. The warning threshold defaults to `8_000` events and can be tuned with `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS` or `Durababble.workflow_history_warning_events = 8_000`; reaching it logs a warning through `Durababble.logger` but does not stop the run.
+
+When an open workflow exceeds the hard limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`. The terminal failure clears workflow leases and retry deadlines, and terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming it, so workers do not repeatedly claim the same oversized run. Completed, canceled, and failed workflows are returned as-is and remain inspectable.
+
+Treat a warning log or `WorkflowHistoryLimitExceeded` as a design or retention signal rather than a number to raise reflexively. Reshape the workload using the patterns above, compact completed history through a deliberate retention tool, or raise the hard limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.
 
 ## Sleeping
 
@@ -315,6 +321,19 @@ worker.run_until_idle
 <!-- DOCS:workflow-cancellation-example:end -->
 
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
+
+## Termination
+
+Termination is the hard-stop operator path. `Workflow.handle(run_id).terminate(reason:)` durably marks the workflow `terminated` without asking workflow code to observe a cancellation request and without running cleanup steps. The terminal run has no result and stores the reason as its error.
+
+Use cancellation when workflow code should unwind, compensate, or mark external state through ordinary durable cleanup. Use termination when the caller needs the workflow to stop at the next safe durable boundary and must prevent later waits, workflow commands, completion writes, or recovery from reviving it.
+
+```ruby
+handle = ImportCustomers.start({ "file_id" => "file_123" })
+handle.terminate(reason: "operator replaced the import")
+```
+
+If a workflow is already completed, failed, canceled, or terminated, termination is idempotent and returns the existing terminal run.
 
 ## Using `async` for parallelism
 

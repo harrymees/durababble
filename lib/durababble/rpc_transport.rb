@@ -4,6 +4,7 @@
 require "paquito"
 require "concurrent-ruby"
 require "grpc"
+require_relative "worker_identity"
 require_relative "rpc_proto"
 
 module Durababble
@@ -37,7 +38,7 @@ module Durababble
 
       #: (String) -> String?
       def rpc_address_for(node_id)
-        @entries[node_id]
+        @entries[node_id] || WorkerIdentity.address_for(node_id)
       end
     end
 
@@ -94,12 +95,12 @@ module Durababble
         true
       end
 
-      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String) -> bool
-      def evict_lease(worker_pool:, target_kind:, target_id:, target_class: "")
+      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String, ?expected_worker_id: String) -> bool
+      def evict_lease(worker_pool:, target_kind:, target_id:, target_class: "", expected_worker_id: "")
         Observability.trace("durababble.rpc.client.evict_lease", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
           with_rpc_errors do
             @stub.evict_lease(
-              Proto::EvictLeaseRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
+              Proto::EvictLeaseRequest.new(worker_pool:, target_kind:, target_class:, target_id:, expected_worker_id:),
               deadline: deadline,
             )
           end
@@ -107,12 +108,12 @@ module Durababble
         true
       end
 
-      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String) -> bool
-      def deliver_message(worker_pool:, target_kind:, target_id:, target_class: "")
+      #: (worker_pool: String, target_kind: String, target_id: String, ?target_class: String, ?expected_worker_id: String) -> bool
+      def deliver_message(worker_pool:, target_kind:, target_id:, target_class: "", expected_worker_id: "")
         Observability.trace("durababble.rpc.client.deliver_message", "durababble.worker.pool" => worker_pool, "durababble.rpc.target_kind" => target_kind, "durababble.rpc.target_class" => target_class) do
           with_rpc_errors do
             @stub.deliver_message(
-              Proto::DeliverMessageRequest.new(worker_pool:, target_kind:, target_class:, target_id:),
+              Proto::DeliverMessageRequest.new(worker_pool:, target_kind:, target_class:, target_id:, expected_worker_id:),
               deadline: deadline,
             )
           end
@@ -120,8 +121,8 @@ module Durababble
         true
       end
 
-      #: (worker_pool: Object?, method: Object?, args: Object?, ?class_name: Object?, ?object_id: Object?, ?workflow_id: Object?, ?deadline_ms: Object?) -> Object
-      def call_transient_response(worker_pool:, method:, args:, class_name: "", object_id: "", workflow_id: "", deadline_ms: 0)
+      #: (worker_pool: Object?, method: Object?, args: Object?, ?class_name: Object?, ?object_id: Object?, ?workflow_id: Object?, ?deadline_ms: Object?, ?expected_worker_id: Object?) -> Object
+      def call_transient_response(worker_pool:, method:, args:, class_name: "", object_id: "", workflow_id: "", deadline_ms: 0, expected_worker_id: "")
         Observability.trace("durababble.rpc.client.call_transient", "durababble.worker.pool" => worker_pool, "durababble.rpc.method" => method, "durababble.workflow.id" => workflow_id, "durababble.object.type" => class_name, "durababble.object.id" => object_id) do
           with_rpc_errors do
             @stub.call_transient(
@@ -133,6 +134,7 @@ module Durababble
                 method:,
                 args: Rpc.dump(args),
                 deadline_ms:,
+                expected_worker_id:,
               ),
               deadline: deadline,
             )
@@ -151,6 +153,7 @@ module Durababble
             object_id: kwargs.fetch(:object_id, ""),
             workflow_id: kwargs.fetch(:workflow_id, ""),
             deadline_ms: kwargs.fetch(:deadline_ms, 0),
+            expected_worker_id: kwargs.fetch(:expected_worker_id, ""),
           ),
         )
       rescue Unavailable => e
@@ -192,11 +195,16 @@ module Durababble
           workflow_id: payload.fetch("workflow_id"),
           method: payload.fetch("command"),
           args: payload.fetch("payload", {}),
+          expected_worker_id: payload.fetch("expected_worker_id"),
         )
       end
     end
 
     class Server
+      # Cap how long #stop blocks waiting for the serving task to drain. A hung
+      # request must not wedge shutdown forever; we log and move on past this.
+      STOP_DRAIN_TIMEOUT = 5.0
+
       #: String?
       attr_reader :node_id
       #: String
@@ -204,7 +212,7 @@ module Durababble
       #: Integer?
       attr_reader :port
 
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
       def initialize(
         node_id:,
         store:,
@@ -220,7 +228,9 @@ module Durababble
         awaken_batch: nil,
         evict_lease: nil,
         deliver_message: nil,
-        verify_deliver_message_owner: true
+        verify_deliver_message_owner: true,
+        identity_id: nil,
+        stop_drain_timeout: STOP_DRAIN_TIMEOUT
       )
         @node_id = node_id
         @store = store
@@ -237,6 +247,8 @@ module Durababble
         @evict_lease = evict_lease
         @deliver_message = deliver_message
         @verify_deliver_message_owner = verify_deliver_message_owner
+        @identity_id = identity_id
+        @stop_drain_timeout = stop_drain_timeout
       end
 
       #: () -> Server
@@ -245,7 +257,7 @@ module Durababble
 
         @server = GRPC::RpcServer.new(pool_size: @pool_size)
         @port = @server.add_http2_port("#{host}:#{@requested_port}", @credentials)
-        @node_id ||= address
+        @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
         current_node_id = @node_id
         @server.handle(Service.new(
           node_id: current_node_id,
@@ -267,7 +279,16 @@ module Durababble
       #: () -> void
       def stop
         @server&.stop
-        @server_task&.wait
+        task = @server_task
+        if task
+          task.wait(@stop_drain_timeout)
+          if task.pending?
+            Durababble.logger&.warn(
+              "Durababble::Rpc::Server#stop timed out after #{@stop_drain_timeout}s " \
+                "waiting for the serving task to drain; abandoning it",
+            )
+          end
+        end
       ensure
         @server = nil
         @server_task = nil
@@ -324,6 +345,8 @@ module Durababble
         request = request #: as untyped
         Observability.trace("durababble.rpc.server.evict_lease", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
+          return Proto::EvictLeaseResponse.new if expected_worker_mismatch?(request)
+
           @evict_lease&.call(
             worker_pool: request.worker_pool,
             target_kind: request.target_kind,
@@ -339,7 +362,7 @@ module Durababble
         request = request #: as untyped
         Observability.trace("durababble.rpc.server.deliver_message", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
-          unless @verify_deliver_message_owner && stale_workflow_message?(request)
+          unless expected_worker_mismatch?(request) || (@verify_deliver_message_owner && stale_workflow_message?(request))
             @deliver_message&.call(
               worker_pool: request.worker_pool,
               target_kind: request.target_kind,
@@ -386,9 +409,10 @@ module Durababble
       #: (Object) -> Object?
       def call_workflow_transient(request)
         request = request #: as untyped
+        expected_worker_id = request.expected_worker_id.to_s.empty? ? @node_id : request.expected_worker_id
         payload = {
           "workflow_id" => request.workflow_id,
-          "expected_worker_id" => @node_id,
+          "expected_worker_id" => expected_worker_id,
           "command" => request["method"],
           "payload" => Rpc.load(request.args) || {},
         }
@@ -414,17 +438,24 @@ module Durababble
         request = request #: as untyped
         return false unless request.target_kind == "workflow"
 
-        lease = @store.current_workflow_lease(request.target_id)
+        lease = @store.current_workflow_lease(request.target_id, worker_pool: request.worker_pool)
         !lease || lease.fetch("worker_id") != @node_id
+      end
+
+      #: (Object) -> bool
+      def expected_worker_mismatch?(request)
+        request = request #: as untyped
+        expected_worker_id = request.expected_worker_id.to_s
+        !expected_worker_id.empty? && expected_worker_id != @node_id
       end
 
       #: (Object) -> Proto::TransientResponse?
       def moved_response(request)
         request = request #: as untyped
-        lease = @store.current_workflow_lease(request.workflow_id)
+        lease = @store.current_workflow_lease(request.workflow_id, worker_pool: request.worker_pool)
         return unless lease
 
-        new_node_id = lease.fetch("worker_id")
+        new_node_id = lease.fetch("worker_id").to_s
         return if new_node_id == @node_id
 
         Proto::TransientResponse.new(

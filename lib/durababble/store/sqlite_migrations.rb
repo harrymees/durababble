@@ -22,6 +22,7 @@ module Durababble
         CREATE TABLE IF NOT EXISTS #{table("workflows")} (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL,
+          worker_pool TEXT NOT NULL DEFAULT 'default',
           status TEXT NOT NULL,
           input BLOB NOT NULL,
           result BLOB,
@@ -138,6 +139,7 @@ module Durababble
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
+          worker_pool TEXT NOT NULL DEFAULT 'default',
           object_type TEXT NOT NULL,
           object_id TEXT NOT NULL,
           state BLOB,
@@ -145,7 +147,7 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (object_type, object_id)
+          PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
       create_inbox_tables!
@@ -176,17 +178,19 @@ module Durababble
     def create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
+          worker_pool TEXT NOT NULL DEFAULT 'default',
           target_kind TEXT NOT NULL,
           target_type TEXT NOT NULL,
           target_id TEXT NOT NULL,
           last_sequence INTEGER NOT NULL DEFAULT 0,
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (target_kind, target_type, target_id)
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("inbox")} (
           id TEXT PRIMARY KEY,
+          worker_pool TEXT NOT NULL DEFAULT 'default',
           target_kind TEXT NOT NULL,
           target_type TEXT NOT NULL,
           target_id TEXT NOT NULL,
@@ -195,6 +199,7 @@ module Durababble
           method_name TEXT,
           operation_id TEXT NOT NULL,
           idempotency_key TEXT,
+          idempotency_hash TEXT,
           shape_hash TEXT NOT NULL,
           payload BLOB NOT NULL,
           status TEXT NOT NULL,
@@ -209,16 +214,17 @@ module Durababble
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           completed_at INTEGER,
           dead_lettered_at INTEGER,
-          UNIQUE (target_kind, target_type, target_id, sequence),
-          UNIQUE (target_kind, target_type, target_id, idempotency_key)
+          UNIQUE (worker_pool, target_kind, target_type, target_id, sequence),
+          UNIQUE (idempotency_hash)
         )
       SQL
       execute(<<~SQL)
         CREATE INDEX IF NOT EXISTS #{index_name("inbox", "target_status_sequence")}
-        ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)
+        ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, status, sequence)
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
+          worker_pool TEXT NOT NULL DEFAULT 'default',
           target_kind TEXT NOT NULL,
           target_type TEXT NOT NULL,
           target_id TEXT NOT NULL,
@@ -228,12 +234,12 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (target_kind, target_type, target_id)
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
         CREATE INDEX IF NOT EXISTS #{index_name("target_activations", "queue")}
-        ON #{table("target_activations")} (status, ready_at, created_at)
+        ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)
       SQL
     end
   end
