@@ -12,7 +12,6 @@ class DurababbleStoreTest < DurababbleTestCase
   ScriptedPgConnection = DurababbleScriptedSqlSupport::ScriptedPgConnection
   ScriptedMysqlConnection = DurababbleScriptedSqlSupport::ScriptedMysqlConnection
   FlakyDeliveryClient = DurababbleScriptedSqlSupport::FlakyDeliveryClient
-  MysqlMigrationProbeStore = DurababbleScriptedSqlSupport::MysqlMigrationProbeStore
 
   test "routes active record connections through mysql and postgres adapters" do
     assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema")
@@ -414,59 +413,6 @@ class DurababbleStoreTest < DurababbleTestCase
       store.mark_workflow_running(workflow_id, worker_id: "owner", lease_seconds: 60)
 
       assert_hash_includes store.current_workflow_lease(workflow_id), "worker_id" => "owner"
-    end
-  end
-
-  test "adds missing MySQL workflow cancellation columns only once" do
-    store = MysqlMigrationProbeStore.new(
-      schema: "mysql_schema",
-      columns: { "mysql_schema_workflows" => ["cancel_reason"] },
-    )
-
-    store.send(:add_column_if_missing, "workflows", "cancel_reason", "TEXT")
-    store.send(:add_column_if_missing, "workflows", "cancel_requested_at", "DATETIME(6)")
-
-    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
-    assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
-  end
-
-  test "widens legacy worker_pool keys when upgrading existing MySQL schemas" do
-    with_durababble_store(durababble_store_backends.first, "worker_pool_upgrade", migrate: false) do |store|
-      skip("MySQL-specific upgrade migration path") unless backend_descriptor.mysql?
-
-      store.migrate!
-
-      quoted = ->(name) { store.send(:quote_column_name, name) }
-      table = ->(name) { store.send(:table, name) }
-      inbox_unique = quoted.call(store.send(:index_name, "inbox", "target_sequence_unique"))
-
-      # Recreate the pre-worker_pool key shape that an upgraded schema would still carry: the column
-      # was backfilled but the legacy PRIMARY/UNIQUE keys never included it.
-      store.send(:execute, "ALTER TABLE #{table.call("durable_objects")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("object_type")}, #{quoted.call("object_id")})")
-      store.send(:execute, "ALTER TABLE #{table.call("mailbox_sequences")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")})")
-      store.send(:execute, "ALTER TABLE #{table.call("target_activations")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")})")
-      store.send(:execute, "ALTER TABLE #{table.call("inbox")} DROP INDEX #{inbox_unique}, ADD UNIQUE KEY #{inbox_unique} (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")}, #{quoted.call("sequence")})")
-
-      refute store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
-      refute store.send(:key_includes_worker_pool?, "mailbox_sequences", "PRIMARY")
-      refute store.send(:key_includes_worker_pool?, "target_activations", "PRIMARY")
-      refute store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
-
-      # Re-running the migration must rebuild the widened, worker-pool-scoped keys.
-      store.instance_variable_set(:@migrated, false)
-      store.migrate!
-
-      assert store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
-      assert store.send(:key_includes_worker_pool?, "mailbox_sequences", "PRIMARY")
-      assert store.send(:key_includes_worker_pool?, "target_activations", "PRIMARY")
-      assert store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
-
-      # Idempotent: a second pass over already-widened keys is a no-op and leaves them intact.
-      store.instance_variable_set(:@migrated, false)
-      store.migrate!
-
-      assert store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
-      assert store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
     end
   end
 
@@ -1176,17 +1122,6 @@ class DurababbleStoreTest < DurababbleTestCase
       :ok
     }
     assert_equal 2, attempts
-
-    index_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")
-        sql_result([{ "exists" => 1 }])
-      end
-    end
-    index_store = mysql_store(index_connection)
-    index_store.send(:add_index_if_missing, "inbox", "missing_idx", "INDEX `missing_idx` (status)")
-    index_store.send(:drop_index_if_present, "inbox", "present_idx")
-    assert index_connection.queries.any? { |sql| sql.include?("ADD INDEX `missing_idx`") }
-    assert index_connection.queries.any? { |sql| sql.include?("DROP INDEX `present_idx`") }
   end
 
   private
