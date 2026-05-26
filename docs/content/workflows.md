@@ -124,6 +124,7 @@ worker.run_until_idle
 handle = FulfillOrder.start(order, id: "fulfillment-order-123")
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
+handle.terminate(reason: "operator hard stop")
 ```
 
 ## Replay
@@ -314,6 +315,19 @@ worker.run_until_idle
 <!-- DOCS:workflow-cancellation-example:end -->
 
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
+
+## Termination
+
+Termination is the hard-stop operator path. `Workflow.handle(run_id).terminate(reason:)` durably marks the workflow `terminated` without asking workflow code to observe a cancellation request and without running cleanup steps. The terminal run has no result and stores the reason as its error.
+
+Use cancellation when workflow code should unwind, compensate, or mark external state through ordinary durable cleanup. Use termination when the caller needs the workflow to stop at the next safe durable boundary and must prevent later waits, workflow commands, completion writes, or recovery from reviving it.
+
+```ruby
+handle = ImportCustomers.start({ "file_id" => "file_123" })
+handle.terminate(reason: "operator replaced the import")
+```
+
+If a workflow is already completed, failed, canceled, or terminated, termination is idempotent and returns the existing terminal run.
 
 ## Using `async` for parallelism
 

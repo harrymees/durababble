@@ -85,15 +85,15 @@ Durababble's stance is that durable execution is great for things that must surv
 
 The mesh piggybacks on infrastructure Durababble already needs for correct durable execution: leases.
 
-To execute a workflow or process a durable object's inbox, a worker first claims a lease in the database. The lease row records `worker_id` and `locked_until` so that exactly one worker is doing the work at a time and stale ownership can be fenced. That row is the address book — `worker_id` is set to the worker's reachable gRPC address by default, so any caller that can read the lease can also dial the owner.
+To execute a workflow or process a durable object's inbox, a worker first claims a lease in the database. The lease row records `worker_id` and `locked_until` so that exactly one worker is doing the work at a time and stale ownership can be fenced. For production runtimes, `worker_id` is a compact identity such as `7f3a9c21d0ab@10.0.0.42:50051`: the prefix is a per-process random worker id, and the suffix is the reachable gRPC address. That row is the address book and the incarnation fence, so any caller that can read the lease can dial the owner and tell the receiver which exact worker identity it expected.
 
 A simple call flows like this:
 
 1. Caller has a handle: `ReviewWorkflow.handle(run_id)`.
 2. Caller invokes a method: `handle.label`.
-3. The router reads `current_workflow_lease(workflow_id)` and gets back the owning worker's id (which is its gRPC address).
-4. The router opens (or reuses) a gRPC connection to that address and sends the call.
-5. The owning worker validates that it still holds the lease, runs the handler, and returns the result.
+3. The router reads `current_workflow_lease(workflow_id)` and gets back the owning worker's full identity.
+4. The router opens (or reuses) a gRPC connection to the address suffix and sends the call with the full identity as `expected_worker_id`.
+5. The owning worker validates that its local identity matches `expected_worker_id`, validates that it still holds the lease, runs the handler, and returns the result.
 
 ```mermaid
 sequenceDiagram
@@ -104,15 +104,15 @@ sequenceDiagram
 
     C->>C: handle = ReviewWorkflow.handle(run_id) then handle.label
     C->>DB: SELECT worker_id FROM lease WHERE workflow_id = run_id
-    DB-->>C: 10.0.0.42:50051
-    C->>O: gRPC CallTransient(label)
-    O->>O: validate - I still hold this lease
+    DB-->>C: 7f3a9c21d0ab@10.0.0.42:50051
+    C->>O: gRPC CallTransient(label, expected_worker_id)
+    O->>O: validate - this message is for my worker id and I still hold this lease
     O-->>C: "ready for review"
 
     Note over C,O: If the lease moved, the caller gets StaleLease,<br/>re-reads the lease, and dials the new owner.
 ```
 
-If the lease has moved (the owner crashed, the workflow was rescheduled), the caller gets `StaleLease` or `NodeUnavailable` and can retry, which re-reads the lease and dials the new owner. The DB is consulted to find the owner, not to carry the payload.
+If the lease has moved (the owner crashed, the workflow was rescheduled), or if Kubernetes has recycled the old owner's address for a new worker with a different identity, the caller gets `StaleLease` or `NodeUnavailable` and can retry, which re-reads the lease and dials the new owner. The DB is consulted to find the owner, not to carry the payload.
 
 For durable objects, the same flow applies. `Account.at("acct_123").balance` reads the object's lease, dials the owner, and returns the current state. `Account.at("acct_123").credit(1_000)` writes a row to the object's inbox and waits for the owning worker's mailbox loop to apply it.
 

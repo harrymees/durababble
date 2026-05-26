@@ -34,6 +34,7 @@ class DurababblePublicWorkflowApiTest < DurababbleTestCase
         ],
         store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] },
       )
+      assert_respond_to PublicApiCounterWorkflow.handle(run.id, store:), :terminate
     end
   end
 end

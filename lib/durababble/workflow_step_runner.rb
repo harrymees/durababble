@@ -123,15 +123,15 @@ module Durababble
     def handle_step_error(error, command_id:, step:, attributes:)
       step = step #: as untyped
       message = "#{error.class}: #{error.message}"
-      assert_workflow_lease!
-      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
         "error.type" => error.class.name,
       )
       Observability.count("durababble.workflow.step.failures", attributes)
-      return error unless step.retry_policy.retryable?(error, attempt_number:)
+      unless step.retry_policy.retryable?(error, attempt_number:)
+        return record_final_step_failure(command_id, message:, fallback_error: error)
+      end
 
       delay = step.retry_policy.delay_for_attempt(attempt_number)
       Observability.count(
@@ -139,10 +139,46 @@ module Durababble
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
       synchronize_store do
-        scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: @retry_run_at.call(delay))
-        raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+        run_at = @retry_run_at.call(delay)
+        if @store.respond_to?(:record_step_failed_and_schedule_retry)
+          @store.record_step_failed_and_schedule_retry(
+            workflow_id: @workflow_id,
+            command_id:,
+            error: message,
+            worker_id: @worker_id,
+            run_at:,
+          )
+        else
+          @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id)
+          scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at:)
+          raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+        end
       end
-      StepRetryScheduled.new(message)
+      crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
+    end
+
+    #: (Integer, message: String, fallback_error: StandardError) -> StandardError
+    def record_final_step_failure(command_id, message:, fallback_error:)
+      synchronize_store do
+        @store.record_step_failed(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          terminal: true,
+          error_class: fallback_error.class.name,
+          error_message: fallback_error.message,
+        )
+      end
+      crash_or(:step_failed_recorded, fallback_error)
+    end
+
+    #: (Symbol, StandardError) -> StandardError
+    def crash_or(point, error)
+      crash!(point)
+      error
+    rescue InjectedCrash => crash
+      crash
     end
 
     #: (Integer) -> Heartbeat

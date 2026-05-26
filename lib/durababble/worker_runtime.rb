@@ -46,7 +46,8 @@ module Durababble
       @workflows = workflows
       @objects = objects
       @worker_pool = worker_pool
-      @worker_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
+      @worker_identity_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
+      @worker_id = @worker_identity_id
       @lease_seconds = lease_seconds
       @poll_interval = poll_interval
       @migrate = migrate
@@ -62,6 +63,8 @@ module Durababble
       @last_error = nil
       @rpc_server = nil
       @rpc_address = nil
+      @worker_store = nil
+      @rpc_store = nil
     end
 
     #: () -> untyped
@@ -79,9 +82,10 @@ module Durababble
         )
         start_rpc_server
         worker = begin
-          Worker.new(store: @store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate)
+          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
         rescue StandardError
           stop_rpc_server
+          close_isolated_stores
           raise
         end
         @thread = Thread.new { run_loop(worker) }
@@ -134,22 +138,34 @@ module Durababble
     #: () -> untyped
     def close
       shutdown
+      close_isolated_stores
       @store.close if @owns_store
     end
 
     private
 
     #: () -> untyped
+    def worker_store
+      @worker_store ||= isolated_store
+    end
+
+    #: () -> untyped
+    def rpc_store
+      @rpc_store ||= isolated_store
+    end
+
+    #: () -> untyped
     def start_rpc_server
       @rpc_server = Rpc::Server.new(
         node_id: nil,
-        store: @store,
+        store: rpc_store,
         worker_pool: @worker_pool,
         host: @rpc_host,
         port: @rpc_port,
         credentials: @rpc_credentials,
         pool_size: @rpc_pool_size,
         verify_deliver_message_owner: false,
+        identity_id: @worker_identity_id,
         deliver_message: method(:enqueue_delivery),
       ).start
       @rpc_address = @rpc_server.address
@@ -166,10 +182,32 @@ module Durababble
       server.stop
     end
 
+    #: () -> untyped
+    def isolated_store
+      return @store unless @store.respond_to?(:pooled_connections)
+
+      @store.pooled_connections
+    end
+
+    #: () -> void
+    def close_isolated_stores
+      [@worker_store, @rpc_store].compact.uniq.each do |isolated_store|
+        next if isolated_store.equal?(@store)
+        next unless isolated_store.respond_to?(:close)
+
+        isolated_store.close
+      end
+      @worker_store = nil
+      @rpc_store = nil
+    end
+
     #: (**untyped) -> untyped
     def enqueue_delivery(**delivery)
+      return unless delivery.fetch(:worker_pool) == @worker_pool
+
       @mutex.synchronize do
         @deliveries << {
+          worker_pool: delivery.fetch(:worker_pool),
           target_kind: delivery.fetch(:target_kind),
           target_type: delivery[:target_type] || delivery.fetch(:target_class),
           target_id: delivery.fetch(:target_id),
@@ -187,6 +225,7 @@ module Durababble
           delivery = next_delivery
           result = if delivery
             worker.deliver_target(
+              worker_pool: delivery.fetch(:worker_pool),
               target_kind: delivery.fetch(:target_kind),
               target_type: delivery.fetch(:target_type),
               target_id: delivery.fetch(:target_id),

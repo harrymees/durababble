@@ -12,6 +12,7 @@ module Durababble
         CREATE TABLE IF NOT EXISTS #{table("workflows")} (
           id text PRIMARY KEY,
           name text NOT NULL,
+          worker_pool text NOT NULL DEFAULT 'default',
           status text NOT NULL,
           input bytea NOT NULL,
           result bytea,
@@ -27,6 +28,7 @@ module Durababble
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       SQL
+      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_by text")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
       execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
@@ -131,6 +133,7 @@ module Durababble
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (
+          worker_pool text NOT NULL DEFAULT 'default',
           object_type text NOT NULL,
           object_id text NOT NULL,
           state bytea,
@@ -138,9 +141,10 @@ module Durababble
           locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (object_type, object_id)
+          PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
+      execute("ALTER TABLE #{table("durable_objects")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -192,17 +196,19 @@ module Durababble
     def create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("mailbox_sequences")} (
+          worker_pool text NOT NULL DEFAULT 'default',
           target_kind text NOT NULL,
           target_type text NOT NULL,
           target_id text NOT NULL,
           last_sequence bigint NOT NULL DEFAULT 0,
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (target_kind, target_type, target_id)
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("inbox")} (
           id text PRIMARY KEY,
+          worker_pool text NOT NULL DEFAULT 'default',
           target_kind text NOT NULL,
           target_type text NOT NULL,
           target_id text NOT NULL,
@@ -211,6 +217,7 @@ module Durababble
           method_name text,
           operation_id text NOT NULL,
           idempotency_key text,
+          idempotency_hash text,
           shape_hash text NOT NULL,
           payload bytea NOT NULL,
           status text NOT NULL,
@@ -225,11 +232,12 @@ module Durababble
           updated_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz,
           dead_lettered_at timestamptz,
-          UNIQUE (target_kind, target_type, target_id, sequence)
+          UNIQUE (worker_pool, target_kind, target_type, target_id, sequence)
         )
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
+          worker_pool text NOT NULL DEFAULT 'default',
           target_kind text NOT NULL,
           target_type text NOT NULL,
           target_id text NOT NULL,
@@ -239,20 +247,25 @@ module Durababble
           locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (target_kind, target_type, target_id)
+          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
+      execute("ALTER TABLE #{table("mailbox_sequences")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
+      execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
+      execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS idempotency_hash text")
+      execute("ALTER TABLE #{table("target_activations")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
+      backfill_inbox_idempotency_hashes!
     end
 
     #: () -> untyped
     def create_performance_indexes!
-      create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (status ASC, created_at ASC)")
-      create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (status ASC, next_run_at ASC, created_at ASC)")
-      create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (status ASC, locked_until ASC)")
+      create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, created_at ASC)")
+      create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, next_run_at ASC, created_at ASC)")
+      create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, locked_until ASC)")
       drop_postgres_index("workflows_pending_created_idx")
-      create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (status ASC, runnable_immediately ASC, created_at ASC)")
-      create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (next_run_at ASC, created_at ASC) WHERE status = 'failed'")
-      create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (created_at ASC) WHERE status = 'canceling'")
+      create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, runnable_immediately ASC, created_at ASC)")
+      create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (worker_pool ASC, next_run_at ASC, created_at ASC) WHERE status = 'failed'")
+      create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (worker_pool ASC, created_at ASC) WHERE status = 'canceling'")
       create_postgres_index("workflow_history_command_idx", "ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
       create_postgres_index("waits_event_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, event_key ASC, created_at ASC)")
       create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")
@@ -269,12 +282,43 @@ module Durababble
       create_postgres_index("inbox_worker_lease_idx", "ON #{table("inbox")} (status ASC, locked_by ASC)")
       create_postgres_index("target_activations_worker_lease_idx", "ON #{table("target_activations")} (status ASC, locked_by ASC)")
       execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
-      create_postgres_index("inbox_target_idempotency_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, idempotency_key) WHERE idempotency_key IS NOT NULL", unique: true)
-      create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
-      create_postgres_index("inbox_target_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, sequence)")
-      create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
-      create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (status, ready_at, created_at)")
-      create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (status, locked_until, created_at)")
+      drop_postgres_index("inbox_target_idempotency_idx")
+      create_postgres_index("inbox_idempotency_hash_idx", "ON #{table("inbox")} (idempotency_hash) WHERE idempotency_hash IS NOT NULL", unique: true)
+      create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, status, sequence)")
+      create_postgres_index("inbox_target_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, sequence)")
+      create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (worker_pool, status, ready_at, created_at)")
+      create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
+      create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
+    end
+
+    #: () -> untyped
+    def backfill_inbox_idempotency_hashes!
+      rows = execute_params(<<~SQL, []).to_a
+        SELECT id, worker_pool, target_kind, target_type, target_id, idempotency_key
+        FROM #{table("inbox")}
+        WHERE idempotency_key IS NOT NULL AND idempotency_hash IS NULL
+      SQL
+      rows.each do |row|
+        hash = inbox_idempotency_hash_for_migration(
+          row.fetch("idempotency_key"),
+          worker_pool: row.fetch("worker_pool"),
+          target_kind: row.fetch("target_kind"),
+          target_type: row.fetch("target_type"),
+          target_id: row.fetch("target_id"),
+        )
+        execute_params("UPDATE #{table("inbox")} SET idempotency_hash = $1 WHERE id = $2", [hash, row.fetch("id")])
+      end
+    end
+
+    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+    def inbox_idempotency_hash_for_migration(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
+        "worker_pool" => worker_pool,
+        "target_kind" => target_kind,
+        "target_type" => target_type,
+        "target_id" => target_id,
+        "idempotency_key" => idempotency_key,
+      }))
     end
 
     #: (untyped, untyped, ?unique: bool) -> untyped

@@ -35,11 +35,11 @@ class DurababbleEngineTest < DurababbleTestCase
       { "id" => workflow_id, "status" => @workflow_status, "input" => {} }
     end
 
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       { "id" => workflow_id, "status" => "running", "input" => {}, "locked_by" => worker_id, "lease_seconds" => lease_seconds }
     end
 
-    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+    def claim_inbox_messages(worker_pool: "default", target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
       @claim_limits << limit
       return [] unless target_kind == "workflow" && target_type == "command-drain" && target_id == "wf-1"
       return [] unless worker_id == "worker-a" && lease_seconds == 9
@@ -133,17 +133,17 @@ class DurababbleEngineTest < DurababbleTestCase
       @workflows = {}
     end
 
-    def create_workflow(name:, input:, worker_id:, lease_seconds:)
-      @created_workflows << { name:, input:, worker_id:, lease_seconds: }
-      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "status" => "running", "input" => input, "locked_by" => worker_id }
+    def create_workflow(name:, input:, worker_id:, lease_seconds:, worker_pool: "default")
+      @created_workflows << { name:, input:, worker_id:, lease_seconds:, worker_pool: }
+      @workflows["wf-inline"] = { "id" => "wf-inline", "name" => name, "worker_pool" => worker_pool, "status" => "running", "input" => input, "locked_by" => worker_id }
       "wf-inline"
     end
 
-    def enqueue_workflow(name:, input:, id: nil)
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       raise "Engine#run should create the leased running workflow directly"
     end
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       raise "Engine#run should not claim a workflow it just created"
     end
 
@@ -183,8 +183,8 @@ class DurababbleEngineTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def enqueue_workflow(name:, input:, id: nil)
-      @enqueued << { name:, input:, id: }
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @enqueued << { name:, input:, id:, worker_pool: }
       id || "wf-#{@enqueued.length}"
     end
   end
@@ -210,7 +210,7 @@ class DurababbleEngineTest < DurababbleTestCase
       @row.merge("id" => workflow_id)
     end
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       @row = @row.merge("id" => workflow_id, "status" => "running", "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds)
     end
 
@@ -227,7 +227,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
   test "still supports requested injected crash points" do
     no_lease_store = Object.new
-    crashy_engine = Durababble::Engine.new(store: no_lease_store, migrate: false, crash_after: :workflow_completed)
+    crashy_engine = Durababble::Engine.new(store: no_lease_store, crash_after: :workflow_completed)
     assert_raises(Durababble::InjectedCrash) { crashy_engine.send(:crash!, :workflow_completed) }
   end
 
@@ -239,7 +239,7 @@ class DurababbleEngineTest < DurababbleTestCase
 
     assert_equal "wf-1", workflow_id
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil, worker_pool: "default" }], store.enqueued
   end
 
   test "passes explicit workflow ids to the store enqueue path" do
@@ -249,7 +249,17 @@ class DurababbleEngineTest < DurababbleTestCase
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 }, id: "wf-explicit")
 
     assert_equal "wf-explicit", workflow_id
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: "wf-explicit" }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: "wf-explicit", worker_pool: "default" }], store.enqueued
+  end
+
+  test "engine enqueue writes workflows into its worker pool" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:, worker_pool: "critical", migrate: false)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
+
+    assert_equal "wf-1", workflow_id
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: nil, worker_pool: "critical" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
@@ -379,13 +389,13 @@ class DurababbleEngineTest < DurababbleTestCase
       end
     end
     store = InlineRunStore.new
-    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9, migrate: false)
+    engine = Durababble::Engine.new(store:, worker_id: "inline-worker", lease_seconds: 9)
 
     run = engine.run(workflow, input: { "count" => 2 })
 
     assert_equal "completed", run.status
     assert_equal({ "count" => 2, "done" => true }, run.result)
-    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9 }], store.created_workflows
+    assert_equal [{ name: "inline-run", input: { "count" => 2 }, worker_id: "inline-worker", lease_seconds: 9, worker_pool: "default" }], store.created_workflows
   end
 
   durababble_store_backends.each do |backend|
@@ -555,7 +565,7 @@ class DurababbleEngineTest < DurababbleTestCase
           store.record_step_started(workflow_id:, command_id: 0, name: "first")
           store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-          run = Durababble::Engine.new(store:, worker_id: "history-at-max", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-at-max").resume(workflow, workflow_id:)
 
           assert_equal "completed", run.status
           assert_equal({ "count" => 2 }, run.result)
@@ -579,7 +589,7 @@ class DurababbleEngineTest < DurababbleTestCase
             raise "history should not be fetched once the count is over the configured limit"
           end
 
-          run = Durababble::Engine.new(store:, worker_id: "history-prefetch", migrate: false).resume(ImmediateWorkflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-prefetch").resume(ImmediateWorkflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/Durababble::WorkflowHistoryLimitExceeded: workflow #{workflow_id} has 4 history events, exceeding max 3/, run.error)
@@ -605,8 +615,8 @@ class DurababbleEngineTest < DurababbleTestCase
           store.record_step_started(workflow_id:, command_id: 0, name: "first")
           store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-          run = Durababble::Engine.new(store:, worker_id: "history-over", migrate: false).resume(workflow, workflow_id:)
-          replay = Durababble::Engine.new(store:, worker_id: "history-over-again", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-over").resume(workflow, workflow_id:)
+          replay = Durababble::Engine.new(store:, worker_id: "history-over-again").resume(workflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/WorkflowHistoryLimitExceeded/, run.error)
@@ -633,7 +643,7 @@ class DurababbleEngineTest < DurababbleTestCase
               store.record_step_started(workflow_id:, command_id: 0, name: "first")
               store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
 
-              run = Durababble::Engine.new(store:, worker_id: "history-warning", migrate: false).resume(workflow, workflow_id:)
+              run = Durababble::Engine.new(store:, worker_id: "history-warning").resume(workflow, workflow_id:)
 
               assert_equal "completed", run.status
               assert logger.warnings.any? { |message| message.include?("workflow #{workflow_id} has 3 workflow history events") }
@@ -674,7 +684,7 @@ class DurababbleEngineTest < DurababbleTestCase
             "status" => "pending",
           )
 
-          failed = Durababble::Engine.new(store:, worker_id: "history-terminal", migrate: false).resume(workflow, workflow_id:)
+          failed = Durababble::Engine.new(store:, worker_id: "history-terminal").resume(workflow, workflow_id:)
           worker = Durababble::Worker.new(store:, workflows: [workflow], worker_id: "activation-cleanup", migrate: false)
           assert_equal :worked, worker.tick
           assert_equal :idle, worker.tick
@@ -702,7 +712,7 @@ class DurababbleEngineTest < DurababbleTestCase
           workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
           store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
 
-          run = Durababble::Engine.new(store:, worker_id: "history-attempt", migrate: false).resume(workflow, workflow_id:)
+          run = Durababble::Engine.new(store:, worker_id: "history-attempt").resume(workflow, workflow_id:)
 
           assert_equal "failed", run.status
           assert_match(/WorkflowHistoryLimitExceeded/, run.error)
@@ -725,12 +735,12 @@ class DurababbleEngineTest < DurababbleTestCase
           end
           workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wait" })
 
-          waiting = Durababble::Engine.new(store:, worker_id: "history-wait", migrate: false).resume(workflow, workflow_id:)
+          waiting = Durababble::Engine.new(store:, worker_id: "history-wait").resume(workflow, workflow_id:)
           assert_equal "waiting", waiting.status
           assert_equal 2, store.workflow_history_count_for(workflow_id)
 
           assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-          completed = Durababble::Engine.new(store:, worker_id: "history-wait-recover", migrate: false).resume(workflow, workflow_id:)
+          completed = Durababble::Engine.new(store:, worker_id: "history-wait-recover").resume(workflow, workflow_id:)
 
           assert_equal "completed", completed.status
           assert_equal({ "id" => "wait", "slept" => true }, completed.result)
