@@ -65,12 +65,15 @@ class DurababbleDstMutationTest < DurababbleTestCase
     # Bug 2: a worker that crashes holding a fence leaves the row `running`
     # forever unless another worker atomically takes it over past its lease via
     # claim_expired_fence. Refuse to reclaim and the side effect never runs and
-    # the fence is stuck — both flagged.
+    # the fence is stuck — both flagged. The reclaim is exercised under DST
+    # through DeterministicSqliteStore#with_fence (which re-implements the
+    # inherited with_fence under virtual time); its reclaim seam is the single
+    # point that reverting the fix touches.
     mutation = proc { |**| false }
 
     assert_mutation_detected(
       "fence_holder_crash_and_reclaim",
-      Durababble::MysqlStore,
+      Durababble::Deterministic::DeterministicSqliteStore,
       :reclaim_expired_fence,
       mutation,
     )

@@ -95,6 +95,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "concurrent duplicate explicit workflow id enqueues create one workflow row with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; this test spins up concurrent independent Store.connect handles") if backend.sqlite?
+
       with_durababble_store(backend, "explicit_workflow_id_race") do |store|
         workflow_id = "wf-race-#{SecureRandom.hex(4)}"
         queue = Queue.new

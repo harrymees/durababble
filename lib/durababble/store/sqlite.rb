@@ -154,6 +154,15 @@ module Durababble
         rows = result_set.to_a
         rows = rows.map { |row| row.is_a?(Hash) ? columns.map { |column| row[column] } : row } unless columns.empty?
         ActiveRecord::Result.new(columns, rows, affected_rows: db.changes)
+      rescue SQLite3::ConstraintException => e
+        # The raw sqlite3 driver bypasses ActiveRecord, so a unique violation
+        # surfaces as SQLite3::ConstraintException rather than the
+        # ActiveRecord::RecordNotUnique the inherited orchestration rescues
+        # (e.g. insert_workflow -> WorkflowAlreadyExists). Translate so the
+        # MySQL-style error handling applies unchanged.
+        raise ActiveRecord::RecordNotUnique, e.message if e.message.include?("UNIQUE constraint failed")
+
+        raise
       ensure
         statement.close
       end

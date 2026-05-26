@@ -112,6 +112,25 @@ module Durababble
         @crashes_armed = previous
       end
 
+      # Routes SecureRandom.uuid through the store's monotonic id seam for the
+      # duration of the block, then restores it. The base store stamps several
+      # ids (workflow, wait, step-attempt, inbox) with SecureRandom.uuid rather
+      # than the overridable generate_uuid seam; under simulation those random
+      # ids leak into trace events (workflow_claimed id:, wait_completed
+      # wait_id:) and break run-to-run digest determinism. Drawing them from the
+      # same monotonic counter makes a seed replay byte-identical and keeps id
+      # order equal to insertion order. The scheduler is single-threaded, so a
+      # process-global stub is safe for the length of one run.
+      #: [T] () { () -> T } -> T
+      def with_deterministic_uuids(&block)
+        original = SecureRandom.method(:uuid)
+        store = self
+        SecureRandom.define_singleton_method(:uuid) { store.send(:generate_uuid) }
+        block.call
+      ensure
+        SecureRandom.define_singleton_method(:uuid, original) if original
+      end
+
       # --- Deterministic clock / identity seams ------------------------------
 
       #: () -> Integer
@@ -138,7 +157,7 @@ module Durababble
         # Re-affirming a lease we already hold is not a fresh claim; mirror
         # VirtualYugabyte and only trace the pending/expired -> running edge so
         # the per-seed workflow_claimed count stays stable.
-        already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_id]).first
+        already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
         claimed = super
         trace_event("workflow_claimed", id: workflow_id, worker: worker_id) if claimed && !already_owned
         claimed
@@ -351,6 +370,17 @@ module Durababble
         raise
       end
 
+      # The bug-2 reclaim seam: atomically take over a 'running' fence whose
+      # lease has expired (claim_expired_fence is a single UPDATE; affected_rows
+      # == 1 means we won the takeover). Kept as its own method so the DST
+      # mutation test can revert the fix in one place and confirm
+      # fence_holder_crash_and_reclaim goes red. Mirrors the inherited
+      # with_fence's inline reclaim.
+      #: (workflow_id: String, key: String, token: String, timeout: Numeric) -> bool
+      def reclaim_expired_fence(workflow_id:, key:, token:, timeout:)
+        execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
+      end
+
       # Single-shot, non-blocking: the production loop sleeps wall-clock until the
       # message resolves, which never terminates under virtual time.
       #: (String, ?poll_interval: Numeric, ?timeout: Numeric?) -> Object?
@@ -442,7 +472,13 @@ module Durababble
       def all_attempts
         grouped = Hash.new { |_hash, _key| [] }
         by_workflow = {} #: Hash[String, Array[Hash[String, Object?]]]
-        select_all("step_attempts", order: "id").each do |row|
+        # Order chronologically: the base store stamps attempt ids with
+        # SecureRandom.uuid (not the monotonic seam), so id order is not
+        # insertion order. started_at is the integer tick; sequential attempts
+        # for a step start on strictly later ticks, so this puts the latest
+        # attempt last for the harness's `attempts.last` comparison. The random
+        # id is a stable secondary key for any same-tick ties.
+        select_all("step_attempts", order: "started_at, id").each do |row|
           (by_workflow[row.fetch("workflow_id")] ||= []) << with_command_id(row)
         end
         @injected_attempts.each do |workflow_id, attempts|

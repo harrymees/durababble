@@ -1677,14 +1677,16 @@ module Durababble
         network = VirtualNetwork.new(scheduler:, drop_percent: scenario == "chaos" ? 5 : 0)
         store = DeterministicSqliteStore.build(scheduler:)
         begin
-          harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
-          trace.event(0, "dst", "begin", scenario:, seed:)
-          block.call(harness)
-          scheduler.run
-          harness.verify!
-          trace.event(scheduler.time, "dst", "end", scenario:, seed:)
-          trace_s = trace.to_s
-          Result.new(scenario:, seed:, trace: trace_s, digest: Digest::SHA256.hexdigest(trace_s), violations: harness.violations, summary: store.summary)
+          store.with_deterministic_uuids do
+            harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
+            trace.event(0, "dst", "begin", scenario:, seed:)
+            block.call(harness)
+            scheduler.run
+            harness.verify!
+            trace.event(scheduler.time, "dst", "end", scenario:, seed:)
+            trace_s = trace.to_s
+            Result.new(scenario:, seed:, trace: trace_s, digest: Digest::SHA256.hexdigest(trace_s), violations: harness.violations, summary: store.summary)
+          end
         ensure
           store.close
         end
