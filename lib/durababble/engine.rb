@@ -4,6 +4,7 @@
 require "async"
 require "securerandom"
 
+require_relative "error_formatting"
 require_relative "workflow_execution"
 
 module Durababble
@@ -65,23 +66,6 @@ module Durababble
     end
 
     private
-
-    # Number of backtrace frames retained in a persisted failure. The innermost
-    # frames (where the error was raised) sit at the top, so capping the tail
-    # keeps the column bounded without losing the frames that matter for debugging.
-    ERROR_BACKTRACE_LIMIT = 50
-
-    # Render an exception into the single `error` string we persist on a failed
-    # workflow/command, embedding the backtrace so failures are diagnosable from
-    # storage alone instead of just `"Class: message"`.
-    #: (Exception) -> String
-    def format_error(error)
-      message = "#{error.class}: #{error.message}"
-      backtrace = error.backtrace
-      return message if backtrace.nil? || backtrace.empty?
-
-      [message, *backtrace.first(ERROR_BACKTRACE_LIMIT)].join("\n")
-    end
 
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
@@ -188,7 +172,7 @@ module Durababble
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
-      message = format_error(e)
+      message = ErrorFormatting.format_error(e)
       @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)

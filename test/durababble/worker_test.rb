@@ -66,6 +66,11 @@ class DurababbleWorkerTest < DurababbleTestCase
       @step_attempts
     end
 
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      position ||= command_id
+      @step_attempts.count { |attempt| attempt.fetch("position").to_i == position.to_i }
+    end
+
     def workflow_cancellation(_workflow_id)
       nil
     end
