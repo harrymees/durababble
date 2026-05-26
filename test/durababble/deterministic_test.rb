@@ -39,6 +39,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_retry_then_complete",
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
+    "object_command_failure_exhaustion",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -441,6 +442,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
   test "re-delivers and completes a command exactly once after a transient retry" do
     result = Durababble::Deterministic.prove("workflow_command_retry_then_complete", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "dead-letters an object command once it exhausts its attempts" do
+    result = Durababble::Deterministic.prove("object_command_failure_exhaustion", seed: 7)
 
     assert_empty result.violations
   end
