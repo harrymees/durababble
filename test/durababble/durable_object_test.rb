@@ -848,7 +848,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         store.claim_target_activation(worker_id: "owner-node", lease_seconds: 30, target_kinds: ["object"], target_types: [ReadGateObject.object_type])
         client = QueryRoutingClient.new(result: "owner-local")
         store.rpc_client_factory = ->(address) do
-          assert_equal "owner-node", address
+          assert_equal("owner-node", address)
           client
         end
 
@@ -880,7 +880,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           end
 
           def [](key)
-            key == "method" ? "value" : @object_id if key == "method" || key == "object_id"
+            case key
+            when "method"
+              "value"
+            when "object_id"
+              @object_id
+            end
           end
         end.new(ReadGateObject.object_type, "object-1")
 
@@ -915,7 +920,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           end
 
           def [](key)
-            key == "method" ? "value" : @object_id if key == "method" || key == "object_id"
+            case key
+            when "method"
+              "value"
+            when "object_id"
+              @object_id
+            end
           end
         end.new(ReadGateObject.object_type, "object-1")
 
@@ -958,7 +968,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           end
 
           def [](key)
-            key == "method" ? "unsafe_set_from_query" : @object_id if key == "method" || key == "object_id"
+            case key
+            when "method"
+              "unsafe_set_from_query"
+            when "object_id"
+              @object_id
+            end
           end
         end.new(ReadGateObject.object_type, "object-1")
 

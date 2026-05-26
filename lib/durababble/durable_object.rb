@@ -161,7 +161,7 @@ module Durababble
 
     class TransientRequest
       #: String
-      attr_reader :class_name
+      attr_reader :class_name, :worker_pool
 
       #: (class_name: String, object_id: String, method: String, worker_pool: String) -> void
       def initialize(class_name:, object_id:, method:, worker_pool:)
@@ -180,9 +180,6 @@ module Durababble
           @object_id
         end
       end
-
-      #: () -> String
-      def worker_pool = @worker_pool
     end
 
     #: (Object, String, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
@@ -412,7 +409,7 @@ module Durababble
 
     #: (untyped, worker_pool: untyped, object_id: untyped, method_name: untyped, payload: untyped) -> untyped
     def invoke_query(object_class, worker_pool:, object_id:, method_name:, payload:)
-      payload = payload || {}
+      payload ||= {}
       args = payload.fetch("args", [])
       kwargs = payload.fetch("kwargs", {})
       state = DurableObject.state_from_store(@store, worker_pool:, object_type: object_class.object_type, object_id:)

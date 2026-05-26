@@ -552,7 +552,10 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       store:,
       worker_pool: "default",
       workflow_handlers: {},
-      transient_handler: ->(request:, args:) { raise Durababble::WorkflowRpc::StaleLease, "object moved" },
+      transient_handler: lambda do |request:, args:|
+        _ = [request, args]
+        raise Durababble::WorkflowRpc::StaleLease, "object moved"
+      end,
       node_directory: Durababble::Rpc::NodeDirectory.new("node-b" => "127.0.0.1:6000"),
       authorize: nil,
       awaken_batch: nil,
