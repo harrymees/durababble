@@ -291,7 +291,8 @@ module Durababble
         )
       end
 
-      @store.workflow_rpc_client_factory.call(worker_id, worker_pool: "default")
+      worker_pool = @worker_pool || "default"
+      @store.workflow_rpc_client_factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
     end
   end
 end

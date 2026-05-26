@@ -158,19 +158,7 @@ module Durababble
 
     #: () { (Store) -> Object? } -> Object?
     def with_dedicated_connection(&block)
-      owner = @owner #: as untyped
-      pool = owner&.connection_pool
-      return block.call(self) unless pool
-
-      dedicated_connection = pool.checkout
-      dedicated_store = self.class.from_active_record(connection: dedicated_connection, schema: @schema)
-      dedicated_store.rpc_client_factory = @rpc_client_factory
-      dedicated_store.workflow_rpc_client_factory = @workflow_rpc_client_factory
-      dedicated_store.local_workflow_rpc_node_id = @local_workflow_rpc_node_id
-      dedicated_store.local_workflow_rpc_handlers = @local_workflow_rpc_handlers
-      block.call(dedicated_store)
-    ensure
-      pool&.checkin(dedicated_connection) if dedicated_connection
+      block.call(self)
     end
 
     #: () -> Time
