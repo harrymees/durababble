@@ -2,6 +2,8 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "timeout"
+require "concurrent"
 
 class DurababbleRpcTransportTest < DurababbleTestCase
   TestTransientResponse = Struct.new(:result, :ok, :err, :moved, keyword_init: true)
@@ -234,6 +236,21 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
   ensure
     server&.stop
+  end
+
+  test "stop returns even when the server task never drains" do
+    server = Durababble::Rpc::Server.allocate
+    fake_server = Object.new
+    def fake_server.stop; end
+    server.instance_variable_set(:@server, fake_server)
+    server.instance_variable_set(:@stop_drain_timeout, 0.1)
+    # A resolvable future that is never fulfilled models a run loop that does not
+    # observe the stop signal; stop must not block on it forever.
+    server.instance_variable_set(:@server_task, Concurrent::Promises.resolvable_future)
+
+    Timeout.timeout(5) { server.stop }
+
+    assert_nil server.instance_variable_get(:@server_task)
   end
 
   test "rejects unauthorized gRPC peers before running handlers" do

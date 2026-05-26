@@ -274,6 +274,8 @@ class DurababbleEngineTest < DurababbleTestCase
     assert_empty store.completed
     assert_equal "msg-1", store.failed.fetch(0).fetch(:message_id)
     assert_match(/RuntimeError: stop/, store.failed.fetch(0).fetch(:error))
+    # The command-dispatch failure must keep the backtrace, not just class + message.
+    assert_match(/engine_test\.rb:\d+/, store.failed.fetch(0).fetch(:error))
     assert_equal ["wf-1", "worker-a"], store.suspended
   end
 
@@ -430,6 +432,23 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal first.error, second.error
         assert_equal 1, attempts
         assert_nil store.workflow(first.id).fetch("next_run_at")
+      end
+    end
+
+    test "preserves the failing step backtrace in the persisted workflow error with #{backend.name}" do
+      with_durababble_store(backend, "engine_test") do |store|
+        workflow = durababble_test_workflow("backtrace-capture") do
+          test_step("explode") { |_ctx| raise "boom" }
+        end
+        engine = Durababble::Engine.new(store:, worker_id: "owner")
+
+        run = engine.run(workflow, input: {})
+
+        assert_equal "failed", run.status
+        assert_match(/RuntimeError: boom/, run.error)
+        # The backtrace must survive so operators can locate the failing frame.
+        assert_match(/engine_test\.rb:\d+/, run.error)
+        assert_equal run.error, store.workflow(run.id).fetch("error")
       end
     end
 

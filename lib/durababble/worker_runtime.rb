@@ -61,6 +61,7 @@ module Durababble
       @stopping = false
       @thread = nil
       @last_error = nil
+      @consecutive_errors = 0
       @rpc_server = nil
       @rpc_address = nil
       @worker_store = nil
@@ -74,6 +75,7 @@ module Durababble
 
         @stopping = false
         @last_error = nil
+        @consecutive_errors = 0
         @deliveries.clear
         Observability.count(
           "durababble.worker.runtime.starts",
@@ -233,14 +235,17 @@ module Durababble
           else
             worker.tick
           end
+          @consecutive_errors = 0
           wait_for_work if result == :idle && !stopping?
         rescue LeaseConflict => e
           @last_error = e
           break if stopping?
         rescue StandardError => e
           @last_error = e
+          @consecutive_errors += 1
           break if stopping?
 
+          log_loop_error(e)
           wait_for_work
         end
       end
@@ -263,6 +268,17 @@ module Durababble
       @mutex.synchronize do
         @condition.wait(@mutex, @poll_interval) unless @stopping || !@deliveries.empty?
       end
+    end
+
+    # Surface unexpected polling failures so a worker that is silently spinning
+    # on a recurring error (bad migration, broken handler, lost DB) is visible
+    # instead of looking idle. LeaseConflict is normal contention and skips this.
+    #: (Exception) -> void
+    def log_loop_error(error)
+      Durababble.logger&.warn(
+        "Durababble worker #{@worker_id} hit an unexpected polling error " \
+          "(#{@consecutive_errors} in a row): #{error.class}: #{error.message}",
+      )
     end
   end
 end
