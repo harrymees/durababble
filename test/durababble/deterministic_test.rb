@@ -33,6 +33,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
     "cancellation_cleanup_crash_fuzz",
+    "cancellation_during_suspend_race",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
     "stolen_lease_write_rejection",
@@ -487,6 +488,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "record_cancel_crashed"
+  end
+
+  test "leaves no live step when cancellation lands while running before the step suspends" do
+    result = Durababble::Deterministic.prove("cancellation_during_suspend_race", seed: 1)
+
+    assert_empty result.violations
   end
 
   test "atomically terminates dependents when termination requests crash" do

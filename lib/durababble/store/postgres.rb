@@ -216,12 +216,23 @@ module Durababble
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:, context: "cancellation result")
-      update = if worker_id
-        execute_store_query(:cancel_workflow_with_worker, [workflow_id, serialized_result, reason, worker_id])
-      else
-        execute_store_query(:cancel_workflow, [workflow_id, serialized_result, reason])
+      transaction do
+        result_set = if worker_id
+          execute_store_query(:cancel_workflow_with_worker, [workflow_id, serialized_result, reason, worker_id])
+        else
+          execute_store_query(:cancel_workflow, [workflow_id, serialized_result, reason])
+        end
+        require_fenced_workflow_update!(result_set, workflow_id:, worker_id:, operation: "workflow cancellation")
+        # Terminalize any live wait/step/attempt the workflow still carries. When a
+        # cancellation was requested while the workflow was still running -- before
+        # its step suspended -- the request-time cleanup found nothing to cancel
+        # (the wait/step/attempt did not exist yet), and the step then recorded its
+        # wait and suspended into 'canceling'. Finalization here is the one place
+        # guaranteed to leave a clean terminal, so it repeats the idempotent,
+        # status-gated cleanup that the cancellation request runs.
+        cancel_pending_waits_for_workflow(workflow_id)
+        result_set
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
     #: (String, error: String, ?worker_id: String?) -> Object
