@@ -1,0 +1,11 @@
+{
+  "name": "durababble",
+  "private": true,
+  "scripts": {
+    "format:markdown": "prettier --write \"AGENTS.md\" \"README.md\" \"bench/**/*.md\" \"docs/**/*.md\" \"examples/**/*.md\"",
+    "check:markdown": "prettier --check \"AGENTS.md\" \"README.md\" \"bench/**/*.md\" \"docs/**/*.md\" \"examples/**/*.md\""
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

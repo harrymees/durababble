@@ -263,6 +263,7 @@ Cancellation is cooperative execution, not hard termination.
 - If workflow code catches cancellation and returns after cleanup, the engine records the workflow as `canceled` and stores the cleanup result. Re-raising `CancellationError` also records `canceled`.
 - If cleanup raises an unrelated error, ordinary step retry policy applies. Retryable cleanup failures remain `canceling` with `next_run_at` set and become claimable again only when due. Exhausted or non-retryable cleanup failures mark the workflow `failed`.
 - Child workflow APIs must require an explicit child-cancellation policy. Parent cancellation must not silently terminate child work or report `canceled` before the selected child policy reaches a durable outcome.
+
 ### Hard termination
 
 Termination is an operator hard stop, not cancellation with stronger wording.
