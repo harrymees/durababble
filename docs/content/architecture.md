@@ -114,7 +114,7 @@ Durababble enforces its payload limits after Paquito serialization and before wr
 
 ## Durability semantics
 
-- Enqueue persists the workflow before work is claimed.
+- Enqueue persists the workflow before work is claimed. Callers may provide an explicit workflow id; Durababble generates missing ids above the store boundary, inserts the final id through the workflow row primary key, and raises `Durababble::WorkflowAlreadyExists` on duplicates before any workflow history, wait, inbox, or target activation side effects are written. Terminal workflow rows still own their ids for deduplication.
 - Claiming work atomically marks one workflow `running` and writes `locked_by`/`locked_until` using locked queue selection.
 - A workflow heartbeat extends an owned running lease.
 - A step heartbeat (`step_context.heartbeat.record(cursor)`) compare-and-swaps against the current workflow lease owner/deadline, extends `locked_until`, and stores an opaque Paquito-serialized cursor on the current step/attempt. If the workflow lease expired or moved, the heartbeat raises `LeaseConflict` instead of reviving a zombie owner.

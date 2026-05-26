@@ -152,6 +152,26 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "pending", params[3]
   end
 
+  test "postgres enqueue_workflow uses an explicit id and maps duplicate ids" do
+    connection = ScriptedPgConnection.new
+    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    _sql, params = connection.exec_params_calls.first
+    assert_equal "wf-explicit", params[0]
+
+    duplicate = Durababble::PostgresStore.new(
+      ScriptedPgConnection.new(params_results: [->(_sql, _params) { raise ActiveRecord::RecordNotUnique, "duplicate key value violates unique constraint" }]),
+      schema: "durababble_test",
+    )
+    error = assert_raises(Durababble::WorkflowAlreadyExists) do
+      duplicate.enqueue_workflow(name: "demo", input: {}, id: "wf-explicit")
+    end
+    assert_match(/workflow wf-explicit already exists/, error.message)
+  end
+
   test "postgres create_workflow inserts the initial running row in one statement" do
     connection = ScriptedPgConnection.new
     store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
@@ -185,6 +205,26 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "INSERT INTO"
     assert_includes sql, "status"
     refute_includes sql, "UPDATE"
+  end
+
+  test "mysql enqueue_workflow uses an explicit id and maps duplicate ids" do
+    connection = ScriptedMysqlConnection.new
+    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    sql = connection.queries.first
+    assert_includes sql, "'wf-explicit'"
+
+    duplicate = Durababble::MysqlStore.new(
+      ScriptedMysqlConnection.new { |_sql| raise ActiveRecord::RecordNotUnique, "Duplicate entry 'wf-explicit' for key 'PRIMARY'" },
+      schema: "durababble_test",
+    )
+    error = assert_raises(Durababble::WorkflowAlreadyExists) do
+      duplicate.enqueue_workflow(name: "demo", input: {}, id: "wf-explicit")
+    end
+    assert_match(/workflow wf-explicit already exists/, error.message)
   end
 
   test "mysql create_workflow inserts the initial running row in one statement" do

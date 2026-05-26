@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "async"
+require "securerandom"
 
 require_relative "workflow_execution"
 
@@ -23,9 +24,10 @@ module Durababble
       @worker_pool = worker_pool
     end
 
-    #: (untyped, input: untyped) -> untyped
-    def enqueue(workflow_class, input:)
-      @store.enqueue_workflow(name: workflow_class.workflow_name, input:, worker_pool: @worker_pool)
+    #: (untyped, input: untyped, ?id: untyped) -> untyped
+    def enqueue(workflow_class, input:, id: nil)
+      workflow_id = id || SecureRandom.uuid
+      @store.enqueue_workflow(name: workflow_class.workflow_name, input:, id: workflow_id, worker_pool: @worker_pool)
     end
 
     #: (untyped, input: untyped) -> untyped

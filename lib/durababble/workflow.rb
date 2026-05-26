@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "securerandom"
+
 require_relative "durable_method_dsl"
 
 module Durababble
@@ -36,24 +38,26 @@ module Durababble
         workflow_name
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
-      def enqueue(input, store: nil, engine: nil, worker_pool: nil)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil)
         if worker_pool
-          Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, worker_pool:)
+          workflow_id = id || SecureRandom.uuid
+          Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
         else
-          Durababble.engine_for(store:, engine:).enqueue(self, input:)
+          Durababble.engine_for(store:, engine:).enqueue(self, input:, id:)
         end
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
-      def start(input, store: nil, engine: nil, worker_pool: nil)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil)
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
-          workflow_id = resolved_store.enqueue_workflow(name: workflow_name, input:, worker_pool:)
+          workflow_id = id || SecureRandom.uuid
+          resolved_store.enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
           handle(workflow_id, store: resolved_store, worker_pool:)
         else
           resolved_engine = Durababble.engine_for(store:, engine:)
-          workflow_id = resolved_engine.enqueue(self, input:)
+          workflow_id = resolved_engine.enqueue(self, input:, id:)
           handle(workflow_id, engine: resolved_engine)
         end
       end

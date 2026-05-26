@@ -43,6 +43,7 @@ module Durababble
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
+  class WorkflowAlreadyExists < Error; end
 
   class PayloadTooLarge < Error
     #: Symbol

@@ -469,16 +469,18 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
-      id = SecureRandom.uuid
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+      workflow_id = id
       serialized_input = dump_serialized(input, surface: :workflow_input, context: "workflow #{name}")
       if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, worker_pool, status, serialized_input, worker_id, lease_seconds || 60])
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, serialized_input, worker_id, lease_seconds || 60])
       else
-        execute_store_query(:insert_workflow, [id, name, worker_pool, status, serialized_input])
+        execute_store_query(:insert_workflow, [workflow_id, name, worker_pool, status, serialized_input])
       end
-      id
+      workflow_id
+    rescue ActiveRecord::RecordNotUnique
+      raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
     #: (workflow_id: String, worker_id: String) -> bool

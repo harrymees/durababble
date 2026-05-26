@@ -47,6 +47,107 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "enqueues explicit workflow ids and rejects duplicate ids without side effects with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id") do |store|
+        workflow_id = "wf-explicit-#{SecureRandom.hex(4)}"
+
+        assert_equal workflow_id, store.enqueue_workflow(name: "explicit-id", input: { "count" => 1 }, id: workflow_id)
+        assert_hash_includes(
+          store.workflow(workflow_id),
+          "id" => workflow_id,
+          "name" => "explicit-id",
+          "status" => "pending",
+          "input" => { "count" => 1 },
+        )
+
+        error = assert_raises(Durababble::WorkflowAlreadyExists) do
+          store.enqueue_workflow(name: "explicit-id", input: { "count" => 2 }, id: workflow_id)
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
+
+        assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "pending"
+        assert_equal [], store.workflow_history_for(workflow_id)
+        assert_equal [], store.steps_for(workflow_id)
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
+      end
+    end
+
+    test "completed workflows still reject duplicate explicit workflow ids with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id_completed") do |store|
+        workflow_id = "wf-completed-#{SecureRandom.hex(4)}"
+
+        assert_equal workflow_id, store.enqueue_workflow(name: "explicit-completed", input: { "count" => 1 }, id: workflow_id)
+        store.complete_workflow(workflow_id, result: { "count" => 2 })
+        assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "count" => 2 }
+
+        error = assert_raises(Durababble::WorkflowAlreadyExists) do
+          store.enqueue_workflow(name: "explicit-completed", input: { "count" => 3 }, id: workflow_id)
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
+
+        assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "completed", "result" => { "count" => 2 }
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+      end
+    end
+
+    test "concurrent duplicate explicit workflow id enqueues create one workflow row with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id_race") do |store|
+        workflow_id = "wf-race-#{SecureRandom.hex(4)}"
+        queue = Queue.new
+        thread_count = 8
+        mutex = Mutex.new
+        condition = ConditionVariable.new
+        ready = 0
+        release = false
+
+        threads = thread_count.times.map do |index|
+          Thread.new do
+            thread_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              mutex.synchronize do
+                ready += 1
+                condition.broadcast
+                condition.wait(mutex) until release
+              end
+              queue << [:ok, thread_store.enqueue_workflow(name: "explicit-race", input: { "winner" => index }, id: workflow_id)]
+            rescue Durababble::WorkflowAlreadyExists => e
+              queue << [:duplicate, e.message]
+            rescue StandardError => e
+              queue << [:error, e]
+            ensure
+              thread_store.close
+            end
+          end
+        end
+
+        mutex.synchronize do
+          condition.wait(mutex) until ready == thread_count
+          release = true
+          condition.broadcast
+        end
+
+        results = thread_count.times.map { queue.pop }
+        threads.each(&:join)
+
+        errors = results.select { |status, _value| status == :error }.map(&:last)
+        raise errors.first unless errors.empty?
+
+        assert_equal 1, results.count { |status, _value| status == :ok }
+        assert_equal thread_count - 1, results.count { |status, _value| status == :duplicate }
+        assert_equal [workflow_id], results.select { |status, _value| status == :ok }.map(&:last)
+        assert_hash_includes store.workflow(workflow_id), "id" => workflow_id, "name" => "explicit-race", "status" => "pending"
+        assert_equal [], store.workflow_history_for(workflow_id)
+        assert_equal [], store.steps_for(workflow_id)
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
+      end
+    end
+
     test "sets and preserves step started_at when a scheduled step starts with #{backend.name}" do
       with_durababble_store(backend, "step_start_metadata") do |store|
         workflow_id = store.create_workflow(name: "step-start-metadata", input: {})
