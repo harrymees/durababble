@@ -34,6 +34,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "cooperative_cancellation_cleanup",
     "cancellation_cleanup_crash_fuzz",
     "cancellation_during_suspend_race",
+    "parallel_branch_failure_orphans_step",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
     "stolen_lease_write_rejection",
@@ -492,6 +493,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
   test "leaves no live step when cancellation lands while running before the step suspends" do
     result = Durababble::Deterministic.prove("cancellation_during_suspend_race", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "terminalizes a parked parallel branch when a sibling fails the workflow" do
+    result = Durababble::Deterministic.prove("parallel_branch_failure_orphans_step", seed: 1)
 
     assert_empty result.violations
   end

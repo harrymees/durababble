@@ -462,7 +462,10 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
         assert_equal "failed", run.status
         assert_match(/boom masked/, run.error)
-        assert_equal [["wait_for_release", "waiting"], ["fail_sibling", "failed"]], store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] }
+        # The sibling failure terminalizes the workflow; fail_workflow then cancels the
+        # parked branch's wait so the failed (terminal, non-resumable) workflow does not
+        # strand a live `waiting` step.
+        assert_equal [["wait_for_release", "canceled"], ["fail_sibling", "failed"]], store.steps_for(run.id).map { |step| [step.fetch("name"), step.fetch("status")] }
       end
     end
 

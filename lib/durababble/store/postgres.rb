@@ -237,12 +237,23 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      update = if worker_id
-        execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
-      else
-        execute_store_query(:fail_workflow, [workflow_id, error])
+      transaction do
+        result_set = if worker_id
+          execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
+        else
+          execute_store_query(:fail_workflow, [workflow_id, error])
+        end
+        require_fenced_workflow_update!(result_set, workflow_id:, worker_id:, operation: "workflow failure")
+        # fail_workflow is the final-failure path (it clears next_run_at, so the row
+        # is terminal and is never resumed). A parallel branch may still be parked on
+        # a wait at this point -- a live wait/step/attempt that the workflow will now
+        # never drive to completion. Terminalize it in the same transaction so the
+        # failed workflow lands clean, exactly as cancellation and termination do
+        # (an abandoned parked branch is terminalized as 'canceled'; the real failure
+        # lives on the workflow's own error column).
+        cancel_pending_waits_for_workflow(workflow_id)
+        result_set
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
