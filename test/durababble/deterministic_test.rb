@@ -360,6 +360,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes failures.first.last.join("\n"), "stuck fence"
   end
 
+  test "flags a stuck outbox message whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_outbox", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck outbox"
+  end
+
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
     result = Durababble::Deterministic.prove("fence_holder_crash_and_reclaim", seed: 7)
 

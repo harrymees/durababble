@@ -277,6 +277,7 @@ module Durababble
 
       #: (untyped, untyped) -> untyped
       def verify_outbox_invariants!(workflows_state, outbox_state)
+        final_time = scheduler.time
         outbox_state.each_value do |message|
           outbox_id = message.fetch("id")
           status = message.fetch("status")
@@ -286,8 +287,19 @@ module Durababble
           end
           next unless status == "processing"
 
-          if message.fetch("locked_by").nil? || message.fetch("locked_until").nil?
+          locked_by = message.fetch("locked_by")
+          locked_until = message.fetch("locked_until")
+          if locked_by.nil? || locked_until.nil?
             violations << "processing outbox #{outbox_id} has no lease"
+            next
+          end
+
+          # Symmetric to the stuck-fence checker: once the scheduler has drained,
+          # no worker remains to reclaim a lease. An outbox message still
+          # `processing` with an expired `locked_until` is stuck forever — the
+          # crashed-holder-never-reclaimed bug class applied to the outbox lease.
+          if locked_until < final_time
+            violations << "stuck outbox #{outbox_id} for workflow #{message.fetch("workflow_id")} held by #{locked_by.inspect} with expired lease never reclaimed"
           end
         end
       end
