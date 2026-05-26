@@ -263,6 +263,7 @@ module Durababble
           UPDATE #{table("workflows")}
           SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
           WHERE id = $1
+            AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
         SQL
       end
     end
@@ -276,7 +277,7 @@ module Durababble
         )
       else
         execute_params(
-          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = $1 AND status IN ('running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending')",
+          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = $1 AND status IN ('running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending')",
           [workflow_id, dump_serialized(result)],
         )
       end
@@ -293,7 +294,7 @@ module Durababble
           )
         else
           execute_params(
-            "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
+            "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
             [workflow_id, dump_serialized(result), reason],
           )
         end
@@ -312,7 +313,7 @@ module Durababble
           )
         else
           execute_params(
-            "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1",
+            "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
             [workflow_id, error],
           )
         end

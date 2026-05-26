@@ -702,6 +702,61 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "unfenced workflow status writes do not mutate terminal rows with #{backend.name}" do
+      with_durababble_store(backend, "terminal_immutability") do |store|
+        completed_id = store.enqueue_workflow(name: "terminal-completed", input: {})
+        store.complete_workflow(completed_id, result: { "done" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completed_id, result: { "done" => false })
+        end
+        store.cancel_workflow(completed_id, reason: "too late")
+        store.fail_workflow(completed_id, error: "too late")
+        store.mark_workflow_running(completed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(completed_id),
+          "status" => "completed",
+          "result" => { "done" => true },
+          "error" => nil,
+          "locked_by" => nil,
+        )
+
+        canceled_id = store.enqueue_workflow(name: "terminal-canceled", input: {})
+        store.cancel_workflow(canceled_id, reason: "operator stop", result: { "cleanup" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(canceled_id, result: { "done" => true })
+        end
+        store.cancel_workflow(canceled_id, reason: "second cancel")
+        store.fail_workflow(canceled_id, error: "too late")
+        store.mark_workflow_running(canceled_id)
+        assert_hash_includes(
+          store.workflow(canceled_id),
+          "status" => "canceled",
+          "result" => { "cleanup" => true },
+          "error" => "operator stop",
+          "locked_by" => nil,
+        )
+
+        failed_id = store.enqueue_workflow(name: "terminal-failed", input: {})
+        store.fail_workflow(failed_id, error: "fatal")
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(failed_id, result: { "done" => true })
+        end
+        store.cancel_workflow(failed_id, reason: "too late")
+        store.fail_workflow(failed_id, error: "different")
+        store.mark_workflow_running(failed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(failed_id),
+          "status" => "failed",
+          "error" => "fatal",
+          "next_run_at" => nil,
+          "locked_by" => nil,
+        )
+      end
+    end
+
     test "terminal workflow writes do not leave incomplete durable work with #{backend.name}" do
       with_durababble_store(backend, "terminal_work_cleanup") do |store|
         completion_id = store.create_workflow(name: "reject-incomplete-complete", input: {})

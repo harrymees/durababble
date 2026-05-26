@@ -130,6 +130,8 @@ module Durababble
       #: (untyped, ?worker_id: untyped, ?lease_seconds: untyped) -> untyped
       def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
         row = @workflows.fetch(workflow_id)
+        return deep(row) if WorkflowStatus.terminal?(row)
+
         row["status"] = "running"
         row["error"] = nil
         if worker_id
@@ -160,6 +162,8 @@ module Durababble
       def complete_workflow(workflow_id, result:, worker_id: nil)
         row = @workflows.fetch(workflow_id)
         require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow completion")
+        raise Error, "workflow #{workflow_id} cannot complete from a terminal state" if WorkflowStatus.terminal?(row)
+
         row["status"] = "completed"
         row["result"] = deep(result)
         row["error"] = nil
@@ -173,6 +177,8 @@ module Durababble
       def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
         row = @workflows.fetch(workflow_id)
         require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow cancellation")
+        return if WorkflowStatus.terminal?(row)
+
         row["status"] = "canceled"
         row["result"] = deep(result)
         row["error"] = reason
@@ -186,6 +192,8 @@ module Durababble
       def fail_workflow(workflow_id, error:, worker_id: nil)
         row = @workflows.fetch(workflow_id)
         require_fenced_workflow_update!(row, workflow_id:, worker_id:, operation: "workflow failure")
+        return if WorkflowStatus.terminal?(row)
+
         row["status"] = "failed"
         row["error"] = error
         row["locked_by"] = nil

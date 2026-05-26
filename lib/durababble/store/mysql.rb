@@ -32,9 +32,13 @@ module Durababble
           UPDATE #{table("workflows")}
           SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
           WHERE id = ?
+            AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
         SQL
       else
-        execute_params("UPDATE #{table("workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ?", [workflow_id])
+        execute_params(
+          "UPDATE #{table("workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
+          [workflow_id],
+        )
       end
     end
 
@@ -468,6 +472,7 @@ module Durababble
           UPDATE #{table("workflows")}
           SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
           WHERE id = ?
+            AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
             AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
             AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = ? AND status IN ('running', 'waiting'))
             AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = ? AND status = 'pending')
@@ -494,6 +499,7 @@ module Durababble
               cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)),
               locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
             WHERE id = ?
+              AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
           SQL
         end
         require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
@@ -515,6 +521,7 @@ module Durababble
             UPDATE #{table("workflows")}
             SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
             WHERE id = ?
+              AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
           SQL
         end
         require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
