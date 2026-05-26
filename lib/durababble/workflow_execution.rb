@@ -104,28 +104,15 @@ module Durababble
       step = instance.class.step_definition(method_name)
       shape = step_command_shape(step:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
-      command_id, future, scheduled_from_history = synchronize_store do
-        command_id = @next_command_id
-        @next_command_id += 1
-        future = CommandFuture.new(command_id)
-        @futures[command_id] = future
-        scheduled_from_history = schedule_command!(command_id, name: step.name, shape:, event_budget: 3)
-        [command_id, future, scheduled_from_history]
-      end
+      command_id, future, scheduled_from_history = allocate_command(name: step.name, shape:)
       attributes = step_attributes(instance, step:, command_id:)
-      Observability.count("durababble.workflow.replay.steps", attributes) if @replay_history.terminal_recorded?(command_id)
-
-      unless @replay_history.terminal_recorded?(command_id)
-        if scheduled_from_history
-          ensure_history_limit_allows!(additional_events: 2)
-          @replay_history.reserve_events!(2)
-        end
+      if @replay_history.terminal_recorded?(command_id)
+        Observability.count("durababble.workflow.replay.steps", attributes)
+      else
+        reserve_scheduled_followup_events!(scheduled_from_history)
         dispatch_command!(command_id, step:, attributes:, &block)
       end
-      deliver_recorded_resolutions!
-      result = await_with_command_delivery(future, command_id)
-      raise_if_cancel_requested!
-      result
+      await_command_result(future, command_id)
     end
 
     #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?interrupt_on_command: bool) -> untyped
@@ -133,26 +120,13 @@ module Durababble
       assert_workflow_task!("durable wait #{name}")
       shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
-      command_id, future, scheduled_from_history = synchronize_store do
-        command_id = @next_command_id
-        @next_command_id += 1
-        future = CommandFuture.new(command_id)
-        @futures[command_id] = future
-        scheduled_from_history = schedule_command!(command_id, name:, shape:, event_budget: 3)
-        [command_id, future, scheduled_from_history]
-      end
+      command_id, future, scheduled_from_history = allocate_command(name:, shape:)
 
       unless @replay_history.terminal_recorded?(command_id)
-        if scheduled_from_history
-          ensure_history_limit_allows!(additional_events: 2)
-          @replay_history.reserve_events!(2)
-        end
+        reserve_scheduled_followup_events!(scheduled_from_history)
         record_wait_command!(command_id, name:, wait_request:)
       end
-      deliver_recorded_resolutions!
-      result = await_with_command_delivery(future, command_id, interrupt_on_command:)
-      raise_if_cancel_requested!
-      result
+      await_command_result(future, command_id, interrupt_on_command:)
     end
 
     # Awaits a command future, delivering pending workflow commands at the resulting
@@ -231,6 +205,40 @@ module Durababble
     end
 
     private
+
+    # Reserves the next command id, registers its future, and replays or records
+    # the schedule. Returns [command_id, future, scheduled_from_history] where
+    # scheduled_from_history is true when the schedule matched recorded history.
+    #: (name: untyped, shape: untyped) -> [Integer, CommandFuture, bool]
+    def allocate_command(name:, shape:)
+      synchronize_store do
+        command_id = @next_command_id
+        @next_command_id += 1
+        future = CommandFuture.new(command_id)
+        @futures[command_id] = future
+        scheduled_from_history = schedule_command!(command_id, name:, shape:, event_budget: 3)
+        [command_id, future, scheduled_from_history]
+      end
+    end
+
+    # A command replayed from a recorded schedule has two follow-up events (the
+    # start + terminal records) that were budgeted at schedule time; reserve them
+    # against the history limit before they are written.
+    #: (bool) -> void
+    def reserve_scheduled_followup_events!(scheduled_from_history)
+      return unless scheduled_from_history
+
+      ensure_history_limit_allows!(additional_events: 2)
+      @replay_history.reserve_events!(2)
+    end
+
+    #: (CommandFuture, Integer, ?interrupt_on_command: bool) -> untyped
+    def await_command_result(future, command_id, interrupt_on_command: false)
+      deliver_recorded_resolutions!
+      result = await_with_command_delivery(future, command_id, interrupt_on_command:)
+      raise_if_cancel_requested!
+      result
+    end
 
     #: () -> untyped
     def raise_if_cancel_requested!
