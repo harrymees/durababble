@@ -188,6 +188,7 @@ module Durababble
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time) -> Array[Hash[String, Object?]]
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now)
       result = transaction do
+        assert_workflow_inbox_lease_for_update!(target_kind:, workflow_id: target_id, worker_id:)
         rows = inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
         claimable = contiguous_claimable_inbox_rows(rows, now:)
         claimable.each do |row|
@@ -281,6 +282,8 @@ module Durababble
     #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
     def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
       transaction do
+        # [DURABABBLE-LEASE-4] Workflow command history commits need the workflow and inbox leases.
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:)
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
 
@@ -300,6 +303,8 @@ module Durababble
     #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
     def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
       transaction do
+        # [DURABABBLE-LEASE-4] Workflow command failure history is also a workflow commit.
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:)
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
 
@@ -347,6 +352,14 @@ module Durababble
       raise LeaseConflict, "#{message} or the lease expired or moved" if worker_id
 
       raise Error, message
+    end
+
+    #: (target_kind: Object?, workflow_id: Object?, worker_id: String) -> void
+    def assert_workflow_inbox_lease_for_update!(target_kind:, workflow_id:, worker_id:)
+      return unless target_kind.to_s == "workflow"
+
+      # [DURABABBLE-LEASE-4] Workflow inbox commands run inside the workflow lease boundary.
+      assert_workflow_lease_for_update!(workflow_id: workflow_id.to_s, worker_id:)
     end
 
     #: (workflow_id: String, worker_id: String) -> void

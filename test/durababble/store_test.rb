@@ -626,11 +626,16 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
       sql_result,
     ])).fail_object_command(command_id: "cmd", error: "boom", worker_id: "w")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
-      .complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
-      .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+    assert_raises(Durababble::LeaseConflict) do
+      pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
+        .complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
+    end
+    assert_raises(Durababble::LeaseConflict) do
+      pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
+        .fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+    end
     pg_store(ScriptedPgConnection.new(params_results: [
+      sql_result([{ "owned" => 1 }]),
       sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
       sql_result,
       sql_result([{ "event_index" => "0" }]),
@@ -640,6 +645,7 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
     ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
+      sql_result([{ "owned" => 1 }]),
       sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
       sql_result,
       sql_result([{ "event_index" => "1" }]),

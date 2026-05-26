@@ -351,15 +351,102 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
         assert_nil store.claim_target_activation(worker_id: "other", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
 
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker",
+        )
         claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
         assert_equal [first], claimed.map { |message| message.fetch("id") }
         store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
-        store.complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker")
+        assert store.suspend_workflow(workflow_id:, worker_id: "activation-worker")
+        store.complete_target_activation(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          worker_id: "activation-worker",
+        )
 
         rearmed = store.claim_target_activation(worker_id: "activation-worker-2", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
         assert_hash_includes rearmed, "target_id" => workflow_id, "locked_by" => "activation-worker-2"
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker-2", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker-2",
+        )
         remaining = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker-2", lease_seconds: 30, limit: 1)
         assert_equal [second], remaining.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "workflow inbox command writes require a live workflow lease with #{backend.name}" do
+      with_durababble_store(backend, "workflow_inbox_lease_fence") do |store|
+        store.migrate!
+
+        [
+          [
+            "completion",
+            lambda do |workflow_id, message_id|
+              store.complete_workflow_command(
+                message_id:,
+                workflow_id:,
+                result: { "ok" => true },
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+          [
+            "failure",
+            lambda do |workflow_id, message_id|
+              store.fail_workflow_command(
+                message_id:,
+                workflow_id:,
+                error: "boom",
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+        ].each do |operation, write_command|
+          workflow_id = store.enqueue_workflow(name: "approval", input: { "operation" => operation })
+          message_id = store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: operation } },
+          )
+
+          assert_hash_includes(
+            store.claim_target_activation(
+              worker_id: "workflow-owner",
+              lease_seconds: 300,
+              target_kinds: ["workflow"],
+              target_types: ["approval"],
+            ),
+            "target_id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          assert_hash_includes(
+            store.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed_messages = store.claim_inbox_messages(
+            target_kind: "workflow",
+            target_type: "approval",
+            target_id: workflow_id,
+            worker_id: "workflow-owner",
+            lease_seconds: 300,
+          )
+          assert_equal(
+            [message_id],
+            claimed_messages.map { |message| message.fetch("id") },
+          )
+
+          assert_equal 1, store.steal_expired_leases!(now: Time.now + 31)
+          assert_raises(Durababble::LeaseConflict) { write_command.call(workflow_id, message_id) }
+          assert_equal [], store.workflow_history_for(workflow_id)
+          assert_hash_includes store.inbox_message(message_id), "status" => "running", "locked_by" => "workflow-owner"
+        end
       end
     end
 
@@ -519,10 +606,11 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
       with_durababble_store(backend, "inbox_crash_after_commit") do |store|
         store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
         message_id = store.enqueue_inbox_message(
           target_kind: "workflow",
           target_type: "approval",
-          target_id: "wf-2",
+          target_id: workflow_id,
           message_kind: "workflow_command",
           method_name: "approve",
           payload: { "reason" => "ok" },
@@ -532,7 +620,12 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         begin
           assert_hash_includes(recovered.inbox_message(message_id), "status" => "pending")
           assert_equal(1, recovered.inbox_message(message_id).fetch("sequence").to_i)
-          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-2", worker_id: "workflow-owner", lease_seconds: 30)
+          assert_hash_includes(
+            recovered.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "workflow-owner", lease_seconds: 30)
           assert_equal([message_id], claimed.map { |message| message.fetch("id") })
         ensure
           recovered.close

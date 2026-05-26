@@ -260,6 +260,11 @@ pred liveTargetActivation[target: InboxTarget, worker: Worker, t: Time] {
     r.activation_owner = worker and r.activation_time = t and some r.activation_expiresAt and gt[r.activation_expiresAt, t]
 }
 
+pred workflowInboxLeaseHeld[cmd: InboxCommand, worker: Worker, t: Time] {
+  cmd.command_target.target_kind = ObjectInbox
+  or liveWorkflowLease[cmd.command_target.target_workflow, worker, t]
+}
+
 pred workflowSame[w: Workflow, t: Time, tnext: Time] {
   workflowStatus[w, tnext] = workflowStatus[w, t]
   workflowNextRun[w, tnext] = workflowNextRun[w, t]
@@ -963,6 +968,7 @@ pred claimInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] 
     commandStatus[cmd, t] = CommandRunning and no owner: Worker | liveCommandLease[cmd, owner, t]
   )
   liveTargetActivation[cmd.command_target, worker, t]
+  workflowInboxLeaseHeld[cmd, worker, t]
   no other: InboxCommand - cmd | other.command_target = cmd.command_target and
     lt[other.command_sequence, cmd.command_sequence] and inboxCommandBlocks[other, worker, t]
   commandStatus[cmd, tnext] = CommandRunning
@@ -973,6 +979,7 @@ pred claimInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] 
 
 pred completeInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] {
   liveCommandLease[cmd, worker, t]
+  workflowInboxLeaseHeld[cmd, worker, t]
   commandStatus[cmd, tnext] = CommandCompleted
   no ((command_row.cmd) & (command_time.tnext)).command_owner
   no ((command_row.cmd) & (command_time.tnext)).command_expiresAt
@@ -983,6 +990,7 @@ pred completeInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Tim
 
 pred failInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] {
   liveCommandLease[cmd, worker, t]
+  workflowInboxLeaseHeld[cmd, worker, t]
   commandStatus[cmd, tnext] = CommandFailed
   no ((command_row.cmd) & (command_time.tnext)).command_owner
   no ((command_row.cmd) & (command_time.tnext)).command_expiresAt
@@ -992,6 +1000,7 @@ pred failInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] {
 
 pred deadLetterInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] {
   liveCommandLease[cmd, worker, t]
+  workflowInboxLeaseHeld[cmd, worker, t]
   commandStatus[cmd, tnext] = CommandDeadLettered
   no ((command_row.cmd) & (command_time.tnext)).command_owner
   no ((command_row.cmd) & (command_time.tnext)).command_expiresAt
@@ -1171,6 +1180,12 @@ assert waitsWakeOnce {
 assert staleOwnersCannotCommit {
   all c: DurableCommit |
     c.commit_kind in (WorkflowCommit + StepCommit + WaitCommit) implies liveWorkflowLease[c.commit_workflow, c.commit_worker, c.commit_time]
+}
+
+assert workflowInboxCommandCommitsNeedWorkflowLease {
+  all c: DurableCommit |
+    c.commit_kind = InboxCommandCommit and c.commit_command.command_target.target_kind = WorkflowInbox implies
+      liveWorkflowLease[c.commit_command.command_target.target_workflow, c.commit_worker, c.commit_time]
 }
 
 /**
@@ -1600,8 +1615,9 @@ pred exampleWorkflowInboxCommandCompletes {
     enqueueWorkflow[wf, first, first.next]
     enqueueInboxCommand[cmd, first.next, first.next.next]
     claimTargetActivation[target, worker, first.next.next, first.next.next.next]
-    claimInboxCommand[cmd, worker, first.next.next.next, first.next.next.next.next]
-    completeInboxCommand[cmd, worker, first.next.next.next.next, first.next.next.next.next.next]
+    claimWorkflow[wf, worker, first.next.next.next, first.next.next.next.next]
+    claimInboxCommand[cmd, worker, first.next.next.next.next, first.next.next.next.next.next]
+    completeInboxCommand[cmd, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
   }
 }
 
@@ -1742,7 +1758,7 @@ run exampleInboxCommandEnqueues for 5 but exactly 1 InboxTarget, 1 InboxCommand,
 run exampleTargetActivationClaims for 6 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 4 Time expect 1
 run exampleInboxCommandClaims for 7 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 5 Time expect 1
 run exampleInboxCommandCompletes for 7 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 1 DurableCommit, 5 Time expect 1
-run exampleWorkflowInboxCommandCompletes for 8 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 1 DurableCommit, 6 Time expect 1
+run exampleWorkflowInboxCommandCompletes for 8 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 1 DurableCommit, 7 Time expect 1
 run exampleInboxCommandFailureRetry for 9 but exactly 1 InboxTarget, 1 InboxCommand, 2 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 9 Time expect 1
 run exampleInboxCommandFifoHeadBlocksLaterCommand for 12 but exactly 1 InboxTarget, 2 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 7 Time expect 1
 run exampleInboxCommandFailureRearmsActivation for 7 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 6 Time expect 1
@@ -1764,3 +1780,4 @@ check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worke
 check staleFenceTokensCannotComplete for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check durableInboxCommandSerializationHolds for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
+check workflowInboxCommandCommitsNeedWorkflowLease for 4 but 2 Workflow, 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
