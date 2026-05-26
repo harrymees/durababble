@@ -166,6 +166,63 @@ class DurababbleWorkflowTest < DurababbleTestCase
     )
   end
 
+  test "workflow command replay validates completed command result shape" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+      result: { "approved_by" => "operator" },
+    )
+
+    assert_nil execution.send(:replay_workflow_command_event, event)
+
+    event["payload"]["result"] = { "approved_by" => "someone-else" }
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/different result/, error.message)
+  end
+
+  test "workflow command replay validates failed command error shape" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_failed",
+      method_name: "reject",
+      kwargs: { reason: "not approved" },
+      error: "DurababbleWorkflowTest::ApiTestChargeFailed: not approved",
+    )
+
+    assert_nil execution.send(:replay_workflow_command_event, event)
+
+    event["error"] = "RuntimeError: different"
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/different error/, error.message)
+  end
+
+  test "workflow command replay rejects unknown or unexpectedly successful commands" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    unknown = workflow_command_history_event("workflow_command_completed", method_name: "missing")
+
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, unknown)
+    end
+    assert_match(/unknown workflow command missing/, error.message)
+
+    successful = workflow_command_history_event(
+      "workflow_command_failed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+      error: "RuntimeError: expected",
+    )
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, successful)
+    end
+    assert_match(/expected workflow command approve to fail/, error.message)
+  end
+
   durababble_store_backends.each do |backend|
     test "runs exposed workflow commands from durable inbox activations and returns results with #{backend.name}" do
       with_durababble_store(backend, "workflow_commands") do |store|
@@ -360,6 +417,22 @@ class DurababbleWorkflowTest < DurababbleTestCase
   end
 
   private
+
+  def replay_execution_for(workflow_class)
+    Durababble::WorkflowExecution.allocate.tap do |execution|
+      execution.instance_variable_set(:@workflow_id, "wf-replay")
+      execution.instance_variable_set(:@workflow_class, workflow_class)
+      execution.instance_variable_set(:@workflow, workflow_class.new)
+    end
+  end
+
+  def workflow_command_history_event(kind, method_name:, kwargs: {}, result: nil, error: nil)
+    payload = { "method" => method_name.to_s, "args" => [], "kwargs" => kwargs }
+    payload["result"] = result unless result.nil?
+    event = { "kind" => kind, "name" => method_name.to_s, "payload" => payload }
+    event["error"] = error unless error.nil?
+    event
+  end
 
   def wait_until(timeout: 10)
     deadline = Time.now + timeout
