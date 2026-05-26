@@ -614,7 +614,10 @@ module Durababble
 
     #: (String) -> [String?, String?]
     def parse_step_failure_error(error)
-      error_class, error_message = error.split(": ", 2)
+      # Persisted errors carry a trailing backtrace (see ErrorFormatting), so
+      # only the first line holds the "Class: message" we want to reconstruct.
+      first_line = error.lines.first&.chomp || error
+      error_class, error_message = first_line.split(": ", 2)
       return [nil, nil] unless error_message
 
       [error_class, error_message]

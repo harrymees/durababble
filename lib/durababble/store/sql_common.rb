@@ -226,13 +226,30 @@ module Durababble
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
-        claimable = contiguous_claimable_inbox_rows(rows, now:)
-        claimable.each do |row|
+        contiguous_claimable_inbox_rows(rows, now:).map do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
+          claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
         end
-        claimable.map { |row| inbox_message(row.fetch("id").to_s) }
       end
       result #: as Array[Hash[String, Object?]]
+    end
+
+    # Post-claim view of a row we just row-locked and marked running in this
+    # transaction, avoiding a redundant re-read per claimed message. The row
+    # lock guarantees no other writer touched the row between the claim read
+    # and here, so mirroring the column writes from
+    # mark_inbox_row_running_without_transaction yields exactly what a re-read
+    # would return.
+    #: (Hash[String, Object?], worker_id: String, lease_seconds: Numeric, now: Time) -> Hash[String, Object?]
+    def claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
+      claimed = decode_row(row)
+      attempts = claimed.fetch("attempts") #: as untyped
+      claimed["status"] = "running"
+      claimed["attempts"] = attempts.to_i + 1
+      claimed["locked_by"] = worker_id
+      claimed["locked_until"] = now + lease_seconds
+      claimed["updated_at"] = now
+      claimed
     end
 
     #: (workflow_id: String, worker_id: String) -> bool

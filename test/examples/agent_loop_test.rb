@@ -253,9 +253,10 @@ class AgentLoopExampleTest < DurababbleTestCase
       poll_interval: 0.02,
       migrate: false,
     )
+    stop = false
     errors = Queue.new
     workflow_thread = Thread.new do
-      workflow_worker.tick
+      workflow_worker.tick until stop
     rescue StandardError => e
       errors << e
     end
@@ -271,6 +272,7 @@ class AgentLoopExampleTest < DurababbleTestCase
       sleep(0.02)
     end
   ensure
+    stop = true
     workflow_thread&.join(1)
     workflow_thread&.kill if workflow_thread&.alive?
     object_runtime&.shutdown(timeout: nil)
