@@ -36,6 +36,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
     "stolen_lease_write_rejection",
+    "timer_wakeup_batch_crash_fuzz",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
@@ -500,6 +501,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     refute_includes result.trace, "stale_accepted"
+  end
+
+  test "atomically wakes a batch of due timers through crashes without stranding waiters" do
+    result = Durababble::Deterministic.prove("timer_wakeup_batch_crash_fuzz", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wake_crashed"
   end
 
   test "dead-letters an object command once it exhausts its attempts" do
