@@ -387,6 +387,23 @@ module Durababble
       state
     end
 
+    #: (worker_pool: String, object_type: String, object_id: String, name: String, wake_at: Object?, payload: Object?) -> Object?
+    def upsert_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:, wake_at:, payload:)
+      wake_at = wake_at #: as Time
+      serialized_payload = dump_serialized(payload, surface: :inbox_payload, context: "object wakeup #{object_type}/#{object_id} (#{name})")
+      execute_store_query(:upsert_object_wakeup, [worker_pool, object_type, object_id, name, timestamp(wake_at), serialized_payload])
+    end
+
+    #: (worker_pool: String, object_type: String, object_id: String, name: String) -> Object?
+    def delete_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:)
+      execute_store_query(:delete_object_wakeup, [worker_pool, object_type, object_id, name])
+    end
+
+    #: (worker_pool: String, object_type: String, object_id: String) -> Object?
+    def delete_all_object_wakeups_without_transaction(worker_pool:, object_type:, object_id:)
+      execute_store_query(:delete_all_object_wakeups, [worker_pool, object_type, object_id])
+    end
+
     #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
       return if target_kinds&.empty? || target_types&.empty?
@@ -566,7 +583,7 @@ module Durababble
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
     end
 
-    #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
+    #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
       serialized_payload = dump_inbox_payload(target_kind:, target_type:, target_id:, message_kind:, payload:)
@@ -633,6 +650,17 @@ module Durababble
         finish_completed_waits(returning, {})
       end
       completed = completed #: as Integer
+      completed
+    end
+
+    #: (Time, Integer) -> Integer
+    def complete_object_wakeups(now, batch_size)
+      completed = transaction do
+        wakeups = execute_store_query(:due_object_wakeups, [now, batch_size]).map { |row| decode_row(row) }
+        deliver_due_object_wakeups(wakeups)
+      end
+      completed = completed #: as Integer
+      report_object_wakeups_completed(completed)
       completed
     end
 

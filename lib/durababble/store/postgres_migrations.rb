@@ -131,6 +131,19 @@ module Durababble
           PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("object_wakeups")} (
+          worker_pool text NOT NULL DEFAULT 'default',
+          object_type text NOT NULL,
+          object_id text NOT NULL,
+          name text NOT NULL,
+          wake_at timestamptz NOT NULL,
+          payload bytea NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          PRIMARY KEY (worker_pool, object_type, object_id, name)
+        )
+      SQL
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -231,6 +244,7 @@ module Durababble
       create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")
       create_postgres_index("waits_workflow_created_idx", "ON #{table("waits")} (workflow_id ASC, created_at ASC)")
       create_postgres_index("waits_workflow_status_idx", "ON #{table("waits")} (workflow_id ASC, status ASC)")
+      create_postgres_index("object_wakeups_due_idx", "ON #{table("object_wakeups")} (wake_at ASC, created_at ASC)")
       create_postgres_index("step_attempts_workflow_started_position_idx", "ON #{table("step_attempts")} (workflow_id ASC, started_at ASC, position ASC)")
       create_postgres_index("step_attempts_workflow_position_status_started_idx", "ON #{table("step_attempts")} (workflow_id ASC, position ASC, status ASC, started_at DESC)")
       create_postgres_index("outbox_queue_idx", "ON #{table("outbox")} (status ASC, created_at ASC)")

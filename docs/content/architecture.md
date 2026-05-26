@@ -97,6 +97,8 @@ end
 
 The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. Synchronous asks and asynchronous tells enqueue inbox rows and wake or activate the object target; workers drain the object's contiguous ready mailbox prefix, invoke exposed command methods, and commit state plus message completion in one store transaction. Generated command idempotency keys remain stable across retries because they derive from the durable mailbox row.
 
+Object commands may schedule any number of independent, named wakeups with `schedule_wake(name:, at:, payload: nil)`, replace one by re-scheduling the same `name`, remove one with `cancel_wake(name:)`, or drop them all with `cancel_all_wakes`. Pending wakeups are stored outside the mailbox so future commands are not blocked behind an alarm time, but scheduling/cancellation commits in the same transaction as command state and command completion. When a wake time matures, the store converts that row into a normal object `wake` inbox message in the same worker pool, carrying the wake's name, and the worker delivers it through `on_wake(name:, payload:)`.
+
 ## Storage model
 
 - `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, `next_run_at` for durably scheduled step retries, first cooperative cancellation request metadata (`cancel_reason`, `cancel_requested_at`, `cancel_delivered_at`), and the terminal `terminated` state for operator hard stops.
@@ -105,7 +107,8 @@ The durable-object contract is actor-like: commands for the same `(object_type, 
 - `waits`: durable timer waits, including context needed to resume.
 - `fences`: idempotency fence state. A row is inserted as `running` before the side effect block executes; waiters read the completed result instead of running the block.
 - `outbox`: durable outgoing messages with unique keys, processing leases, expiry recovery, and acknowledgements.
-- `durable_objects`: latest durable-object state by `(object_type, object_id)`.
+- `durable_objects`: latest durable-object state by `(worker_pool, object_type, object_id)`.
+- `object_wakeups`: pending durable-object wakeups keyed by `(worker_pool, object_type, object_id, name)`, so an object can hold several named wakes at once; each row includes the wake time and Paquito payload that will be delivered to `on_wake`.
 - `mailbox_sequences`: per-target sequence allocation state for workflow and object inbox messages.
 - `inbox`: persisted object asks/tells/wakes plus workflow command messages, including target identity, mailbox sequence, idempotency key, shape hash, retry/dead-letter fields, result/error, and retention deadline.
 
