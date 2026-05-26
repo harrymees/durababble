@@ -5,6 +5,8 @@ require_relative "../test_helper"
 
 class DurababbleWorkerTest < DurababbleTestCase
   class WorkerTestStore
+    include Durababble::TestSupport::FakeStoreCommandClaiming
+
     attr_reader :migrations, :claims, :resumed, :deliveries
 
     def initialize(claims)
@@ -82,21 +84,6 @@ class DurababbleWorkerTest < DurababbleTestCase
 
     def claim_inbox_messages(**)
       []
-    end
-
-    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
-      return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
-      raise Durababble::LeaseConflict, "workflow #{workflow_id} lease lost" unless workflow_owned?(workflow_id:, worker_id:)
-
-      claim_inbox_messages(
-        worker_pool:,
-        target_kind: "workflow",
-        target_type: workflow_name,
-        target_id: workflow_id,
-        worker_id:,
-        lease_seconds:,
-        limit: 1,
-      ).first
     end
 
     def record_step_scheduled(workflow_id:, command_id:, name:, **)

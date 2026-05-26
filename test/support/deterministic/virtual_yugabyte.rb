@@ -6,6 +6,8 @@ require_relative "core"
 module Durababble
   module Deterministic
     class VirtualYugabyte
+      include Durababble::TestSupport::FakeStoreCommandClaiming
+
       #: untyped
       attr_reader :scheduler, :fault_plan
 
@@ -376,22 +378,6 @@ module Durababble
       #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, limit: untyped) -> untyped
       def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default")
         []
-      end
-
-      #: (worker_pool: untyped, workflow_name: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped) -> untyped
-      def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
-        return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
-        raise LeaseConflict, "workflow #{workflow_id} lease lost" unless workflow_owned?(workflow_id:, worker_id:)
-
-        claim_inbox_messages(
-          worker_pool:,
-          target_kind: "workflow",
-          target_type: workflow_name,
-          target_id: workflow_id,
-          worker_id:,
-          lease_seconds:,
-          limit: 1,
-        ).first
       end
 
       #: (workflow_id: untyped, worker_id: untyped) -> untyped
