@@ -45,6 +45,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "object_command_state_crash_fuzz",
     "object_command_activation_driven_drain",
     "object_command_idempotent_enqueue",
+    "object_command_multi_target_isolation",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -491,6 +492,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "object_delivery_crashed"
+  end
+
+  test "isolates concurrent object mailboxes so commands never cross-contaminate targets" do
+    result = Durababble::Deterministic.prove("object_command_multi_target_isolation", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "multi_target_crashed"
   end
 
   test "collapses repeated idempotent enqueues to one exactly-once delivery through crashes" do
