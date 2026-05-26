@@ -139,7 +139,7 @@ class DurababbleEngineTest < DurababbleTestCase
       "wf-inline"
     end
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       raise "Engine#run should create the leased running workflow directly"
     end
 
@@ -183,9 +183,9 @@ class DurababbleEngineTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
-      @enqueued << { name:, input:, worker_pool: }
-      "wf-#{@enqueued.length}"
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @enqueued << { name:, input:, id:, worker_pool: }
+      id || "wf-#{@enqueued.length}"
     end
   end
 
@@ -237,9 +237,19 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "default" }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "default" }], store.enqueued
+  end
+
+  test "passes explicit workflow ids to the store enqueue path" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: "wf-explicit", worker_pool: "default" }], store.enqueued
   end
 
   test "engine enqueue writes workflows into its worker pool" do
@@ -248,8 +258,8 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "critical" }], store.enqueued
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "critical" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
