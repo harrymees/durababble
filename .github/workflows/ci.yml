@@ -46,6 +46,25 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
+  dst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      # The Deterministic Simulation Testing suite runs uninstrumented and
+      # against the in-memory SQLite store only, so it needs no database
+      # service and no SimpleCov. Kept out of the coverage gate because its
+      # seed sweeps add ~no incremental coverage but dominate wall time.
+      - name: Run deterministic simulation suite
+        run: bundle exec rake dst
+
   lint-typecheck:
     runs-on: ubuntu-latest
     timeout-minutes: 20
