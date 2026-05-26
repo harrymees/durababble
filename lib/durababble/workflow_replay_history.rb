@@ -3,7 +3,7 @@
 
 module Durababble
   class WorkflowReplayHistory
-    TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled"].freeze
+    TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled", "step_failed"].freeze
 
     #: (Array[Hash[String, Object?]]) -> void
     def initialize(events)
@@ -95,8 +95,18 @@ module Durababble
       when "step_scheduled"
         @scheduled[command_id] = event
       when *TERMINAL_KINDS
+        return if retrying_step_failure?(event)
+
         @terminal[command_id] = event
       end
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def retrying_step_failure?(event)
+      return false unless event.fetch("kind") == "step_failed"
+
+      payload = event["payload"]
+      payload.is_a?(Hash) && payload["retrying"] == true
     end
   end
 end

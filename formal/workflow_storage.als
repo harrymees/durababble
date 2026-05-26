@@ -62,7 +62,7 @@ abstract sig ActivationStatus {}
 one sig ActivationPending, ActivationRunning extends ActivationStatus {}
 
 abstract sig CommandHistoryKind {}
-one sig CommandScheduled, CommandStarted, CommandResolved extends CommandHistoryKind {}
+one sig CommandScheduled, CommandStarted, CommandSucceeded, CommandWaiting, CommandCanceled, CommandRejected, CommandErrored extends CommandHistoryKind {}
 
 abstract sig CommitKind {}
 one sig WorkflowCommit, StepCommit, WaitCommit, FenceCommit, OutboxCommit, InboxCommandCommit extends CommitKind {}
@@ -223,6 +223,22 @@ fun commandScheduledShape[c: WorkflowCommand, t: Time]: set CommandShape {
 
 fun commandHistorySequence[c: WorkflowCommand, kind: CommandHistoryKind, t: Time]: set Time {
   ((chr_command.c) & (chr_kind.kind) & (chr_time.t)).chr_sequence
+}
+
+fun terminalCommandHistoryKinds: set CommandHistoryKind {
+  CommandSucceeded + CommandWaiting + CommandCanceled + CommandRejected
+}
+
+fun terminalCommandHistoryRows[c: WorkflowCommand, t: Time]: set CommandHistoryRow {
+  { r: CommandHistoryRow | r.chr_command = c and r.chr_time = t and r.chr_kind in terminalCommandHistoryKinds }
+}
+
+fun latestTerminalCommandHistoryRows[c: WorkflowCommand, t: Time]: set CommandHistoryRow {
+  { r: terminalCommandHistoryRows[c, t] | no later: terminalCommandHistoryRows[c, t] | lt[r.chr_sequence, later.chr_sequence] }
+}
+
+fun latestTerminalCommandHistoryKind[c: WorkflowCommand, t: Time]: set CommandHistoryKind {
+  latestTerminalCommandHistoryRows[c, t].chr_kind
 }
 
 pred liveWorkflowLease[w: Workflow, worker: Worker, t: Time] {
@@ -453,6 +469,21 @@ pred unchangedExceptHistory[wf: lone Workflow, st: lone Step, att: lone Attempt,
   all cmd: WorkflowCommand - hist | commandHistorySame[cmd, t, tnext]
 }
 
+pred unchangedExceptStartStepHistory[wf: Workflow, st: Step, att: Attempt, hist: WorkflowCommand, t: Time, tnext: Time] {
+  all other: Workflow - wf | workflowSame[other, t, tnext]
+  all other: Step - st | stepSame[other, t, tnext]
+  all other: Attempt - att | {
+    other.attempt_step = st and attemptStatus[other, t] = AttemptRunning implies attemptStatus[other, tnext] = AttemptFailed
+    not (other.attempt_step = st and attemptStatus[other, t] = AttemptRunning) implies attemptSame[other, t, tnext]
+  }
+  all other: Wait | waitSame[other, t, tnext]
+  all other: Fence | fenceSame[other, t, tnext]
+  all other: OutboxMessage | outboxSame[other, t, tnext]
+  all other: InboxCommand | commandSame[other, t, tnext]
+  all other: InboxTarget | targetActivationSame[other, t, tnext]
+  all cmd: WorkflowCommand - hist | commandHistorySame[cmd, t, tnext]
+}
+
 pred preserveLeasesExcept[wf: lone Workflow, t: Time, tnext: Time] {
   all w: Workflow - wf, worker: Worker, exp: Time |
     (some l: LeaseRow | l.lr_workflow = w and l.lr_worker = worker and l.lr_expiresAt = exp and l.lr_time = t)
@@ -523,9 +554,10 @@ pred releaseOrStealLease[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   preserveLeasesExcept[wf, t, tnext]
 }
 
-pred scheduleWorkflowCommand[wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, t: Time, tnext: Time] {
+pred scheduleWorkflowCommand[wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-CONCURRENCY-1] Concurrent workflow fibers append ordered step command history before side-effect execution.
   cmd.wc_workflow = wf
+  liveWorkflowLease[wf, worker, t]
   workflowStatus[wf, t] = Running
   no r: CommandHistoryRow | r.chr_command = cmd and r.chr_time = t
   workflowSame[wf, t, tnext]
@@ -550,10 +582,11 @@ pred scheduleWorkflowCommand[wf: Workflow, cmd: WorkflowCommand, shape: CommandS
   preserveLeasesExcept[none, t, tnext]
 }
 
-pred startStep[wf: Workflow, st: Step, att: Attempt, t: Time, tnext: Time] {
+pred startStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-STEP-2] Incomplete steps can retry by appending a fresh running attempt.
   st.step_workflow = wf
   att.attempt_step = st
+  liveWorkflowLease[wf, worker, t]
   workflowStatus[wf, t] = Running
   stepStatus[st, t] != StepCompleted
   no attemptStatus[att, t]
@@ -562,7 +595,13 @@ pred startStep[wf: Workflow, st: Step, att: Attempt, t: Time, tnext: Time] {
   stepStatus[st, tnext] = StepRunning
   attemptStatus[att, tnext] = AttemptRunning
   all old: Attempt - att | old.attempt_step = st and attemptStatus[old, t] = AttemptRunning implies attemptStatus[old, tnext] = AttemptFailed
-  unchangedExcept[wf, st, att, none, none, none, none, none, t, tnext]
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandScheduledShape[cmd, t]
+    commandHistoryAppend[cmd, CommandStarted, none, tnext, t, tnext]
+    unchangedExceptStartStepHistory[wf, st, att, cmd, t, tnext]
+  }
   preserveLeasesExcept[none, t, tnext]
 }
 
@@ -581,13 +620,15 @@ pred completeStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, t: Time,
   some cmd: WorkflowCommand | {
     cmd.wc_workflow = wf
     cmd.wc_step = st
-    commandHistoryAppend[cmd, CommandResolved, none, tnext, t, tnext]
+    some commandHistorySequence[cmd, CommandStarted, t]
+    commandHistoryAppend[cmd, CommandSucceeded, none, tnext, t, tnext]
     unchangedExceptHistory[wf, st, att, none, none, none, none, none, cmd, t, tnext]
   }
   preserveLeasesExcept[none, t, tnext]
 }
 
 pred retryStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, t: Time, tnext: Time] {
+  -- [DURABABBLE-STEP-2] Retryable failure history and retry backoff commit atomically.
   st.step_workflow = wf
   att.attempt_step = st
   liveWorkflowLease[wf, worker, t]
@@ -601,8 +642,57 @@ pred retryStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, 
   stepStatus[st, tnext] = StepFailed
   attemptStatus[att, tnext] = AttemptFailed
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
-  unchangedExcept[wf, st, att, none, none, none, none, none, t, tnext]
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandHistorySequence[cmd, CommandStarted, t]
+    commandHistoryAppend[cmd, CommandErrored, none, tnext, t, tnext]
+    unchangedExceptHistory[wf, st, att, none, none, none, none, none, cmd, t, tnext]
+  }
   preserveLeasesExcept[wf, t, tnext]
+}
+
+pred failStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, t: Time, tnext: Time] {
+  st.step_workflow = wf
+  att.attempt_step = st
+  liveWorkflowLease[wf, worker, t]
+  workflowStatus[wf, t] = Running
+  stepStatus[st, t] = StepRunning
+  attemptStatus[att, t] = AttemptRunning
+  workflowStatus[wf, tnext] = Running
+  workflowCancelSame[wf, t, tnext]
+  stepStatus[st, tnext] = StepFailed
+  attemptStatus[att, tnext] = AttemptFailed
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandHistorySequence[cmd, CommandStarted, t]
+    commandHistoryAppend[cmd, CommandRejected, none, tnext, t, tnext]
+    unchangedExceptHistory[wf, st, att, none, none, none, none, none, cmd, t, tnext]
+  }
+  preserveLeasesExcept[none, t, tnext]
+}
+
+pred cancelStep[wf: Workflow, st: Step, att: Attempt, worker: Worker, t: Time, tnext: Time] {
+  st.step_workflow = wf
+  att.attempt_step = st
+  liveWorkflowLease[wf, worker, t]
+  workflowStatus[wf, t] = Running
+  some workflowCancelRequestedAt[wf, t]
+  stepStatus[st, t] = StepRunning
+  attemptStatus[att, t] = AttemptRunning
+  workflowStatus[wf, tnext] = Running
+  workflowCancelSame[wf, t, tnext]
+  stepStatus[st, tnext] = StepCanceled
+  attemptStatus[att, tnext] = AttemptCanceled
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandHistorySequence[cmd, CommandStarted, t]
+    commandHistoryAppend[cmd, CommandCanceled, none, tnext, t, tnext]
+    unchangedExceptHistory[wf, st, att, none, none, none, none, none, cmd, t, tnext]
+  }
+  preserveLeasesExcept[none, t, tnext]
 }
 
 pred recordWait[wf: Workflow, st: Step, att: lone Attempt, wait: Wait, worker: Worker, t: Time, tnext: Time] {
@@ -627,7 +717,14 @@ pred recordWait[wf: Workflow, st: Step, att: lone Attempt, wait: Wait, worker: W
   waitStatus[wait, tnext] = WaitPending
   workflowStatus[wf, tnext] in (Waiting + Canceling) implies no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
   workflowStatus[wf, tnext] = Running implies liveWorkflowLease[wf, worker, tnext]
-  unchangedExcept[wf, st, att, wait, none, none, none, none, t, tnext]
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandScheduledShape[cmd, t]
+    some att implies some commandHistorySequence[cmd, CommandStarted, t]
+    commandHistoryAppend[cmd, CommandWaiting, none, tnext, t, tnext]
+    unchangedExceptHistory[wf, st, att, wait, none, none, none, none, cmd, t, tnext]
+  }
   workflowStatus[wf, tnext] in (Waiting + Canceling) implies preserveLeasesExcept[wf, t, tnext]
   workflowStatus[wf, tnext] = Running implies preserveLeasesExcept[none, t, tnext]
 }
@@ -650,7 +747,13 @@ pred wakeWait[wf: Workflow, st: Step, att: lone Attempt, wait: Wait, trigger: Wa
   some att implies attemptStatus[att, tnext] = AttemptCompleted
   waitStatus[wait, tnext] = WaitCompleted
   one e: WakeEvent | e.wake_wait = wait and e.wake_trigger = trigger and e.wake_time = t
-  unchangedExcept[wf, st, att, wait, none, none, none, none, t, tnext]
+  some cmd: WorkflowCommand | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    some commandHistorySequence[cmd, CommandWaiting, t]
+    commandHistoryAppend[cmd, CommandSucceeded, none, tnext, t, tnext]
+    unchangedExceptHistory[wf, st, att, wait, none, none, none, none, cmd, t, tnext]
+  }
   preserveLeasesExcept[none, t, tnext]
 }
 
@@ -915,10 +1018,12 @@ pred step[t: Time, tnext: Time] {
   or some wf: Workflow, worker: Worker | claimWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | heartbeatWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | releaseOrStealLease[wf, worker, t, tnext]
-  or some wf: Workflow, cmd: WorkflowCommand, shape: CommandShape | scheduleWorkflowCommand[wf, cmd, shape, t, tnext]
-  or some wf: Workflow, st: Step, att: Attempt | startStep[wf, st, att, t, tnext]
+  or some wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, worker: Worker | scheduleWorkflowCommand[wf, cmd, shape, worker, t, tnext]
+  or some wf: Workflow, st: Step, att: Attempt, worker: Worker | startStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker | completeStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | retryStep[wf, st, att, worker, due, t, tnext]
+  or some wf: Workflow, st: Step, att: Attempt, worker: Worker | failStep[wf, st, att, worker, t, tnext]
+  or some wf: Workflow, st: Step, att: Attempt, worker: Worker | cancelStep[wf, st, att, worker, t, tnext]
   or some wf: Workflow, st: Step, wait: Wait, worker: Worker | recordWait[wf, st, none, wait, worker, t, tnext]
   or some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker | recordWait[wf, st, att, wait, worker, t, tnext]
   or some wf: Workflow, st: Step, wait: Wait, trigger: WaitTrigger | wakeWait[wf, st, none, wait, trigger, t, tnext]
@@ -984,6 +1089,45 @@ assert scheduledCommandHistoryIsReplayStable {
   all wf: Workflow, sequence, t: Time |
     lone cmd: WorkflowCommand | cmd.wc_workflow = wf and some r: CommandHistoryRow |
       r.chr_command = cmd and r.chr_kind = CommandScheduled and r.chr_sequence = sequence and r.chr_time = t
+}
+
+/**
+ * [DURABABBLE-CONCURRENCY-1] Replay indexes terminal command history by command
+ * id and uses the latest terminal event, so a completed timer wait supersedes
+ * the earlier waiting event for the same command.
+ */
+assert terminalCommandHistoryUsesLatestReplayEvent {
+  all cmd: WorkflowCommand, t: Time | lone latestTerminalCommandHistoryRows[cmd, t]
+  all cmd: WorkflowCommand, t: Time |
+    some commandHistorySequence[cmd, CommandSucceeded, t] and some commandHistorySequence[cmd, CommandWaiting, t]
+    implies latestTerminalCommandHistoryKind[cmd, t] = CommandSucceeded
+}
+
+/**
+ * [DURABABBLE-CONCURRENCY-1] Runtime command history is append-only in the
+ * same lifecycle order the engine writes to MySQL/PostgreSQL: commands are
+ * scheduled before they start or wait, and terminal step failures/cancellations
+ * only follow a started attempt.
+ */
+assert commandHistoryFollowsRuntimeLifecycle {
+  all r: CommandHistoryRow | r.chr_kind != CommandScheduled implies
+    some scheduled: CommandHistoryRow |
+      scheduled.chr_command = r.chr_command and
+      scheduled.chr_kind = CommandScheduled and
+      scheduled.chr_time = r.chr_time and
+      lt[scheduled.chr_sequence, r.chr_sequence]
+  all r: CommandHistoryRow | r.chr_kind in (CommandRejected + CommandCanceled + CommandErrored) implies
+    some started: CommandHistoryRow |
+      started.chr_command = r.chr_command and
+      started.chr_kind = CommandStarted and
+      started.chr_time = r.chr_time and
+      lt[started.chr_sequence, r.chr_sequence]
+  all r: CommandHistoryRow | r.chr_kind = CommandSucceeded implies
+    some earlier: CommandHistoryRow |
+      earlier.chr_command = r.chr_command and
+      earlier.chr_kind in (CommandStarted + CommandWaiting) and
+      earlier.chr_time = r.chr_time and
+      lt[earlier.chr_sequence, r.chr_sequence]
 }
 
 /**
@@ -1092,24 +1236,35 @@ pred exampleWorkflowCompletes {
 }
 
 pred exampleLeaseStealAndReplay {
-  some wf: Workflow, st: Step, att: Attempt, worker1, worker2: Worker | {
+  some wf: Workflow, st: Step, att: Attempt, worker1, worker2: Worker, cmd: WorkflowCommand, shape: CommandShape | {
     worker1 != worker2
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker1, first.next, first.next.next]
     stutter[first.next.next, first.next.next.next]
     releaseOrStealLease[wf, worker2, first.next.next.next, first.next.next.next.next]
     claimWorkflow[wf, worker2, first.next.next.next.next, first.next.next.next.next.next]
-    startStep[wf, st, att, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker2, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    startStep[wf, st, att, worker2, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
   }
 }
 
 pred exampleWaitWake {
-  some wf: Workflow, st: Step, att: Attempt, wait: Wait, trigger: WaitTrigger, worker: Worker | {
+  some wf: Workflow, st: Step, att: Attempt, wait: Wait, trigger: WaitTrigger, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, att, first.next.next, first.next.next.next]
-    recordWait[wf, st, att, wait, worker, first.next.next.next, first.next.next.next.next]
-    wakeWait[wf, st, att, wait, trigger, first.next.next.next.next, first.next.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    recordWait[wf, st, att, wait, worker, first.next.next.next.next, first.next.next.next.next.next]
+    wakeWait[wf, st, att, wait, trigger, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    lt[
+      commandHistorySequence[cmd, CommandWaiting, first.next.next.next.next.next.next],
+      commandHistorySequence[cmd, CommandSucceeded, first.next.next.next.next.next.next]
+    ]
+    latestTerminalCommandHistoryKind[cmd, first.next.next.next.next.next.next] = CommandSucceeded
   }
 }
 
@@ -1119,7 +1274,7 @@ pred exampleDirectWaitWake {
     cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    scheduleWorkflowCommand[wf, cmd, shape, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
     recordWait[wf, st, none, wait, worker, first.next.next.next, first.next.next.next.next]
     wakeWait[wf, st, none, wait, trigger, first.next.next.next.next, first.next.next.next.next.next]
     stepStatus[st, first.next.next.next.next.next] = StepCompleted
@@ -1128,91 +1283,146 @@ pred exampleDirectWaitWake {
 }
 
 pred exampleWaitAllowsSiblingCompletionBeforeSuspension {
-  some wf: Workflow, waitStep, siblingStep: Step, waitAttempt, siblingAttempt: Attempt, wait: Wait, trigger: WaitTrigger, worker: Worker | {
+  some wf: Workflow, waitStep, siblingStep: Step, waitAttempt, siblingAttempt: Attempt, wait: Wait, worker: Worker, waitCmd, siblingCmd: WorkflowCommand, waitShape, siblingShape: CommandShape | {
     waitStep != siblingStep
+    waitCmd != siblingCmd
+    waitCmd.wc_workflow = wf
+    waitCmd.wc_step = waitStep
+    siblingCmd.wc_workflow = wf
+    siblingCmd.wc_step = siblingStep
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, waitStep, waitAttempt, first.next.next, first.next.next.next]
-    recordWait[wf, waitStep, waitAttempt, wait, worker, first.next.next.next, first.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next] = Running
-    startStep[wf, siblingStep, siblingAttempt, first.next.next.next.next, first.next.next.next.next.next]
-    completeStep[wf, siblingStep, siblingAttempt, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
-    wakeWait[wf, waitStep, waitAttempt, wait, trigger, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    some l: LeaseRow | l.lr_workflow = wf and l.lr_time = first.next.next and l.lr_expiresAt = last
+    scheduleWorkflowCommand[wf, waitCmd, waitShape, worker, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, siblingCmd, siblingShape, worker, first.next.next.next, first.next.next.next.next]
+    startStep[wf, waitStep, waitAttempt, worker, first.next.next.next.next, first.next.next.next.next.next]
+    startStep[wf, siblingStep, siblingAttempt, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    recordWait[wf, waitStep, waitAttempt, wait, worker, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next] = Running
+    completeStep[wf, siblingStep, siblingAttempt, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next.next] = Running
+    stepStatus[siblingStep, first.next.next.next.next.next.next.next.next] = StepCompleted
+    stepStatus[waitStep, first.next.next.next.next.next.next.next.next] = StepWaiting
   }
 }
 
 pred exampleRetryBackoff {
-  some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | {
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, att, first.next.next, first.next.next.next]
-    retryStep[wf, st, att, worker, due, first.next.next.next, first.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next] = Pending
-    workflowNextRun[wf, first.next.next.next.next] = due
-    stutter[first.next.next.next.next, first.next.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    retryStep[wf, st, att, worker, due, first.next.next.next.next, first.next.next.next.next.next]
     workflowStatus[wf, first.next.next.next.next.next] = Pending
+    workflowNextRun[wf, first.next.next.next.next.next] = due
+    stutter[first.next.next.next.next.next, first.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next] = Pending
   }
 }
 
 pred exampleRetryThenCompletesWithFailedAttemptHistory {
-  some wf: Workflow, st: Step, failedAttempt, completedAttempt: Attempt, worker: Worker, due: Time | {
+  some wf: Workflow, st: Step, failedAttempt, completedAttempt: Attempt, worker: Worker, due: Time, cmd: WorkflowCommand, shape: CommandShape | {
     failedAttempt != completedAttempt
-    due = first.next.next.next.next.next
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    due = first.next.next.next.next.next.next
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, failedAttempt, first.next.next, first.next.next.next]
-    retryStep[wf, st, failedAttempt, worker, due, first.next.next.next, first.next.next.next.next]
-    stutter[first.next.next.next.next, first.next.next.next.next.next]
-    claimWorkflow[wf, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
-    startStep[wf, st, completedAttempt, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
-    completeStep[wf, st, completedAttempt, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
-    attemptStatus[failedAttempt, first.next.next.next.next.next.next.next.next] = AttemptFailed
-    attemptStatus[completedAttempt, first.next.next.next.next.next.next.next.next] = AttemptCompleted
-    completeWorkflow[wf, worker, first.next.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next.next.next.next.next.next] = Completed
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, failedAttempt, worker, first.next.next.next, first.next.next.next.next]
+    retryStep[wf, st, failedAttempt, worker, due, first.next.next.next.next, first.next.next.next.next.next]
+    stutter[first.next.next.next.next.next, first.next.next.next.next.next.next]
+    claimWorkflow[wf, worker, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    startStep[wf, st, completedAttempt, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
+    completeStep[wf, st, completedAttempt, worker, first.next.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next.next]
+    attemptStatus[failedAttempt, first.next.next.next.next.next.next.next.next.next] = AttemptFailed
+    attemptStatus[completedAttempt, first.next.next.next.next.next.next.next.next.next] = AttemptCompleted
+    stepStatus[st, first.next.next.next.next.next.next.next.next.next] = StepCompleted
+  }
+}
+
+pred exampleStepFailureReplaysAsTerminalHistory {
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    failStep[wf, st, att, worker, first.next.next.next.next, first.next.next.next.next.next]
+    stepStatus[st, first.next.next.next.next.next] = StepFailed
+    attemptStatus[att, first.next.next.next.next.next] = AttemptFailed
+    latestTerminalCommandHistoryKind[cmd, first.next.next.next.next.next] = CommandRejected
   }
 }
 
 pred exampleCancellationCompletesAfterCleanup {
-  some wf: Workflow, cleanupStep: Step, cleanupAttempt: Attempt, worker: Worker | {
+  some wf: Workflow, cleanupStep: Step, cleanupAttempt: Attempt, worker: Worker, cleanupCmd: WorkflowCommand, cleanupShape: CommandShape | {
+    cleanupCmd.wc_workflow = wf
+    cleanupCmd.wc_step = cleanupStep
     enqueueWorkflow[wf, first, first.next]
     requestWorkflowCancellation[wf, first.next, first.next.next]
     workflowStatus[wf, first.next.next] = Canceling
     claimWorkflow[wf, worker, first.next.next, first.next.next.next]
-    startStep[wf, cleanupStep, cleanupAttempt, first.next.next.next, first.next.next.next.next]
-    completeStep[wf, cleanupStep, cleanupAttempt, worker, first.next.next.next.next, first.next.next.next.next.next]
-    failOrFinishCancellationWorkflow[wf, worker, Canceled, first.next.next.next.next.next, first.next.next.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next.next.next] = Canceled
+    scheduleWorkflowCommand[wf, cleanupCmd, cleanupShape, worker, first.next.next.next, first.next.next.next.next]
+    startStep[wf, cleanupStep, cleanupAttempt, worker, first.next.next.next.next, first.next.next.next.next.next]
+    completeStep[wf, cleanupStep, cleanupAttempt, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    failOrFinishCancellationWorkflow[wf, worker, Canceled, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next] = Canceled
   }
 }
 
 pred exampleWaitingCancellationCancelsWait {
-  some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker | {
+  some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, att, first.next.next, first.next.next.next]
-    recordWait[wf, st, att, wait, worker, first.next.next.next, first.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next] = Waiting
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    recordWait[wf, st, att, wait, worker, first.next.next.next.next, first.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next] = Waiting
+    requestWorkflowCancellation[wf, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next] = Canceling
+    stepStatus[st, first.next.next.next.next.next.next] = StepCanceled
+    attemptStatus[att, first.next.next.next.next.next.next] = AttemptCanceled
+    waitStatus[wait, first.next.next.next.next.next.next] = WaitCanceled
+    failOrFinishCancellationWorkflow[wf, none, Canceled, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+  }
+}
+
+pred exampleRunningStepCancellationRecordsHistory {
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
     requestWorkflowCancellation[wf, first.next.next.next.next, first.next.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next.next] = Canceling
-    stepStatus[st, first.next.next.next.next.next] = StepCanceled
-    attemptStatus[att, first.next.next.next.next.next] = AttemptCanceled
-    waitStatus[wait, first.next.next.next.next.next] = WaitCanceled
-    failOrFinishCancellationWorkflow[wf, none, Canceled, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    cancelStep[wf, st, att, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    stepStatus[st, first.next.next.next.next.next.next] = StepCanceled
+    attemptStatus[att, first.next.next.next.next.next.next] = AttemptCanceled
+    latestTerminalCommandHistoryKind[cmd, first.next.next.next.next.next.next] = CommandCanceled
   }
 }
 
 pred exampleBackoffCancellationClearsDue {
-  some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time | {
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, att, first.next.next, first.next.next.next]
-    retryStep[wf, st, att, worker, due, first.next.next.next, first.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next] = Pending
-    some workflowNextRun[wf, first.next.next.next.next]
-    requestWorkflowCancellation[wf, first.next.next.next.next, first.next.next.next.next.next]
-    workflowStatus[wf, first.next.next.next.next.next] = Canceling
-    no workflowNextRun[wf, first.next.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    retryStep[wf, st, att, worker, due, first.next.next.next.next, first.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next] = Pending
+    some workflowNextRun[wf, first.next.next.next.next.next]
+    requestWorkflowCancellation[wf, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next] = Canceling
+    no workflowNextRun[wf, first.next.next.next.next.next.next]
   }
 }
 
@@ -1244,10 +1454,32 @@ pred exampleExpiredRunningWorkflowReclaimedDirectly {
 }
 
 pred exampleStepStart {
-  some wf: Workflow, st: Step, att: Attempt, worker: Worker | {
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    startStep[wf, st, att, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+  }
+}
+
+pred exampleStepStartSupersedesRunningAttempt {
+  some wf: Workflow, st: Step, oldAttempt, newAttempt: Attempt, worker1, worker2: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    oldAttempt != newAttempt
+    worker1 != worker2
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker1, first.next, first.next.next]
+    some l: LeaseRow | l.lr_workflow = wf and l.lr_time = first.next.next and l.lr_expiresAt = first.next.next.next.next
+    scheduleWorkflowCommand[wf, cmd, shape, worker1, first.next.next, first.next.next.next]
+    startStep[wf, st, oldAttempt, worker1, first.next.next.next, first.next.next.next.next]
+    no owner: Worker | liveWorkflowLease[wf, owner, first.next.next.next.next]
+    claimWorkflow[wf, worker2, first.next.next.next.next, first.next.next.next.next.next]
+    startStep[wf, st, newAttempt, worker2, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    attemptStatus[oldAttempt, first.next.next.next.next.next.next] = AttemptFailed
+    attemptStatus[newAttempt, first.next.next.next.next.next.next] = AttemptRunning
   }
 }
 
@@ -1259,8 +1491,8 @@ pred exampleParallelCommandSchedules {
     cmd2.wc_step = st2
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    scheduleWorkflowCommand[wf, cmd1, shape1, first.next.next, first.next.next.next]
-    scheduleWorkflowCommand[wf, cmd2, shape2, first.next.next.next, first.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd1, shape1, worker, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd2, shape2, worker, first.next.next.next, first.next.next.next.next]
     some commandScheduledShape[cmd1, first.next.next.next.next]
     some commandScheduledShape[cmd2, first.next.next.next.next]
   }
@@ -1312,11 +1544,11 @@ pred exampleScheduledCommandReplayBeforeStepStart {
     cmd.wc_step = st
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
-    scheduleWorkflowCommand[wf, cmd, shape, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
     stepStatus[st, first.next.next.next] = StepScheduled
     stutter[first.next.next.next, first.next.next.next.next]
     some commandScheduledShape[cmd, first.next.next.next.next]
-    startStep[wf, st, att, first.next.next.next.next, first.next.next.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next.next, first.next.next.next.next.next]
     stepStatus[st, first.next.next.next.next.next] = StepRunning
   }
 }
@@ -1333,10 +1565,10 @@ pred exampleTerminalCommandHistoryCanResolveOutOfScheduleOrder {
     enqueueWorkflow[wf, first, first.next]
     claimWorkflow[wf, worker, first.next, first.next.next]
     some l: LeaseRow | l.lr_workflow = wf and l.lr_time = first.next.next and l.lr_expiresAt = last
-    scheduleWorkflowCommand[wf, cmd0, shape0, first.next.next, first.next.next.next]
-    scheduleWorkflowCommand[wf, cmd1, shape1, first.next.next.next, first.next.next.next.next]
-    startStep[wf, step0, att0, first.next.next.next.next, first.next.next.next.next.next]
-    startStep[wf, step1, att1, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    scheduleWorkflowCommand[wf, cmd0, shape0, worker, first.next.next, first.next.next.next]
+    scheduleWorkflowCommand[wf, cmd1, shape1, worker, first.next.next.next, first.next.next.next.next]
+    startStep[wf, step0, att0, worker, first.next.next.next.next, first.next.next.next.next.next]
+    startStep[wf, step1, att1, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
     completeStep[wf, step1, att1, worker, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
     completeStep[wf, step0, att0, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
     lt[
@@ -1344,8 +1576,8 @@ pred exampleTerminalCommandHistoryCanResolveOutOfScheduleOrder {
       commandHistorySequence[cmd1, CommandScheduled, first.next.next.next.next.next.next.next.next]
     ]
     lt[
-      commandHistorySequence[cmd1, CommandResolved, first.next.next.next.next.next.next.next.next],
-      commandHistorySequence[cmd0, CommandResolved, first.next.next.next.next.next.next.next.next]
+      commandHistorySequence[cmd1, CommandSucceeded, first.next.next.next.next.next.next.next.next],
+      commandHistorySequence[cmd0, CommandSucceeded, first.next.next.next.next.next.next.next.next]
     ]
   }
 }
@@ -1486,23 +1718,26 @@ pred exampleInboxCommandDeadLettersAndStopsActivation {
 
 run exampleWorkflowCompletes for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
 run exampleLeaseStealAndReplay for 10 but exactly 1 Workflow, 2 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time expect 1
-run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 8 Time expect 1
+run exampleWaitWake for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 14 CommandHistoryRow, 8 Time expect 1
 run exampleDirectWaitWake for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
-run exampleWaitAllowsSiblingCompletionBeforeSuspension for 12 but exactly 1 Workflow, 1 Worker, 2 Step, 2 Attempt, 1 Wait, 1 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 9 Time expect 1
-run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
-run exampleRetryThenCompletesWithFailedAttemptHistory for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 2 Attempt, 1 WorkflowCommand, 1 CommandShape, 10 Time expect 1
-run exampleCancellationCompletesAfterCleanup for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
-run exampleWaitingCancellationCancelsWait for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
-run exampleBackoffCancellationClearsDue for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
+run exampleWaitAllowsSiblingCompletionBeforeSuspension for 7 but exactly 1 Workflow, exactly 1 Worker, exactly 2 Step, exactly 2 Attempt, exactly 1 Wait, 0 WaitTrigger, exactly 2 WorkflowCommand, exactly 2 CommandShape, exactly 8 WorkflowRow, exactly 11 StepRow, exactly 7 AttemptRow, exactly 7 LeaseRow, exactly 2 WaitRow, exactly 21 CommandHistoryRow, exactly 1 DurableCommit, 0 WakeEvent, 0 Fence, 0 FenceToken, 0 OutboxMessage, 0 InboxTarget, 0 InboxCommand, 0 OutboxAck, 0 FenceRow, 0 OutboxRow, 0 CommandRow, 0 TargetActivationRow, 9 Time expect 1
+run exampleRetryBackoff for 8 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, exactly 9 CommandHistoryRow, 7 Time expect 1
+run exampleRetryThenCompletesWithFailedAttemptHistory for 6 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 2 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, exactly 9 WorkflowRow, exactly 7 StepRow, exactly 8 AttemptRow, exactly 6 LeaseRow, exactly 21 CommandHistoryRow, exactly 1 DurableCommit, 0 Wait, 0 WaitTrigger, 0 Fence, 0 FenceToken, 0 OutboxMessage, 0 InboxTarget, 0 InboxCommand, 0 WakeEvent, 0 OutboxAck, 0 WaitRow, 0 FenceRow, 0 OutboxRow, 0 CommandRow, 0 TargetActivationRow, 10 Time expect 1
+run exampleStepFailureReplaysAsTerminalHistory for 8 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 6 Time expect 1
+run exampleCancellationCompletesAfterCleanup for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time expect 1
+run exampleWaitingCancellationCancelsWait for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WorkflowCommand, 1 CommandShape, exactly 12 CommandHistoryRow, 8 Time expect 1
+run exampleRunningStepCancellationRecordsHistory for 8 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 7 Time expect 1
+run exampleBackoffCancellationClearsDue for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleRunningCancellationMetadataReleasedToCanceling for 7 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 5 Time expect 1
 run exampleExpiredRunningWorkflowReclaimedDirectly for 8 but exactly 1 Workflow, 2 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
 run exampleStepStart for 6 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 5 Time expect 1
+run exampleStepStartSupersedesRunningAttempt for 8 but exactly 1 Workflow, 2 Worker, 1 Step, 2 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleParallelCommandSchedules for 8 but exactly 1 Workflow, 1 Worker, 2 Step, 2 WorkflowCommand, 2 CommandShape, 6 Time expect 1
 run exampleFenceOutbox for 9 but exactly 1 Workflow, 1 Worker, 1 FenceToken, 1 Fence, 1 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleAbandonedFenceRemainsRunningAfterCrashReplay for 8 but exactly 1 Workflow, 1 Worker, exactly 1 Step, 2 FenceToken, 1 Fence, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 5 Time expect 1
 run exampleOutboxExpiryReclaimAndAck for 10 but exactly 1 Workflow, 2 Worker, 1 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleScheduledCommandReplayBeforeStepStart for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 1
-run exampleTerminalCommandHistoryCanResolveOutOfScheduleOrder for 4 but exactly 1 Workflow, exactly 1 Worker, exactly 2 Step, exactly 2 Attempt, exactly 2 WorkflowCommand, exactly 2 CommandShape, exactly 9 WorkflowRow, exactly 13 StepRow, exactly 9 AttemptRow, exactly 8 LeaseRow, exactly 18 CommandHistoryRow, exactly 2 DurableCommit, 0 Wait, 0 WaitTrigger, 0 Fence, 0 FenceToken, 0 OutboxMessage, 0 InboxTarget, 0 InboxCommand, 0 WakeEvent, 0 OutboxAck, 0 WaitRow, 0 FenceRow, 0 OutboxRow, 0 CommandRow, 0 TargetActivationRow, 10 Time expect 1
+run exampleTerminalCommandHistoryCanResolveOutOfScheduleOrder for 4 but exactly 1 Workflow, exactly 1 Worker, exactly 2 Step, exactly 2 Attempt, exactly 2 WorkflowCommand, exactly 2 CommandShape, exactly 8 WorkflowRow, exactly 11 StepRow, exactly 7 AttemptRow, exactly 7 LeaseRow, exactly 21 CommandHistoryRow, exactly 2 DurableCommit, 0 Wait, 0 WaitTrigger, 0 Fence, 0 FenceToken, 0 OutboxMessage, 0 InboxTarget, 0 InboxCommand, 0 WakeEvent, 0 OutboxAck, 0 WaitRow, 0 FenceRow, 0 OutboxRow, 0 CommandRow, 0 TargetActivationRow, 9 Time expect 1
 run exampleInboxCommandEnqueues for 5 but exactly 1 InboxTarget, 1 InboxCommand, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 3 Time expect 1
 run exampleTargetActivationClaims for 6 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 4 Time expect 1
 run exampleInboxCommandClaims for 7 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 5 Time expect 1
@@ -1519,6 +1754,8 @@ check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attemp
 check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check scheduledCommandHistoryIsReplayStable for 4 but 2 Workflow, 2 Worker, 3 Step, 3 WorkflowCommand, 3 CommandShape, 5 Time expect 0
+check terminalCommandHistoryUsesLatestReplayEvent for 4 but 1 Workflow, 2 Worker, 2 Step, 2 Attempt, 2 Wait, 2 WaitTrigger, 2 WorkflowCommand, 2 CommandShape, 7 Time expect 0
+check commandHistoryFollowsRuntimeLifecycle for 4 but 1 Workflow, 2 Worker, 2 Step, 2 Attempt, 2 Wait, 2 WaitTrigger, 2 WorkflowCommand, 2 CommandShape, 7 Time expect 0
 check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0

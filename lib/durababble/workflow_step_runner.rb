@@ -124,14 +124,16 @@ module Durababble
       step = step #: as untyped
       message = "#{error.class}: #{error.message}"
       assert_workflow_lease!
-      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
         "error.type" => error.class.name,
       )
       Observability.count("durababble.workflow.step.failures", attributes)
-      return error unless step.retry_policy.retryable?(error, attempt_number:)
+      unless step.retry_policy.retryable?(error, attempt_number:)
+        synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
+        return error
+      end
 
       delay = step.retry_policy.delay_for_attempt(attempt_number)
       Observability.count(
@@ -139,8 +141,13 @@ module Durababble
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
       synchronize_store do
-        scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: @retry_run_at.call(delay))
-        raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+        @store.record_step_failed_and_schedule_retry(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          run_at: @retry_run_at.call(delay),
+        )
       end
       StepRetryScheduled.new(message)
     end

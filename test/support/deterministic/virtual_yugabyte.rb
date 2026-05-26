@@ -236,15 +236,22 @@ module Durababble
       end
 
       #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, payload: nil)
         assert_workflow_lease!(workflow_id, worker_id) if worker_id
         command_id = normalize_command_id(command_id, position)
         step = @steps[workflow_id].fetch(command_id)
         step["status"] = "failed"
         step["error"] = error
         update_latest_attempt(workflow_id, command_id, "failed", nil, error)
-        append_history(workflow_id:, kind: "step_failed", command_id:, error:)
+        append_history(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
         trace("step_failed", id: workflow_id, command_id:, error:)
+      end
+
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, worker_id: untyped, run_at: untyped) -> untyped
+      def record_step_failed_and_schedule_retry(workflow_id:, error:, run_at:, command_id: nil, position: nil, worker_id:)
+        assert_workflow_lease!(workflow_id, worker_id)
+        record_step_failed(workflow_id:, error:, command_id:, position:, payload: { "retrying" => true })
+        schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
       end
 
       #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped

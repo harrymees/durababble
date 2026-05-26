@@ -69,6 +69,47 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "atomically records failed retry attempts with retry backoff with #{backend.name}" do
+      with_durababble_store(backend, "step_retry_atomicity") do |store|
+        workflow_id = store.enqueue_workflow(name: "atomic-retry", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 30)
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+        store.record_step_started(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+
+        assert_raises(Durababble::LeaseConflict) do
+          store.record_step_failed_and_schedule_retry(
+            workflow_id:,
+            command_id: 0,
+            error: "RuntimeError: wrong owner",
+            worker_id: "worker-b",
+            run_at: Time.now + 60,
+          )
+        end
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "running"
+        assert_equal ["step_scheduled", "step_started"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+
+        run_at = Time.now + 60
+        store.record_step_failed_and_schedule_retry(
+          workflow_id:,
+          command_id: 0,
+          error: "RuntimeError: retry me",
+          worker_id: "worker-a",
+          run_at:,
+        )
+
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "failed", "error" => "RuntimeError: retry me"
+        retry_row = store.workflow(workflow_id)
+        assert_hash_includes retry_row, "status" => "pending", "locked_by" => nil
+        refute_nil retry_row.fetch("next_run_at")
+        retry_history = store.workflow_history_for(workflow_id)
+        assert_equal ["step_scheduled", "step_started", "step_failed"], retry_history.map { |event| event.fetch("kind") }
+        assert_equal({ "retrying" => true }, retry_history.last.fetch("payload"))
+        assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30)
+        store.make_workflow_due!(workflow_id, now: Time.now)
+        assert_hash_includes store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30), "id" => workflow_id, "locked_by" => "worker-b"
+      end
+    end
+
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})

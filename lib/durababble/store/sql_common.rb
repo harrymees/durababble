@@ -28,6 +28,25 @@ module Durababble
       end
     end
 
+    #: (workflow_id: String, error: String, run_at: Time, worker_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_failed_and_schedule_retry(workflow_id:, error:, run_at:, worker_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      transaction do
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:)
+        # [DURABABBLE-STEP-2] A retryable failure and its backoff row commit atomically.
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, payload: { "retrying" => true })
+        scheduled = schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+
+        scheduled
+      end
+    end
+
+    #: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
+    def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+      raise NotImplementedError
+    end
+
     #: (String) -> Hash[String, Object?]
     def workflow(workflow_id)
       row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = #{placeholder(1)}", [workflow_id]).first
@@ -357,8 +376,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+    #: (workflow_id: String, command_id: Integer, error: String, ?payload: Object?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, payload: nil)
       raise NotImplementedError
     end
 

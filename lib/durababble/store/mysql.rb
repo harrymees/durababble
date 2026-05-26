@@ -537,15 +537,15 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:)
+    #: (workflow_id: String, command_id: Integer, error: String, ?payload: Object?) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, payload: nil)
       execute_params(<<~SQL, [error, workflow_id, command_id])
         UPDATE #{table("steps")}
         SET status = 'failed', error = ?, updated_at = NOW(6)
         WHERE workflow_id = ? AND position = ?
       SQL
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, error:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
     #: (workflow_id: String, error: String) -> Object?
