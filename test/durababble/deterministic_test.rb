@@ -41,6 +41,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_delivery_to_terminal_workflow",
     "object_command_failure_exhaustion",
     "object_command_crash_fuzz",
+    "object_command_state_crash_fuzz",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -458,6 +459,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "object_command_crashed"
+  end
+
+  test "applies durable object state exactly once per command through store crashes" do
+    result = Durababble::Deterministic.prove("object_command_state_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_state_crashed"
   end
 
   test "dead-letters queued commands when their workflow terminated before delivery" do
