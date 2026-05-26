@@ -3,6 +3,8 @@
 
 module Durababble
   module MysqlMigrations
+    # Pre-production: we create every table in its final shape. There is no live data to migrate, so
+    # the schema is declared once in CREATE TABLE rather than assembled through incremental ALTERs.
     #: () -> untyped
     def migrate!
       return self if @migrated
@@ -30,10 +32,6 @@ module Durababble
           INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )
       SQL
-      add_column_if_missing("workflows", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
-      add_column_if_missing("workflows", "cancel_reason", "TEXT")
-      add_column_if_missing("workflows", "cancel_requested_at", "DATETIME(6)")
-      add_column_if_missing("workflows", "cancel_delivered_at", "DATETIME(6)")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("workflow_history")} (
           workflow_id VARCHAR(191) NOT NULL,
@@ -148,7 +146,6 @@ module Durababble
           PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
-      add_column_if_missing("durable_objects", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -168,27 +165,11 @@ module Durababble
           INDEX #{quote_column_name(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
         )
       SQL
-      create_performance_indexes!
       @migrated = true
       self
     end
 
     private
-
-    #: (untyped, untyped, untyped) -> untyped
-    def add_column_if_missing(table_name, column_name, column_type)
-      exists = execute_params(<<~SQL, ["#{table_prefix}_#{table_name}", column_name]).first
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = DATABASE()
-          AND table_name = ?
-          AND column_name = ?
-        LIMIT 1
-      SQL
-      return if exists
-
-      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_column_name(column_name.to_s)} #{column_type}")
-    end
 
     #: () -> untyped
     def create_inbox_tables!
@@ -256,81 +237,6 @@ module Durababble
           INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
         )
       SQL
-      add_column_if_missing("mailbox_sequences", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
-      add_column_if_missing("inbox", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
-      add_column_if_missing("inbox", "idempotency_hash", "VARCHAR(64)")
-      add_column_if_missing("target_activations", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
-      backfill_inbox_idempotency_hashes!
-      drop_index_if_present("inbox", "idempotency_key")
-      add_index_if_missing("inbox", index_name("inbox", "idempotency_hash_unique"), "UNIQUE KEY #{quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash)")
-    end
-
-    #: () -> untyped
-    def backfill_inbox_idempotency_hashes!
-      rows = execute_params(<<~SQL, []).to_a
-        SELECT id, worker_pool, target_kind, target_type, target_id, idempotency_key
-        FROM #{table("inbox")}
-        WHERE idempotency_key IS NOT NULL AND idempotency_hash IS NULL
-      SQL
-      rows.each do |row|
-        hash = inbox_idempotency_hash_for_migration(
-          row.fetch("idempotency_key"),
-          worker_pool: row.fetch("worker_pool"),
-          target_kind: row.fetch("target_kind"),
-          target_type: row.fetch("target_type"),
-          target_id: row.fetch("target_id"),
-        )
-        execute_params("UPDATE #{table("inbox")} SET idempotency_hash = ? WHERE id = ?", [hash, row.fetch("id")])
-      end
-    end
-
-    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
-    def inbox_idempotency_hash_for_migration(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
-      Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
-        "worker_pool" => worker_pool,
-        "target_kind" => target_kind,
-        "target_type" => target_type,
-        "target_id" => target_id,
-        "idempotency_key" => idempotency_key,
-      }))
-    end
-
-    #: () -> untyped
-    def create_performance_indexes!
-      add_index_if_missing("workflows", index_name("workflows", "worker_lease"), "INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("outbox", index_name("outbox", "worker_lease"), "INDEX #{quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("inbox", index_name("inbox", "worker_lease"), "INDEX #{quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("target_activations", index_name("target_activations", "worker_lease"), "INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)")
-    end
-
-    #: (untyped, untyped, untyped) -> untyped
-    def add_index_if_missing(table_name, index_name, index_definition)
-      exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
-        SELECT 1
-        FROM information_schema.statistics
-        WHERE table_schema = DATABASE()
-          AND table_name = ?
-          AND index_name = ?
-        LIMIT 1
-      SQL
-      return if exists
-
-      execute("ALTER TABLE #{table(table_name)} ADD #{index_definition}")
-    end
-
-    #: (untyped, untyped) -> untyped
-    def drop_index_if_present(table_name, index_name)
-      exists = execute_params(<<~SQL, [raw_table_name(table_name), index_name]).first
-        SELECT 1
-        FROM information_schema.statistics
-        WHERE table_schema = DATABASE()
-          AND table_name = ?
-          AND index_name = ?
-        LIMIT 1
-      SQL
-      return unless exists
-
-      execute("DROP INDEX #{quote_column_name(index_name.to_s)} ON #{table(table_name)}")
     end
   end
 end
