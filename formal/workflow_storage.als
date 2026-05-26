@@ -998,6 +998,7 @@ pred inboxCommandBlocks[cmd: InboxCommand, worker: Worker, t: Time] {
 }
 
 pred claimInboxCommand[cmd: InboxCommand, worker: Worker, t: Time, tnext: Time] {
+  some commandStatus[cmd, t]
   (
     commandStatus[cmd, t] in (CommandPending + CommandFailed)
   )
@@ -1269,6 +1270,11 @@ assert durableInboxCommandSerializationHolds {
     lone worker: Worker | some cmd: InboxCommand | cmd.command_target = target and liveCommandLease[cmd, worker, t]
   all c: DurableCommit |
     c.commit_kind = InboxCommandCommit implies liveCommandLease[c.commit_command, c.commit_worker, c.commit_time]
+}
+
+assert inboxClaimsRequireExistingRows {
+  all cmd: InboxCommand, worker: Worker, t: Time - last |
+    no commandStatus[cmd, t] implies not claimInboxCommand[cmd, worker, t, t.next]
 }
 
 /**
@@ -1859,4 +1865,5 @@ check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worke
 check staleFenceTokensCannotFinish for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check durableInboxCommandSerializationHolds for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
+check inboxClaimsRequireExistingRows for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check workflowInboxCommandCommitsNeedWorkflowLease for 4 but 2 Workflow, 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
