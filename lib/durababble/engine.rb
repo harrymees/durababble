@@ -65,37 +65,6 @@ module Durababble
       end
     end
 
-    #: (untyped, workflow_id: untyped, ?claimed: untyped, ?limit: untyped) -> untyped
-    def drain_workflow_inbox(workflow_class, workflow_id:, claimed: nil, limit: 10)
-      current = claimed || @store.workflow(workflow_id)
-      return 0 if terminal_workflow_row?(current)
-
-      claimed ||= @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool)
-      raise LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
-
-      workflow = workflow_class.new
-      drained = 0
-      while drained < limit
-        messages = @store.claim_inbox_messages(
-          worker_pool: @worker_pool,
-          target_kind: "workflow",
-          target_type: workflow_class.workflow_name,
-          target_id: workflow_id,
-          worker_id: @worker_id,
-          lease_seconds: @lease_seconds,
-          limit: 1,
-        )
-        break if messages.empty?
-
-        messages.each do |message|
-          drained += 1
-          dispatch_workflow_command(workflow_class, workflow, workflow_id:, message:)
-        end
-      end
-      @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
-      drained
-    end
-
     private
 
     #: (untyped) -> bool
@@ -121,28 +90,6 @@ module Durababble
       )
     end
 
-    #: (untyped, untyped, workflow_id: untyped, message: untyped) -> untyped
-    def dispatch_workflow_command(workflow_class, workflow, workflow_id:, message:)
-      unless message.fetch("message_kind") == "workflow_command"
-        @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: "Durababble::Error: unsupported workflow inbox message #{message.fetch("message_kind")}", worker_id: @worker_id)
-        return
-      end
-
-      payload = message.fetch("payload")
-      method_name = (message["method_name"] || payload.fetch("method")).to_sym
-      unless workflow_class.exposed_commands.key?(method_name)
-        @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: "Durababble::WorkflowRpc::UnknownCommand: #{method_name}", worker_id: @worker_id)
-        return
-      end
-
-      args = payload.fetch("args", [])
-      kwargs = payload.fetch("kwargs", {})
-      result = workflow.public_send(method_name, *args, **kwargs)
-      @store.complete_workflow_command(message_id: message.fetch("id"), workflow_id:, result:, worker_id: @worker_id)
-    rescue StandardError => e
-      @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: ErrorFormatting.format_error(e), worker_id: @worker_id)
-    end
-
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
       attributes = {
@@ -161,6 +108,7 @@ module Durababble
             history.count { |event| event.fetch("kind") == "step_completed" },
             attributes,
           )
+          workflow = workflow_class.new
           execution = WorkflowExecution.new(
             store: @store,
             workflow_id:,
@@ -168,10 +116,12 @@ module Durababble
             lease_seconds: @lease_seconds,
             history:,
             root_task:,
+            workflow_class:,
+            workflow:,
+            worker_pool: @worker_pool,
             crash_after: @crash_after,
             history_warning_logged:,
           )
-          workflow = workflow_class.new
           workflow.__durababble_execution__ = execution
           result = WorkflowExecutionContext.with_current(execution) do
             WorkflowDeterminism.enforce(workflow_id:) do

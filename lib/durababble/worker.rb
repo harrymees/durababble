@@ -110,7 +110,7 @@ module Durababble
       worker_pool = activation_worker_pool(activation)
       engine = engine_for(worker_pool)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
-      engine.drain_workflow_inbox(workflow, workflow_id:, claimed:) if claimed
+      engine.resume(workflow, workflow_id:, claimed:) if claimed
       target = activation_target(activation, worker_pool:)
       if advisory
         if claimed

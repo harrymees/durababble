@@ -248,7 +248,9 @@ Timer waits persist a wake time and Paquito context, suspend the workflow only a
 
 A step wait is a terminal command-resolution record, but releasing the workflow lease to `waiting` happens only after the workflow activation reaches a safe suspension point. If one branch records a wait while sibling workflow fibers have already scheduled process-local steps, those sibling steps may finish and commit before the workflow row is released.
 
-Workflow commands are durable workflow inbox messages delivered to the workflow lease owner. A committed command must make the target runnable immediately. If a live owner holds the workflow lease, the runtime sends `DeliverMessage` after commit; if there is no live owner or advisory delivery fails, the durable target activation remains claimable by the worker pool. The command executes before a new durable workflow command starts, after a step completes/fails/waits, when a running step heartbeats or otherwise yields to the workflow engine, or when a sleep/wait activation is interrupted by message work. A non-heartbeating user step body is not preempted mid-Ruby-frame; the command runs when the active owner reaches a safe point or lease expiry/recovery gives the target to another worker.
+Workflow commands are durable workflow inbox messages delivered to the workflow lease owner. A committed command must make the target runnable immediately. If a live owner holds the workflow lease, the runtime sends `DeliverMessage` after commit; if there is no live owner or advisory delivery fails, the durable target activation remains claimable by the worker pool. The command executes inside the active `WorkflowExecution` and same workflow object instance that is running or replaying `#execute` after a step completes/fails/waits, when a running step heartbeats or otherwise yields to the workflow engine, or when a condition wait is interrupted by message work. A non-heartbeating user step body is not preempted mid-Ruby-frame; the command runs when the active owner reaches a safe point or lease expiry/recovery gives the target to another worker.
+
+Workflow command delivery appends a `workflow_command_completed` or `workflow_command_failed` history record with the inbox message id, method, args, kwargs, sequence, shape hash, and result or error. Replay delivers those command records in `workflow_history` order only after preceding scheduled/resolved workflow command history has been consumed, invokes the command handler against workflow-local state, and raises nondeterminism if the exposed method is missing or the replayed result/error diverges from the recorded command record.
 
 Synchronous workflow command APIs are durable asks. The caller waits for the inbox row to store a serialized result or typed error, then returns/re-raises it. If the caller times out or loses its connection after the row commits, the durable command is not canceled; retrying with the same idempotency key reattaches to the same inbox row. Command responses do not require the general outbox table because the response is a one-to-one property of the ask row; workflow/object code may still write ordinary outbox messages when a command handler needs durable delivery to an external system.
 
@@ -549,19 +551,23 @@ Durababble.configure do |c|
   c.cache_capacity = 5_000
   c.max_cached_workflows = 1_000
   c.shutdown_grace_s = 30
-  c.max_workflow_args_bytes = 4 * 1024 * 1024
-  c.warn_workflow_args_bytes = 1 * 1024 * 1024
-  c.max_step_output_bytes = 4 * 1024 * 1024
-  c.warn_step_output_bytes = 1 * 1024 * 1024
-  c.max_object_state_bytes = 4 * 1024 * 1024
-  c.warn_object_state_bytes = 1 * 1024 * 1024
+  c.payload_limits = {
+    workflow_input: 4 * 1024 * 1024,
+    workflow_result: 4 * 1024 * 1024,
+    step_output: 4 * 1024 * 1024,
+    object_state: 4 * 1024 * 1024,
+    inbox_payload: 4 * 1024 * 1024,
+    rpc_argument: 4 * 1024 * 1024
+  }
   c.workflow_history_warning_events = ENV.fetch("DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS", "8000").to_i
   c.max_workflow_history_events = ENV.fetch("DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS", "10000").to_i
   c.observability = MyApp::Observability::Durababble
 end
 ```
 
-Size guards are production requirements. Durababble warns at configured thresholds and raises `Durababble::PayloadTooLarge` when serialized workflow args, step outputs, or object state exceed max bytes. The runtime does not silently spill oversized values to blob storage.
+The current Ruby API exposes payload limits as one process-wide override hash: `Durababble.payload_limits = { workflow_input: bytes, workflow_result: bytes, step_output: bytes, object_state: bytes, inbox_payload: bytes, rpc_argument: bytes }`. Matching environment variables are `DURABABBLE_MAX_WORKFLOW_INPUT_BYTES`, `DURABABBLE_MAX_WORKFLOW_RESULT_BYTES`, `DURABABBLE_MAX_STEP_OUTPUT_BYTES`, `DURABABBLE_MAX_OBJECT_STATE_BYTES`, `DURABABBLE_MAX_INBOX_PAYLOAD_BYTES`, and `DURABABBLE_MAX_RPC_ARGUMENT_BYTES`; `workflow_args` and `DURABABBLE_MAX_WORKFLOW_ARGS_BYTES` remain compatibility aliases for workflow input bytes. Every default is `4 * 1024 * 1024` serialized bytes, and every configured value must be positive.
+
+Size guards are production requirements. Durababble raises `Durababble::PayloadTooLarge` when serialized workflow inputs, workflow results, step outputs, durable object state, inbox payload/result bytes, or `CallTransient` RPC arguments exceed the configured maximum. Checks run after Paquito serialization against the exact byte string that will be written to MySQL/MariaDB `LONGBLOB`, PostgreSQL/YSQL `bytea`, or sent as protobuf `bytes`; PostgreSQL's client-side hex literal text is not counted as payload size. The error message identifies the surface and context such as workflow id, object id, inbox message id, or RPC method, but it must not include the serialized payload or original Ruby value. Rejected writes happen before the durable mutation or inside a rolled-back SQL transaction, so oversized workflow rows, history completions, inbox rows, object-state updates, and RPC handler side effects are not partially persisted. The runtime does not silently spill oversized values to blob storage.
 
 The workflow-history guard is a replay-cost and correctness guard, not a retention system. Applications should alert on the warning log at `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS`, alert on `Durababble::WorkflowHistoryLimitExceeded`, inspect the workflow type/id and history count, and remediate by splitting the workflow into smaller durable runs/objects, pruning or compacting old terminal histories with an explicit operator tool, or raising `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` only after the long-history benchmark shows acceptable replay latency and allocation cost.
 

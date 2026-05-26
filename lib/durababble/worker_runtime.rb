@@ -87,7 +87,6 @@ module Durababble
           Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
         rescue StandardError
           stop_rpc_server
-          close_isolated_stores
           raise
         end
         @thread = Thread.new { run_loop(worker) }
@@ -140,7 +139,6 @@ module Durababble
     #: () -> untyped
     def close
       shutdown
-      close_isolated_stores
       @store.close if @owns_store
     end
 
@@ -148,12 +146,12 @@ module Durababble
 
     #: () -> untyped
     def worker_store
-      @worker_store ||= isolated_store
+      @worker_store ||= @store
     end
 
     #: () -> untyped
     def rpc_store
-      @rpc_store ||= isolated_store
+      @rpc_store ||= @store
     end
 
     #: () -> untyped
@@ -182,25 +180,6 @@ module Durababble
       @rpc_server = nil
       @rpc_address = nil
       server.stop
-    end
-
-    #: () -> untyped
-    def isolated_store
-      return @store unless @store.respond_to?(:pooled_connections)
-
-      @store.pooled_connections
-    end
-
-    #: () -> void
-    def close_isolated_stores
-      [@worker_store, @rpc_store].compact.uniq.each do |isolated_store|
-        next if isolated_store.equal?(@store)
-        next unless isolated_store.respond_to?(:close)
-
-        isolated_store.close
-      end
-      @worker_store = nil
-      @rpc_store = nil
     end
 
     #: (**untyped) -> untyped

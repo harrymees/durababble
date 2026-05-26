@@ -15,22 +15,17 @@ class DurababbleStoreTest < DurababbleTestCase
   MysqlMigrationProbeStore = DurababbleScriptedSqlSupport::MysqlMigrationProbeStore
 
   test "routes active record connections through mysql and postgres adapters" do
-    assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema")
-    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection: ScriptedPgConnection.new, schema: "schema")
-    assert_kind_of Durababble::PostgresStore, Durababble::Store.new(ScriptedPgConnection.new, schema: "schema")
+    assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedPgConnection.new), schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.new(connection_pool: scripted_pool(ScriptedPgConnection.new), schema: "schema")
     assert_raises(ArgumentError) { Durababble::Store.new(schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::Store.new(scripted_pool(ScriptedPgConnection.new), schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::MysqlStore.new(ScriptedMysqlConnection.new, schema: "schema") }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(schema: "schema") }
 
-    pool = Struct.new(:connection) do
-      def lease_connection = connection
-    end.new(ScriptedMysqlConnection.new)
-    owner_pool = Struct.new(:disconnected) do
-      def disconnect!
-        self.disconnected = true
-      end
-    end.new(false)
+    owner_pool = scripted_pool(ScriptedMysqlConnection.new)
     owner = Struct.new(:connection_pool).new(owner_pool)
-    store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema", owner:)
+    store = Durababble::Store.from_active_record(connection_pool: owner_pool, schema: "schema", owner:)
     assert_kind_of Durababble::MysqlStore, store
     store.close
     assert owner_pool.disconnected
@@ -38,10 +33,60 @@ class DurababbleStoreTest < DurababbleTestCase
     unsupported = Object.new
     unsupported.define_singleton_method(:adapter_name) { "SQLite" }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection: unsupported, schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection_pool: scripted_pool(unsupported), schema: "schema") }
     assert_equal "postgresql", Durababble::Store.send(:active_record_config_for, "postgres://user:pass@example.test:5432/db").fetch(:adapter)
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "mysql://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "trilogy://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
+  end
+
+  test "stores checkout connections from the active record pool as needed" do
+    pool = scripted_pool(ScriptedMysqlConnection.new)
+
+    store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema")
+
+    assert_equal "schema", store.schema
+    refute_respond_to store, :pooled_connections
+    assert_equal 1, pool.checked_out
+
+    before_query = pool.checked_out
+    store.send(:execute_params, "SELECT ?", [1])
+
+    assert_operator pool.checked_out, :>, before_query
+
+    before_transaction = pool.checked_out
+    store.send(:transaction) do
+      store.send(:execute_params, "SELECT ?", [1])
+      store.send(:execute_params, "SELECT ?", [2])
+    end
+
+    assert_equal before_transaction + 1, pool.checked_out
+  end
+
+  test "database url query parameters are preserved in active record config" do
+    config = Durababble::Store.send(
+      :active_record_config_for,
+      "postgres://user:p%40ss@example.test:5432/db?sslmode=require&connect_timeout=5&application_name=durababble",
+    )
+
+    assert_equal "postgresql", config.fetch(:adapter)
+    assert_equal "user", config.fetch(:username)
+    assert_equal "p@ss", config.fetch(:password)
+    assert_equal "example.test", config.fetch(:host)
+    assert_equal 5432, config.fetch(:port)
+    assert_equal "db", config.fetch(:database)
+    assert_equal "require", config.fetch(:sslmode)
+    assert_equal "5", config.fetch(:connect_timeout)
+    assert_equal "durababble", config.fetch(:application_name)
+
+    mysql_config = Durababble::Store.send(
+      :active_record_config_for,
+      "mysql://user:pass@example.test/db?socket=%2Ftmp%2Fmysql.sock&read_timeout=10",
+    )
+
+    assert_equal "trilogy", mysql_config.fetch(:adapter)
+    assert_equal "/tmp/mysql.sock", mysql_config.fetch(:socket)
+    assert_equal "10", mysql_config.fetch(:read_timeout)
   end
 
   test "close removes generated active record connection constants" do
@@ -53,7 +98,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal("Durababble::#{const_name}", owner.name)
     assert(Durababble.const_defined?(const_name, false))
 
-    store = Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema", owner:)
+    store = Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema", owner:)
     store.close
 
     refute(Durababble.const_defined?(const_name, false))
@@ -137,7 +182,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "postgres enqueue_workflow inserts the pending row in one statement" do
     connection = ScriptedPgConnection.new
-    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+    store = pg_store(connection, schema: "durababble_test")
 
     workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
 
@@ -154,7 +199,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "postgres enqueue_workflow uses an explicit id and maps duplicate ids" do
     connection = ScriptedPgConnection.new
-    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+    store = pg_store(connection, schema: "durababble_test")
 
     workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
 
@@ -162,7 +207,7 @@ class DurababbleStoreTest < DurababbleTestCase
     _sql, params = connection.exec_params_calls.first
     assert_equal "wf-explicit", params[0]
 
-    duplicate = Durababble::PostgresStore.new(
+    duplicate = pg_store(
       ScriptedPgConnection.new(params_results: [->(_sql, _params) { raise ActiveRecord::RecordNotUnique, "duplicate key value violates unique constraint" }]),
       schema: "durababble_test",
     )
@@ -174,7 +219,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "postgres create_workflow inserts the initial running row in one statement" do
     connection = ScriptedPgConnection.new
-    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+    store = pg_store(connection, schema: "durababble_test")
 
     workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
 
@@ -195,7 +240,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "mysql enqueue_workflow inserts the pending row in one statement" do
     connection = ScriptedMysqlConnection.new
-    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+    store = mysql_store(connection, schema: "durababble_test")
 
     workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
 
@@ -209,7 +254,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "mysql enqueue_workflow uses an explicit id and maps duplicate ids" do
     connection = ScriptedMysqlConnection.new
-    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+    store = mysql_store(connection, schema: "durababble_test")
 
     workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
 
@@ -217,7 +262,7 @@ class DurababbleStoreTest < DurababbleTestCase
     sql = connection.queries.first
     assert_includes sql, "'wf-explicit'"
 
-    duplicate = Durababble::MysqlStore.new(
+    duplicate = mysql_store(
       ScriptedMysqlConnection.new { |_sql| raise ActiveRecord::RecordNotUnique, "Duplicate entry 'wf-explicit' for key 'PRIMARY'" },
       schema: "durababble_test",
     )
@@ -229,7 +274,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "mysql create_workflow inserts the initial running row in one statement" do
     connection = ScriptedMysqlConnection.new
-    store = Durababble::MysqlStore.new(connection, schema: "durababble_test")
+    store = mysql_store(connection, schema: "durababble_test")
 
     workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
 
@@ -255,7 +300,7 @@ class DurababbleStoreTest < DurababbleTestCase
         "locked_until" => Time.utc(2026, 1, 1, 0, 1),
       }]),
     ])
-    store = Durababble::PostgresStore.new(connection, schema: "durababble_test")
+    store = pg_store(connection, schema: "durababble_test")
 
     claimed = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 9, workflow_names: ["demo"])
 
@@ -369,45 +414,6 @@ class DurababbleStoreTest < DurababbleTestCase
       store.mark_workflow_running(workflow_id, worker_id: "owner", lease_seconds: 60)
 
       assert_hash_includes store.current_workflow_lease(workflow_id), "worker_id" => "owner"
-    end
-  end
-
-  test "migrates legacy JSONB runtime columns into Paquito bytea columns in Yugabyte" do
-    with_yugabyte_store(migrate: false) do |store|
-      connection = PG.connect(durababble_yugabyte_database_url)
-      connection.exec("CREATE SCHEMA #{PG::Connection.quote_ident(schema)}")
-      connection.exec(<<~SQL)
-        CREATE TABLE #{PG::Connection.quote_ident(schema)}.workflows (
-          id text PRIMARY KEY,
-          name text NOT NULL,
-          status text NOT NULL,
-          input jsonb NOT NULL DEFAULT '{}'::jsonb,
-          result jsonb,
-          error text,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          updated_at timestamptz NOT NULL DEFAULT now()
-        )
-      SQL
-      connection.exec_params(
-        "INSERT INTO #{PG::Connection.quote_ident(schema)}.workflows (id, name, status, input, result) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
-        ["legacy", "demo", "completed", '{"count":1}', '{"count":2}'],
-      )
-      connection.close
-
-      store.migrate!
-
-      assert_equal({ "count" => 1 }, store.workflow("legacy").fetch("input"))
-      assert_equal({ "count" => 2 }, store.workflow("legacy").fetch("result"))
-      data_type = PG.connect(durababble_yugabyte_database_url) do |verify|
-        verify.exec_params(<<~SQL, [schema, "workflows", "input"]).first.fetch("data_type")
-          SELECT data_type
-          FROM information_schema.columns
-          WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
-        SQL
-      end
-      assert_equal("bytea", data_type)
-    ensure
-      connection&.close unless connection&.finished?
     end
   end
 
@@ -931,7 +937,7 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  test "handles postgres fence replay, serialization migration, retry, and helper branches" do
+  test "handles postgres fence replay, retry, and helper branches" do
     completed = { "status" => "completed", "result" => pg_dump({ "done" => true }), "error" => nil }
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }
     connection = ScriptedPgConnection.new(
@@ -944,19 +950,6 @@ class DurababbleStoreTest < DurababbleTestCase
         sql_result([], affected_rows: 0),
         sql_result([], affected_rows: 0),
         sql_result([failed]),
-        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        sql_result([{ "column_name" => "id" }]),
-        sql_result,
-        sql_result,
-        sql_result([{ "data_type" => "bytea", "is_nullable" => "YES" }]),
-        sql_result,
-      ],
-      exec_results: [
-        sql_result,
-        sql_result([
-          { "id" => "one", "payload" => "{\"ok\":true}" },
-          { "id" => "two", "payload" => nil },
-        ]),
       ],
     )
     store = pg_store(connection)
@@ -964,9 +957,6 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "created" => true }, store.with_fence(workflow_id: "wf", key: "created") { { "created" => true } })
     assert_equal({ "done" => true }, store.with_fence(workflow_id: "wf", key: "done", timeout: 0))
     assert_raises(Durababble::Error) { store.with_fence(workflow_id: "wf", key: "failed", timeout: 0) }
-    store.send(:migrate_serialized_column!, "outbox", "payload", not_null: true)
-    store.send(:migrate_serialized_column!, "outbox", "payload")
-    store.send(:migrate_serialized_column!, "outbox", "missing")
 
     attempts = 0
     result = store.send(:retry_serialization_failures) do
@@ -1051,25 +1041,11 @@ class DurababbleStoreTest < DurababbleTestCase
       pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise ActiveRecord::Deadlocked } }))
         .send(:execute, "SELECT 1")
     end
-
-    migration_connection = ScriptedPgConnection.new(
-      params_results: [
-        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        sql_result([{ "column_name" => "id" }]),
-      ],
-      exec_results: [
-        sql_result,
-        sql_result([{ "id" => "one", "payload" => "{\"ok\":true}" }]),
-        sql_result,
-        sql_result,
-      ],
-    )
-    pg_store(migration_connection).send(:migrate_serialized_column!, "outbox", "payload")
   end
 
   test "uses active record mysql quoting, sanitization, and transaction retry" do
     connection = ScriptedMysqlConnection.new
-    store = Durababble::MysqlStore.new(connection, schema: "branch-schema-with-a-very-long-name-that-will-be-hashed")
+    store = mysql_store(connection, schema: "branch-schema-with-a-very-long-name-that-will-be-hashed")
 
     assert_match(/\Adura_[0-9a-f]{10}\z/, store.send(:table_prefix))
     assert_equal "`dura_#{Digest::SHA1.hexdigest("branch_schema_with_a_very_long_name_that_will_be_hashed")[0, 10]}_workflows`", store.send(:table, "workflows")
@@ -1114,16 +1090,16 @@ class DurababbleStoreTest < DurababbleTestCase
 
   def shared_store
     Durababble::Store.allocate.tap do |store|
-      store.send(:initialize, ScriptedPgConnection.new, schema: "schema")
+      store.send(:initialize, scripted_pool(ScriptedPgConnection.new), schema: "schema")
     end
   end
 
-  def pg_store(connection = ScriptedPgConnection.new)
-    Durababble::Store.new(connection, schema: "branch_schema")
+  def pg_store(connection = ScriptedPgConnection.new, schema: "branch_schema")
+    Durababble::Store.new(connection_pool: scripted_pool(connection), schema:)
   end
 
-  def mysql_store(connection = ScriptedMysqlConnection.new)
-    Durababble::MysqlStore.new(connection, schema: "branch_schema")
+  def mysql_store(connection = ScriptedMysqlConnection.new, schema: "branch_schema")
+    Durababble::MysqlStore.new(scripted_pool(connection), schema:)
   end
 
   def with_yugabyte_store(migrate: true, &block)

@@ -3,6 +3,8 @@
 
 require_relative "../test_helper"
 
+require "uri"
+
 class DurababbleDocumentationTest < DurababbleTestCase
   # Expected return value for each marked example. The map exists so adding a
   # new example forces a deliberate decision about what the example proves;
@@ -140,10 +142,36 @@ class DurababbleDocumentationTest < DurababbleTestCase
     refute_includes counter_visible, "Durababble::Worker.new"
   end
 
+  test "docs theme jsdelivr imports are pinned to explicit package versions" do
+    paths = Dir[File.join(root, "docs/theme/**/*")].select do |path|
+      File.file?(path) && [".html", ".js"].include?(File.extname(path)) && !path.include?("/vendor/")
+    end
+    cdn_urls = paths.flat_map do |path|
+      File.read(path).scan(%r{https://cdn\.jsdelivr\.net/npm/[^'"\s)]+}).map { |url| [path, url] }
+    end
+    unpinned = cdn_urls.reject { |_path, url| pinned_jsdelivr_npm_url?(url) }
+
+    assert_empty(
+      unpinned.map { |path, url| "#{path.delete_prefix("#{root}/")}: #{url}" },
+      "docs theme CDN imports must pin npm packages with an explicit @version",
+    )
+  end
+
   private
 
   def root
     File.expand_path("../..", __dir__)
+  end
+
+  def pinned_jsdelivr_npm_url?(url)
+    package_path = URI.parse(url).path.delete_prefix("/npm/")
+    if package_path.start_with?("@")
+      package_path.match?(%r{\A@[^/]+/[^/@]+@[^/]+})
+    else
+      package_path.match?(%r{\A[^/@]+@[^/]+})
+    end
+  rescue URI::InvalidURIError
+    false
   end
 
   def discover_marked_examples
