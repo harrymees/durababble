@@ -41,7 +41,7 @@ module Durababble
         Durababble.const_set(connection_name, connection_class)
         begin
           connection_class.establish_connection(adapter: "sqlite3", database: ":memory:", pool: 1)
-          new(connection_class.connection_pool, schema:, owner: connection_class)
+          new(connection_class.connection_pool, schema:, owner: connection_class) #: as SqliteStore
         rescue StandardError
           Store.send(:remove_active_record_class_const, connection_class)
           raise
@@ -65,9 +65,9 @@ module Durababble
 
     # The store binds to one leased connection (see #initialize); always yield it
     # so inherited orchestration runs against the database carrying the UDF.
-    #: () { (Object) -> Object? } -> Object?
-    def with_connection
-      yield @connection
+    #: [T] () { (Object) -> T } -> T
+    def with_connection(&block)
+      block.call(@connection)
     end
 
     #: () -> void
@@ -220,16 +220,20 @@ module Durababble
       status = row.fetch("status").to_s
       return false if InboxStatus.dead_lettered?(status)
 
-      now_tick = timestamp_or_nil(now)
+      now_tick = timestamp_or_nil(now).to_i
       if InboxStatus.running?(status)
         locked_until = row["locked_until"]
         return false unless locked_until
 
+        locked_until = locked_until #: as untyped
         return locked_until.to_i < now_tick
       end
 
       ready_at = row["ready_at"]
-      ready_at.nil? || ready_at.to_i <= now_tick
+      return true if ready_at.nil?
+
+      ready_at = ready_at #: as untyped
+      ready_at.to_i <= now_tick
     end
 
     #: (Hash[String, Object?], now: Object?) -> Object?

@@ -75,6 +75,9 @@ module ActiveRecord
       end
       def with_connection(&block); end
 
+      sig { returns(AbstractAdapter) }
+      def lease_connection; end
+
       sig { void }
       def disconnect!; end
 
@@ -189,6 +192,14 @@ class Trilogy
   def query(sql); end
 end
 
+module SQLite3
+  class ConstraintException < StandardError; end
+
+  class Blob < String
+    def initialize(value); end
+  end
+end
+
 module Durababble
   class Store
     def current_workflow_lease(workflow_id, worker_pool: nil); end
@@ -220,6 +231,12 @@ module Durababble
     def quote_column_name(identifier); end
     def quoted_schema; end
     def schema; end
+    def table(name); end
+  end
+
+  module SqliteMigrations
+    def execute(sql); end
+    def index_name(table_name, suffix); end
     def table(name); end
   end
 
