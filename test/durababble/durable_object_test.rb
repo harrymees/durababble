@@ -84,6 +84,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     def object_state(object_type:, object_id:, worker_pool: "default") = @state
 
+    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+      @state.nil? ? Durababble::Store::NO_OBJECT_STATE : @state
+    end
+
     def complete_object_command(command_id:, result:, **kwargs)
       @completed << [command_id, result]
       @state = kwargs.fetch(:state) if kwargs.key?(:state) && !kwargs.fetch(:state).equal?(Durababble::Store::NO_OBJECT_STATE)

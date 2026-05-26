@@ -71,15 +71,8 @@ module Durababble
       #: (Object, object_type: String, object_id: String, ?worker_pool: String) -> Object?
       def state_from_store(store, object_type:, object_id:, worker_pool: "default")
         store = store #: as untyped
-        if store.respond_to?(:object_state_entry)
-          state = store.object_state_entry(worker_pool:, object_type:, object_id:)
-          return UNINITIALIZED if state.equal?(Store::NO_OBJECT_STATE)
-
-          return state
-        end
-
-        state = store.object_state(worker_pool:, object_type:, object_id:)
-        state.nil? ? UNINITIALIZED : state
+        state = store.object_state_entry(worker_pool:, object_type:, object_id:)
+        state.equal?(Store::NO_OBJECT_STATE) ? UNINITIALIZED : state
       end
 
       # Single source for the object-command observability attribute bundle, so
@@ -395,8 +388,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def retry_run_at(delay)
-      base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
-      base + delay
+      @store.current_time + delay
     end
 
     #: (untyped, object_id: untyped, message: untyped, method_name: untyped) -> untyped

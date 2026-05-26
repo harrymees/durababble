@@ -259,6 +259,16 @@ module Durababble
         trace("step_failed", id: workflow_id, command_id:, error:)
       end
 
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, worker_id: untyped, run_at: untyped) -> untyped
+      def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        record_step_failed(workflow_id:, command_id:, error:, worker_id:)
+        scheduled = schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
+        raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+
+        scheduled
+      end
+
       #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped, error: untyped, ?worker_id: untyped) -> untyped
       def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
         assert_workflow_lease!(workflow_id, worker_id) if worker_id
@@ -432,6 +442,12 @@ module Durababble
       def steps_for(workflow_id) = @steps[workflow_id].values.sort_by { |row| row.fetch("position") }.map { |row| deep(row) }
       #: (untyped) -> untyped
       def step_attempts_for(workflow_id) = @attempts[workflow_id].map { |row| deep(row) }
+
+      #: (workflow_id: untyped, ?command_id: untyped, ?position: untyped) -> untyped
+      def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+        command_id = normalize_command_id(command_id, position)
+        @attempts[workflow_id].count { |attempt| attempt.fetch("position") == command_id }
+      end
 
       #: () -> untyped
       def summary

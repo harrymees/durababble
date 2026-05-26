@@ -140,19 +140,13 @@ module Durababble
       )
       synchronize_store do
         run_at = @retry_run_at.call(delay)
-        if @store.respond_to?(:record_step_failed_and_schedule_retry)
-          @store.record_step_failed_and_schedule_retry(
-            workflow_id: @workflow_id,
-            command_id:,
-            error: message,
-            worker_id: @worker_id,
-            run_at:,
-          )
-        else
-          @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id)
-          scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at:)
-          raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
-        end
+        @store.record_step_failed_and_schedule_retry(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          run_at:,
+        )
       end
       crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
     end
@@ -210,11 +204,7 @@ module Durababble
     #: (Integer) -> Integer
     def attempt_number_for(command_id)
       count = synchronize_store do
-        if @store.respond_to?(:step_attempt_count_for)
-          @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
-        else
-          @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
-        end
+        @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
       end
       count = count #: as untyped
       count.to_i
