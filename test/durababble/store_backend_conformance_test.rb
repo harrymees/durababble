@@ -913,6 +913,20 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.workflow(completion_id), "status" => "running", "result" => nil
         assert_equal ["scheduled"], store.steps_for(completion_id).map { |step| step.fetch("status") }
 
+        pending_wait_id = store.create_workflow(name: "reject-pending-wait-complete", input: {})
+        store.record_wait(
+          workflow_id: pending_wait_id,
+          command_id: 0,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+        store.record_step_completed(workflow_id: pending_wait_id, command_id: 0, result: { "finished" => true })
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(pending_wait_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(pending_wait_id), "status" => "waiting", "result" => nil
+        assert_equal ["pending"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
+
         cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
         store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
         store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running")

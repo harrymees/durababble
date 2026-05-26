@@ -768,6 +768,7 @@ pred completeWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   workflowStatus[wf, t] = Running
   all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] = StepCompleted
   all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting)
+  no wt: Wait | wt.wait_step.step_workflow = wf and waitStatus[wt, t] = WaitPending
   workflowStatus[wf, tnext] = Completed
   workflowCancelSame[wf, t, tnext]
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
@@ -778,19 +779,42 @@ pred completeWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
 
 pred failOrFinishCancellationWorkflow[wf: Workflow, worker: lone Worker, status: WorkflowStatus, t: Time, tnext: Time] {
   status in (Failed + Canceled)
+  some workflowStatus[wf, t]
   workflowStatus[wf, t] in (Pending + Running + Waiting + Canceling)
   some worker implies liveWorkflowLease[wf, worker, t]
-  status = Canceled implies {
-    all st: Step | st.step_workflow = wf and some stepStatus[st, t] implies stepStatus[st, t] not in (StepScheduled + StepRunning + StepWaiting)
-    all att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] implies attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting)
-  }
   workflowStatus[wf, tnext] = status
   no workflowNextRun[wf, tnext]
   status = Failed implies workflowCancelSame[wf, t, tnext]
   status = Canceled and some workflowCancelRequestedAt[wf, t] implies workflowCancelSame[wf, t, tnext]
   status = Canceled and no workflowCancelRequestedAt[wf, t] implies workflowCancelRequestedAt[wf, tnext] = t
   no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
-  unchangedExcept[wf, none, none, none, none, none, none, none, t, tnext]
+  status = Failed implies unchangedExcept[wf, none, none, none, none, none, none, none, t, tnext]
+  status = Canceled implies {
+    all other: Workflow - wf | workflowSame[other, t, tnext]
+    all st: Step | st.step_workflow != wf implies stepSame[st, t, tnext]
+    all st: Step | st.step_workflow = wf implies {
+      no stepStatus[st, t] implies no stepStatus[st, tnext]
+      some stepStatus[st, t] and stepStatus[st, t] in (StepScheduled + StepRunning + StepWaiting) implies stepStatus[st, tnext] = StepCanceled
+      some stepStatus[st, t] and stepStatus[st, t] not in (StepScheduled + StepRunning + StepWaiting) implies stepSame[st, t, tnext]
+    }
+    all att: Attempt | att.attempt_step.step_workflow != wf implies attemptSame[att, t, tnext]
+    all att: Attempt | att.attempt_step.step_workflow = wf implies {
+      no attemptStatus[att, t] implies no attemptStatus[att, tnext]
+      some attemptStatus[att, t] and attemptStatus[att, t] in (AttemptRunning + AttemptWaiting) implies attemptStatus[att, tnext] = AttemptCanceled
+      some attemptStatus[att, t] and attemptStatus[att, t] not in (AttemptRunning + AttemptWaiting) implies attemptSame[att, t, tnext]
+    }
+    all wt: Wait | wt.wait_step.step_workflow != wf implies waitSame[wt, t, tnext]
+    all wt: Wait | wt.wait_step.step_workflow = wf implies {
+      no waitStatus[wt, t] implies no waitStatus[wt, tnext]
+      waitStatus[wt, t] = WaitPending implies waitStatus[wt, tnext] = WaitCanceled
+      some waitStatus[wt, t] and waitStatus[wt, t] != WaitPending implies waitSame[wt, t, tnext]
+    }
+    all f: Fence | fenceSame[f, t, tnext]
+    all o: OutboxMessage | outboxSame[o, t, tnext]
+    all c: InboxCommand | commandSame[c, t, tnext]
+    all target: InboxTarget | targetActivationSame[target, t, tnext]
+    all cmd: WorkflowCommand | commandHistorySame[cmd, t, tnext]
+  }
   preserveLeasesExcept[wf, t, tnext]
 }
 
@@ -798,6 +822,7 @@ pred requestWorkflowCancellation[wf: Workflow, t: Time, tnext: Time] {
   -- Workflow cancellation is cooperative and stored as metadata. Runnable and
   -- suspended workflows enter canceling immediately, while a running workflow
   -- keeps its lease until it suspends, retries, or releases.
+  some workflowStatus[wf, t]
   workflowStatus[wf, t] in (Pending + Running + Waiting + Canceling + Failed)
   not terminalWorkflow[wf, t]
   no workflowCancelRequestedAt[wf, t]
@@ -1247,15 +1272,16 @@ assert durableInboxCommandSerializationHolds {
 }
 
 /**
- * [DURABABBLE-WF-1] Completed/canceled workflows cannot retain unfinished step
- * or attempt rows. Failed rows are terminal when they have no retry deadline,
- * but may retain diagnostic incomplete work.
+ * [DURABABBLE-WF-1] Completed/canceled workflows cannot retain unfinished step,
+ * attempt, or wait rows. Failed rows are terminal when they have no retry
+ * deadline, but may retain diagnostic incomplete work.
  */
 assert terminalWorkflowsHaveNoIncompleteWork {
   all wf: Workflow, t: Time |
     closedWorkflow[wf, t] implies {
       no st: Step | st.step_workflow = wf and some stepStatus[st, t] and stepStatus[st, t] in (StepScheduled + StepRunning + StepWaiting)
       no att: Attempt | att.attempt_step.step_workflow = wf and some attemptStatus[att, t] and attemptStatus[att, t] in (AttemptRunning + AttemptWaiting)
+      no wt: Wait | wt.wait_step.step_workflow = wf and waitStatus[wt, t] = WaitPending
     }
 }
 
@@ -1423,6 +1449,25 @@ pred exampleWaitingCancellationCancelsWait {
     attemptStatus[att, first.next.next.next.next.next.next] = AttemptCanceled
     waitStatus[wait, first.next.next.next.next.next.next] = WaitCanceled
     failOrFinishCancellationWorkflow[wf, none, Canceled, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+  }
+}
+
+pred exampleTerminalCancellationCleansPendingWait {
+  some wf: Workflow, st: Step, att: Attempt, wait: Wait, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    recordWait[wf, st, att, wait, worker, first.next.next.next.next, first.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next] = Waiting
+    waitStatus[wait, first.next.next.next.next.next] = WaitPending
+    failOrFinishCancellationWorkflow[wf, none, Canceled, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next] = Canceled
+    stepStatus[st, first.next.next.next.next.next.next] = StepCanceled
+    attemptStatus[att, first.next.next.next.next.next.next] = AttemptCanceled
+    waitStatus[wait, first.next.next.next.next.next.next] = WaitCanceled
   }
 }
 
@@ -1774,6 +1819,7 @@ run exampleRetryThenCompletesWithFailedAttemptHistory for 6 but exactly 1 Workfl
 run exampleStepFailureReplaysAsTerminalHistory for 8 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 6 Time expect 1
 run exampleCancellationCompletesAfterCleanup for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time expect 1
 run exampleWaitingCancellationCancelsWait for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WorkflowCommand, 1 CommandShape, exactly 12 CommandHistoryRow, 8 Time expect 1
+run exampleTerminalCancellationCleansPendingWait for 10 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 Wait, 1 WorkflowCommand, 1 CommandShape, exactly 9 CommandHistoryRow, 7 Time expect 1
 run exampleRunningStepCancellationRecordsHistory for 8 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 7 Time expect 1
 run exampleBackoffCancellationClearsDue for 9 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 1
 run exampleRunningCancellationMetadataReleasedToCanceling for 7 but exactly 1 Workflow, 1 Worker, 1 Step, 1 Attempt, 1 WorkflowCommand, 1 CommandShape, 5 Time expect 1
