@@ -211,21 +211,30 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
   def resume_with_worker(backend, workflow_class, workflow_id, workflows: {}, objects: [], crash_after: nil)
     worker_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
     caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+    target_worker_id = "handle-rpc-target-worker-#{workflow_id}"
+    caller_worker_id = "handle-rpc-caller-worker-#{workflow_id}"
+    claimed = caller_store.claim_workflow(
+      workflow_id:,
+      worker_id: caller_worker_id,
+      lease_seconds: Durababble::Engine::DEFAULT_LEASE_SECONDS,
+    )
+    raise Durababble::LeaseConflict, "workflow #{workflow_id} is leased by another worker" unless claimed
+
     worker = Durababble::Worker.new(
       store: worker_store,
       workflows:,
       objects:,
-      worker_id: "handle-rpc-target-worker",
+      worker_id: target_worker_id,
       migrate: false,
     )
     queue = Queue.new
     caller = Thread.new do
       result = Durababble::Engine.new(
         store: caller_store,
-        worker_id: "handle-rpc-caller-worker",
+        worker_id: caller_worker_id,
         crash_after:,
         migrate: false,
-      ).resume(workflow_class, workflow_id:)
+      ).resume(workflow_class, workflow_id:, claimed:)
       queue << [:ok, result]
     rescue StandardError => e
       queue << [:error, e]
