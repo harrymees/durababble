@@ -118,4 +118,34 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
 
     assert_equal ["step_completed"], resolutions
   end
+
+  test "terminal resolution is delivered before a later workflow command event" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, payload: { "name" => "wait" }, event_index: 0),
+      completed_event(0, event_index: 1),
+      workflow_command_event(event_index: 2),
+    ])
+    resolutions = []
+
+    history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "wait" })
+    history.deliver_resolutions({ 0 => Durababble::CommandFuture.new(0) }) { |event, _future| resolutions << event.fetch("kind") }
+
+    assert_equal ["step_completed"], resolutions
+  end
+
+  test "scheduled events without persisted indexes can still be consumed" do
+    history = Durababble::WorkflowReplayHistory.new([
+      { "kind" => "step_scheduled", "command_id" => 0, "name" => "legacy", "payload" => { "name" => "legacy" } },
+    ])
+
+    assert history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "legacy" })
+  end
+
+  test "non-terminal step failures are not replay terminal events" do
+    history = Durababble::WorkflowReplayHistory.new([
+      { "kind" => "step_failed", "command_id" => 0, "event_index" => 0, "error" => "RuntimeError: retry" },
+    ])
+
+    assert_nil history.next_undeliverable_command_id({})
+  end
 end
