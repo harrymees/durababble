@@ -416,52 +416,6 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  test "widens legacy worker_pool keys when upgrading existing Yugabyte schemas" do
-    with_yugabyte_store(migrate: false) do |store|
-      store.migrate!
-
-      table = ->(name) { store.send(:table, name) }
-      quoted = ->(name) { store.send(:quote_column_name, name) }
-      pk_signatures = ->(name) { store.send(:key_constraints_with_columns, name, contype: "p").map { |row| row.fetch("columns") } }
-      unique_signatures = ->(name) { store.send(:key_constraints_with_columns, name, contype: "u").map { |row| row.fetch("columns") } }
-
-      # Drop the worker-pool-scoped key and replace it with the pre-worker_pool narrow shape an
-      # upgraded schema would still carry, matching the existing constraint by its exact column
-      # signature so we never guess the auto-generated constraint name.
-      downgrade = lambda do |name, contype, keyword, wide_columns, narrow_columns|
-        current = store.send(:key_constraints_with_columns, name, contype:).find { |row| row.fetch("columns") == wide_columns.join(",") }
-        store.send(:execute, "ALTER TABLE #{table.call(name)} DROP CONSTRAINT #{quoted.call(current.fetch("conname"))}")
-        store.send(:execute, "ALTER TABLE #{table.call(name)} ADD #{keyword} (#{narrow_columns.map { |column| quoted.call(column) }.join(", ")})")
-      end
-
-      downgrade.call("durable_objects", "p", "PRIMARY KEY", ["worker_pool", "object_type", "object_id"], ["object_type", "object_id"])
-      downgrade.call("mailbox_sequences", "p", "PRIMARY KEY", ["worker_pool", "target_kind", "target_type", "target_id"], ["target_kind", "target_type", "target_id"])
-      downgrade.call("target_activations", "p", "PRIMARY KEY", ["worker_pool", "target_kind", "target_type", "target_id"], ["target_kind", "target_type", "target_id"])
-      downgrade.call("inbox", "u", "UNIQUE", ["worker_pool", "target_kind", "target_type", "target_id", "sequence"], ["target_kind", "target_type", "target_id", "sequence"])
-
-      refute_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
-      refute_includes pk_signatures.call("mailbox_sequences"), "worker_pool,target_kind,target_type,target_id"
-      refute_includes pk_signatures.call("target_activations"), "worker_pool,target_kind,target_type,target_id"
-      refute_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
-
-      # Re-running the migration must rebuild the widened, worker-pool-scoped keys.
-      store.instance_variable_set(:@migrated, false)
-      store.migrate!
-
-      assert_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
-      assert_includes pk_signatures.call("mailbox_sequences"), "worker_pool,target_kind,target_type,target_id"
-      assert_includes pk_signatures.call("target_activations"), "worker_pool,target_kind,target_type,target_id"
-      assert_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
-
-      # Idempotent: a second pass over already-widened keys is a no-op and leaves them intact.
-      store.instance_variable_set(:@migrated, false)
-      store.migrate!
-
-      assert_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
-      assert_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
-    end
-  end
-
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),

@@ -3,6 +3,10 @@
 
 module Durababble
   module PostgresMigrations
+    # Pre-production: we create every table in its final shape. There is no live data to migrate, so
+    # the schema is declared once in CREATE TABLE rather than assembled through incremental ALTERs.
+    # Secondary indexes are still created separately because Postgres cannot declare non-unique,
+    # partial, or DESC indexes inline in CREATE TABLE.
     #: () -> untyped
     def migrate!
       return self if @migrated
@@ -28,15 +32,6 @@ module Durababble
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       SQL
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_by text")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS next_run_at timestamptz")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS runnable_immediately boolean NOT NULL DEFAULT true")
-      execute("UPDATE #{table("workflows")} SET runnable_immediately = (next_run_at IS NULL) WHERE status = 'pending'")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_reason text")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamptz")
-      execute("ALTER TABLE #{table("workflows")} ADD COLUMN IF NOT EXISTS cancel_delivered_at timestamptz")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("workflow_history")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
@@ -66,7 +61,6 @@ module Durababble
           PRIMARY KEY (workflow_id, position)
         )
       SQL
-      execute("ALTER TABLE #{table("steps")} ADD COLUMN IF NOT EXISTS heartbeat_cursor bytea")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("step_attempts")} (
           id text PRIMARY KEY,
@@ -81,7 +75,6 @@ module Durababble
           completed_at timestamptz
         )
       SQL
-      execute("ALTER TABLE #{table("step_attempts")} ADD COLUMN IF NOT EXISTS heartbeat_cursor bytea")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("waits")} (
           id text PRIMARY KEY,
@@ -111,12 +104,6 @@ module Durababble
           PRIMARY KEY (workflow_id, key)
         )
       SQL
-      execute("ALTER TABLE #{table("fences")} ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'completed'")
-      execute("ALTER TABLE #{table("fences")} ALTER COLUMN result DROP NOT NULL")
-      execute("ALTER TABLE #{table("fences")} ADD COLUMN IF NOT EXISTS error text")
-      execute("ALTER TABLE #{table("fences")} ADD COLUMN IF NOT EXISTS locked_by text")
-      execute("ALTER TABLE #{table("fences")} ADD COLUMN IF NOT EXISTS locked_until timestamptz")
-      execute("ALTER TABLE #{table("fences")} ADD COLUMN IF NOT EXISTS completed_at timestamptz")
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("outbox")} (
           id text PRIMARY KEY,
@@ -144,8 +131,6 @@ module Durababble
           PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
-      execute("ALTER TABLE #{table("durable_objects")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
-      ensure_worker_pool_primary_key!("durable_objects", ["worker_pool", "object_type", "object_id"])
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -229,74 +214,15 @@ module Durababble
           PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
         )
       SQL
-      execute("ALTER TABLE #{table("mailbox_sequences")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
-      execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
-      execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS idempotency_hash text")
-      execute("ALTER TABLE #{table("target_activations")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
-      ensure_worker_pool_primary_key!("mailbox_sequences", ["worker_pool", "target_kind", "target_type", "target_id"])
-      ensure_worker_pool_unique_key!("inbox", ["worker_pool", "target_kind", "target_type", "target_id", "sequence"])
-      ensure_worker_pool_primary_key!("target_activations", ["worker_pool", "target_kind", "target_type", "target_id"])
-      backfill_inbox_idempotency_hashes!
     end
 
-    # Widen a legacy PRIMARY KEY so it includes worker_pool. Fresh installs already define the
-    # worker-pool-scoped key in CREATE TABLE, so this is a no-op there; only schemas created before
-    # worker_pool existed get rebuilt. Without this, ON CONFLICT (worker_pool, ...) upserts fail on
-    # Postgres because no matching unique/primary constraint exists for the widened conflict target.
-    #: (String, Array[String]) -> void
-    def ensure_worker_pool_primary_key!(table_name, columns)
-      ensure_worker_pool_key!(table_name, columns, contype: "p", definition_keyword: "PRIMARY KEY")
-    end
-
-    # Widen a legacy UNIQUE constraint so it includes worker_pool. Same fresh-install no-op behaviour
-    # as the primary-key variant; guards against two worker pools colliding on the old narrower key.
-    #: (String, Array[String]) -> void
-    def ensure_worker_pool_unique_key!(table_name, columns)
-      ensure_worker_pool_key!(table_name, columns, contype: "u", definition_keyword: "UNIQUE")
-    end
-
-    #: (String, Array[String], contype: String, definition_keyword: String) -> void
-    def ensure_worker_pool_key!(table_name, columns, contype:, definition_keyword:)
-      constraints = key_constraints_with_columns(table_name, contype:)
-      desired = columns.join(",")
-      return if constraints.any? { |row| row.fetch("columns") == desired }
-
-      legacy = (columns - ["worker_pool"]).join(",")
-      legacy_constraint = constraints.find { |row| row.fetch("columns") == legacy }
-      if legacy_constraint
-        execute("ALTER TABLE #{table(table_name)} DROP CONSTRAINT IF EXISTS #{quote_column_name(legacy_constraint.fetch("conname"))}")
-      end
-      column_list = columns.map { |column| quote_column_name(column) }.join(", ")
-      execute("ALTER TABLE #{table(table_name)} ADD #{definition_keyword} (#{column_list})")
-    end
-
-    # Returns each PRIMARY KEY ('p') or UNIQUE ('u') constraint on the table with its ordered,
-    # comma-joined column list, so the caller can match by exact column signature rather than name.
-    #: (String, contype: String) -> Array[Hash[String, Object?]]
-    def key_constraints_with_columns(table_name, contype:)
-      # contype is a fixed internal value ('p' or 'u') supplied by this module, never user input, so
-      # it is inlined as a "char" literal. Binding it as a text parameter trips Postgres' "char" = text
-      # operator resolution.
-      execute_params(<<~SQL, [schema.to_s, table_name]).to_a
-        SELECT con.conname,
-               (
-                 SELECT string_agg(att.attname, ',' ORDER BY ck.ord)
-                 FROM unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord)
-                 JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ck.attnum
-               ) AS columns
-        FROM pg_constraint con
-        JOIN pg_class c ON c.oid = con.conrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = '#{contype}'
-      SQL
-    end
-
+    # Postgres cannot declare these inline in CREATE TABLE (non-unique, partial, and DESC indexes all
+    # require a separate statement), so the secondary indexes are created here in their final shape.
     #: () -> untyped
     def create_performance_indexes!
       create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, created_at ASC)")
       create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, next_run_at ASC, created_at ASC)")
       create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, locked_until ASC)")
-      drop_postgres_index("workflows_pending_created_idx")
       create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, runnable_immediately ASC, created_at ASC)")
       create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (worker_pool ASC, next_run_at ASC, created_at ASC) WHERE status = 'failed'")
       create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (worker_pool ASC, created_at ASC) WHERE status = 'canceling'")
@@ -309,50 +235,16 @@ module Durababble
       create_postgres_index("step_attempts_workflow_position_status_started_idx", "ON #{table("step_attempts")} (workflow_id ASC, position ASC, status ASC, started_at DESC)")
       create_postgres_index("outbox_queue_idx", "ON #{table("outbox")} (status ASC, created_at ASC)")
       create_postgres_index("outbox_expired_lease_idx", "ON #{table("outbox")} (status ASC, locked_until ASC)")
-      drop_postgres_index("workflows_worker_lease_idx")
-      drop_postgres_index("outbox_worker_lease_idx")
       create_postgres_index("workflows_worker_lease_idx", "ON #{table("workflows")} (locked_by ASC) WHERE status = 'running'")
       create_postgres_index("outbox_worker_lease_idx", "ON #{table("outbox")} (status ASC, locked_by ASC)")
       create_postgres_index("inbox_worker_lease_idx", "ON #{table("inbox")} (status ASC, locked_by ASC)")
       create_postgres_index("target_activations_worker_lease_idx", "ON #{table("target_activations")} (status ASC, locked_by ASC)")
-      execute("ALTER TABLE #{table("inbox")} DROP CONSTRAINT IF EXISTS inbox_idempotency_key_key")
-      drop_postgres_index("inbox_target_idempotency_idx")
       create_postgres_index("inbox_idempotency_hash_idx", "ON #{table("inbox")} (idempotency_hash) WHERE idempotency_hash IS NOT NULL", unique: true)
       create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, status, sequence)")
       create_postgres_index("inbox_target_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, sequence)")
       create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (worker_pool, status, ready_at, created_at)")
       create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
       create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
-    end
-
-    #: () -> untyped
-    def backfill_inbox_idempotency_hashes!
-      rows = execute_params(<<~SQL, []).to_a
-        SELECT id, worker_pool, target_kind, target_type, target_id, idempotency_key
-        FROM #{table("inbox")}
-        WHERE idempotency_key IS NOT NULL AND idempotency_hash IS NULL
-      SQL
-      rows.each do |row|
-        hash = inbox_idempotency_hash_for_migration(
-          row.fetch("idempotency_key"),
-          worker_pool: row.fetch("worker_pool"),
-          target_kind: row.fetch("target_kind"),
-          target_type: row.fetch("target_type"),
-          target_id: row.fetch("target_id"),
-        )
-        execute_params("UPDATE #{table("inbox")} SET idempotency_hash = $1 WHERE id = $2", [hash, row.fetch("id")])
-      end
-    end
-
-    #: (untyped, worker_pool: untyped, target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
-    def inbox_idempotency_hash_for_migration(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
-      Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
-        "worker_pool" => worker_pool,
-        "target_kind" => target_kind,
-        "target_type" => target_type,
-        "target_id" => target_id,
-        "idempotency_key" => idempotency_key,
-      }))
     end
 
     #: (untyped, untyped, ?unique: bool) -> untyped
@@ -371,13 +263,6 @@ module Durababble
       execute("CREATE #{"UNIQUE " if unique}INDEX IF NOT EXISTS #{quote_column_name(index_name)} #{definition}")
     ensure
       execute("RESET search_path")
-    end
-
-    #: (untyped) -> untyped
-    def drop_postgres_index(name)
-      [name.to_s, postgres_index_name(name)].uniq.each do |index_name|
-        execute("DROP INDEX IF EXISTS #{quoted_schema}.#{quote_column_name(index_name)}")
-      end
     end
 
     #: (untyped) -> untyped
