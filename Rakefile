@@ -34,6 +34,11 @@ namespace :test do
     ENV["DURABABBLE_COVERAGE"] = "1"
     Rake::Task[:test].invoke
   end
+
+  desc "DST mutation check: revert each known crash-recovery fix and confirm a scenario goes red"
+  task :mutation do
+    ruby("-Ilib -Itest test/durababble/dst_mutation_test.rb")
+  end
 end
 
 task default: :test
