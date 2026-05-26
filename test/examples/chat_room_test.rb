@@ -96,7 +96,11 @@ class ChatRoomExampleTest < DurababbleTestCase
           room.post_message("ghost", "i should not be here")
         end
         assert_match(/ghost/, error.message)
-        assert_equal([], room.snapshot.fetch("messages"))
+        assert_raises_matching(Durababble::ObjectReadBlocked, /dead_lettered mailbox head/) do
+          room.snapshot
+        end
+        state = store.object_state(object_type: ChatRoomExample::ChatRoom.object_type, object_id: "lobby")
+        assert_equal([], state ? state.fetch("messages") : [])
       ensure
         stop = true
         worker_thread&.join(1)
@@ -216,6 +220,7 @@ class ChatRoomExampleTest < DurababbleTestCase
       loop do
         get_response = http_get("#{base}/api/announcements/#{workflow_id}")
         announcement_row = JSON.parse(get_response.body)
+        assert(announcement_row.key?("terminal"), "expected announcement status response to include terminal, got #{get_response.code}: #{get_response.body}")
         break if announcement_row.fetch("terminal")
         raise "announcement workflow did not finish in time" if Time.now >= deadline
 

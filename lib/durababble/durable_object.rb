@@ -5,6 +5,7 @@ require_relative "durable_method_dsl"
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
+  class ObjectReadBlocked < Error; end
 
   class DurableObject
     extend DurableMethodDSL
@@ -117,6 +118,29 @@ module Durababble
 
   class DurableObjectRef
     COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
+    TRANSIENT_ROUTE_ATTEMPTS = 2
+
+    class TransientRequest
+      #: String
+      attr_reader :class_name
+
+      #: (class_name: String, object_id: String, method: String) -> void
+      def initialize(class_name:, object_id:, method:)
+        @class_name = class_name
+        @object_id = object_id
+        @method = method
+      end
+
+      #: (String | Symbol) -> String?
+      def [](key)
+        case key.to_s
+        when "method"
+          @method
+        when "object_id"
+          @object_id
+        end
+      end
+    end
 
     #: (Object, String, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
     def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
@@ -152,11 +176,74 @@ module Durababble
     def invoke_query(method_name, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
-        state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
-        object = @object_class.new(durable_id: @durable_id, state:, store: @store)
-        object.instance_variable_set(:@__durababble_query_context, true)
-        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+        attempts = 0
+        begin
+          if (lease = current_object_lease)
+            return invoke_owned_query(method_name, args:, kwargs:, block:) if current_runtime_owns?(lease)
+
+            return invoke_remote_query(method_name, args:, kwargs:, lease:)
+          end
+
+          DurableObjectTransientHandler.assert_read_gate_open!(@store, object_type: @object_class.object_type, object_id: @durable_id)
+          invoke_local_query(method_name, args:, kwargs:, block:)
+        rescue WorkflowRpc::NoActiveLease, WorkflowRpc::StaleLease
+          attempts += 1
+          retry if attempts < TRANSIENT_ROUTE_ATTEMPTS
+
+          raise
+        end
       end
+    end
+
+    #: () -> Hash[String, Object?]?
+    def current_object_lease
+      return unless @store.respond_to?(:current_object_lease)
+
+      @store.current_object_lease(@object_class.object_type, @durable_id)
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def current_runtime_owns?(lease)
+      worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
+      worker_id = worker_id.call if worker_id.respond_to?(:call)
+      !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def invoke_owned_query(method_name, args:, kwargs:, block:)
+      handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
+      if handler
+        return handler.call(
+          request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s),
+          args: { "args" => args, "kwargs" => kwargs },
+        )
+      end
+
+      DurableObjectTransientHandler.assert_read_gate_open!(@store, object_type: @object_class.object_type, object_id: @durable_id)
+      invoke_local_query(method_name, args:, kwargs:, block:)
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
+    def invoke_remote_query(method_name, args:, kwargs:, lease:)
+      worker_id = lease.fetch("worker_id")
+      client = @store.rpc_client_factory.call(worker_id)
+      client.call_transient(
+        worker_pool: @worker_pool,
+        class_name: @object_class.object_type,
+        object_id: @durable_id,
+        method: method_name.to_s,
+        args: { "args" => args, "kwargs" => kwargs },
+      )
+    rescue Durababble::Rpc::Unavailable => e
+      raise WorkflowRpc::NodeUnavailable, e.message
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def invoke_local_query(method_name, args:, kwargs:, block:)
+      state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
+      object = @object_class.new(durable_id: @durable_id, state:, store: @store)
+      object.instance_variable_set(:@__durababble_query_context, true)
+      kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
     end
 
     #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
@@ -201,6 +288,95 @@ module Durababble
         "durababble.object.id" => @durable_id,
         "durababble.object.method" => method_name,
       }
+    end
+  end
+
+  class DurableObjectTransientHandler
+    BLOCKING_READ_STATUSES = ["pending", "failed", "running", "dead_lettered"].freeze
+
+    class << self
+      #: (untyped, object_type: untyped, object_id: untyped) -> void
+      def assert_read_gate_open!(store, object_type:, object_id:)
+        blocker = blocking_read_message(store, object_type:, object_id:)
+        return unless blocker
+
+        raise ObjectReadBlocked, "durable object #{object_type}/#{object_id} transient read is blocked by #{blocker.fetch("status")} mailbox head #{blocker.fetch("id")}"
+      end
+
+      private
+
+      #: (untyped, object_type: untyped, object_id: untyped) -> untyped
+      def blocking_read_message(store, object_type:, object_id:)
+        return unless store.respond_to?(:inbox_messages_for)
+
+        messages = store.inbox_messages_for(target_kind: "object", target_type: object_type, target_id: object_id)
+        messages.find { |message| BLOCKING_READ_STATUSES.include?(message.fetch("status").to_s) }
+      end
+    end
+
+    #: (store: untyped, objects: untyped, node_id: untyped) -> void
+    def initialize(store:, objects:, node_id:)
+      @store = store
+      @objects = normalize_objects(objects)
+      @node_id = node_id
+    end
+
+    #: (request: untyped, args: untyped) -> untyped
+    def call(request:, args:)
+      object_type = request.class_name
+      object_id = request["object_id"]
+      method_name = request["method"].to_sym
+      object_class = @objects.fetch(object_type) do
+        raise WorkflowRpc::UnknownCommand, "unknown durable object type #{object_type}"
+      end
+      unless object_class.exposed_queries.key?(method_name)
+        raise WorkflowRpc::UnknownCommand, "unknown durable object transient method #{object_type}##{method_name}"
+      end
+
+      assert_current_lease!(object_type:, object_id:)
+      self.class.assert_read_gate_open!(@store, object_type:, object_id:)
+      result = invoke_query(object_class, object_id:, method_name:, payload: args || {})
+      assert_current_lease!(object_type:, object_id:)
+      result
+    end
+
+    private
+
+    #: (untyped) -> untyped
+    def normalize_objects(objects)
+      case objects
+      when Hash
+        objects.transform_keys(&:to_s)
+      else
+        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
+      end
+    end
+
+    #: (object_type: untyped, object_id: untyped) -> void
+    def assert_current_lease!(object_type:, object_id:)
+      lease = @store.current_object_lease(object_type, object_id)
+      raise WorkflowRpc::NoActiveLease, "durable object #{object_type}/#{object_id} has no active owner" unless lease
+
+      expected = node_id
+      return if lease.fetch("worker_id") == expected
+
+      raise WorkflowRpc::StaleLease, "#{expected} no longer owns durable object #{object_type}/#{object_id}; current owner is #{lease.fetch("worker_id")}"
+    end
+
+    #: () -> untyped
+    def node_id
+      @node_id.respond_to?(:call) ? @node_id.call : @node_id
+    end
+
+    #: (untyped, object_id: untyped, method_name: untyped, payload: untyped) -> untyped
+    def invoke_query(object_class, object_id:, method_name:, payload:)
+      payload = payload || {}
+      args = payload.fetch("args", [])
+      kwargs = payload.fetch("kwargs", {})
+      state = @store.object_state(object_type: object_class.object_type, object_id:)
+      object = object_class.new(durable_id: object_id, state:, store: @store)
+      object.instance_variable_set(:@__durababble_query_context, true)
+      kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
     end
   end
 

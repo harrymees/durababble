@@ -97,6 +97,10 @@ end
 
 The durable-object contract is actor-like: commands for the same `(object_type, object_id)` serialize through that identity, each command receives `command_context`, and retries/recovery are recorded in the unified inbox. Synchronous asks and asynchronous tells enqueue inbox rows and wake or activate the object target; workers drain the object's contiguous ready mailbox prefix, invoke exposed command methods, and commit state plus message completion in one store transaction. Generated command idempotency keys remain stable across retries because they derive from the durable mailbox row.
 
+Exposed durable-object reads are owner-local transient calls. A handle first probes the active object lease; if another runtime owns the object, the handle calls that owner through `Rpc::Server#CallTransient`, and if the current `WorkerRuntime` owns the lease it takes the registered in-process transient handler fast path. The caller reads persisted state locally only when no active owner exists and the mailbox read gate is open. The owner-side handler validates ownership before and after invoking the exposed method, so lease loss or handoff rejects the read instead of returning a result from a stale owner.
+
+The read gate is deliberately strict: any pending, running, retry-failed, or dead-lettered object inbox row blocks exposed reads with `Durababble::ObjectReadBlocked`. This means a caller sees a retryable read failure while earlier mailbox work is queued, in flight, waiting for retry, or stuck at a dead-lettered head, rather than a persisted-state snapshot that might be stale relative to work the owner must process first.
+
 ## Storage model
 
 - `workflows`: one row per run; stores status, input, result, errors, workflow lease owner/deadline, `next_run_at` for durably scheduled step retries, and first cooperative cancellation request metadata (`cancel_reason`, `cancel_requested_at`, `cancel_delivered_at`).
@@ -133,6 +137,7 @@ The durable-object contract is actor-like: commands for the same `(object_type, 
 - Outbox rows are unique by key, leased for delivery, reclaimable after lease expiry, and acknowledged after external delivery.
 - Workflow RPC routing is lease-validated at both ends: callers look up the current active lease holder, receivers reject messages unless they still own the workflow before and after handler execution, and callers retry stale ownership, no-active-owner, and transport-unavailable failures only after a fresh owner lookup. If the fresh lookup finds no active owner for a recoverable workflow, `WorkflowRpc::Router` starts and awaits a new lease through `WorkflowRpc::LeaseStarter`, then reroutes the original RPC opaquely to the caller; terminal/shutdown states are still surfaced as non-routable.
 - Cross-node workflow RPC uses the same lease validation over gRPC: `Rpc::Server#CallTransient` returns protobuf `LeaseMoved`, `not_running`, or `RemoteError` responses, and `Rpc::WorkflowClient` decodes those into the typed `WorkflowRpc` errors the router already understands.
+- Durable-object transient reads use the same `CallTransient` transport surface. The caller routes to the active object owner, the owner validates its object lease before and after running the exposed method, stale ownership returns a moved response when a fresh owner exists, and transport-unavailable owner failures do not fall back to persisted-state inspection.
 
 ## Application worker lifecycle
 

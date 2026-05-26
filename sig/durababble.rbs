@@ -34,6 +34,7 @@ module Durababble
 
   interface _RpcDeliverMessageClient
     def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String) -> true
+    def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> serialized_payload
   end
 
   interface _RpcClientFactory
@@ -42,6 +43,10 @@ module Durababble
 
   interface _TransientHandler
     def call: (request: Object, args: serialized_payload) -> serialized_payload
+  end
+
+  interface _WorkerIdProvider
+    def call: () -> String
   end
 
   interface _RpcRequester
@@ -82,6 +87,9 @@ module Durababble
   end
 
   class CommandTimeout < Error
+  end
+
+  class ObjectReadBlocked < Error
   end
 
   class IdempotencyKeyConflict < Error
@@ -155,6 +163,8 @@ module Durababble
   class Store
     attr_reader schema: String
     attr_accessor rpc_client_factory: _RpcClientFactory
+    attr_accessor local_worker_id: (String | _WorkerIdProvider)?
+    attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
 

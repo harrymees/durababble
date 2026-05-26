@@ -18,6 +18,8 @@ module ChatRoomExample
       @port = port
       @database_url = database_url
       @schema = schema
+      @close_mutex = Mutex.new
+      @closed = false
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
       ChatRoomExample.configure(database_url:, schema:)
@@ -65,12 +67,17 @@ module ChatRoomExample
     end
 
     def close
+      @close_mutex.synchronize do
+        return if @closed
+
+        @closed = true
+      end
       @tcp_server&.close unless @tcp_server&.closed?
       @timer_stop = true
       @timer_thread&.join(1)
       @timer_thread&.kill if @timer_thread&.alive?
-      @workflow_runtime&.shutdown
-      @object_runtime&.shutdown
+      @workflow_runtime&.shutdown(timeout: nil)
+      @object_runtime&.shutdown(timeout: nil)
       @timer_store&.close
       @store&.close
     rescue IOError
@@ -202,7 +209,13 @@ module ChatRoomExample
       row = @store.workflow(workflow_id)
       input = row.fetch("input")
       room_id = input.fetch("room")
-      snapshot = ChatRoom.at(room_id, store: @store).snapshot
+      snapshot = nil
+      snapshot_error = nil
+      begin
+        snapshot = ChatRoom.at(room_id, store: @store).snapshot
+      rescue Durababble::ObjectReadBlocked => e
+        snapshot_error = e.message
+      end
       json(
         200,
         "workflow_id" => workflow_id,
@@ -212,6 +225,7 @@ module ChatRoomExample
         "result" => row["result"],
         "error" => row["error"],
         "room_snapshot" => snapshot,
+        "room_snapshot_error" => snapshot_error,
       )
     end
 

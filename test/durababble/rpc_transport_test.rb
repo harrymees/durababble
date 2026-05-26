@@ -7,6 +7,14 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   TestTransientResponse = Struct.new(:result, :ok, :err, :moved, keyword_init: true)
   TestRemoteError = Struct.new(:klass, :message, keyword_init: true)
 
+  class RpcReadGateObject < Durababble::DurableObject
+    object_type "rpc_read_gate_object"
+
+    expose def value(prefix:)
+      "#{prefix}:#{current_state.fetch("value")}"
+    end
+  end
+
   class FailingGrpcStub
     def initialize(error)
       @error = error
@@ -231,6 +239,37 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     server&.stop
   end
 
+  test "serves durable object exposed reads through CallTransient" do
+    store = self.store
+    store.save_object_state(object_type: RpcReadGateObject.object_type, object_id: "acct-1", state: { "value" => "owner" })
+    store.rearm_target_activation(
+      target_kind: "object",
+      target_type: RpcReadGateObject.object_type,
+      target_id: "acct-1",
+      ready_at: Time.now,
+    )
+    store.claim_target_activation(worker_id: "node-a", lease_seconds: 30, target_kinds: ["object"], target_types: [RpcReadGateObject.object_type])
+    server = start_rpc_server(
+      node_id: "node-a",
+      store:,
+      transient_handler: Durababble::DurableObjectTransientHandler.new(store:, objects: [RpcReadGateObject], node_id: "node-a"),
+    )
+    client = Durababble::Rpc::Client.new(address: server.address)
+
+    assert_equal(
+      "seen:owner",
+      client.call_transient(
+        worker_pool: "default",
+        class_name: RpcReadGateObject.object_type,
+        object_id: "acct-1",
+        method: "value",
+        args: { "args" => [], "kwargs" => { prefix: "seen" } },
+      ),
+    )
+  ensure
+    server&.stop
+  end
+
   test "decodes transport payloads and typed transient response branches" do
     assert_nil Durababble::Rpc.load(nil)
     assert_nil Durababble::Rpc.load("")
@@ -239,6 +278,11 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     assert_raises(Durababble::Rpc::RemoteError) do
       Durababble::Rpc::Client.decode_transient_response(
         TestTransientResponse.new(result: :err, err: TestRemoteError.new(klass: "UnknownRemote", message: "bad")),
+      )
+    end
+    assert_raises_matching(Durababble::ObjectReadBlocked, /blocked/) do
+      Durababble::Rpc::Client.decode_transient_response(
+        TestTransientResponse.new(result: :err, err: TestRemoteError.new(klass: "Durababble::ObjectReadBlocked", message: "blocked")),
       )
     end
   end
@@ -310,6 +354,26 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       :call,
     )
     assert_equal "node-b", moved.moved.new_node_id
+
+    store.rearm_target_activation(target_kind: "object", target_type: "counter", target_id: "counter-1", ready_at: Time.now)
+    store.claim_target_activation(worker_id: "node-b", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"])
+    object_moved_service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store:,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: ->(request:, args:) { raise Durababble::WorkflowRpc::StaleLease, "object moved" },
+      node_directory: Durababble::Rpc::NodeDirectory.new("node-b" => "127.0.0.1:6000"),
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: nil,
+    )
+    object_moved = object_moved_service.call_transient(
+      Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", class_name: "counter", object_id: "counter-1", method: "value", args: Durababble::Rpc.dump({})),
+      :call,
+    )
+    assert_equal "node-b", object_moved.moved.new_node_id
 
     move_lease_to("node-a")
     same_node_service = Durababble::Rpc::Service.new(

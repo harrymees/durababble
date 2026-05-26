@@ -63,7 +63,12 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           params: ["object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
-        "current object lease probe" => {
+        "current object activation lease probe" => {
+          sql: query_sql(:current_object_activation_lease),
+          params: ["counter", "object-1"],
+          expected_key_fragment: "PRIMARY",
+        },
+        "current object inbox lease probe" => {
           sql: query_sql(:current_object_lease),
           params: ["counter", "object-1"],
           expected_key_fragment: "inbox_target",
@@ -226,6 +231,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, payload, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('inbox-object-1-#{i}', 'object', 'counter', 'object-1', #{i}, 'ask', 'increment', 'op-object-1-#{i}', #{mysql_literal(i == 1 ? "idempotency-1" : nil)}, 'shape', #{inbox_payload}, #{mysql_literal(i == 1 ? "running" : "pending")}, #{created_at}, #{mysql_literal(i == 1 ? "owner" : nil)}, #{mysql_literal(i == 1 ? now + 300 : nil)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, payload, status, ready_at, created_at, updated_at) VALUES ('inbox-other-#{i}', 'object', 'counter', 'other-#{i}', 1, 'ask', 'increment', 'op-other-#{i}', NULL, 'shape', #{inbox_payload}, 'pending', #{created_at}, #{created_at}, #{created_at})")
     end
+    execute("INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('object', 'counter', 'object-1', 'running', #{mysql_literal(now - 3600)}, 'owner', #{mysql_literal(now + 300)}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
     execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
     execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")

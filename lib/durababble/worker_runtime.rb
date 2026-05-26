@@ -141,6 +141,7 @@ module Durababble
 
     #: () -> untyped
     def start_rpc_server
+      transient_handler = DurableObjectTransientHandler.new(store: @store, objects: @objects, node_id: -> { @worker_id })
       @rpc_server = Rpc::Server.new(
         node_id: nil,
         store: @store,
@@ -150,10 +151,13 @@ module Durababble
         credentials: @rpc_credentials,
         pool_size: @rpc_pool_size,
         verify_deliver_message_owner: false,
+        transient_handler:,
         deliver_message: method(:enqueue_delivery),
       ).start
       @rpc_address = @rpc_server.address
       @worker_id = @rpc_server.node_id
+      @store.local_worker_id = -> { @worker_id } if @store.respond_to?(:local_worker_id=)
+      @store.local_transient_handler = transient_handler if @store.respond_to?(:local_transient_handler=)
     end
 
     #: () -> untyped
@@ -163,6 +167,8 @@ module Durababble
 
       @rpc_server = nil
       @rpc_address = nil
+      @store.local_worker_id = nil if @store.respond_to?(:local_worker_id=)
+      @store.local_transient_handler = nil if @store.respond_to?(:local_transient_handler=)
       server.stop
     end
 

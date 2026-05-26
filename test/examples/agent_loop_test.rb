@@ -236,7 +236,6 @@ class AgentLoopExampleTest < DurababbleTestCase
 
   def run_agent_loop_workers(backend, workflow_id, timeout: 10)
     workflow_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
-    object_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
     workflow_worker = Durababble::Worker.new(
       store: workflow_store,
       workflows: [AgentLoopExample::AgentLoopWorkflow],
@@ -244,20 +243,16 @@ class AgentLoopExampleTest < DurababbleTestCase
       worker_id: "agent-loop-workflow-test",
       migrate: false,
     )
-    object_worker = Durababble::Worker.new(
-      store: object_store,
+    object_runtime = Durababble::WorkerRuntime.start(
+      database_url: backend.database_url,
+      schema:,
       workflows: {},
       objects: [AgentLoopExample::VirtualFileSystem],
-      worker_id: "agent-loop-object-test",
+      worker_pool: "agent-loop-objects",
+      poll_interval: 0.02,
       migrate: false,
     )
-    stop = false
     errors = Queue.new
-    object_thread = Thread.new do
-      object_worker.tick until stop
-    rescue StandardError => e
-      errors << e
-    end
     workflow_thread = Thread.new do
       workflow_worker.tick
     rescue StandardError => e
@@ -275,12 +270,9 @@ class AgentLoopExampleTest < DurababbleTestCase
       sleep(0.02)
     end
   ensure
-    stop = true
     workflow_thread&.join(1)
-    object_thread&.join(1)
     workflow_thread&.kill if workflow_thread&.alive?
-    object_thread&.kill if object_thread&.alive?
+    object_runtime&.shutdown(timeout: nil)
     workflow_store&.close
-    object_store&.close
   end
 end

@@ -22,7 +22,7 @@ module Durababble
     #: Object
     attr_reader :connection
     #: Object
-    attr_accessor :rpc_client_factory
+    attr_accessor :rpc_client_factory, :local_worker_id, :local_transient_handler
 
     class << self
       #: (*Object?, **Object?) ?{ (Object?) -> Object? } -> Store
@@ -130,6 +130,8 @@ module Durababble
       @owner = owner
       @migrated = false
       @rpc_client_factory = ->(address) { Durababble::Rpc::Client.new(address:) }
+      @local_worker_id = nil
+      @local_transient_handler = nil
     end
 
     #: () -> void

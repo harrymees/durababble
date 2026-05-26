@@ -812,6 +812,16 @@ module Durababble
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = $1 AND position = $2"
     end
 
+    define(:pg_current_object_activation_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "target_activations")}
+        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= now()
+        LIMIT 1
+      SQL
+    end
+
     define(:pg_current_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT target_id AS object_id, locked_by AS worker_id, locked_until
@@ -1282,6 +1292,16 @@ module Durababble
 
     define(:mysql_step_heartbeat_cursor, backend: :mysql) do |store|
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = ? AND position = ?"
+    end
+
+    define(:mysql_current_object_activation_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "target_activations")}
+        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        LIMIT 1
+      SQL
     end
 
     define(:mysql_current_object_lease, backend: :mysql) do |store|

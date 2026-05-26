@@ -69,6 +69,7 @@ module Durababble
           error = error #: as untyped
           typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
           raise typed if typed
+          raise ObjectReadBlocked, error.message if error.klass == "Durababble::ObjectReadBlocked"
 
           raise Durababble::Rpc::RemoteError, "#{error.klass}: #{error.message}"
         end
@@ -204,7 +205,7 @@ module Durababble
       #: Integer?
       attr_reader :port
 
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: untyped, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -354,9 +355,9 @@ module Durababble
       #: (Object, Object) -> Proto::TransientResponse
       def call_transient(request, call)
         request = request #: as untyped
-        Observability.trace("durababble.rpc.server.call_transient", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => request.object_id) do
+        Observability.trace("durababble.rpc.server.call_transient", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => durable_object_id(request)) do
           authorize!(call)
-          result = if request.workflow_id.empty?
+          result = if workflow_id(request).empty?
             call_custom_transient(request)
           else
             call_workflow_transient(request)
@@ -421,7 +422,11 @@ module Durababble
       #: (Object) -> Proto::TransientResponse?
       def moved_response(request)
         request = request #: as untyped
-        lease = @store.current_workflow_lease(request.workflow_id)
+        lease = if workflow_id(request).empty?
+          @store.send(:current_object_lease, request.class_name, durable_object_id(request))
+        else
+          @store.current_workflow_lease(workflow_id(request))
+        end
         return unless lease
 
         new_node_id = lease.fetch("worker_id")
@@ -444,6 +449,16 @@ module Durababble
             backtrace: error.backtrace || [],
           ),
         )
+      end
+
+      #: (untyped) -> String
+      def workflow_id(request)
+        request.workflow_id.to_s
+      end
+
+      #: (untyped) -> String
+      def durable_object_id(request)
+        request["object_id"].to_s
       end
     end
   end

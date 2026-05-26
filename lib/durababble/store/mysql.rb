@@ -203,7 +203,8 @@ module Durababble
 
     #: (Object?, Object?) -> Object?
     def current_object_lease(object_type, object_id)
-      execute_store_query(:current_object_lease, [object_type, object_id]).first
+      execute_store_query(:current_object_activation_lease, [object_type, object_id]).first ||
+        execute_store_query(:current_object_lease, [object_type, object_id]).first
     end
 
     #: (?now: Time) -> Integer
