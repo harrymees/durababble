@@ -193,7 +193,7 @@ module Durababble
         state = DurableObject.state_from_store(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
-        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+        object.public_send(method_name, *args, **kwargs, &block)
       end
     end
 
@@ -305,7 +305,7 @@ module Durababble
       Observability.trace("durababble.object.command", attributes) do
         object = build_object(object_class, object_id:, message:)
         args, kwargs = object_args(message)
-        result = kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
+        result = object.public_send(method_name, *args, **kwargs)
         complete_message(object, message, result:, attributes:)
         Observability.count("durababble.object.command.successes", attributes)
         result

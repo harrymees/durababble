@@ -151,7 +151,7 @@ module Durababble
 
       args = payload.fetch("args", [])
       kwargs = payload.fetch("kwargs", {})
-      result = kwargs.empty? ? workflow.public_send(method_name, *args) : workflow.public_send(method_name, *args, **kwargs)
+      result = workflow.public_send(method_name, *args, **kwargs)
       @store.complete_workflow_command(message_id: message.fetch("id"), workflow_id:, result:, worker_id: @worker_id)
     rescue StandardError => e
       @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: format_error(e), worker_id: @worker_id)
