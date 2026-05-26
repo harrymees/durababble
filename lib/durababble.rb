@@ -14,12 +14,35 @@ module Durababble
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
   DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000
   DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS = 8_000
-  DEFAULT_MAX_WORKFLOW_INPUT_BYTES = 4 * 1024 * 1024
-  DEFAULT_MAX_WORKFLOW_RESULT_BYTES = 4 * 1024 * 1024
-  DEFAULT_MAX_STEP_OUTPUT_BYTES = 4 * 1024 * 1024
-  DEFAULT_MAX_OBJECT_STATE_BYTES = 4 * 1024 * 1024
-  DEFAULT_MAX_INBOX_PAYLOAD_BYTES = 4 * 1024 * 1024
-  DEFAULT_MAX_RPC_ARGUMENT_BYTES = 4 * 1024 * 1024
+  DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+  PAYLOAD_LIMIT_DEFAULTS = {
+    workflow_input: DEFAULT_MAX_PAYLOAD_BYTES,
+    workflow_result: DEFAULT_MAX_PAYLOAD_BYTES,
+    step_output: DEFAULT_MAX_PAYLOAD_BYTES,
+    object_state: DEFAULT_MAX_PAYLOAD_BYTES,
+    inbox_payload: DEFAULT_MAX_PAYLOAD_BYTES,
+    rpc_argument: DEFAULT_MAX_PAYLOAD_BYTES,
+  }.freeze
+  PAYLOAD_LIMIT_ENVS = {
+    workflow_input: ["DURABABBLE_MAX_WORKFLOW_INPUT_BYTES", "DURABABBLE_MAX_WORKFLOW_ARGS_BYTES"],
+    workflow_result: ["DURABABBLE_MAX_WORKFLOW_RESULT_BYTES"],
+    step_output: ["DURABABBLE_MAX_STEP_OUTPUT_BYTES"],
+    object_state: ["DURABABBLE_MAX_OBJECT_STATE_BYTES"],
+    inbox_payload: ["DURABABBLE_MAX_INBOX_PAYLOAD_BYTES"],
+    rpc_argument: ["DURABABBLE_MAX_RPC_ARGUMENT_BYTES"],
+  }.freeze
+  PAYLOAD_LIMIT_LABELS = {
+    workflow_input: "workflow input",
+    workflow_result: "workflow result",
+    step_output: "step output",
+    object_state: "object state",
+    inbox_payload: "inbox payload",
+    rpc_argument: "rpc argument",
+  }.freeze
+  PAYLOAD_LIMIT_ALIASES = {
+    workflow_args: :workflow_input,
+    workflow_error: :workflow_result,
+  }.freeze
 
   class Error < StandardError; end
   class InjectedCrash < Error; end
@@ -99,18 +122,6 @@ module Durababble
     attr_writer :max_workflow_history_events
     #: untyped
     attr_writer :workflow_history_warning_events
-    #: untyped
-    attr_writer :max_workflow_input_bytes
-    #: untyped
-    attr_writer :max_workflow_result_bytes
-    #: untyped
-    attr_writer :max_step_output_bytes
-    #: untyped
-    attr_writer :max_object_state_bytes
-    #: untyped
-    attr_writer :max_inbox_payload_bytes
-    #: untyped
-    attr_writer :max_rpc_argument_bytes
 
     #: (Store?) -> Engine?
     def default_store=(store)
@@ -171,42 +182,16 @@ module Durababble
       end
     end
 
-    #: () -> Integer
-    def max_workflow_input_bytes
-      payload_limit(:@max_workflow_input_bytes, "DURABABBLE_MAX_WORKFLOW_INPUT_BYTES", DEFAULT_MAX_WORKFLOW_INPUT_BYTES, "max workflow input bytes", fallback_env: "DURABABBLE_MAX_WORKFLOW_ARGS_BYTES")
+    #: () -> Hash[Symbol, Integer]
+    def payload_limits
+      PAYLOAD_LIMIT_DEFAULTS.each_with_object({}) do |(surface, default_value), limits|
+        limits[surface] = payload_limit(surface, default_value)
+      end
     end
 
-    #: () -> Integer
-    def max_workflow_args_bytes = max_workflow_input_bytes
-
-    #: ((Integer | String) value) -> (Integer | String)
-    def max_workflow_args_bytes=(value)
-      self.max_workflow_input_bytes = value
-    end
-
-    #: () -> Integer
-    def max_workflow_result_bytes
-      payload_limit(:@max_workflow_result_bytes, "DURABABBLE_MAX_WORKFLOW_RESULT_BYTES", DEFAULT_MAX_WORKFLOW_RESULT_BYTES, "max workflow result bytes")
-    end
-
-    #: () -> Integer
-    def max_step_output_bytes
-      payload_limit(:@max_step_output_bytes, "DURABABBLE_MAX_STEP_OUTPUT_BYTES", DEFAULT_MAX_STEP_OUTPUT_BYTES, "max step output bytes")
-    end
-
-    #: () -> Integer
-    def max_object_state_bytes
-      payload_limit(:@max_object_state_bytes, "DURABABBLE_MAX_OBJECT_STATE_BYTES", DEFAULT_MAX_OBJECT_STATE_BYTES, "max object state bytes")
-    end
-
-    #: () -> Integer
-    def max_inbox_payload_bytes
-      payload_limit(:@max_inbox_payload_bytes, "DURABABBLE_MAX_INBOX_PAYLOAD_BYTES", DEFAULT_MAX_INBOX_PAYLOAD_BYTES, "max inbox payload bytes")
-    end
-
-    #: () -> Integer
-    def max_rpc_argument_bytes
-      payload_limit(:@max_rpc_argument_bytes, "DURABABBLE_MAX_RPC_ARGUMENT_BYTES", DEFAULT_MAX_RPC_ARGUMENT_BYTES, "max rpc argument bytes")
+    #: (Hash[Symbol | String, Integer | String] limits) -> Hash[Symbol | String, Integer | String]
+    def payload_limits=(limits)
+      @payload_limits = normalize_payload_limits(limits)
     end
 
     #: () -> untyped
@@ -316,40 +301,40 @@ module Durababble
 
     private
 
-    #: (Symbol, String, Integer, String, ?fallback_env: String?) -> Integer
-    def payload_limit(ivar, env_name, default_value, label, fallback_env: nil)
-      configured = if instance_variable_defined?(ivar)
-        instance_variable_get(ivar)
-      elsif ENV.key?(env_name)
+    #: (Symbol, Integer) -> Integer
+    def payload_limit(surface, default_value)
+      configured_limits = instance_variable_defined?(:@payload_limits) ? normalize_payload_limits(@payload_limits) : {}
+      configured = if configured_limits.key?(surface)
+        configured_limits.fetch(surface)
+      elsif (env_name = PAYLOAD_LIMIT_ENVS.fetch(surface).find { |name| ENV.key?(name) })
         ENV.fetch(env_name)
-      elsif fallback_env && ENV.key?(fallback_env)
-        ENV.fetch(fallback_env)
       else
         default_value
       end
       Integer(configured).tap do |value|
-        raise ArgumentError, "#{label} must be positive" unless value.positive?
+        raise ArgumentError, "#{PAYLOAD_LIMIT_LABELS.fetch(surface)} payload limit must be positive" unless value.positive?
       end
     end
 
-    #: (Symbol) -> Integer
+    #: (Symbol | String) -> Integer
     def payload_limit_for_surface(surface)
-      case surface
-      when :workflow_input, :workflow_args
-        max_workflow_input_bytes
-      when :workflow_result, :workflow_error
-        max_workflow_result_bytes
-      when :step_output
-        max_step_output_bytes
-      when :object_state
-        max_object_state_bytes
-      when :inbox_payload
-        max_inbox_payload_bytes
-      when :rpc_argument
-        max_rpc_argument_bytes
-      else
-        raise ArgumentError, "unknown payload limit surface: #{surface}"
+      payload_limits.fetch(canonical_payload_limit_surface(surface))
+    end
+
+    #: (Hash[Symbol | String, Integer | String]) -> Hash[Symbol, Integer | String]
+    def normalize_payload_limits(limits)
+      limits.each_with_object({}) do |(surface, value), normalized|
+        normalized[canonical_payload_limit_surface(surface)] = value
       end
+    end
+
+    #: (Symbol | String) -> Symbol
+    def canonical_payload_limit_surface(surface)
+      surface = surface.to_sym
+      surface = PAYLOAD_LIMIT_ALIASES.fetch(surface, surface)
+      return surface if PAYLOAD_LIMIT_DEFAULTS.key?(surface)
+
+      raise ArgumentError, "unknown payload limit surface: #{surface}"
     end
 
     #: (Object?) -> String

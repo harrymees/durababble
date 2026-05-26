@@ -268,7 +268,7 @@ module Durababble
 
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
     def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
-      serialized = dump_serialized(result, surface: :step_output, context: "workflow #{workflow_id} command #{command_id}")
+      serialized = dump_step_output(workflow_id:, command_id:, result:)
       execute_store_query(:complete_step, [serialized, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "completed", serialized_result: serialized, error: nil)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
@@ -276,7 +276,7 @@ module Durababble
 
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
-      serialized_result = dump_serialized(result, surface: :workflow_result, context: "workflow #{workflow_id} result")
+      serialized_result = dump_workflow_result(workflow_id:, result:)
       update = if worker_id
         execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
       else
@@ -287,7 +287,7 @@ module Durababble
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
-      serialized_result = dump_serialized(result, surface: :workflow_result, context: "workflow #{workflow_id} cancellation result")
+      serialized_result = dump_workflow_result(workflow_id:, result:, context: "cancellation result")
       update = if worker_id
         execute_store_query(:cancel_workflow_with_worker, [serialized_result, reason, reason, workflow_id, worker_id])
       else
@@ -435,7 +435,7 @@ module Durababble
 
     #: (object_type: String, object_id: String, state: Object?, ?worker_pool: String) -> Object?
     def save_object_state(object_type:, object_id:, state:, worker_pool: "default")
-      serialized_state = dump_serialized(state, surface: :object_state, context: "#{object_type}/#{object_id}")
+      serialized_state = dump_object_state(object_type:, object_id:, state:)
       execute_store_query(:save_object_state, [worker_pool, object_type, object_id, serialized_state])
       state
     end
@@ -472,7 +472,7 @@ module Durababble
     #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
     def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
       workflow_id = id
-      serialized_input = dump_serialized(input, surface: :workflow_input, context: "workflow #{name}")
+      serialized_input = dump_workflow_input(name:, input:)
       if worker_id
         execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, serialized_input, worker_id, lease_seconds || 60])
       else
@@ -614,7 +614,7 @@ module Durababble
     #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
-      serialized_payload = dump_serialized(payload, surface: :inbox_payload, context: "#{target_kind} #{target_type}/#{target_id} #{message_kind}")
+      serialized_payload = dump_inbox_payload(target_kind:, target_type:, target_id:, message_kind:, payload:)
       execute_store_query(:insert_inbox_message, [id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, idempotency_hash, shape_hash, serialized_payload, ready_at, max_attempts])
     end
 
@@ -636,7 +636,7 @@ module Durababble
 
     #: (message_id: String, result: Object?) -> Object?
     def complete_inbox_message_without_transaction(message_id:, result:)
-      serialized_result = dump_serialized(result, surface: :inbox_payload, context: "inbox message #{message_id} result")
+      serialized_result = dump_inbox_result(message_id:, result:)
       execute_store_query(:complete_inbox_message, [serialized_result, message_id])
     end
 

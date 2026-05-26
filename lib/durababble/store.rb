@@ -450,6 +450,36 @@ module Durababble
       serialized
     end
 
+    #: (name: String, input: Object?) -> Object?
+    def dump_workflow_input(name:, input:)
+      dump_serialized(input, surface: :workflow_input, context: "workflow #{name}")
+    end
+
+    #: (workflow_id: String, result: Object?, ?context: String) -> Object?
+    def dump_workflow_result(workflow_id:, result:, context: "result")
+      dump_serialized(result, surface: :workflow_result, context: "workflow #{workflow_id} #{context}")
+    end
+
+    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
+    def dump_step_output(workflow_id:, command_id:, result:)
+      dump_serialized(result, surface: :step_output, context: "workflow #{workflow_id} command #{command_id}")
+    end
+
+    #: (object_type: String, object_id: String, state: Object?) -> Object?
+    def dump_object_state(object_type:, object_id:, state:)
+      dump_serialized(state, surface: :object_state, context: "#{object_type}/#{object_id}")
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String, message_kind: String, payload: Object?) -> Object?
+    def dump_inbox_payload(target_kind:, target_type:, target_id:, message_kind:, payload:)
+      dump_serialized(payload, surface: :inbox_payload, context: "#{target_kind} #{target_type}/#{target_id} #{message_kind}")
+    end
+
+    #: (message_id: String, result: Object?) -> Object?
+    def dump_inbox_result(message_id:, result:)
+      dump_serialized(result, surface: :inbox_payload, context: "inbox message #{message_id} result")
+    end
+
     #: (Hash[String, Object?]) -> String
     def row_worker_pool(row)
       row.fetch("worker_pool", "default").to_s

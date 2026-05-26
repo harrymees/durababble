@@ -10,18 +10,18 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         payload = payload_value("workflow-input")
         size = serialized_size(payload)
 
-        with_payload_limit(:max_workflow_input_bytes, size + 1) do
+        with_payload_limit(:workflow_input, size + 1) do
           id = store.enqueue_workflow(name: "payload-input-under", input: payload)
           assert_equal payload, store.workflow(id).fetch("input")
         end
 
-        with_payload_limit(:max_workflow_input_bytes, size) do
+        with_payload_limit(:workflow_input, size) do
           id = store.enqueue_workflow(name: "payload-input-at", input: payload)
           assert_equal payload, store.workflow(id).fetch("input")
         end
 
         before = count_rows(store, "workflows")
-        error = with_payload_limit(:max_workflow_input_bytes, size - 1) do
+        error = with_payload_limit(:workflow_input, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.enqueue_workflow(name: "payload-input-over", input: payload)
           end
@@ -36,20 +36,20 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         payload = payload_value("workflow-result")
         size = serialized_size(payload)
 
-        with_payload_limit(:max_workflow_result_bytes, size + 1) do
+        with_payload_limit(:workflow_result, size + 1) do
           id = store.create_workflow(name: "payload-result-under", input: {})
           store.complete_workflow(id, result: payload)
           assert_equal payload, store.workflow(id).fetch("result")
         end
 
-        with_payload_limit(:max_workflow_result_bytes, size) do
+        with_payload_limit(:workflow_result, size) do
           id = store.create_workflow(name: "payload-result-at", input: {})
           store.complete_workflow(id, result: payload)
           assert_equal payload, store.workflow(id).fetch("result")
         end
 
         id = store.create_workflow(name: "payload-result-over", input: {})
-        error = with_payload_limit(:max_workflow_result_bytes, size - 1) do
+        error = with_payload_limit(:workflow_result, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.complete_workflow(id, result: payload)
           end
@@ -66,20 +66,20 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         payload = payload_value("step-output")
         size = serialized_size(payload)
 
-        with_payload_limit(:max_step_output_bytes, size + 1) do
+        with_payload_limit(:step_output, size + 1) do
           id = prepare_step(store, "payload-step-under")
           store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
           assert_equal payload, store.steps_for(id).first.fetch("result")
         end
 
-        with_payload_limit(:max_step_output_bytes, size) do
+        with_payload_limit(:step_output, size) do
           id = prepare_step(store, "payload-step-at")
           store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
           assert_equal payload, store.steps_for(id).first.fetch("result")
         end
 
         id = prepare_step(store, "payload-step-over")
-        error = with_payload_limit(:max_step_output_bytes, size - 1) do
+        error = with_payload_limit(:step_output, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
           end
@@ -95,19 +95,19 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         payload = payload_value("object-state")
         size = serialized_size(payload)
 
-        with_payload_limit(:max_object_state_bytes, size + 1) do
+        with_payload_limit(:object_state, size + 1) do
           store.save_object_state(object_type: "PayloadObject", object_id: "under", state: payload)
           assert_equal payload, store.object_state(object_type: "PayloadObject", object_id: "under")
         end
 
-        with_payload_limit(:max_object_state_bytes, size) do
+        with_payload_limit(:object_state, size) do
           store.save_object_state(object_type: "PayloadObject", object_id: "at", state: payload)
           assert_equal payload, store.object_state(object_type: "PayloadObject", object_id: "at")
         end
 
         original = { "body" => "small" }
         store.save_object_state(object_type: "PayloadObject", object_id: "over", state: original)
-        error = with_payload_limit(:max_object_state_bytes, size - 1) do
+        error = with_payload_limit(:object_state, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.save_object_state(object_type: "PayloadObject", object_id: "over", state: payload)
           end
@@ -123,18 +123,18 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         payload = object_command_payload(argument)
         size = serialized_size(payload)
 
-        with_payload_limit(:max_inbox_payload_bytes, size + 1) do
+        with_payload_limit(:inbox_payload, size + 1) do
           id = store.enqueue_object_command(object_type: "PayloadObject", object_id: "under", method_name: "write", args: [argument], kwargs: {})
           assert_equal payload, store.inbox_message(id).fetch("payload")
         end
 
-        with_payload_limit(:max_inbox_payload_bytes, size) do
+        with_payload_limit(:inbox_payload, size) do
           id = store.enqueue_object_command(object_type: "PayloadObject", object_id: "at", method_name: "write", args: [argument], kwargs: {})
           assert_equal payload, store.inbox_message(id).fetch("payload")
         end
 
         before = ["inbox", "mailbox_sequences", "target_activations"].to_h { |table| [table, count_rows(store, table)] }
-        error = with_payload_limit(:max_inbox_payload_bytes, size - 1) do
+        error = with_payload_limit(:inbox_payload, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.enqueue_object_command(object_type: "PayloadObject", object_id: "over", method_name: "write", args: [argument], kwargs: {})
           end
@@ -151,7 +151,7 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         result = payload_value("inbox-result")
         size = serialized_size(result)
 
-        error = with_payload_limit(:max_inbox_payload_bytes, size - 1) do
+        error = with_payload_limit(:inbox_payload, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
             store.complete_object_command(
               command_id: id,
@@ -184,17 +184,16 @@ class DurababblePayloadLimitTest < DurababbleTestCase
     Durababble::Store::SERIALIZER.dump(value).bytesize
   end
 
-  def with_payload_limit(setting, value)
-    ivar = :"@#{setting}"
-    configured = Durababble.instance_variable_defined?(ivar)
-    previous = Durababble.instance_variable_get(ivar) if configured
-    Durababble.public_send("#{setting}=", value)
+  def with_payload_limit(surface, value)
+    configured = Durababble.instance_variable_defined?(:@payload_limits)
+    previous = Durababble.instance_variable_get(:@payload_limits) if configured
+    Durababble.payload_limits = { surface => value }
     yield
   ensure
     if configured
-      Durababble.instance_variable_set(ivar, previous)
-    elsif Durababble.instance_variable_defined?(ivar)
-      Durababble.remove_instance_variable(ivar)
+      Durababble.instance_variable_set(:@payload_limits, previous)
+    elsif Durababble.instance_variable_defined?(:@payload_limits)
+      Durababble.remove_instance_variable(:@payload_limits)
     end
   end
 

@@ -549,19 +549,21 @@ Durababble.configure do |c|
   c.cache_capacity = 5_000
   c.max_cached_workflows = 1_000
   c.shutdown_grace_s = 30
-  c.max_workflow_input_bytes = 4 * 1024 * 1024
-  c.max_workflow_result_bytes = 4 * 1024 * 1024
-  c.max_step_output_bytes = 4 * 1024 * 1024
-  c.max_object_state_bytes = 4 * 1024 * 1024
-  c.max_inbox_payload_bytes = 4 * 1024 * 1024
-  c.max_rpc_argument_bytes = 4 * 1024 * 1024
+  c.payload_limits = {
+    workflow_input: 4 * 1024 * 1024,
+    workflow_result: 4 * 1024 * 1024,
+    step_output: 4 * 1024 * 1024,
+    object_state: 4 * 1024 * 1024,
+    inbox_payload: 4 * 1024 * 1024,
+    rpc_argument: 4 * 1024 * 1024
+  }
   c.workflow_history_warning_events = ENV.fetch("DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS", "8000").to_i
   c.max_workflow_history_events = ENV.fetch("DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS", "10000").to_i
   c.observability = MyApp::Observability::Durababble
 end
 ```
 
-The current Ruby API exposes payload limits as process-wide setters and matching environment variables: `Durababble.max_workflow_input_bytes` / `DURABABBLE_MAX_WORKFLOW_INPUT_BYTES`, `Durababble.max_workflow_result_bytes` / `DURABABBLE_MAX_WORKFLOW_RESULT_BYTES`, `Durababble.max_step_output_bytes` / `DURABABBLE_MAX_STEP_OUTPUT_BYTES`, `Durababble.max_object_state_bytes` / `DURABABBLE_MAX_OBJECT_STATE_BYTES`, `Durababble.max_inbox_payload_bytes` / `DURABABBLE_MAX_INBOX_PAYLOAD_BYTES`, and `Durababble.max_rpc_argument_bytes` / `DURABABBLE_MAX_RPC_ARGUMENT_BYTES`. `Durababble.max_workflow_args_bytes` and `DURABABBLE_MAX_WORKFLOW_ARGS_BYTES` remain compatibility aliases for workflow input bytes. Every default is `4 * 1024 * 1024` serialized bytes, and every configured value must be positive.
+The current Ruby API exposes payload limits as one process-wide override hash: `Durababble.payload_limits = { workflow_input: bytes, workflow_result: bytes, step_output: bytes, object_state: bytes, inbox_payload: bytes, rpc_argument: bytes }`. Matching environment variables are `DURABABBLE_MAX_WORKFLOW_INPUT_BYTES`, `DURABABBLE_MAX_WORKFLOW_RESULT_BYTES`, `DURABABBLE_MAX_STEP_OUTPUT_BYTES`, `DURABABBLE_MAX_OBJECT_STATE_BYTES`, `DURABABBLE_MAX_INBOX_PAYLOAD_BYTES`, and `DURABABBLE_MAX_RPC_ARGUMENT_BYTES`; `workflow_args` and `DURABABBLE_MAX_WORKFLOW_ARGS_BYTES` remain compatibility aliases for workflow input bytes. Every default is `4 * 1024 * 1024` serialized bytes, and every configured value must be positive.
 
 Size guards are production requirements. Durababble raises `Durababble::PayloadTooLarge` when serialized workflow inputs, workflow results, step outputs, durable object state, inbox payload/result bytes, or `CallTransient` RPC arguments exceed the configured maximum. Checks run after Paquito serialization against the exact byte string that will be written to MySQL/MariaDB `LONGBLOB`, PostgreSQL/YSQL `bytea`, or sent as protobuf `bytes`; PostgreSQL's client-side hex literal text is not counted as payload size. The error message identifies the surface and context such as workflow id, object id, inbox message id, or RPC method, but it must not include the serialized payload or original Ruby value. Rejected writes happen before the durable mutation or inside a rolled-back SQL transaction, so oversized workflow rows, history completions, inbox rows, object-state updates, and RPC handler side effects are not partially persisted. The runtime does not silently spill oversized values to blob storage.
 

@@ -159,20 +159,8 @@ module Durababble
   def self.max_workflow_history_events=: ((Integer | String) value) -> (Integer | String)
   def self.workflow_history_warning_events: () -> Integer
   def self.workflow_history_warning_events=: ((Integer | String) value) -> (Integer | String)
-  def self.max_workflow_input_bytes: () -> Integer
-  def self.max_workflow_input_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_workflow_args_bytes: () -> Integer
-  def self.max_workflow_args_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_workflow_result_bytes: () -> Integer
-  def self.max_workflow_result_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_step_output_bytes: () -> Integer
-  def self.max_step_output_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_object_state_bytes: () -> Integer
-  def self.max_object_state_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_inbox_payload_bytes: () -> Integer
-  def self.max_inbox_payload_bytes=: ((Integer | String) value) -> (Integer | String)
-  def self.max_rpc_argument_bytes: () -> Integer
-  def self.max_rpc_argument_bytes=: ((Integer | String) value) -> (Integer | String)
+  def self.payload_limits: () -> Hash[Symbol, Integer]
+  def self.payload_limits=: (Hash[Symbol | String, Integer | String] limits) -> Hash[Symbol | String, Integer | String]
   def self.logger: () -> Object?
   def self.logger=: (Object? logger) -> Object?
   def self.enforce_payload_limit!: (surface: Symbol | String, bytesize: Integer, ?context: String?) -> true

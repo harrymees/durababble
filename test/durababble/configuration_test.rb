@@ -32,15 +32,15 @@ class DurababbleConfigurationTest < DurababbleTestCase
   end
 
   test "payload byte limits reject non-positive values and keep workflow args alias" do
-    with_config(:@max_step_output_bytes, 0) do
-      error = assert_raises(ArgumentError) { Durababble.max_step_output_bytes }
+    with_config(:@payload_limits, { step_output: 0 }) do
+      error = assert_raises(ArgumentError) { Durababble.payload_limits }
       assert_match(/must be positive/, error.message)
     end
 
-    with_config(:@max_workflow_input_bytes, 123) do
-      assert_equal 123, Durababble.max_workflow_args_bytes
-      Durababble.max_workflow_args_bytes = 456
-      assert_equal 456, Durababble.max_workflow_input_bytes
+    with_config(:@payload_limits, { "workflow_args" => 123 }) do
+      assert_equal 123, Durababble.payload_limits.fetch(:workflow_input)
+      Durababble.payload_limits = { workflow_args: 456 }
+      assert_equal 456, Durababble.payload_limits.fetch(:workflow_input)
     end
   end
 
