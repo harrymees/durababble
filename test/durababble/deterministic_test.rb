@@ -35,6 +35,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "cancellation_cleanup_crash_fuzz",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
+    "stolen_lease_write_rejection",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
@@ -492,6 +493,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "terminate_request_crashed"
+  end
+
+  test "rejects every durable write from a worker whose lease was stolen" do
+    result = Durababble::Deterministic.prove("stolen_lease_write_rejection", seed: 1)
+
+    assert_empty result.violations
+    refute_includes result.trace, "stale_accepted"
   end
 
   test "dead-letters an object command once it exhausts its attempts" do
