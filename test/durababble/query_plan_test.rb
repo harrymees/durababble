@@ -138,7 +138,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_mailbox_sequence_for_update,
     :mysql_make_workflow_due,
     :mysql_mark_inbox_row_running,
-    :mysql_mark_wait_workflow_pending,
+    :mysql_mark_waits_workflows_pending,
     :mysql_mark_workflow_canceling_for_request,
     :mysql_mark_workflow_cancellation_delivered,
     :mysql_mark_workflow_running,
@@ -258,6 +258,18 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       return unless normalized.match?(/\A(?:SELECT|INSERT|UPDATE|DELETE|WITH)\b/i)
 
       @recorded_queries << [normalized, params]
+    end
+  end
+
+  class RecordingConnectionPool
+    attr_reader :connection
+
+    def initialize(connection_pool)
+      @connection = RecordingConnection.new(connection_pool.lease_connection)
+    end
+
+    def with_connection
+      yield @connection
     end
   end
 
@@ -670,9 +682,10 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     require "pg"
 
     active_record_class = Durababble::Store.send(:active_record_class_for, durababble_yugabyte_database_url)
-    connection = RecordingConnection.new(active_record_class.connection_pool.lease_connection)
+    recording_pool = RecordingConnectionPool.new(active_record_class.connection_pool)
+    connection = recording_pool.connection
     @durababble_schema = "durababble_plan_test_#{Process.pid}_#{SecureRandom.hex(4)}"
-    @durababble_store = Durababble::Store.from_active_record(connection:, schema:, owner: active_record_class)
+    @durababble_store = Durababble::Store.from_active_record(connection_pool: recording_pool, schema:, owner: active_record_class)
     @durababble_store.migrate!
     connection
   end

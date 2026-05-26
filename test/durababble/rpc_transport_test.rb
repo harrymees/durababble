@@ -2,6 +2,8 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "timeout"
+require "concurrent"
 
 class DurababbleRpcTransportTest < DurababbleTestCase
   TestTransientResponse = Struct.new(:result, :ok, :err, :moved, keyword_init: true)
@@ -127,6 +129,34 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     node_b&.stop
   end
 
+  test "rejects workflow RPCs addressed to a previous worker incarnation at a recycled address" do
+    store = self.store
+    ran = false
+    server = start_rpc_server(
+      node_id: nil,
+      store:,
+      workflow_handlers: { "status" => ->(_payload) { ran = true } },
+    )
+    old_identity = "previous-worker@#{server.address}"
+    store.claim_workflow(workflow_id:, worker_id: old_identity, lease_seconds: 30)
+    client = Durababble::Rpc::Client.new(address: server.address)
+
+    assert_match(/\A[0-9a-f]{12}@#{Regexp.escape(server.address)}\z/, server.node_id)
+    assert_equal(server.address, Durababble::WorkerIdentity.address_for(old_identity))
+    assert_raises(Durababble::WorkflowRpc::StaleLease) do
+      client.call_transient(
+        worker_pool: "default",
+        workflow_id:,
+        method: "status",
+        args: {},
+        expected_worker_id: old_identity,
+      )
+    end
+    assert_equal(false, ran)
+  ensure
+    server&.stop
+  end
+
   test "acknowledges workflow message wakeups without work when the lease moved away" do
     store = self.store
     claim_as("node-b")
@@ -169,7 +199,8 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   test "maps no active lease and unavailable nodes to typed routing failures" do
     store = self.store
     server = start_rpc_server(node_id: "node-a", store:, workflow_handlers: {})
-    client = Durababble::Rpc::Client.new(address: server.address, timeout: 0.1)
+    address = server.address
+    client = Durababble::Rpc::Client.new(address:)
 
     assert_raises_matching(Durababble::WorkflowRpc::NoActiveLease, /not running/) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
@@ -177,6 +208,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
     server.stop
     server = nil
+    client = Durababble::Rpc::Client.new(address:, timeout: 0.1)
     assert_raises(Durababble::WorkflowRpc::NodeUnavailable) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
     end
@@ -195,6 +227,38 @@ class DurababbleRpcTransportTest < DurababbleTestCase
         client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
       end
     end
+  end
+
+  test "keeps server lifecycle and workflow client command validation idempotent" do
+    store = self.store
+    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0, pool_size: 2)
+
+    assert_same(server, server.start)
+    assert_same(server, server.start)
+    assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
+    assert_equal(true, Durababble::Rpc::Client.new(address: server.address).awaken_batch(worker_pool: "default", workflow_ids: []))
+
+    client = Durababble::Rpc::WorkflowClient.new(address: server.address)
+    assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /not_workflow_rpc/) do
+      client.request("not_workflow_rpc", {})
+    end
+  ensure
+    server&.stop
+  end
+
+  test "stop returns even when the server task never drains" do
+    server = Durababble::Rpc::Server.allocate
+    fake_server = Object.new
+    def fake_server.stop; end
+    server.instance_variable_set(:@server, fake_server)
+    server.instance_variable_set(:@stop_drain_timeout, 0.1)
+    # A resolvable future that is never fulfilled models a run loop that does not
+    # observe the stop signal; stop must not block on it forever.
+    server.instance_variable_set(:@server_task, Concurrent::Promises.resolvable_future)
+
+    Timeout.timeout(5) { server.stop }
+
+    assert_nil server.instance_variable_get(:@server_task)
   end
 
   test "rejects unauthorized gRPC peers before running handlers" do
@@ -270,6 +334,59 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     server&.stop
   end
 
+  test "enforces RPC argument byte limits before sending or dispatching" do
+    args = { "body" => "x" * 64 }
+    size = Durababble::Rpc::SERIALIZER.dump(args).bytesize
+    calls = []
+    server = start_rpc_server(
+      node_id: "node-a",
+      store:,
+      transient_handler: lambda do |request:, args:|
+        calls << [request["method"], args]
+        { "ok" => true }
+      end,
+    )
+    client = Durababble::Rpc::Client.new(address: server.address)
+
+    with_payload_limit(:rpc_argument, size + 1) do
+      assert_equal(
+        { "ok" => true },
+        client.call_transient(worker_pool: "default", method: "status", args:),
+      )
+    end
+    assert_equal([["status", args]], calls)
+
+    with_payload_limit(:rpc_argument, size) do
+      assert_equal(
+        { "ok" => true },
+        client.call_transient(worker_pool: "default", method: "status", args:),
+      )
+    end
+    assert_equal([["status", args], ["status", args]], calls)
+
+    error = with_payload_limit(:rpc_argument, size - 1) do
+      assert_raises(Durababble::PayloadTooLarge) do
+        client.call_transient(worker_pool: "default", method: "status", args:)
+      end
+    end
+    assert_equal(:rpc_argument, error.surface)
+    assert_match(/CallTransient status args/, error.message)
+    assert_equal(2, calls.length)
+
+    raw_args = Durababble::Rpc::SERIALIZER.dump(args)
+    raw_stub = Durababble::Rpc::Proto::Stub.new(server.address, :this_channel_is_insecure)
+    response = with_payload_limit(:rpc_argument, size - 1) do
+      raw_stub.call_transient(
+        Durababble::Rpc::Proto::TransientRequest.new(worker_pool: "default", method: "status", args: raw_args),
+        deadline: Time.now + 5,
+      )
+    end
+    assert_equal("Durababble::PayloadTooLarge", response.err.klass)
+    assert_equal(2, calls.length)
+  ensure
+    server&.stop
+  end
+
   test "decodes transport payloads and typed transient response branches" do
     assert_nil Durababble::Rpc.load(nil)
     assert_nil Durababble::Rpc.load("")
@@ -285,6 +402,79 @@ class DurababbleRpcTransportTest < DurababbleTestCase
         TestTransientResponse.new(result: :err, err: TestRemoteError.new(klass: "Durababble::ObjectReadBlocked", message: "blocked")),
       )
     end
+  end
+
+  test "delivers workflow message wakeups when this node owns the workflow lease" do
+    store = self.store
+    claim_as("node-a")
+    delivered = []
+    service = Durababble::Rpc::Service.new(
+      node_id: "node-a",
+      store:,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: nil,
+      deliver_message: ->(**kwargs) { delivered << kwargs },
+    )
+
+    service.deliver_message(
+      Durababble::Rpc::Proto::DeliverMessageRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+      ),
+      :call,
+    )
+
+    assert_equal(
+      [{ worker_pool: "default", target_kind: "workflow", target_class: "", target_id: workflow_id }],
+      delivered,
+    )
+  end
+
+  test "drops target RPCs addressed to a previous worker incarnation" do
+    store = self.store
+    delivered = []
+    service = Durababble::Rpc::Service.new(
+      node_id: "fresh-worker@127.0.0.1:50051",
+      store:,
+      worker_pool: "default",
+      workflow_handlers: {},
+      transient_handler: nil,
+      node_directory: Durababble::Rpc::NodeDirectory.new,
+      authorize: nil,
+      awaken_batch: nil,
+      evict_lease: ->(**kwargs) { delivered << [:evict, kwargs] },
+      deliver_message: ->(**kwargs) { delivered << [:deliver, kwargs] },
+    )
+
+    service.evict_lease(
+      Durababble::Rpc::Proto::EvictLeaseRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+        expected_worker_id: "old-worker@127.0.0.1:50051",
+      ),
+      :call,
+    )
+    service.deliver_message(
+      Durababble::Rpc::Proto::DeliverMessageRequest.new(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: "",
+        target_id: workflow_id,
+        expected_worker_id: "old-worker@127.0.0.1:50051",
+      ),
+      :call,
+    )
+
+    assert_empty delivered
   end
 
   test "drops stale workflow deliveries and returns local transient responses" do
@@ -419,5 +609,18 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   def complete_workflow
     store.complete_workflow(workflow_id, result: {})
+  end
+
+  def with_payload_limit(surface, value)
+    configured = Durababble.instance_variable_defined?(:@payload_limits)
+    previous = Durababble.instance_variable_get(:@payload_limits) if configured
+    Durababble.payload_limits = { surface => value }
+    yield
+  ensure
+    if configured
+      Durababble.instance_variable_set(:@payload_limits, previous)
+    elsif Durababble.instance_variable_defined?(:@payload_limits)
+      Durababble.remove_instance_variable(:@payload_limits)
+    end
   end
 end

@@ -1,7 +1,8 @@
 ---
 title: "Tutorials"
 linkTitle: "Tutorials"
-weight: 15
+weight: 90
+collapsible: false
 ---
 
 # Tutorials

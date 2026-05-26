@@ -13,14 +13,26 @@ module ChatRoomExample
   }.freeze
 
   class << self
-    def configure(database_url: nil, schema: nil)
+    def configure(database_url: nil, schema: nil, workflow_worker_pool: "default", object_worker_pool: "default")
       @database_url = database_url
       @schema = schema
+      @workflow_worker_pool = workflow_worker_pool
+      @object_worker_pool = object_worker_pool
     end
 
     def reset_configuration!
       @database_url = nil
       @schema = nil
+      @workflow_worker_pool = "default"
+      @object_worker_pool = "default"
+    end
+
+    def workflow_worker_pool
+      @workflow_worker_pool || "default"
+    end
+
+    def object_worker_pool
+      @object_worker_pool || "default"
     end
 
     def with_store
@@ -200,7 +212,7 @@ module ChatRoomExample
 
     step def record_request(room_id, text, delay_seconds)
       ChatRoomExample.with_store do |store|
-        room = ChatRoomExample::ChatRoom.at(room_id, store:)
+        room = ChatRoomExample::ChatRoom.at(room_id, store:, worker_pool: ChatRoomExample.object_worker_pool)
         preview = delay_seconds.positive? ? "Announcement scheduled in #{format_delay(delay_seconds)}: #{text}" : "Announcement queued: #{text}"
         message = room.post_system_message(
           preview,
@@ -213,7 +225,7 @@ module ChatRoomExample
 
     step def post_announcement(room_id, text)
       ChatRoomExample.with_store do |store|
-        room = ChatRoomExample::ChatRoom.at(room_id, store:)
+        room = ChatRoomExample::ChatRoom.at(room_id, store:, worker_pool: ChatRoomExample.object_worker_pool)
         message = room.post_system_message(
           text,
           { "kind" => "announcement" },

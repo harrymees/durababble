@@ -83,6 +83,19 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  class WorkerPoolEnqueueStore
+    attr_reader :enqueued
+
+    def initialize
+      @enqueued = []
+    end
+
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @enqueued << { name:, input:, id:, worker_pool: }
+      id || "wf-#{@enqueued.length}"
+    end
+  end
+
   test "registers class-oriented workflow steps and public exposed methods" do
     assert_equal "api_test_order_workflow", ApiTestOrderWorkflow.workflow_name
     assert_equal [:charge, :finish], ApiTestOrderWorkflow.step_order
@@ -132,6 +145,111 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
     assert_match(/terminal/, error.message)
     refute store.enqueued
+  end
+
+  test "worker pool class helpers enqueue through the store without per-pool engines" do
+    store = WorkerPoolEnqueueStore.new
+
+    Durababble::Engine.stub(:new, ->(*) { raise "unexpected engine construction" }) do
+      assert_equal "wf-pool-one", ApiTestOrderWorkflow.enqueue({ "request_id" => "one" }, id: "wf-pool-one", store:, worker_pool: "critical")
+      handle = ApiTestOrderWorkflow.start({ "request_id" => "two" }, store:, worker_pool: "bulk")
+
+      assert_match(/\A[0-9a-f-]{36}\z/, handle.workflow_id)
+    end
+
+    generated_id = store.enqueued.fetch(1).fetch(:id)
+    assert_equal(
+      [
+        { name: "api_test_order_workflow", input: { "request_id" => "one" }, id: "wf-pool-one", worker_pool: "critical" },
+        { name: "api_test_order_workflow", input: { "request_id" => "two" }, id: generated_id, worker_pool: "bulk" },
+      ],
+      store.enqueued,
+    )
+  end
+
+  test "workflow command replay validates completed command result shape" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+      result: { "approved_by" => "operator" },
+    )
+
+    assert_nil execution.send(:replay_workflow_command_event, event)
+
+    event["payload"]["result"] = { "approved_by" => "someone-else" }
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/different result/, error.message)
+  end
+
+  test "workflow command replay requires a recorded result for completed commands" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+    )
+    refute(event.fetch("payload").key?("result"), "fixture should omit the result so the assertion is exercised")
+
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/no recorded result/, error.message)
+  end
+
+  test "workflow command replay accepts a matching recorded nil result" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    execution.instance_variable_get(:@workflow).define_singleton_method(:approve) { |**| nil }
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+    )
+    event["payload"]["result"] = nil
+
+    assert_nil(execution.send(:replay_workflow_command_event, event))
+  end
+
+  test "workflow command replay validates failed command error shape" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_failed",
+      method_name: "reject",
+      kwargs: { reason: "not approved" },
+      error: "DurababbleWorkflowTest::ApiTestChargeFailed: not approved",
+    )
+
+    assert_nil execution.send(:replay_workflow_command_event, event)
+
+    event["error"] = "RuntimeError: different"
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/different error/, error.message)
+  end
+
+  test "workflow command replay rejects unknown or unexpectedly successful commands" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    unknown = workflow_command_history_event("workflow_command_completed", method_name: "missing")
+
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, unknown)
+    end
+    assert_match(/unknown workflow command missing/, error.message)
+
+    successful = workflow_command_history_event(
+      "workflow_command_failed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+      error: "RuntimeError: expected",
+    )
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, successful)
+    end
+    assert_match(/expected workflow command approve to fail/, error.message)
   end
 
   durababble_store_backends.each do |backend|
@@ -192,6 +310,255 @@ class DurababbleWorkflowTest < DurababbleTestCase
       end
     end
 
+    test "delivers workflow commands into the active deterministic execution with #{backend.name}" do
+      with_durababble_store(backend, "workflow_active_commands") do |store|
+        store.migrate!
+        execute_object_ids = []
+        command_object_ids = []
+        finish_object_ids = []
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "active-approval-command"
+
+          define_method(:execute) do |_input|
+            execute_object_ids << object_id
+            @approved = false
+            ready = wait_condition(timeout: 60) { @approved }
+            finish(ready)
+          end
+
+          define_method(:finish) do |ready|
+            finish_object_ids << object_id
+            { "ready" => ready, "approved" => @approved }
+          end
+          step :finish
+
+          define_method(:approve) do
+            @approved = true
+            command_object_ids << object_id
+            { "approved" => @approved }
+          end
+          expose_command :approve
+        end
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.workflow_name => workflow },
+          worker_id: "active-command-worker",
+          migrate: false,
+        )
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        assert_equal(:worked, worker.tick)
+        assert_equal("waiting", store.workflow(workflow_id).fetch("status"))
+
+        result_queue = Queue.new
+        caller = Thread.new do
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+          begin
+            result_queue << [:ok, workflow.handle(workflow_id, store: caller_store).approve]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          ensure
+            caller_store.close
+          end
+        end
+
+        wait_until { store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id) }
+        assert_equal(:worked, worker.tick)
+        status, command_result = result_queue.pop
+        caller.join
+
+        assert_equal(:ok, status)
+        assert_equal(true, command_result.fetch("approved"))
+        completed = store.workflow(workflow_id)
+        assert_hash_includes(completed, "status" => "completed")
+        assert_equal(
+          { "ready" => true, "approved" => true },
+          completed.fetch("result"),
+        )
+        assert_equal(command_object_ids.last, execute_object_ids.last)
+        assert_equal(command_object_ids.last, finish_object_ids.last)
+        assert_equal(2, execute_object_ids.length)
+        assert_equal(1, command_object_ids.length)
+        assert_nil(store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id))
+
+        history = store.workflow_history_for(workflow_id)
+        assert_equal(
+          ["step_scheduled", "step_waiting", "workflow_command_completed", "step_scheduled", "step_started", "step_completed"],
+          history.map { |event| event.fetch("kind") },
+        )
+        command_event = history.detect { |event| event.fetch("kind") == "workflow_command_completed" }
+        assert_hash_includes(
+          command_event.fetch("payload"),
+          "method" => "approve",
+          "args" => [],
+          "kwargs" => {},
+          "result" => command_result,
+        )
+      ensure
+        caller&.kill if caller&.alive?
+      end
+    end
+
+    test "delivers a workflow command that satisfies a no-timeout wait_condition with #{backend.name}" do
+      with_durababble_store(backend, "workflow_polling_wait_commands") do |store|
+        store.migrate!
+        execute_runs = 0
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "polling-approval-command"
+
+          define_method(:execute) do |_input|
+            execute_runs += 1
+            @approved = false
+            ready = wait_condition { @approved }
+            finish(ready)
+          end
+
+          define_method(:finish) { |ready| { "ready" => ready, "approved" => @approved } }
+          step :finish
+
+          define_method(:approve) do
+            @approved = true
+            { "approved" => @approved }
+          end
+          expose_command :approve
+        end
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.workflow_name => workflow },
+          worker_id: "polling-command-worker",
+          migrate: false,
+        )
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        # First tick: the single-task no-timeout wait suspends the workflow.
+        assert_equal(:worked, worker.tick)
+        assert_equal("waiting", store.workflow(workflow_id).fetch("status"))
+
+        result_queue = Queue.new
+        caller = Thread.new do
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+          begin
+            result_queue << [:ok, workflow.handle(workflow_id, store: caller_store).approve]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          ensure
+            caller_store.close
+          end
+        end
+
+        wait_until { store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id) }
+        # The approve command is delivered mid-wait, raising WorkflowCommandDelivered so
+        # the polling wait_condition re-evaluates its block and the workflow completes.
+        assert_equal(:worked, worker.tick)
+        status, command_result = result_queue.pop
+        caller.join
+
+        assert_equal(:ok, status)
+        assert_equal(true, command_result.fetch("approved"))
+        assert_equal(2, execute_runs)
+        completed = store.workflow(workflow_id)
+        assert_hash_includes(completed, "status" => "completed")
+        assert_equal({ "ready" => true, "approved" => true }, completed.fetch("result"))
+        assert_equal(
+          ["step_scheduled", "step_waiting", "workflow_command_completed", "step_scheduled", "step_started", "step_completed"],
+          store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
+        )
+      ensure
+        caller&.kill if caller&.alive?
+      end
+    end
+
+    test "delivers a workflow command that satisfies a wait deferred behind a concurrent task with #{backend.name}" do
+      with_durababble_store(backend, "workflow_deferred_wait_commands") do |store|
+        store.migrate!
+        execute_runs = 0
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "deferred-approval-command"
+
+          # The wait runs concurrently with a sibling step, so the workflow has more than one
+          # task and the wait DEFERS suspension instead of suspending immediately. The recorded
+          # step_waiting therefore lands in history before the sibling's events and before the
+          # delivered command — the exact ordering that used to strand the workflow in "waiting".
+          define_method(:execute) do |_input|
+            execute_runs += 1
+            @approved = false
+            results = Async do |task|
+              approval = task.async { wait_condition { @approved } }
+              sibling = task.async { do_work }
+              { "approved" => approval.wait, "worked" => sibling.wait }
+            end.wait
+            finish(results)
+          end
+
+          define_method(:do_work) do
+            sleep(0.01)
+            { "worked" => true }
+          end
+          step :do_work
+
+          define_method(:finish) { |results| { "results" => results, "approved" => @approved } }
+          step :finish
+
+          define_method(:approve) do
+            @approved = true
+            { "approved" => @approved }
+          end
+          expose_command :approve
+        end
+        worker = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.workflow_name => workflow },
+          worker_id: "deferred-command-worker",
+          migrate: false,
+        )
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        # First tick: the deferred wait suspends the workflow once the sibling step finishes.
+        assert_equal(:worked, worker.tick)
+        assert_equal("waiting", store.workflow(workflow_id).fetch("status"))
+
+        result_queue = Queue.new
+        caller = Thread.new do
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+          begin
+            result_queue << [:ok, workflow.handle(workflow_id, store: caller_store).approve]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          ensure
+            caller_store.close
+          end
+        end
+
+        wait_until { store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id) }
+        # Second tick: the command is delivered at a safe point after the sibling replays, the
+        # deferred wait re-evaluates its now-satisfied condition, and the workflow completes.
+        assert_equal(:worked, worker.tick)
+        status, command_result = result_queue.pop
+        caller.join
+
+        assert_equal(:ok, status)
+        assert_equal(true, command_result.fetch("approved"))
+        assert_equal(2, execute_runs)
+        completed = store.workflow(workflow_id)
+        assert_hash_includes(completed, "status" => "completed")
+        assert_equal(
+          { "results" => { "approved" => true, "worked" => { "worked" => true } }, "approved" => true },
+          completed.fetch("result"),
+        )
+        assert_nil(store.target_activation(target_kind: "workflow", target_type: workflow.workflow_name, target_id: workflow_id))
+        history_kinds = store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+        assert_includes(history_kinds, "workflow_command_completed")
+        assert_operator(
+          history_kinds.index("step_waiting"),
+          :<,
+          history_kinds.index("workflow_command_completed"),
+          "the deferred wait must be recorded before the command it stranded behind it",
+        )
+      ensure
+        caller&.kill if caller&.alive?
+      end
+    end
+
     test "returns exposed workflow command errors through the ask row with #{backend.name}" do
       with_durababble_store(backend, "workflow_command_errors") do |store|
         store.migrate!
@@ -239,6 +606,22 @@ class DurababbleWorkflowTest < DurababbleTestCase
   end
 
   private
+
+  def replay_execution_for(workflow_class)
+    Durababble::WorkflowExecution.allocate.tap do |execution|
+      execution.instance_variable_set(:@workflow_id, "wf-replay")
+      execution.instance_variable_set(:@workflow_class, workflow_class)
+      execution.instance_variable_set(:@workflow, workflow_class.new)
+    end
+  end
+
+  def workflow_command_history_event(kind, method_name:, kwargs: {}, result: nil, error: nil)
+    payload = { "method" => method_name.to_s, "args" => [], "kwargs" => kwargs }
+    payload["result"] = result unless result.nil?
+    event = { "kind" => kind, "name" => method_name.to_s, "payload" => payload }
+    event["error"] = error unless error.nil?
+    event
+  end
 
   def wait_until(timeout: 10)
     deadline = Time.now + timeout

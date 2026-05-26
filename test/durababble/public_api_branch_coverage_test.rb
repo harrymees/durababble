@@ -71,6 +71,13 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  class RetryPolicyAliasObject < Durababble::DurableObject
+    expose_command retry_policy: { maximum_attempts: 2, schedule: [0] }
+    def command_with_retry_policy_alias
+      "ok"
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "covers explicit and pending workflow macros plus keyword step invocation with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_workflow") do |store|
@@ -96,6 +103,13 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     assert_hash_includes BranchTestPendingWorkflow.exposed_queries, query_with_pending_macro: true
     assert_includes BranchTestPendingWorkflow.exposed_commands, :command_with_pending_macro
     assert_includes BranchTestPendingWorkflow.step_order, :step_with_pending_macro
+  end
+
+  test "registers retry_policy option on pending command macros" do
+    retry_policy = RetryPolicyAliasObject.exposed_commands.fetch(:command_with_retry_policy_alias)
+
+    assert_equal 2, retry_policy.maximum_attempts
+    assert_equal [0], retry_policy.schedule
   end
 
   durababble_store_backends.each do |backend|
@@ -135,12 +149,12 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           "idempotency_key" => "note:hello",
         )
 
-        drained = Durababble::Engine.new(store:, worker_id: "command-worker")
-          .drain_workflow_inbox(BranchTestWorkflow, workflow_id:)
+        engine = Durababble::Engine.new(store:, worker_id: "command-worker")
+        claimed = store.claim_workflow_for_activation(workflow_id:, worker_id: "command-worker", lease_seconds: 60)
+        engine.resume(BranchTestWorkflow, workflow_id:, claimed:)
         status, value = result_queue.pop
         caller.join
 
-        assert_equal(1, drained)
         assert_equal(:ok, status)
         assert_equal("hello", value)
         assert_hash_includes(store.inbox_message(messages.first.fetch("id")), "status" => "completed", "result" => "hello")
@@ -154,7 +168,7 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "enqueues workflows through default and explicit engines with #{backend.name}" do
       with_durababble_store(backend, "public_api_default_engine_workflow") do |store|
-        engine = Durababble::Engine.new(store:, migrate: false)
+        engine = Durababble::Engine.new(store:)
 
         explicit_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, engine:)
         assert_equal(BranchTestWorkflow.workflow_name, store.workflow(explicit_id).fetch("name"))
@@ -163,8 +177,17 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         assert_nil(explicit_handle.result)
         assert_nil(explicit_handle.error)
 
-        started_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, engine:)
+        explicit_workflow_id = "branch-api-explicit-#{SecureRandom.hex(4)}"
+        assert_equal(
+          explicit_workflow_id,
+          BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, id: explicit_workflow_id, engine:),
+        )
+        assert_equal(explicit_workflow_id, store.workflow(explicit_workflow_id).fetch("id"))
+
+        explicit_start_id = "branch-api-start-#{SecureRandom.hex(4)}"
+        started_handle = BranchTestWorkflow.start({ "plain" => "plain", "keyword" => "keyword" }, id: explicit_start_id, engine:)
         assert_instance_of(Durababble::WorkflowRef, started_handle)
+        assert_equal(explicit_start_id, started_handle.workflow_id)
         assert_equal(BranchTestWorkflow.workflow_name, store.workflow(started_handle.workflow_id).fetch("name"))
         completed_run = engine.run(BranchTestWorkflow, input: { "plain" => "plain", "keyword" => "keyword" })
         completed_handle = BranchTestWorkflow.handle(completed_run.id, engine:)

@@ -11,6 +11,8 @@ require_relative "chat_room"
 module ChatRoomExample
   class Server
     TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
+    WORKFLOW_WORKER_POOL = "chat-room-workflows"
+    OBJECT_WORKER_POOL = "chat-room-objects"
     ROOM_PATH = %r{\A/api/rooms/(?<room>[^/]+)(?<rest>/[^?]*)?\z}
 
     def initialize(host:, port:, database_url:, schema:)
@@ -22,13 +24,13 @@ module ChatRoomExample
       @closed = false
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
-      ChatRoomExample.configure(database_url:, schema:)
+      ChatRoomExample.configure(database_url:, schema:, workflow_worker_pool: WORKFLOW_WORKER_POOL, object_worker_pool: OBJECT_WORKER_POOL)
       @workflow_runtime = Durababble::WorkerRuntime.start(
         workflows: [ScheduledAnnouncementWorkflow],
         objects: [],
         database_url:,
         schema:,
-        worker_pool: "chat-room-workflows",
+        worker_pool: ChatRoomExample.workflow_worker_pool,
         poll_interval: 0.05,
       )
       @object_runtime = Durababble::WorkerRuntime.start(
@@ -36,7 +38,7 @@ module ChatRoomExample
         objects: [ChatRoom],
         database_url:,
         schema:,
-        worker_pool: "chat-room-objects",
+        worker_pool: ChatRoomExample.object_worker_pool,
         poll_interval: 0.05,
       )
       # WorkerRuntime processes activations and inbox messages, but durable
@@ -170,7 +172,7 @@ module ChatRoomExample
     def show_room(room_id, query)
       params = query ? URI.decode_www_form(query).to_h : {}
       since = Integer(params.fetch("since", 0))
-      snapshot = ChatRoom.at(room_id, store: @store).snapshot(since:)
+      snapshot = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool).snapshot(since:)
       json(200, "room" => room_id, "snapshot" => snapshot)
     end
 
@@ -178,7 +180,7 @@ module ChatRoomExample
       payload = parse_body(body)
       idempotency_key = payload["idempotency_key"]
       idempotency_key = nil if idempotency_key.to_s.empty?
-      room = ChatRoom.at(room_id, store: @store)
+      room = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool)
       result = yield(room, payload, idempotency_key)
       json(200, "room" => room_id, "result" => result)
     rescue ArgumentError, KeyError, Durababble::Error => e
@@ -197,6 +199,7 @@ module ChatRoomExample
           "text" => text,
           "delay_seconds" => delay_seconds,
         },
+        worker_pool: ChatRoomExample.workflow_worker_pool,
       )
       json(202, "workflow_id" => workflow_id, "room" => room_id, "delay_seconds" => delay_seconds)
     rescue KeyError => e
@@ -212,7 +215,7 @@ module ChatRoomExample
       snapshot = nil
       snapshot_error = nil
       begin
-        snapshot = ChatRoom.at(room_id, store: @store).snapshot
+        snapshot = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool).snapshot
       rescue Durababble::ObjectReadBlocked => e
         snapshot_error = e.message
       end

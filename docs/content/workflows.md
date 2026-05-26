@@ -103,10 +103,11 @@ fulfillment.result
 
 ## Enqueuing And Workflow Handles
 
-`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `engine:` when you want an explicit engine instead of the configured default.
+`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `id:` when the caller needs to choose a stable workflow id; Durababble persists that exact id and raises `Durababble::WorkflowAlreadyExists` if it is already taken. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
 workflow_id = FulfillOrder.enqueue(order)
+workflow_id = FulfillOrder.enqueue(order, id: "fulfillment-order-123")
 
 # in some other long lived process, you'd do:
 worker = Durababble::Worker.new(
@@ -117,13 +118,20 @@ worker = Durababble::Worker.new(
 worker.run_until_idle
 ```
 
-`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
+`FulfillOrder.start(order)` is a convenience that enqueues and returns a handle immediately. It also accepts `id:` and returns a handle whose `workflow_id` is exactly that value. `FulfillOrder.at(workflow_id)` and `FulfillOrder.handle(workflow_id)` give you the same handle later, so web requests, jobs, or other workflows can query or command the durable run without knowing which worker owns it. Each helper accepts `engine:` when a caller needs to route through a non-default engine.
 
 ```ruby
-handle = FulfillOrder.start(order)
+handle = FulfillOrder.start(order, id: "fulfillment-order-123")
 handle.workflow_id
 handle.cancel(reason: "customer requested cancellation")
+handle.terminate(reason: "operator hard stop")
 ```
+
+### Deduplicating Workflow Starts
+
+Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.
+
+Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or terminated workflow still counts as existing, so a later enqueue with the same deterministic id is rejected rather than starting a second run. Callers that want retry-after-completion semantics should choose a new workflow id, such as one that includes an attempt number or version.
 
 ## Replay
 
@@ -313,6 +321,19 @@ worker.run_until_idle
 <!-- DOCS:workflow-cancellation-example:end -->
 
 If a workflow is already completed, failed, or canceled, cancellation is idempotent and does not re-cancel.
+
+## Termination
+
+Termination is the hard-stop operator path. `Workflow.handle(run_id).terminate(reason:)` durably marks the workflow `terminated` without asking workflow code to observe a cancellation request and without running cleanup steps. The terminal run has no result and stores the reason as its error.
+
+Use cancellation when workflow code should unwind, compensate, or mark external state through ordinary durable cleanup. Use termination when the caller needs the workflow to stop at the next safe durable boundary and must prevent later waits, workflow commands, completion writes, or recovery from reviving it.
+
+```ruby
+handle = ImportCustomers.start({ "file_id" => "file_123" })
+handle.terminate(reason: "operator replaced the import")
+```
+
+If a workflow is already completed, failed, canceled, or terminated, termination is idempotent and returns the existing terminal run.
 
 ## Using `async` for parallelism
 

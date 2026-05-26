@@ -33,7 +33,7 @@ module Durababble
         return register_exposed_command(method_name, retry_policy: options.fetch(:retry_policy, options[:retry]))
       end
 
-      set_pending_durable_macro(:expose_command, retry_policy: options[:retry])
+      set_pending_durable_macro(:expose_command, retry_policy: options.fetch(:retry_policy, options[:retry]))
     end
 
     private
