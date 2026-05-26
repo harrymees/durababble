@@ -359,6 +359,12 @@ module Durababble
       result
     end
 
+    #: (object_type: String, object_id: String, state: Object?) -> Object?
+    def save_object_state(object_type:, object_id:, state:)
+      execute_store_query(:save_object_state, [object_type, object_id, dump_serialized(state)])
+      state
+    end
+
     private
 
     #: (String) -> Object?
@@ -502,12 +508,6 @@ module Durababble
       else
         execute_store_query(:lock_inbox_message, [command_id]).first
       end
-    end
-
-    #: (object_type: String, object_id: String, state: Object?) -> Object?
-    def save_object_state(object_type:, object_id:, state:)
-      execute_store_query(:save_object_state, [object_type, object_id, dump_serialized(state)])
-      state
     end
 
     #: (message_id: String, result: Object?) -> Object?

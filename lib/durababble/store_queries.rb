@@ -31,6 +31,11 @@ module Durababble
         QUERIES.values.select { |query| query.backend == backend.to_sym }.map(&:id).sort
       end
 
+      #: (untyped) -> bool
+      def defined?(id)
+        QUERIES.key?(id.to_sym)
+      end
+
       #: () -> untyped
       def hot_query_coverage
         HOT_QUERY_COVERAGE
@@ -1718,6 +1723,84 @@ module Durababble
 
     define(:mysql_target_activation, backend: :mysql) do |store|
       "SELECT * FROM #{table(store, "target_activations")} WHERE target_kind = ? AND target_type = ? AND target_id = ?"
+    end
+
+    # SQLite-specific upsert variants. The SqliteStore resolves every other query
+    # by falling back to its :mysql_* sibling and translating the rendered SQL
+    # (NOW(6) -> dura_now(), DATE_ADD -> +, FOR UPDATE/FORCE INDEX stripped,
+    # INSERT IGNORE -> INSERT OR IGNORE, LEAST/GREATEST -> MIN/MAX). The five
+    # upserts below cannot be regex-translated because ON DUPLICATE KEY UPDATE
+    # needs an explicit conflict target and VALUES()/IF() rewrites, so they are
+    # written directly in SQLite dialect. dura_now() is the per-connection UDF
+    # returning the store's integer clock.
+    define(:sqlite_upsert_step_running, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "steps")} (workflow_id, position, name, status, started_at, updated_at)
+        VALUES (?, ?, ?, 'running', dura_now(), dura_now())
+        ON CONFLICT(workflow_id, position) DO UPDATE SET status = 'running', error = NULL, started_at = COALESCE(started_at, dura_now()), updated_at = dura_now()
+      SQL
+    end
+
+    define(:sqlite_upsert_waiting_step, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "steps")} (workflow_id, position, name, status, result, started_at, updated_at)
+        VALUES (?, ?, ?, 'waiting', ?, dura_now(), dura_now())
+        ON CONFLICT(workflow_id, position) DO UPDATE SET status = 'waiting', result = excluded.result, error = NULL, updated_at = dura_now()
+      SQL
+    end
+
+    define(:sqlite_save_object_state, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "durable_objects")} (object_type, object_id, state)
+        VALUES (?, ?, ?)
+        ON CONFLICT(object_type, object_id) DO UPDATE SET state = excluded.state, updated_at = dura_now()
+      SQL
+    end
+
+    define(:sqlite_upsert_target_activation, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = CASE WHEN status = 'running' THEN status ELSE 'pending' END, ready_at = MIN(ready_at, excluded.ready_at), updated_at = dura_now()
+      SQL
+    end
+
+    define(:sqlite_set_target_activation_pending, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "target_activations")} (target_kind, target_type, target_id, status, ready_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = 'pending', ready_at = excluded.ready_at, locked_by = NULL, locked_until = NULL, updated_at = dura_now()
+      SQL
+    end
+
+    # Standard SQLite builds do not support UPDATE ... ORDER BY ... LIMIT, so the
+    # two "latest attempt" writers select the target primary key via an ordered
+    # subquery and update by id. Param order matches the :mysql_* siblings (the
+    # WHERE-clause binds move into the subquery unchanged).
+    define(:sqlite_update_latest_attempt, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET status = ?, result = ?, error = ?, completed_at = dura_now()
+        WHERE id = (
+          SELECT id FROM #{table(store, "step_attempts")}
+          WHERE workflow_id = ? AND position = ? AND status IN ('running', 'waiting')
+          ORDER BY started_at DESC, id DESC
+          LIMIT 1
+        )
+      SQL
+    end
+
+    define(:sqlite_heartbeat_latest_attempt, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET heartbeat_cursor = ?
+        WHERE id = (
+          SELECT id FROM #{table(store, "step_attempts")}
+          WHERE workflow_id = ? AND position = ? AND status = 'running'
+          ORDER BY started_at DESC, id DESC
+          LIMIT 1
+        )
+      SQL
     end
   end
 end

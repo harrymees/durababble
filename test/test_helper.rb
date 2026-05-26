@@ -18,7 +18,11 @@ module DurababbleMinitestHelper
   def with_durababble_store(backend, schema_suffix, migrate: true, &block)
     @durababble_backend = backend #: untyped
     @durababble_schema = "#{backend.default_schema_prefix}_#{schema_suffix}_#{Process.pid}_#{SecureRandom.hex(4)}" #: String?
-    @durababble_store = Durababble::Store.connect(database_url: backend.database_url, schema: @durababble_schema) #: untyped
+    @durababble_store = if backend.sqlite?
+      Durababble::SqliteStore.build_in_memory(schema: @durababble_schema)
+    else
+      Durababble::Store.connect(database_url: backend.database_url, schema: @durababble_schema)
+    end #: untyped
     @durababble_store.migrate! if migrate
 
     block.call(@durababble_store)

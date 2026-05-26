@@ -385,7 +385,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
 
     Durababble::StoreQueries::QUERIES.each do |id, query|
       assert_equal id, query.id
-      assert_includes [:postgres, :mysql], query.backend
+      assert_includes [:postgres, :mysql, :sqlite], query.backend
       assert_respond_to query.builder, :call
     end
   end
