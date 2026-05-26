@@ -18,8 +18,13 @@ module Durababble
     class RemoteError < Error; end
 
     class << self
-      #: (Object?) -> String
-      def dump(value) = SERIALIZER.dump(value)
+      #: (Object?, ?surface: Symbol?, ?context: String?) -> String
+      def dump(value, surface: nil, context: nil)
+        serialized = SERIALIZER.dump(value)
+        Durababble.enforce_payload_limit!(surface:, bytesize: serialized.bytesize, context:) if surface
+        serialized
+      end
+
       #: (String?) -> Object?
       def load(bytes) = bytes.nil? || bytes.empty? ? nil : SERIALIZER.load(bytes)
     end
@@ -132,7 +137,7 @@ module Durababble
                 object_id:,
                 workflow_id:,
                 method:,
-                args: Rpc.dump(args),
+                args: Rpc.dump(args, surface: :rpc_argument, context: "CallTransient #{method} args"),
                 deadline_ms:,
                 expected_worker_id:,
               ),
@@ -414,7 +419,7 @@ module Durababble
           "workflow_id" => request.workflow_id,
           "expected_worker_id" => expected_worker_id,
           "command" => request["method"],
-          "payload" => Rpc.load(request.args) || {},
+          "payload" => load_request_args(request, context: "CallTransient #{request["method"]} args") || {},
         }
         WorkflowRpc::Handler.new(
           store: @store,
@@ -430,7 +435,15 @@ module Durababble
           raise WorkflowRpc::UnknownCommand, "unknown transient RPC method #{request["method"]}"
         end
 
-        @transient_handler.call(request:, args: Rpc.load(request.args))
+        @transient_handler.call(request:, args: load_request_args(request, context: "CallTransient #{request["method"]} args"))
+      end
+
+      #: (Object, context: String) -> Object?
+      def load_request_args(request, context:)
+        request = request #: as untyped
+        bytes = request.args.to_s
+        Durababble.enforce_payload_limit!(surface: :rpc_argument, bytesize: bytes.bytesize, context:)
+        Rpc.load(request.args)
       end
 
       #: (Object) -> bool

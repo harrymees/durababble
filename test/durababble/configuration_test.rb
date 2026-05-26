@@ -31,6 +31,19 @@ class DurababbleConfigurationTest < DurababbleTestCase
     end
   end
 
+  test "payload byte limits reject non-positive values and keep workflow args alias" do
+    with_config(:@payload_limits, { step_output: 0 }) do
+      error = assert_raises(ArgumentError) { Durababble.payload_limits }
+      assert_match(/must be positive/, error.message)
+    end
+
+    with_config(:@payload_limits, { "workflow_args" => 123 }) do
+      assert_equal 123, Durababble.payload_limits.fetch(:workflow_input)
+      Durababble.payload_limits = { workflow_args: 456 }
+      assert_equal 456, Durababble.payload_limits.fetch(:workflow_input)
+    end
+  end
+
   test "warn_workflow_history_events stays silent below the warning threshold" do
     with_config(:@workflow_history_warning_events, 100) do
       refute Durababble.warn_workflow_history_events(workflow_id: "wf", history_events: 10, max_history_events: 1_000)
