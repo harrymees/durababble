@@ -156,9 +156,21 @@ module Durababble
     end
 
     # Awaits a command future, delivering pending workflow commands at the resulting
-    # safe point. When the wait suspends, commands are still delivered; with
-    # interrupt_on_command the caller is told (via WorkflowCommandDelivered) to retry
-    # instead of suspending so a freshly-delivered command can re-evaluate its condition.
+    # safe point. With interrupt_on_command a freshly-delivered command must re-evaluate
+    # its condition rather than leave the wait parked, so WorkflowCommandDelivered can be
+    # raised from one of two complementary points:
+    #
+    #   1. While the future is still alive — await_command_future raises as soon as its
+    #      delivery counter advances, catching commands delivered by this wait's safe point
+    #      OR by a concurrent sibling task before suspension is decided. This is the path
+    #      that fires in the common case.
+    #   2. After the future was already rejected with WorkflowSuspended at quiescence — the
+    #      counter never advanced, so we make one final delivery attempt here and, if it
+    #      lands a command, convert the suspension into a retry instead of propagating it.
+    #
+    # Without (2) a command committed in the same instant the workflow went quiescent could
+    # be stranded behind an already-rejected future; without (1) a sibling's delivery would
+    # not interrupt a wait that is about to suspend.
     #: (untyped, untyped, ?interrupt_on_command: bool) -> untyped
     def await_with_command_delivery(future, command_id, interrupt_on_command: false)
       result = begin
