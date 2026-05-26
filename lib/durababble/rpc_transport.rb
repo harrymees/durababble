@@ -284,7 +284,7 @@ module Durababble
 
       #: () -> void
       def stop
-        @server&.stop
+        stop_grpc_server
         task = @server_task
         if task
           task.wait(@stop_drain_timeout)
@@ -298,6 +298,20 @@ module Durababble
       ensure
         @server = nil
         @server_task = nil
+      end
+
+      #: () -> void
+      def stop_grpc_server
+        attempts = 0
+        begin
+          @server&.stop
+        rescue RuntimeError => e
+          raise unless e.message == "Cannot stop before starting" && attempts < 10
+
+          attempts += 1
+          sleep(0.01)
+          retry
+        end
       end
 
       #: () -> String
