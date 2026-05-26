@@ -41,7 +41,7 @@ module Durababble
         Durababble.const_set(connection_name, connection_class)
         begin
           connection_class.establish_connection(adapter: "sqlite3", database: ":memory:", pool: 1)
-          new(connection_class.connection_pool.lease_connection, schema:, owner: connection_class)
+          new(connection_class.connection_pool, schema:, owner: connection_class)
         rescue StandardError
           Store.send(:remove_active_record_class_const, connection_class)
           raise
@@ -49,13 +49,26 @@ module Durababble
       end
     end
 
-    #: (Object, schema: String, ?owner: Object?) -> void
-    def initialize(connection, schema:, owner: nil)
+    #: (ActiveRecord::ConnectionAdapters::ConnectionPool, schema: String, ?owner: Object?) -> void
+    def initialize(connection_pool, schema:, owner: nil)
       super
+      # An in-memory SQLite database lives inside a single connection — a second
+      # connection from the pool is a different, empty database. Lease one
+      # connection for the store's lifetime and route every #with_connection
+      # through it so the dura_now() UDF, PRAGMAs, and all data stay on the one
+      # database. This mirrors the test-only, single-serialized-connection model.
+      @connection = connection_pool.lease_connection
       install_sqlite_runtime!
     end
 
     private
+
+    # The store binds to one leased connection (see #initialize); always yield it
+    # so inherited orchestration runs against the database carrying the UDF.
+    #: () { (Object) -> Object? } -> Object?
+    def with_connection
+      yield @connection
+    end
 
     #: () -> void
     def install_sqlite_runtime!

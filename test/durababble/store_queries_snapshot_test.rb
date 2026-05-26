@@ -27,7 +27,14 @@ class StoreQueriesSnapshotTest < DurababbleTestCase
     table_name: "workflows",
   }.freeze
 
+  # Doubles as both the connection pool and the connection: the store reaches
+  # the dialect's quote_column_name through #with_connection, and only that and
+  # the quote character are needed to render SQL offline.
   FakeConnection = Struct.new(:quote_char) do
+    def with_connection
+      yield self
+    end
+
     def quote_column_name(name)
       "#{quote_char}#{name}#{quote_char}"
     end

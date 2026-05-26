@@ -47,7 +47,7 @@ module Durababble
           Durababble.const_set(connection_name, connection_class)
           begin
             connection_class.establish_connection(adapter: "sqlite3", database: ":memory:", pool: 1)
-            store = new(connection_class.connection_pool.lease_connection, scheduler:, fault_plan:, schema:, owner: connection_class)
+            store = new(connection_class.connection_pool, scheduler:, fault_plan:, schema:, owner: connection_class)
             store.migrate!
             store
           rescue StandardError
@@ -57,8 +57,8 @@ module Durababble
         end
       end
 
-      #: (Object, scheduler: untyped, ?fault_plan: untyped, schema: String, ?owner: Object?) -> void
-      def initialize(connection, scheduler:, schema:, fault_plan: nil, owner: nil)
+      #: (ActiveRecord::ConnectionAdapters::ConnectionPool, scheduler: untyped, ?fault_plan: untyped, schema: String, ?owner: Object?) -> void
+      def initialize(connection_pool, scheduler:, schema:, fault_plan: nil, owner: nil)
         @scheduler = scheduler
         @fault_plan = fault_plan || FaultPlan.new(scheduler:)
         @side_effects = 0
@@ -72,7 +72,7 @@ module Durababble
         @write_crash_percent = 0
         @txn_depth = 0
         @crashes_armed = false
-        super(connection, schema:, owner:)
+        super(connection_pool, schema:, owner:)
       end
 
       # --- Seed-driven crash-after-write fuzz mode ---------------------------
