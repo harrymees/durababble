@@ -430,6 +430,92 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
   end
 
+  test "widens legacy worker_pool keys when upgrading existing MySQL schemas" do
+    with_durababble_store(durababble_store_backends.first, "worker_pool_upgrade", migrate: false) do |store|
+      skip("MySQL-specific upgrade migration path") unless backend_descriptor.mysql?
+
+      store.migrate!
+
+      quoted = ->(name) { store.send(:quote_column_name, name) }
+      table = ->(name) { store.send(:table, name) }
+      inbox_unique = quoted.call(store.send(:index_name, "inbox", "target_sequence_unique"))
+
+      # Recreate the pre-worker_pool key shape that an upgraded schema would still carry: the column
+      # was backfilled but the legacy PRIMARY/UNIQUE keys never included it.
+      store.send(:execute, "ALTER TABLE #{table.call("durable_objects")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("object_type")}, #{quoted.call("object_id")})")
+      store.send(:execute, "ALTER TABLE #{table.call("mailbox_sequences")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")})")
+      store.send(:execute, "ALTER TABLE #{table.call("target_activations")} DROP PRIMARY KEY, ADD PRIMARY KEY (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")})")
+      store.send(:execute, "ALTER TABLE #{table.call("inbox")} DROP INDEX #{inbox_unique}, ADD UNIQUE KEY #{inbox_unique} (#{quoted.call("target_kind")}, #{quoted.call("target_type")}, #{quoted.call("target_id")}, #{quoted.call("sequence")})")
+
+      refute store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
+      refute store.send(:key_includes_worker_pool?, "mailbox_sequences", "PRIMARY")
+      refute store.send(:key_includes_worker_pool?, "target_activations", "PRIMARY")
+      refute store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
+
+      # Re-running the migration must rebuild the widened, worker-pool-scoped keys.
+      store.instance_variable_set(:@migrated, false)
+      store.migrate!
+
+      assert store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
+      assert store.send(:key_includes_worker_pool?, "mailbox_sequences", "PRIMARY")
+      assert store.send(:key_includes_worker_pool?, "target_activations", "PRIMARY")
+      assert store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
+
+      # Idempotent: a second pass over already-widened keys is a no-op and leaves them intact.
+      store.instance_variable_set(:@migrated, false)
+      store.migrate!
+
+      assert store.send(:key_includes_worker_pool?, "durable_objects", "PRIMARY")
+      assert store.send(:unique_indexes_with_columns, "inbox").value?("worker_pool,target_kind,target_type,target_id,sequence")
+    end
+  end
+
+  test "widens legacy worker_pool keys when upgrading existing Yugabyte schemas" do
+    with_yugabyte_store(migrate: false) do |store|
+      store.migrate!
+
+      table = ->(name) { store.send(:table, name) }
+      quoted = ->(name) { store.send(:quote_column_name, name) }
+      pk_signatures = ->(name) { store.send(:key_constraints_with_columns, name, contype: "p").map { |row| row.fetch("columns") } }
+      unique_signatures = ->(name) { store.send(:key_constraints_with_columns, name, contype: "u").map { |row| row.fetch("columns") } }
+
+      # Drop the worker-pool-scoped key and replace it with the pre-worker_pool narrow shape an
+      # upgraded schema would still carry, matching the existing constraint by its exact column
+      # signature so we never guess the auto-generated constraint name.
+      downgrade = lambda do |name, contype, keyword, wide_columns, narrow_columns|
+        current = store.send(:key_constraints_with_columns, name, contype:).find { |row| row.fetch("columns") == wide_columns.join(",") }
+        store.send(:execute, "ALTER TABLE #{table.call(name)} DROP CONSTRAINT #{quoted.call(current.fetch("conname"))}")
+        store.send(:execute, "ALTER TABLE #{table.call(name)} ADD #{keyword} (#{narrow_columns.map { |column| quoted.call(column) }.join(", ")})")
+      end
+
+      downgrade.call("durable_objects", "p", "PRIMARY KEY", ["worker_pool", "object_type", "object_id"], ["object_type", "object_id"])
+      downgrade.call("mailbox_sequences", "p", "PRIMARY KEY", ["worker_pool", "target_kind", "target_type", "target_id"], ["target_kind", "target_type", "target_id"])
+      downgrade.call("target_activations", "p", "PRIMARY KEY", ["worker_pool", "target_kind", "target_type", "target_id"], ["target_kind", "target_type", "target_id"])
+      downgrade.call("inbox", "u", "UNIQUE", ["worker_pool", "target_kind", "target_type", "target_id", "sequence"], ["target_kind", "target_type", "target_id", "sequence"])
+
+      refute_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
+      refute_includes pk_signatures.call("mailbox_sequences"), "worker_pool,target_kind,target_type,target_id"
+      refute_includes pk_signatures.call("target_activations"), "worker_pool,target_kind,target_type,target_id"
+      refute_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
+
+      # Re-running the migration must rebuild the widened, worker-pool-scoped keys.
+      store.instance_variable_set(:@migrated, false)
+      store.migrate!
+
+      assert_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
+      assert_includes pk_signatures.call("mailbox_sequences"), "worker_pool,target_kind,target_type,target_id"
+      assert_includes pk_signatures.call("target_activations"), "worker_pool,target_kind,target_type,target_id"
+      assert_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
+
+      # Idempotent: a second pass over already-widened keys is a no-op and leaves them intact.
+      store.instance_variable_set(:@migrated, false)
+      store.migrate!
+
+      assert_includes pk_signatures.call("durable_objects"), "worker_pool,object_type,object_id"
+      assert_includes unique_signatures.call("inbox"), "worker_pool,target_kind,target_type,target_id,sequence"
+    end
+  end
+
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
@@ -969,6 +1055,23 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(ActiveRecord::SerializationFailure) do
       store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::SerializationFailure }
     end
+
+    # Transaction-level deadlocks must also be retried: every #transaction is wrapped in
+    # retry_serialization_failures, so a deadlock that aborts the whole transaction (not just
+    # a single statement) has to be replayed rather than surfaced to the caller.
+    deadlock_attempts = 0
+    deadlock_result = store.send(:retry_serialization_failures) do
+      deadlock_attempts += 1
+      raise ActiveRecord::Deadlocked if deadlock_attempts == 1
+
+      :recovered
+    end
+    assert_equal :recovered, deadlock_result
+    assert_equal 2, deadlock_attempts
+    assert_raises(ActiveRecord::Deadlocked) do
+      store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::Deadlocked }
+    end
+
     assert_equal ["", []], store.send(:workflow_name_filter, nil)
     malicious_name = "a'); DROP TABLE workflows; --"
     assert_equal ["AND name IN ($1, $2)", [malicious_name, "b"]], store.send(:workflow_name_filter, [malicious_name, "b"])

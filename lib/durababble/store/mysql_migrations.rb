@@ -149,6 +149,7 @@ module Durababble
         )
       SQL
       add_column_if_missing("durable_objects", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
+      ensure_worker_pool_primary_key!("durable_objects", ["worker_pool", "object_type", "object_id"])
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -188,6 +189,68 @@ module Durababble
       return if exists
 
       execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_column_name(column_name.to_s)} #{column_type}")
+    end
+
+    # Widen a legacy PRIMARY KEY so it includes worker_pool. Fresh installs already declare the
+    # worker-pool-scoped key in CREATE TABLE, so this is a no-op there; only schemas created before
+    # worker_pool existed get rewritten. Without it the old narrower key keeps enforcing identity on
+    # (e.g.) (object_type, object_id), so two worker pools sharing an id collide and overwrite state.
+    #: (String, Array[String]) -> void
+    def ensure_worker_pool_primary_key!(table_name, columns)
+      return if key_includes_worker_pool?(table_name, "PRIMARY")
+
+      column_list = columns.map { |column| quote_column_name(column) }.join(", ")
+      execute("ALTER TABLE #{table(table_name)} DROP PRIMARY KEY, ADD PRIMARY KEY (#{column_list})")
+    end
+
+    # Widen a legacy UNIQUE KEY so it includes worker_pool. The legacy index is matched by its exact
+    # column signature (worker_pool removed) so the right index is dropped regardless of its name, then
+    # the worker-pool-scoped unique key is recreated. No-op when the widened key already exists.
+    #: (String, String, Array[String]) -> void
+    def ensure_worker_pool_unique_key!(table_name, index_suffix, columns)
+      indexes = unique_indexes_with_columns(table_name)
+      return if indexes.value?(columns.join(","))
+
+      legacy_columns = (columns - ["worker_pool"]).join(",")
+      legacy_name = indexes.find { |_name, index_columns| index_columns == legacy_columns }&.first
+      drop_index_if_present(table_name, legacy_name) if legacy_name
+      name = index_name(table_name, index_suffix)
+      column_list = columns.map { |column| quote_column_name(column) }.join(", ")
+      add_index_if_missing(table_name, name, "UNIQUE KEY #{quote_column_name(name)} (#{column_list})")
+    end
+
+    #: (String, String) -> bool
+    def key_includes_worker_pool?(table_name, index)
+      !execute_params(<<~SQL, [raw_table_name(table_name), index]).first.nil?
+        SELECT 1
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND index_name = ?
+          AND column_name = 'worker_pool'
+        LIMIT 1
+      SQL
+    end
+
+    # Maps each UNIQUE index on the table to its ordered, comma-joined column list, so callers can match
+    # a legacy key by exact column signature rather than by a possibly-divergent index name.
+    #: (String) -> Hash[String, String]
+    def unique_indexes_with_columns(table_name)
+      rows = execute_params(<<~SQL, [raw_table_name(table_name)]).to_a
+        SELECT index_name, seq_in_index, column_name
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = ?
+          AND non_unique = 0
+        ORDER BY index_name, seq_in_index
+      SQL
+      grouped = {} #: Hash[String, Array[[Integer, String]]]
+      rows.each do |row|
+        # information_schema returns uppercase column labels (INDEX_NAME, ...); normalize before fetch.
+        normalized = row.transform_keys { |key| key.to_s.downcase }
+        (grouped[normalized.fetch("index_name")] ||= []) << [normalized.fetch("seq_in_index").to_i, normalized.fetch("column_name").to_s]
+      end
+      grouped.transform_values { |entries| entries.sort_by(&:first).map(&:last).join(",") }
     end
 
     #: () -> untyped
@@ -260,6 +323,9 @@ module Durababble
       add_column_if_missing("inbox", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
       add_column_if_missing("inbox", "idempotency_hash", "VARCHAR(64)")
       add_column_if_missing("target_activations", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
+      ensure_worker_pool_primary_key!("mailbox_sequences", ["worker_pool", "target_kind", "target_type", "target_id"])
+      ensure_worker_pool_unique_key!("inbox", "target_sequence_unique", ["worker_pool", "target_kind", "target_type", "target_id", "sequence"])
+      ensure_worker_pool_primary_key!("target_activations", ["worker_pool", "target_kind", "target_type", "target_id"])
       backfill_inbox_idempotency_hashes!
       drop_index_if_present("inbox", "idempotency_key")
       add_index_if_missing("inbox", index_name("inbox", "idempotency_hash_unique"), "UNIQUE KEY #{quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash)")

@@ -873,6 +873,32 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "heartbeat_step treats the fenced lease renewal as authoritative for #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        workflow_id = store.enqueue_workflow(name: "heartbeat-fence", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 30)
+        store.record_step_started(workflow_id:, position: 0, name: "fenced")
+
+        # The genuine owner renews successfully while it holds the lease.
+        refute_nil store.heartbeat_step(workflow_id:, position: 0, worker_id: "owner", lease_seconds: 30, cursor: { "offset" => 1 })
+
+        # Simulate losing the lease in the window between an ownership read and the
+        # fenced renewal UPDATE: the conditional UPDATE matches zero rows. The renewal
+        # result must be authoritative, so heartbeat_step must report failure (nil)
+        # rather than trusting a stale ownership read or an unscoped locked_until lookup.
+        original = store.method(:execute_store_query)
+        store.define_singleton_method(:execute_store_query) do |id, params = [], **locals|
+          if id == :heartbeat_step_workflow
+            ActiveRecord::Result.empty(affected_rows: 0)
+          else
+            original.call(id, params, **locals)
+          end
+        end
+
+        assert_nil store.heartbeat_step(workflow_id:, position: 0, worker_id: "owner", lease_seconds: 30, cursor: { "offset" => 2 })
+      end
+    end
+
     test "fences terminal workflow status updates with the active workflow lease for #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         completion_id = store.enqueue_workflow(name: "fenced-complete", input: {})

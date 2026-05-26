@@ -697,7 +697,7 @@ module Durababble
       attempts = 0
       begin
         block.call
-      rescue ActiveRecord::SerializationFailure
+      rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
         raise if attempts >= max_attempts
 

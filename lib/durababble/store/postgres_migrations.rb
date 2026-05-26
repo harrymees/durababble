@@ -145,6 +145,7 @@ module Durababble
         )
       SQL
       execute("ALTER TABLE #{table("durable_objects")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
+      ensure_worker_pool_primary_key!("durable_objects", ["worker_pool", "object_type", "object_id"])
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
@@ -232,7 +233,62 @@ module Durababble
       execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
       execute("ALTER TABLE #{table("inbox")} ADD COLUMN IF NOT EXISTS idempotency_hash text")
       execute("ALTER TABLE #{table("target_activations")} ADD COLUMN IF NOT EXISTS worker_pool text NOT NULL DEFAULT 'default'")
+      ensure_worker_pool_primary_key!("mailbox_sequences", ["worker_pool", "target_kind", "target_type", "target_id"])
+      ensure_worker_pool_unique_key!("inbox", ["worker_pool", "target_kind", "target_type", "target_id", "sequence"])
+      ensure_worker_pool_primary_key!("target_activations", ["worker_pool", "target_kind", "target_type", "target_id"])
       backfill_inbox_idempotency_hashes!
+    end
+
+    # Widen a legacy PRIMARY KEY so it includes worker_pool. Fresh installs already define the
+    # worker-pool-scoped key in CREATE TABLE, so this is a no-op there; only schemas created before
+    # worker_pool existed get rebuilt. Without this, ON CONFLICT (worker_pool, ...) upserts fail on
+    # Postgres because no matching unique/primary constraint exists for the widened conflict target.
+    #: (String, Array[String]) -> void
+    def ensure_worker_pool_primary_key!(table_name, columns)
+      ensure_worker_pool_key!(table_name, columns, contype: "p", definition_keyword: "PRIMARY KEY")
+    end
+
+    # Widen a legacy UNIQUE constraint so it includes worker_pool. Same fresh-install no-op behaviour
+    # as the primary-key variant; guards against two worker pools colliding on the old narrower key.
+    #: (String, Array[String]) -> void
+    def ensure_worker_pool_unique_key!(table_name, columns)
+      ensure_worker_pool_key!(table_name, columns, contype: "u", definition_keyword: "UNIQUE")
+    end
+
+    #: (String, Array[String], contype: String, definition_keyword: String) -> void
+    def ensure_worker_pool_key!(table_name, columns, contype:, definition_keyword:)
+      constraints = key_constraints_with_columns(table_name, contype:)
+      desired = columns.join(",")
+      return if constraints.any? { |row| row.fetch("columns") == desired }
+
+      legacy = (columns - ["worker_pool"]).join(",")
+      legacy_constraint = constraints.find { |row| row.fetch("columns") == legacy }
+      if legacy_constraint
+        execute("ALTER TABLE #{table(table_name)} DROP CONSTRAINT IF EXISTS #{quote_column_name(legacy_constraint.fetch("conname"))}")
+      end
+      column_list = columns.map { |column| quote_column_name(column) }.join(", ")
+      execute("ALTER TABLE #{table(table_name)} ADD #{definition_keyword} (#{column_list})")
+    end
+
+    # Returns each PRIMARY KEY ('p') or UNIQUE ('u') constraint on the table with its ordered,
+    # comma-joined column list, so the caller can match by exact column signature rather than name.
+    #: (String, contype: String) -> Array[Hash[String, Object?]]
+    def key_constraints_with_columns(table_name, contype:)
+      # contype is a fixed internal value ('p' or 'u') supplied by this module, never user input, so
+      # it is inlined as a "char" literal. Binding it as a text parameter trips Postgres' "char" = text
+      # operator resolution.
+      execute_params(<<~SQL, [schema.to_s, table_name]).to_a
+        SELECT con.conname,
+               (
+                 SELECT string_agg(att.attname, ',' ORDER BY ck.ord)
+                 FROM unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord)
+                 JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ck.attnum
+               ) AS columns
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = '#{contype}'
+      SQL
     end
 
     #: () -> untyped
