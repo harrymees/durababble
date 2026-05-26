@@ -205,12 +205,25 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      update = if worker_id
-        execute_store_query(:complete_workflow_with_worker, [workflow_id, serialized_result, worker_id])
-      else
-        execute_store_query(:complete_workflow, [workflow_id, serialized_result])
+      transaction do
+        update = if worker_id
+          execute_store_query(:complete_workflow_with_worker, [workflow_id, serialized_result, worker_id])
+        else
+          execute_store_query(:complete_workflow, [workflow_id, serialized_result])
+        end
+        require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
+        # A control-flow wait_condition / wait_until satisfied by a delivered
+        # workflow command (rather than by its timer firing) returns control to
+        # execute while its recorded timer wait + waiting step are left behind:
+        # the command supersedes the wait, so nothing ever completes it. If the
+        # workflow then runs to completion, that live wait/step would strand on a
+        # terminal workflow. Terminalize it in the same transaction, exactly as
+        # cancellation/failure/termination do (the timer-firing path instead
+        # completes the wait+step before the workflow finishes, so this is a no-op
+        # there).
+        cancel_pending_waits_for_workflow(workflow_id)
+        update
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
     end
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object

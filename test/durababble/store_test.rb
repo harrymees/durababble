@@ -887,10 +887,13 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "terminal workflow updates choose fenced and unfenced SQL paths" do
-    # cancel_workflow finalization also issues the idempotent wait/step/attempt cleanup,
-    # so each cancel emits more than one query; scope the fence assertions to the terminal
-    # workflow-row updates (the only queries that touch runnable_immediately).
-    pg_fenced_connection = ScriptedPgConnection.new(params_results: Array.new(6) { sql_result([], affected_rows: 1) })
+    # complete_workflow / cancel_workflow / fail_workflow each also issue the idempotent
+    # wait/step/attempt cleanup cascade (three extra queries per terminal transition), so
+    # each terminal call emits four queries; scope the fence assertions to the terminal
+    # workflow-row updates (the only queries that touch runnable_immediately). Provide one
+    # affected_rows:1 result per emitted query so every fenced workflow-row update sees a
+    # live lease rather than falling onto a default empty result and raising LeaseConflict.
+    pg_fenced_connection = ScriptedPgConnection.new(params_results: Array.new(12) { sql_result([], affected_rows: 1) })
     pg_fenced_store = pg_store(pg_fenced_connection)
     pg_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")

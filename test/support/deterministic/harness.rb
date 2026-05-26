@@ -83,7 +83,7 @@ module Durababble
         activations_state = store.all_target_activations
 
         verify_workflow_invariants!(workflows_state)
-        verify_step_invariants!(workflows_state, steps_state, attempts_state)
+        verify_step_invariants!(workflows_state, steps_state, attempts_state, waits_state)
         verify_wait_invariants!(workflows_state, steps_state, waits_state)
         verify_outbox_invariants!(workflows_state, outbox_state)
         verify_fence_invariants!(fences_state)
@@ -310,7 +310,16 @@ module Durababble
       end
 
       #: (untyped, untyped, untyped) -> untyped
-      def verify_step_invariants!(workflows_state, steps_state, attempts_state)
+      def verify_step_invariants!(workflows_state, steps_state, attempts_state, waits_state)
+        # Steps backed by a wait row are control-flow waits (workflow-level
+        # wait_condition / wait_until / sleep): they go scheduled -> waiting ->
+        # completed/canceled WITHOUT ever recording a step_started, so they carry
+        # no attempt by design (the canonical history is step_scheduled,
+        # step_waiting -- no step_started). Only step-runner dispatched steps
+        # record an attempt, so the "must have an attempt" rule below applies to
+        # them, not to wait commands.
+        wait_positions = Hash.new { |hash, key| hash[key] = {} }
+        waits_state.each_value { |wait| wait_positions[wait.fetch("workflow_id")][wait.fetch("position")] = true }
         steps_state.each do |workflow_id, steps|
           violations << "steps exist for missing workflow #{workflow_id}" unless workflows_state.key?(workflow_id)
           completed_positions = steps.values.select { |step| step.fetch("status") == "completed" }.map { |step| step.fetch("position") }
@@ -330,7 +339,8 @@ module Durababble
             # implies at least one attempt.
             attempts = attempts_state[workflow_id].select { |attempt| attempt.fetch("position") == position }
             scheduled = status == StepStatus::SCHEDULED
-            if attempts.empty? && !scheduled
+            wait_backed = wait_positions[workflow_id].key?(position)
+            if attempts.empty? && !scheduled && !wait_backed
               violations << "step #{workflow_id}/#{position} has no attempt history"
             end
             if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && (scheduled || AttemptStatus.live?(status))
