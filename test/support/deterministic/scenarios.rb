@@ -1512,12 +1512,12 @@ module Durababble
             specs.each { |spec| schedule_wake(name: spec.fetch("name"), at: spec.fetch("at"), payload: spec.fetch("payload")) }
             update_state(current_state.merge("armed" => current_state.fetch("armed") + specs.map { |spec| spec.fetch("name") }))
           end
-          expose_command :arm
-          define_method(:on_wake) do |name:, payload:|
+          expose_command(:arm)
+          define_method(:on_wake) do |name:, payload:| # rubocop:disable Lint/UnusedBlockArgument
             update_state(current_state.merge("wakes" => current_state.fetch("wakes") | [name]))
           end
           define_method(:snapshot) { current_state }
-          expose :snapshot
+          expose(:snapshot)
         end
       end
 

@@ -912,11 +912,16 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal([["retry", { "kind" => "retry" }], ["ttl", { "kind" => "ttl-v2" }]], delivered)
 
         # schedule_many records several names atomically in a single command.
-        AlarmTestObject.tell("alarm-many", :schedule_many, [
-          { "name" => "a", "at" => wake_at, "payload" => { "n" => 1 } },
-          { "name" => "b", "at" => wake_at, "payload" => { "n" => 2 } },
-          { "name" => "c", "at" => wake_at, "payload" => { "n" => 3 } },
-        ], store:)
+        AlarmTestObject.tell(
+          "alarm-many",
+          :schedule_many,
+          [
+            { "name" => "a", "at" => wake_at, "payload" => { "n" => 1 } },
+            { "name" => "b", "at" => wake_at, "payload" => { "n" => 2 } },
+            { "name" => "c", "at" => wake_at, "payload" => { "n" => 3 } },
+          ],
+          store:,
+        )
         assert_equal :worked, worker.tick
         assert_equal 3, store.wake_due_timers(now: wake_at + 1)
         assert_equal 3, wake_inbox(store, "alarm-many").length
@@ -945,10 +950,15 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal ["drop"], AlarmTestObject.at("alarm-cancel", store:).snapshot.fetch("canceled")
 
         # cancel_all_wakes clears every remaining named wake for the object.
-        AlarmTestObject.tell("alarm-clear", :schedule_many, [
-          { "name" => "x", "at" => wake_at, "payload" => { "n" => 1 } },
-          { "name" => "y", "at" => wake_at, "payload" => { "n" => 2 } },
-        ], store:)
+        AlarmTestObject.tell(
+          "alarm-clear",
+          :schedule_many,
+          [
+            { "name" => "x", "at" => wake_at, "payload" => { "n" => 1 } },
+            { "name" => "y", "at" => wake_at, "payload" => { "n" => 2 } },
+          ],
+          store:,
+        )
         assert_equal :worked, worker.tick
         AlarmTestObject.tell("alarm-clear", :cancel_all_alarms, store:)
         assert_equal :worked, worker.tick
