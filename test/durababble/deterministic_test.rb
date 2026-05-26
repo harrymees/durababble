@@ -36,6 +36,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
     "workflow_command_claim_window_crash_matrix",
+    "workflow_command_delivery_to_terminal_workflow",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -428,6 +429,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "fault.injected"
     assert_includes result.trace, "delivery_crashed_after_commit"
+  end
+
+  test "dead-letters queued commands when their workflow terminated before delivery" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_to_terminal_workflow", seed: 7)
+
+    assert_empty result.violations
   end
 
   test "reclaims durably-leased rows after an injected crash inside a claim window" do
