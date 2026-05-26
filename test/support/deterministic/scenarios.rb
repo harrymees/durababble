@@ -113,38 +113,36 @@ module Durababble
         run(seed, "bug_invalid_store_shape") do |h|
           id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.mark_workflow_running(id)
+          base = h.store.workflow(id)
 
-          workflows_state = h.store.instance_variable_get(:@workflows)
-          steps_state = h.store.instance_variable_get(:@steps)
-          attempts_state = h.store.instance_variable_get(:@attempts)
-          waits_state = h.store.instance_variable_get(:@waits)
-          outbox_state = h.store.instance_variable_get(:@outbox)
-
-          workflows_state["bad-status-workflow"] = workflows_state.fetch(id).merge(
+          # Impossible shapes injected via the store's test-only overlay (the real
+          # schema's NOT NULL / FK constraints would reject these), so the harness
+          # invariant checkers see the same corrupt state they must flag.
+          h.store.inject_workflow(base.merge(
             "id" => "bad-status-workflow",
             "status" => "mystery",
             "locked_by" => nil,
             "locked_until" => nil,
-          )
-          workflows_state["partial-lease-workflow"] = workflows_state.fetch(id).merge(
+          ))
+          h.store.inject_workflow(base.merge(
             "id" => "partial-lease-workflow",
             "status" => "pending",
             "locked_by" => "worker-a",
             "locked_until" => nil,
-          )
-          workflows_state["locked-waiting-workflow"] = workflows_state.fetch(id).merge(
+          ))
+          h.store.inject_workflow(base.merge(
             "id" => "locked-waiting-workflow",
             "status" => "waiting",
             "locked_by" => "stale",
             "locked_until" => h.scheduler.time + 10,
-          )
-          workflows_state["terminal-live-step-workflow"] = workflows_state.fetch(id).merge(
+          ))
+          h.store.inject_workflow(base.merge(
             "id" => "terminal-live-step-workflow",
             "status" => "completed",
             "locked_by" => nil,
             "locked_until" => nil,
-          )
-          steps_state["missing-workflow"][0] = {
+          ))
+          h.store.inject_step({
             "workflow_id" => "missing-workflow",
             "position" => 0,
             "name" => "missing_owner",
@@ -152,8 +150,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state["missing-workflow"] << {
+          })
+          h.store.inject_attempt({
             "id" => "missing-workflow-attempt",
             "workflow_id" => "missing-workflow",
             "position" => 0,
@@ -162,8 +160,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state[id][0] = {
+          })
+          h.store.inject_step({
             "workflow_id" => id,
             "position" => 0,
             "name" => "orphaned_step",
@@ -171,8 +169,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state[id][3] = {
+          })
+          h.store.inject_step({
             "workflow_id" => "other-workflow",
             "position" => 4,
             "name" => "bad_step",
@@ -180,8 +178,10 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
+            "__group_id" => id,
+            "__position_key" => 3,
+          })
+          h.store.inject_attempt({
             "id" => "mismatched-step-attempt",
             "workflow_id" => id,
             "position" => 3,
@@ -190,8 +190,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state[id][4] = {
+          })
+          h.store.inject_step({
             "workflow_id" => id,
             "position" => 9,
             "name" => "duplicate_completed_a",
@@ -199,8 +199,9 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state[id][5] = {
+            "__position_key" => 4,
+          })
+          h.store.inject_step({
             "workflow_id" => id,
             "position" => 9,
             "name" => "duplicate_completed_b",
@@ -208,8 +209,9 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state[id][8] = {
+            "__position_key" => 5,
+          })
+          h.store.inject_step({
             "workflow_id" => id,
             "position" => 8,
             "name" => "multi_live",
@@ -217,8 +219,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
+          })
+          h.store.inject_attempt({
             "id" => "live-attempt-a",
             "workflow_id" => id,
             "position" => 8,
@@ -227,8 +229,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
+          })
+          h.store.inject_attempt({
             "id" => "live-attempt-b",
             "workflow_id" => id,
             "position" => 8,
@@ -237,8 +239,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          steps_state["terminal-live-step-workflow"][0] = {
+          })
+          h.store.inject_step({
             "workflow_id" => "terminal-live-step-workflow",
             "position" => 0,
             "name" => "still_running",
@@ -246,8 +248,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state["terminal-live-step-workflow"] << {
+          })
+          h.store.inject_attempt({
             "id" => "terminal-live-attempt",
             "workflow_id" => "terminal-live-step-workflow",
             "position" => 0,
@@ -256,8 +258,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
+          })
+          h.store.inject_attempt({
             "id" => "bad-attempt",
             "workflow_id" => id,
             "position" => 1,
@@ -266,8 +268,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          attempts_state[id] << {
+          })
+          h.store.inject_attempt({
             "id" => "bad-status-attempt",
             "workflow_id" => "other-workflow",
             "position" => 99,
@@ -276,8 +278,8 @@ module Durababble
             "result" => nil,
             "error" => nil,
             "heartbeat_cursor" => nil,
-          }
-          waits_state["bad-wait"] = {
+          })
+          h.store.inject_wait({
             "id" => "bad-wait",
             "workflow_id" => id,
             "position" => 2,
@@ -287,8 +289,8 @@ module Durababble
             "context" => {},
             "payload" => nil,
             "status" => "completed",
-          }
-          waits_state["bad-status-wait"] = {
+          })
+          h.store.inject_wait({
             "id" => "bad-status-wait",
             "workflow_id" => id,
             "position" => 0,
@@ -298,8 +300,8 @@ module Durababble
             "context" => {},
             "payload" => nil,
             "status" => "mystery",
-          }
-          waits_state["completed-running-step-wait"] = {
+          })
+          h.store.inject_wait({
             "id" => "completed-running-step-wait",
             "workflow_id" => id,
             "position" => 0,
@@ -309,8 +311,8 @@ module Durababble
             "context" => {},
             "payload" => nil,
             "status" => "completed",
-          }
-          waits_state["missing-workflow-wait"] = {
+          })
+          h.store.inject_wait({
             "id" => "missing-workflow-wait",
             "workflow_id" => "missing-workflow",
             "position" => 9,
@@ -320,8 +322,8 @@ module Durababble
             "context" => {},
             "payload" => nil,
             "status" => "pending",
-          }
-          outbox_state["bad-outbox"] = {
+          })
+          h.store.inject_outbox({
             "id" => "bad-outbox",
             "workflow_id" => "missing-workflow",
             "topic" => "email",
@@ -330,8 +332,8 @@ module Durababble
             "status" => "processing",
             "locked_by" => nil,
             "locked_until" => nil,
-          }
-          outbox_state["bad-status-outbox"] = {
+          })
+          h.store.inject_outbox({
             "id" => "bad-status-outbox",
             "workflow_id" => id,
             "topic" => "email",
@@ -340,7 +342,7 @@ module Durababble
             "status" => "mystery",
             "locked_by" => nil,
             "locked_until" => nil,
-          }
+          })
         end
       end
 
@@ -349,8 +351,9 @@ module Durababble
         run(seed, "bug_stuck_fence") do |h|
           id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.mark_workflow_running(id)
-          fences = h.store.instance_variable_get(:@fences)
-          fences[[id, "charge"]] = {
+          # A fence left running by a crashed holder, its lease already expired and
+          # never reclaimed — the stuck-fence checker must flag it.
+          h.store.inject_fence({
             "workflow_id" => id,
             "key" => "charge",
             "status" => "running",
@@ -358,7 +361,7 @@ module Durababble
             "error" => nil,
             "locked_by" => "crashed-worker",
             "locked_until" => h.scheduler.time - 1,
-          }
+          })
         end
       end
 
@@ -1554,15 +1557,19 @@ module Durababble
         trace = Trace.new
         scheduler = Scheduler.new(seed:, trace:)
         network = VirtualNetwork.new(scheduler:, drop_percent: scenario == "chaos" ? 5 : 0)
-        store = VirtualYugabyte.new(scheduler:)
-        harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
-        trace.event(0, "dst", "begin", scenario:, seed:)
-        block.call(harness)
-        scheduler.run
-        harness.verify!
-        trace.event(scheduler.time, "dst", "end", scenario:, seed:)
-        trace_s = trace.to_s
-        Result.new(scenario:, seed:, trace: trace_s, digest: Digest::SHA256.hexdigest(trace_s), violations: harness.violations, summary: store.summary)
+        store = DeterministicSqliteStore.build(scheduler:)
+        begin
+          harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
+          trace.event(0, "dst", "begin", scenario:, seed:)
+          block.call(harness)
+          scheduler.run
+          harness.verify!
+          trace.event(scheduler.time, "dst", "end", scenario:, seed:)
+          trace_s = trace.to_s
+          Result.new(scenario:, seed:, trace: trace_s, digest: Digest::SHA256.hexdigest(trace_s), violations: harness.violations, summary: store.summary)
+        ensure
+          store.close
+        end
       end
     end
   end

@@ -113,8 +113,11 @@ module Durababble
       sql = sql.gsub(/\s*FORCE INDEX \([^)]*\)/i, "")
       sql = sql.gsub(/INSERT IGNORE INTO/i, "INSERT OR IGNORE INTO")
       # The integer clock counts microseconds, so a SECOND interval must be
-      # scaled by 1_000_000. Without this, a 30s lease would expire 30µs later.
-      sql = sql.gsub(/DATE_ADD\(\s*NOW\(6\)\s*,\s*INTERVAL\s+(.+?)\s+SECOND\)/i) { "(dura_now() + (#{::Regexp.last_match(1)}) * 1000000)" }
+      # scaled by #seconds_scale. Without this, a 30s lease would expire 30µs
+      # later. The deterministic store runs a 1-tick == 1-second clock and
+      # overrides #seconds_scale to 1.
+      scale = seconds_scale
+      sql = sql.gsub(/DATE_ADD\(\s*NOW\(6\)\s*,\s*INTERVAL\s+(.+?)\s+SECOND\)/i) { "(dura_now() + (#{::Regexp.last_match(1)}) * #{scale})" }
       sql = sql.gsub(/NOW\(6\)/i, "dura_now()")
       sql = sql.gsub(/\bLEAST\(/i, "MIN(")
       sql = sql.gsub(/\bGREATEST\(/i, "MAX(")
@@ -177,6 +180,15 @@ module Durababble
 
       time = time #: as untyped
       (time.to_r * 1_000_000).to_i
+    end
+
+    # How many integer clock units make up one SECOND interval. The base store's
+    # clock counts microseconds, so a NOW(6) + INTERVAL n SECOND must scale n by
+    # 1_000_000. The deterministic subclass runs a 1-tick == 1-second clock and
+    # overrides this to 1.
+    #: () -> Integer
+    def seconds_scale
+      1_000_000
     end
 
     # Integer-clock variants of the base comparison helpers (the base assumes

@@ -1,7 +1,7 @@
 # typed: true
 # frozen_string_literal: true
 
-require_relative "virtual_yugabyte"
+require_relative "deterministic_sqlite_store"
 
 module Durababble
   module Deterministic

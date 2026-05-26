@@ -77,7 +77,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:side_effects)
     assert_equal 1, result.summary.fetch(:processed_outbox)
     assert_includes result.trace, "network.send"
-    assert_includes result.trace, "virtual_yugabyte"
+    assert_includes result.trace, "store"
   end
 
   test "reclaims expired workflow leases deterministically" do
@@ -202,10 +202,10 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
-  test "virtual store keeps command history coherent for deferred waits and cancellation" do
+  test "deterministic store keeps command history coherent for deferred waits and cancellation" do
     trace = Durababble::Deterministic::Trace.new
     scheduler = Durababble::Deterministic::Scheduler.new(seed: 61, trace:)
-    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+    store = Durababble::Deterministic::DeterministicSqliteStore.build(scheduler:)
 
     workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
@@ -264,10 +264,10 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_nil store.workflow_cancellation(completed_id)
   end
 
-  test "virtual store no-op lease and queue paths stay inert" do
+  test "deterministic store no-op lease and queue paths stay inert" do
     trace = Durababble::Deterministic::Trace.new
     scheduler = Durababble::Deterministic::Scheduler.new(seed: 62, trace:)
-    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+    store = Durababble::Deterministic::DeterministicSqliteStore.build(scheduler:)
 
     workflow_id = store.enqueue_workflow(name: "virtual-noops", input: {})
 
@@ -277,7 +277,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_nil store.claim_outbox(worker_id: "sender", lease_seconds: 10)
 
     outbox_id = store.enqueue_outbox(workflow_id:, topic: "topic", payload: {}, key: "key")
-    assert_nil store.ack_outbox(outbox_id, worker_id: "wrong-sender")
+    assert_equal 0, store.ack_outbox(outbox_id, worker_id: "wrong-sender").affected_rows
     assert_equal "pending", store.outbox_message(outbox_id).fetch("status")
 
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
