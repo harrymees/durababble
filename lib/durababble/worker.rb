@@ -5,6 +5,9 @@ require "time"
 
 module Durababble
   class Worker
+    # Base delay before re-attempting to forward a target activation that could
+    # not be delivered. Applied through Backoff.jittered so a fleet of workers
+    # racing on the same activation does not retry in lockstep.
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
 
     #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped, ?worker_pool: String) -> void
@@ -147,7 +150,7 @@ module Durababble
             target_type: object_type,
             target_id: object_id,
             worker_pool:,
-            ready_at: Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
+            ready_at: Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS),
           )
         end
         return
@@ -160,7 +163,7 @@ module Durababble
         target_id: object_id,
         worker_pool:,
         worker_id: @worker_id,
-        now: drained.positive? ? Time.now : Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
+        now: drained.positive? ? Time.now : Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS),
       )
     end
 
@@ -176,7 +179,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def activation_retry_time(workflow_id)
-      retry_at = Time.now + ACTIVATION_FORWARD_RETRY_SECONDS
+      retry_at = Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS)
       row = @store.workflow(workflow_id)
       locked_until = row["locked_until"]
       if row.fetch("status") == "running" && locked_until

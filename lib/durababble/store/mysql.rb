@@ -5,6 +5,11 @@ module Durababble
   class MysqlStore < SqlStore
     include MysqlMigrations
 
+    # Retry budget for transactions that hit a retryable error (deadlock /
+    # lock-wait timeout). Backoff grows linearly per attempt and is jittered.
+    MAX_TRANSACTION_RETRY_ATTEMPTS = 5
+    TRANSACTION_RETRY_STEP_SECONDS = 0.01
+
     class << self
       #: (uri: Object, schema: String) -> Store
       def connect(uri:, schema:)
@@ -739,9 +744,9 @@ module Durababble
       begin
         @connection.transaction(requires_new: true, **options, &block)
       rescue StandardError => error
-        if retryable_mysql_error?(error) && attempts < 5
+        if retryable_mysql_error?(error) && attempts < MAX_TRANSACTION_RETRY_ATTEMPTS
           attempts += 1
-          sleep(0.01 * attempts)
+          sleep(Backoff.linear(attempts, step: TRANSACTION_RETRY_STEP_SECONDS))
           retry
         end
 
