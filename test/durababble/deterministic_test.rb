@@ -35,6 +35,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "cancellation_cleanup_crash_fuzz",
     "cancellation_during_suspend_race",
     "parallel_branch_failure_orphans_step",
+    "parallel_wait_with_retrying_sibling",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
     "stolen_lease_write_rejection",
@@ -499,6 +500,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
   test "terminalizes a parked parallel branch when a sibling fails the workflow" do
     result = Durababble::Deterministic.prove("parallel_branch_failure_orphans_step", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "re-parks a parallel wait branch across a sibling step's retry and settles" do
+    result = Durababble::Deterministic.prove("parallel_wait_with_retrying_sibling", seed: 1)
 
     assert_empty result.violations
   end
