@@ -66,7 +66,7 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
-`Workflow.enqueue(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, engine: nil, id: nil, idempotency_key: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, termination, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
+`Workflow.enqueue(input, id: nil, engine: nil, store: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, id: nil, engine: nil, store: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. When `id:` is omitted, Durababble generates a new workflow id above the store boundary; when `id:` is provided, the enqueue path persists that exact id atomically in the selected worker pool and raises `Durababble::WorkflowAlreadyExists` if a workflow row already owns it, without appending workflow history, inbox messages, waits, or target activations. Completed, failed, canceled, and terminated workflow rows still own their ids, so deterministic ids are deduplication keys for the full lifetime of stored workflow state. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, termination, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
@@ -113,7 +113,7 @@ Lifecycle callbacks are `on_create`, `on_load`, `on_wake(payload: nil)`, and `on
 
 Durable objects support one pending `sleep_until(at:, payload: nil)` wakeup per object id. `sleep_until` atomically replaces the pending sleep row in the same transaction as the command state write. `cancel_sleep` removes it. Matured sleeps convert atomically into durable mailbox wake messages.
 
-Management operations exist for operator use: `list`, `find`, `pause`, `resume`, `cancel`, `destroy!`, `evict`, and explicit `relocate_worker_pool`.
+Durable object management APIs in the current contract are limited to `list`, `find`, `cancel`, `destroy!`, `evict`, and explicit `relocate_worker_pool`. Durable-object `pause` and `resume` control APIs are not part of this contract.
 
 Durababble does not provide a block-form durable-object `.with(id) { ... }` API. Multi-method atomicity is expressed by writing one command method that performs the full operation.
 
@@ -320,7 +320,7 @@ Object inboxes are push-driven. The owner pod drains commands, wakes, and intern
 
 Commands execute one at a time in strict FIFO order per durable target. Target executors drain only the contiguous ready prefix from the mailbox head. `SKIP LOCKED` must not let later messages overtake a blocked head for the same target.
 
-If the mailbox head is waiting for backoff, paused, dead-lettered, or otherwise blocked, later messages for the same target must not run. A dead-lettered or backed-off head remains blocking until an operator retries, skips, cancels, destroys, or repairs the target.
+If the mailbox head is waiting for backoff, dead-lettered, or otherwise blocked, later messages for the same target must not run. A dead-lettered or backed-off head remains blocking until an operator retries, skips, cancels, destroys, or repairs the target.
 
 Object message completion, state write, sleep updates, and mailbox head advancement are one fenced transaction. A crash cannot leave state persisted without the corresponding ask result/message completion, or message completion without the corresponding state write.
 
@@ -565,7 +565,7 @@ Size guards are production requirements. Durababble warns at configured threshol
 
 The workflow-history guard is a replay-cost and correctness guard, not a retention system. Applications should alert on the warning log at `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS`, alert on `Durababble::WorkflowHistoryLimitExceeded`, inspect the workflow type/id and history count, and remediate by splitting the workflow into smaller durable runs/objects, pruning or compacting old terminal histories with an explicit operator tool, or raising `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` only after the long-history benchmark shows acceptable replay latency and allocation cost.
 
-Operational surfaces include CLI migration, workflow run/resume, inspection, version output, built-in bounded listing/finding of workflows and objects, and operator actions for dead-lettered mailbox heads: retry now, skip, cancel target, destroy target, and repair/decode failed payloads.
+CLI tooling is not part of the current Durababble contract. Store migrations remain an explicit setup/deploy responsibility through the store API, and runtime operation is embedded through `Durababble::WorkerRuntime`, `Durababble::Worker`, workflow handles, durable-object handles, and application-owned process supervision. Future non-contract operator or web tooling may add version and inspection views, bounded workflow/object listing, history pruning, dead-letter retry/skip/cancel/destroy/repair flows, and similar operational controls, but this specification does not require a CLI for migration, workflow run/resume, inspection, version output, or operator repair.
 
 Observability requirements:
 
@@ -624,7 +624,6 @@ Observability requirements:
 | Transient exposed methods route to owner | `CallTransient` invokes live object/workflow owner without durable mutation. | Transient RPC specs |
 | Worker pool scopes persisted targets and relevant keys | Persisted targets and query-critical keys include `worker_pool` where routing/claiming requires it. | Worker-pool backend specs |
 | Unified inbox is the durable message model | Object commands, object wakes, and workflow commands share one inbox contract. | Inbox/mailbox specs |
-| CLI supports operational basics | CLI supports migration, workflow run/resume, inspection, and version output. | CLI spec |
 
 ## Crash matrix
 

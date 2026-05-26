@@ -201,6 +201,10 @@ module Durababble
     end
 
     class Server
+      # Cap how long #stop blocks waiting for the serving task to drain. A hung
+      # request must not wedge shutdown forever; we log and move on past this.
+      STOP_DRAIN_TIMEOUT = 5.0
+
       #: String?
       attr_reader :node_id
       #: String
@@ -208,7 +212,7 @@ module Durababble
       #: Integer?
       attr_reader :port
 
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Symbol, ?pool_size: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
       def initialize(
         node_id:,
         store:,
@@ -225,7 +229,8 @@ module Durababble
         evict_lease: nil,
         deliver_message: nil,
         verify_deliver_message_owner: true,
-        identity_id: nil
+        identity_id: nil,
+        stop_drain_timeout: STOP_DRAIN_TIMEOUT
       )
         @node_id = node_id
         @store = store
@@ -243,6 +248,7 @@ module Durababble
         @deliver_message = deliver_message
         @verify_deliver_message_owner = verify_deliver_message_owner
         @identity_id = identity_id
+        @stop_drain_timeout = stop_drain_timeout
       end
 
       #: () -> Server
@@ -273,7 +279,16 @@ module Durababble
       #: () -> void
       def stop
         @server&.stop
-        @server_task&.wait
+        task = @server_task
+        if task
+          task.wait(@stop_drain_timeout)
+          if task.pending?
+            Durababble.logger&.warn(
+              "Durababble::Rpc::Server#stop timed out after #{@stop_drain_timeout}s " \
+                "waiting for the serving task to drain; abandoning it",
+            )
+          end
+        end
       ensure
         @server = nil
         @server_task = nil

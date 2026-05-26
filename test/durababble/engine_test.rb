@@ -139,7 +139,7 @@ class DurababbleEngineTest < DurababbleTestCase
       "wf-inline"
     end
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       raise "Engine#run should create the leased running workflow directly"
     end
 
@@ -183,9 +183,9 @@ class DurababbleEngineTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
-      @enqueued << { name:, input:, worker_pool: }
-      "wf-#{@enqueued.length}"
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @enqueued << { name:, input:, id:, worker_pool: }
+      id || "wf-#{@enqueued.length}"
     end
   end
 
@@ -237,9 +237,19 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
     assert_equal 0, store.migrations
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "default" }], store.enqueued
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "default" }], store.enqueued
+  end
+
+  test "passes explicit workflow ids to the store enqueue path" do
+    store = MigrationTrackingStore.new
+    engine = Durababble::Engine.new(store:)
+
+    workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: "wf-explicit", worker_pool: "default" }], store.enqueued
   end
 
   test "engine enqueue writes workflows into its worker pool" do
@@ -248,8 +258,8 @@ class DurababbleEngineTest < DurababbleTestCase
 
     workflow_id = engine.enqueue(ImmediateWorkflow, input: { "seed" => 1 })
 
-    assert_equal "wf-1", workflow_id
-    assert_equal [{ name: "immediate", input: { "seed" => 1 }, worker_pool: "critical" }], store.enqueued
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal [{ name: "immediate", input: { "seed" => 1 }, id: workflow_id, worker_pool: "critical" }], store.enqueued
   end
 
   test "passes worker ownership to terminal workflow status update without prechecking lease" do
@@ -274,6 +284,8 @@ class DurababbleEngineTest < DurababbleTestCase
     assert_empty store.completed
     assert_equal "msg-1", store.failed.fetch(0).fetch(:message_id)
     assert_match(/RuntimeError: stop/, store.failed.fetch(0).fetch(:error))
+    # The command-dispatch failure must keep the backtrace, not just class + message.
+    assert_match(/engine_test\.rb:\d+/, store.failed.fetch(0).fetch(:error))
     assert_equal ["wf-1", "worker-a"], store.suspended
   end
 
@@ -430,6 +442,23 @@ class DurababbleEngineTest < DurababbleTestCase
         assert_equal first.error, second.error
         assert_equal 1, attempts
         assert_nil store.workflow(first.id).fetch("next_run_at")
+      end
+    end
+
+    test "preserves the failing step backtrace in the persisted workflow error with #{backend.name}" do
+      with_durababble_store(backend, "engine_test") do |store|
+        workflow = durababble_test_workflow("backtrace-capture") do
+          test_step("explode") { |_ctx| raise "boom" }
+        end
+        engine = Durababble::Engine.new(store:, worker_id: "owner")
+
+        run = engine.run(workflow, input: {})
+
+        assert_equal "failed", run.status
+        assert_match(/RuntimeError: boom/, run.error)
+        # The backtrace must survive so operators can locate the failing frame.
+        assert_match(/engine_test\.rb:\d+/, run.error)
+        assert_equal run.error, store.workflow(run.id).fetch("error")
       end
     end
 

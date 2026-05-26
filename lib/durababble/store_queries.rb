@@ -441,8 +441,8 @@ module Durababble
       SQL
     end
 
-    define(:pg_mark_wait_workflow_pending, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'waiting'"
+    define(:pg_mark_waits_workflows_pending, backend: :postgres) do |store, placeholders:|
+      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now() WHERE id IN (#{placeholders}) AND status = 'waiting'"
     end
 
     define(:pg_complete_step, backend: :postgres) do |store|
@@ -1759,8 +1759,8 @@ module Durababble
       "UPDATE #{table(store, "waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_mark_wait_workflow_pending, backend: :mysql) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'waiting'"
+    define(:mysql_mark_waits_workflows_pending, backend: :mysql) do |store, placeholders:|
+      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id IN (#{placeholders}) AND status = 'waiting'"
     end
 
     define(:mysql_lock_workflow_history_workflow, backend: :mysql) do |store|

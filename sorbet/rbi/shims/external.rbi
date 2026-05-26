@@ -24,6 +24,7 @@ module ActiveRecord
   class ActiveRecordError < StandardError; end
   class Deadlocked < ActiveRecordError; end
   class PreparedStatementInvalid < ActiveRecordError; end
+  class RecordNotUnique < ActiveRecordError; end
   class SerializationFailure < ActiveRecordError; end
 
   class Base

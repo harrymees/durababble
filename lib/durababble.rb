@@ -7,6 +7,7 @@ require "logger"
 require_relative "durababble/version"
 require_relative "durababble/statuses"
 require_relative "durababble/observability"
+require_relative "durababble/backoff"
 
 module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
@@ -37,6 +38,7 @@ module Durababble
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
+  class WorkflowAlreadyExists < Error; end
 
   class CancellationError < Error
     #: String?

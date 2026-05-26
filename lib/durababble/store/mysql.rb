@@ -5,6 +5,11 @@ module Durababble
   class MysqlStore < SqlStore
     include MysqlMigrations
 
+    # Retry budget for transactions that hit a retryable error (deadlock /
+    # lock-wait timeout). Backoff grows linearly per attempt and is jittered.
+    MAX_TRANSACTION_RETRY_ATTEMPTS = 5
+    TRANSACTION_RETRY_STEP_SECONDS = 0.01
+
     class << self
       #: (uri: Object, schema: String) -> Store
       def connect(uri:, schema:)
@@ -466,15 +471,17 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
-      id = SecureRandom.uuid
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+      workflow_id = id
       if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, worker_pool, status, dump_serialized(input), worker_id, lease_seconds || 60])
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, dump_serialized(input), worker_id, lease_seconds || 60])
       else
-        execute_store_query(:insert_workflow, [id, name, worker_pool, status, dump_serialized(input)])
+        execute_store_query(:insert_workflow, [workflow_id, name, worker_pool, status, dump_serialized(input)])
       end
-      id
+      workflow_id
+    rescue ActiveRecord::RecordNotUnique
+      raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
     #: (workflow_id: String, worker_id: String) -> bool
@@ -703,8 +710,8 @@ module Durababble
         record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-        execute_store_query(:mark_wait_workflow_pending, [wait.fetch("workflow_id")])
       end
+      mark_waits_workflows_pending(waits)
       Observability.count("durababble.waits.completed", by: waits.length)
       waits.length
     end
@@ -739,9 +746,9 @@ module Durababble
       begin
         @connection.transaction(requires_new: true, **options, &block)
       rescue StandardError => error
-        if retryable_mysql_error?(error) && attempts < 5
+        if retryable_mysql_error?(error) && attempts < MAX_TRANSACTION_RETRY_ATTEMPTS
           attempts += 1
-          sleep(0.01 * attempts)
+          sleep(Backoff.linear(attempts, step: TRANSACTION_RETRY_STEP_SECONDS))
           retry
         end
 

@@ -3,6 +3,8 @@
 
 require_relative "../test_helper"
 require "thread"
+require "stringio"
+require "logger"
 
 class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class RuntimeBranchStore
@@ -135,6 +137,26 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_kind_of RuntimeError, runtime.last_error
     assert_equal "boom", runtime.last_error.message
     assert_equal false, store.closed
+  end
+
+  test "logs unexpected polling errors so recurring failures are not silent" do
+    log_output = StringIO.new
+    previous_logger = Durababble.logger
+    Durababble.logger = Logger.new(log_output)
+    store = RuntimeBranchStore.new(tick_results: [RuntimeError.new("boom"), RuntimeError.new("boom")])
+    runtime = Durababble::WorkerRuntime.new(
+      store:,
+      workflows: {},
+      worker_pool: "default",
+      poll_interval: 0.01,
+      migrate: false,
+    )
+
+    runtime.start
+    eventually(timeout: 3) { assert_match(/boom/, log_output.string) }
+  ensure
+    runtime&.close
+    Durababble.logger = previous_logger
   end
 
   test "uses one pool-backed store for worker and rpc paths when it owns the store" do

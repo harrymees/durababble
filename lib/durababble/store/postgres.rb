@@ -5,6 +5,15 @@ module Durababble
   class PostgresStore < SqlStore
     include PostgresMigrations
 
+    # Retry budgets for serialization/deadlock failures. Backoff grows linearly
+    # per attempt and is jittered to decorrelate competing transactions.
+    # The statement path tolerates more attempts with a coarser step because it
+    # wraps individual statements that may legitimately collide repeatedly.
+    MAX_SERIALIZATION_RETRY_ATTEMPTS = 5
+    SERIALIZATION_RETRY_STEP_SECONDS = 0.001
+    MAX_STATEMENT_RETRY_ATTEMPTS = 20
+    STATEMENT_RETRY_STEP_SECONDS = 0.05
+
     #: () -> Object?
     def drop_schema!
       execute_store_query(:drop_schema)
@@ -411,15 +420,17 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
-      id = SecureRandom.uuid
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+      workflow_id = id
       if worker_id
-        execute_store_query(:insert_workflow_with_worker, [id, name, worker_pool, status, dump_serialized(input), worker_id, lease_seconds || 60])
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, dump_serialized(input), worker_id, lease_seconds || 60])
       else
-        execute_store_query(:insert_workflow, [id, name, worker_pool, status, dump_serialized(input)])
+        execute_store_query(:insert_workflow, [workflow_id, name, worker_pool, status, dump_serialized(input)])
       end
-      id
+      workflow_id
+    rescue ActiveRecord::RecordNotUnique
+      raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
     #: (String) -> Object?
@@ -629,8 +640,8 @@ module Durababble
         record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-        execute_store_query(:mark_wait_workflow_pending, [wait.fetch("workflow_id")])
       end
+      mark_waits_workflows_pending(rows)
       Observability.count("durababble.waits.completed", by: rows.length)
       rows.length
     end
@@ -678,7 +689,7 @@ module Durababble
     end
 
     #: (?max_attempts: Integer) { () -> Object? } -> Object?
-    def retry_serialization_failures(max_attempts: 5, &block)
+    def retry_serialization_failures(max_attempts: MAX_SERIALIZATION_RETRY_ATTEMPTS, &block)
       attempts = 0
       begin
         block.call
@@ -686,7 +697,7 @@ module Durababble
         attempts += 1
         raise if attempts >= max_attempts
 
-        sleep(0.001 * attempts)
+        sleep(Backoff.linear(attempts, step: SERIALIZATION_RETRY_STEP_SECONDS))
         retry
       end
     end
@@ -698,9 +709,9 @@ module Durababble
         @connection.exec_query(sql)
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
-        raise if attempts >= 20
+        raise if attempts >= MAX_STATEMENT_RETRY_ATTEMPTS
 
-        sleep(0.05 * attempts)
+        sleep(Backoff.linear(attempts, step: STATEMENT_RETRY_STEP_SECONDS))
         retry
       end
     end

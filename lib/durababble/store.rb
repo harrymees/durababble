@@ -239,8 +239,8 @@ module Durababble
       end
     end
 
-    #: (name: String, input: Object?, ?worker_pool: String) -> String
-    def enqueue_workflow(name:, input:, worker_pool: "default")
+    #: (name: String, input: Object?, ?id: String?, ?worker_pool: String) -> String
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       raise NotImplementedError
     end
 
