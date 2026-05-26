@@ -119,7 +119,12 @@ module Durababble
     FAILED = "failed"
     RUNNING = "running"
     DEAD_LETTERED = "dead_lettered"
+    # A delivered command is retained in the inbox table as `completed` (UPDATE,
+    # not DELETE), so it is a valid persisted status even though it is never an
+    # activatable mailbox head.
+    COMPLETED = "completed"
 
+    ALL = [PENDING, FAILED, RUNNING, DEAD_LETTERED, COMPLETED].freeze
     ACTIVATABLE = [PENDING, FAILED, RUNNING].freeze
 
     class << self

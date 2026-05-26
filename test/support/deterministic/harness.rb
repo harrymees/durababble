@@ -144,7 +144,7 @@ module Durababble
       # Activation/inbox consistency (the #69 wakeup contract). `reconcile_target_activation`
       # maintains the invariant that a target has a `target_activations` row iff its
       # inbox head (lowest-`sequence` row among pending/failed/running/dead_lettered —
-      # i.e. INBOX_STATUSES, matching `inbox_head_for_update`) is *not* dead-lettered.
+      # i.e. INBOX_HEAD_STATUSES, matching `inbox_head_for_update`) is *not* dead-lettered.
       # Both are written/reconciled inside the same transaction as the inbox change,
       # so at end of run an activatable head with no activation can only mean a lost
       # wakeup: a mailbox with claimable work that no worker will ever be woken to
@@ -163,7 +163,7 @@ module Durababble
         end
 
         by_target.each do |key, messages|
-          head_candidates = messages.select { |message| INBOX_STATUSES.include?(message.fetch("status")) }
+          head_candidates = messages.select { |message| INBOX_HEAD_STATUSES.include?(message.fetch("status")) }
           head = head_candidates.min_by { |message| message.fetch("sequence") }
           next if head.nil? || head.fetch("status") == InboxStatus::DEAD_LETTERED
 
@@ -261,8 +261,13 @@ module Durababble
       ATTEMPT_STATUSES = AttemptStatus::ALL
       WAIT_STATUSES = WaitStatus::ALL
       OUTBOX_STATUSES = OutboxStatus::ALL
-      # InboxStatus has no ALL constant; enumerate its states for validation.
-      INBOX_STATUSES = [InboxStatus::PENDING, InboxStatus::FAILED, InboxStatus::RUNNING, InboxStatus::DEAD_LETTERED].freeze
+      # Every valid persisted inbox status, including the retained `completed`
+      # terminal state — used to flag genuinely unknown statuses.
+      INBOX_STATUSES = InboxStatus::ALL
+      # Mailbox head candidates: the lowest-`sequence` row among these is the head
+      # (matches `inbox_head_for_update`). Excludes `completed`, which is retained
+      # in the table but is never an activatable head.
+      INBOX_HEAD_STATUSES = (InboxStatus::ACTIVATABLE + [InboxStatus::DEAD_LETTERED]).freeze
       # target_activations rows only ever hold these two statuses (see store_queries):
       # `pending` (enqueued/reconciled, unleased) and `running` (claimed, leased).
       ACTIVATION_STATUSES = ["pending", "running"].freeze

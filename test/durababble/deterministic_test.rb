@@ -32,6 +32,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "duplicate_delivery_timer_and_outbox",
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
+    "workflow_command_async_delivery",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -403,6 +404,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 1, failures.length
     assert_includes failures.first.last.join("\n"), "lost wakeup"
+  end
+
+  test "delivers async workflow commands exactly once and retires the wakeup row" do
+    result = Durababble::Deterministic.prove("workflow_command_async_delivery", seed: 7)
+
+    assert_empty result.violations
   end
 
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
