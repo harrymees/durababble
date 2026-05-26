@@ -45,13 +45,18 @@ module Durababble
     end
 
     class LeaseStarter
+      # Base per-attempt spacing for the default lease-poll backoff. Kept small
+      # because we are only waiting for an already-claimed lease row to become
+      # visible, not for slow work to finish.
+      DEFAULT_AWAIT_RETRY_STEP_SECONDS = 0.05
+
       #: (store: untyped, worker_ids: untyped, ?lease_seconds: untyped, ?await_attempts: untyped, ?await_sleep: untyped) -> void
-      def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: ->(_attempt) {})
+      def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: nil)
         @store = store
         @worker_ids = worker_ids
         @lease_seconds = lease_seconds
         @await_attempts = await_attempts
-        @await_sleep = await_sleep
+        @await_sleep = await_sleep || default_await_sleep
       end
 
       #: (workflow_id: untyped) -> untyped
@@ -69,13 +74,24 @@ module Durababble
 
       #: (untyped) -> untyped
       def await_started!(workflow_id)
+        last_attempt = @await_attempts - 1
         @await_attempts.times do |attempt|
           lease = @store.current_workflow_lease(workflow_id)
           return lease if lease
 
-          @await_sleep.call(attempt)
+          # No point sleeping after the final poll — we are about to give up.
+          @await_sleep.call(attempt) unless attempt == last_attempt
         end
         raise NoActiveLease, "workflow #{workflow_id} could not be started with an active lease"
+      end
+
+      # Jittered, linearly growing sleep between lease polls. Routed through
+      # Backoff so a fleet awaiting the same workflow does not poll in lockstep.
+      # Runs on the worker host, outside workflow replay, so the randomness is
+      # determinism-safe.
+      #: () -> untyped
+      def default_await_sleep
+        ->(attempt) { Kernel.sleep(Backoff.linear(attempt + 1, step: DEFAULT_AWAIT_RETRY_STEP_SECONDS)) }
       end
     end
 
