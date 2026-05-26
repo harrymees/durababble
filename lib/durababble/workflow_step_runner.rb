@@ -5,8 +5,8 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, retry_run_at:, crash:)
+    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, retry_run_at:, crash:)
       @store = store #: as untyped
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -18,6 +18,7 @@ module Durababble
       @raise_if_cancel_requested = raise_if_cancel_requested
       @assert_workflow_lease = assert_workflow_lease
       @suspend_workflow_immediately = suspend_workflow_immediately
+      @defer_workflow_suspension = defer_workflow_suspension
       @retry_run_at = retry_run_at
       @crash = crash
     end
@@ -86,8 +87,12 @@ module Durababble
         )
       end
       crash!(:wait_recorded)
-      error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-      future(command_id).reject(error)
+      if suspend_workflow
+        error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
+        future(command_id).reject(error)
+      else
+        @defer_workflow_suspension.call(command_id)
+      end
     end
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void

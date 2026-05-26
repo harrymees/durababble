@@ -149,12 +149,12 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
           "idempotency_key" => "note:hello",
         )
 
-        drained = Durababble::Engine.new(store:, worker_id: "command-worker")
-          .drain_workflow_inbox(BranchTestWorkflow, workflow_id:)
+        engine = Durababble::Engine.new(store:, worker_id: "command-worker")
+        claimed = store.claim_workflow_for_activation(workflow_id:, worker_id: "command-worker", lease_seconds: 60)
+        engine.resume(BranchTestWorkflow, workflow_id:, claimed:)
         status, value = result_queue.pop
         caller.join
 
-        assert_equal(1, drained)
         assert_equal(:ok, status)
         assert_equal("hello", value)
         assert_hash_includes(store.inbox_message(messages.first.fetch("id")), "status" => "completed", "result" => "hello")

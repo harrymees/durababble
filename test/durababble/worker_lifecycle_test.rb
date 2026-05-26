@@ -360,7 +360,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end
@@ -407,7 +412,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-pool-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end
@@ -462,7 +472,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-forward-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end

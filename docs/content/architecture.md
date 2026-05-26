@@ -73,7 +73,7 @@ workflow.cancel(reason: "user request")
 workflow.terminate(reason: "operator hard stop")
 ```
 
-In the current prototype, exposed workflow queries execute against a lightweight handle instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. Workers poll coalesced target activations as the durable fallback rather than polling the inbox table directly.
+In the current prototype, exposed workflow queries execute against a lightweight handle instance. Exposed workflow commands persist `workflow_command` inbox rows for the workflow target, wake the active leaseholder through `DeliverMessage` when one exists, and wait for the ask row to store the command result or error. The owner delivers those rows through the active `WorkflowExecution` at deterministic safe points, invoking the command method on the same workflow instance that is running or replaying `#execute`; workers poll coalesced target activations as the durable fallback rather than constructing a separate workflow object to drain the inbox.
 
 ### Durable objects
 

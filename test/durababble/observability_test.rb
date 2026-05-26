@@ -100,6 +100,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class RuntimeStore
+    include Durababble::TestSupport::FakeStoreCommandClaiming
+
     attr_reader :workflows, :steps, :attempts, :history
 
     def initialize
@@ -151,6 +153,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def workflow_cancellation(_workflow_id) = nil
+    def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default") = nil
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default") = []
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]
