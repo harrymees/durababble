@@ -538,6 +538,7 @@ module Durababble
           SELECT 1 FROM #{table("target_activations")}
           WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
             AND status = 'running' AND locked_by = $4
+            AND locked_until >= now()
           FOR UPDATE
         SQL
         next nil unless activation

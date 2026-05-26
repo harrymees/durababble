@@ -469,6 +469,59 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "expired target activation owners cannot complete activations with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_completion_lease") do |store|
+        store.migrate!
+        store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "stale-activation",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-owner",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-owner",
+        )
+        expire_target_activation!(
+          store,
+          backend,
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+        )
+
+        assert_nil store.complete_target_activation(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+          worker_id: "activation-owner",
+        )
+        assert_hash_includes(
+          store.target_activation(target_kind: "object", target_type: "counter", target_id: "stale-activation"),
+          "status" => "running",
+          "locked_by" => "activation-owner",
+        )
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-reclaimer",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-reclaimer",
+        )
+      end
+    end
+
     test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
       with_durababble_store(backend, "inbox_idempotency") do |store|
         store.migrate!
@@ -971,6 +1024,32 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_nil store.claim_object_command(command_id:, worker_id: "other-object-worker", lease_seconds: 30)
         assert_equal 0, mysql_transaction_depth
       end
+    end
+  end
+
+  def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)
+    table = store.send(:table, "target_activations")
+    if backend.mysql?
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = ?
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [expired_at, target_kind, target_type, target_id],
+      )
+    else
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = now() - interval '1 hour'
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SQL
+        [target_kind, target_type, target_id],
+      )
     end
   end
 

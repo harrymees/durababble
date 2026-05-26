@@ -775,6 +775,7 @@ module Durababble
           SELECT 1 FROM #{table("target_activations")}
           WHERE target_kind = ? AND target_type = ? AND target_id = ?
             AND status = 'running' AND locked_by = ?
+            AND locked_until >= NOW(6)
           FOR UPDATE
         SQL
         next nil unless activation
