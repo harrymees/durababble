@@ -368,13 +368,13 @@ If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the sa
 
 ## RPC
 
-Workflows can expose an RPC surface for other members of the Durababble cluster to invoke. RPCs can just return state, mutate it, change how the workflow execution will proceed, or all of the above.
+Workflows can expose an RPC surface for other members of the Durababble cluster to invoke. Transient query RPCs return owner-local state without durable mutation, while command RPCs can change how the workflow execution will proceed.
 
 RPCs are done by getting a workflow handle for your workflow, and then calling Ruby methods on the handle itself. A caller does not need a Ruby object in the same process as the worker; it needs the workflow id, the workflow class, and a store.
 
 There are two kinds of RPCs you can expose: simple RPCs, and command RPCs.
 
-Simple RPCs are run in parallel and are not expected to ever mutate state on the workflow. They are not recorded durably, and so they can be lost. Use simple RPCs for reads, for things you need to be really cheap, or for situations where the workflow is the "owner" of another resource under the hood that does not record durable state in the workflow itself.
+Simple RPCs are transient queries. They route to the workflow's current active lease owner through `CallTransient`, run against the live workflow instance, and fail with the same not-running, stale-lease, or unavailable-owner errors as transient gRPC routing when no active owner can serve the query. They are not recorded durably, cannot use `idempotency_key:`, cannot call workflow steps or waits, and do not warm or start an inactive workflow.
 
 Commands can mutate state on the workflow, and are processed in serial and recorded and redelivered durably. Use commands for RPCs that need to make it to the workflow, and that change the way the workflow will behave moving forward, like editing local state.
 
@@ -396,4 +396,4 @@ handle.label
 handle.note(message: "approved by legal")
 ```
 
-Durababble handles the RPC machinery between your workers automatically, routing messages to the right worker that has a workflow active. If a workflow is not active when you send an RPC to it, Durababble will warm it up on a worker and then deliver your message.
+Durababble handles the RPC machinery between your workers automatically, routing transient queries to the worker that currently owns the live workflow lease and routing durable commands through the inbox. If a workflow is not active when you send a command to it, Durababble will warm it up on a worker and then deliver your message; transient queries require an active owner and return a not-running error instead of creating durable work.

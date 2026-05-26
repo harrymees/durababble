@@ -120,7 +120,9 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
         handle = BranchTestWorkflow.handle(workflow_id, store:)
 
         assert_respond_to(handle, :labeled_status)
-        assert_equal("status:#{workflow_id}", handle.labeled_status(prefix: "status"))
+        assert_raises(Durababble::WorkflowRpc::NodeUnavailable) do
+          handle.labeled_status(prefix: "status")
+        end
 
         result_queue = Queue.new
         caller = Thread.new do
@@ -201,8 +203,12 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
 
         default_id = BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" })
         assert_equal(BranchTestWorkflow.workflow_name, store.workflow(default_id).fetch("name"))
-        assert_equal("status:#{default_id}", BranchTestWorkflow.handle(default_id).labeled_status(prefix: "status"))
-        assert_equal("status:#{default_id}", BranchTestWorkflow.handle(default_id, engine:).labeled_status(prefix: "status"))
+        assert_raises(Durababble::WorkflowRpc::NoActiveLease) do
+          BranchTestWorkflow.handle(default_id).labeled_status(prefix: "status")
+        end
+        assert_raises(Durababble::WorkflowRpc::NoActiveLease) do
+          BranchTestWorkflow.handle(default_id, engine:).labeled_status(prefix: "status")
+        end
 
         assert_raises(ArgumentError) do
           BranchTestWorkflow.enqueue({ "plain" => "plain", "keyword" => "keyword" }, store:, engine:)

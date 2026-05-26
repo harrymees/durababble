@@ -15,13 +15,14 @@ module Durababble
     #: String
     attr_reader :worker_pool
 
-    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped, ?worker_pool: String) -> void
-    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true, worker_pool: "default")
+    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped, ?worker_pool: String, ?workflow_query_registry: untyped) -> void
+    def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true, worker_pool: "default", workflow_query_registry: nil)
       @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
       @worker_pool = worker_pool
+      @workflow_query_registry = workflow_query_registry
     end
 
     #: (untyped, input: untyped, ?id: untyped) -> untyped
@@ -139,9 +140,11 @@ module Durababble
             history_warning_logged:,
           )
           workflow.__durababble_execution__ = execution
-          result = WorkflowExecutionContext.with_current(execution) do
-            WorkflowDeterminism.enforce(workflow_id:) do
-              workflow.execute(initial_input || initial_context(workflow_id))
+          result = register_query_owner(workflow_id, workflow_class, workflow) do
+            WorkflowExecutionContext.with_current(execution) do
+              WorkflowDeterminism.enforce(workflow_id:) do
+                workflow.execute(initial_input || initial_context(workflow_id))
+              end
             end
           end
           WorkflowExecutionContext.with_current(execution) do
@@ -197,6 +200,13 @@ module Durababble
     #: (untyped) -> untyped
     def initial_context(workflow_id)
       @store.workflow(workflow_id).fetch("input")
+    end
+
+    #: (untyped, untyped, untyped) { () -> untyped } -> untyped
+    def register_query_owner(workflow_id, workflow_class, workflow, &block)
+      return block.call unless @workflow_query_registry
+
+      @workflow_query_registry.register(workflow_id, workflow_class, workflow, &block)
     end
 
     #: (untyped) -> untyped

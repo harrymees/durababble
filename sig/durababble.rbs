@@ -65,6 +65,14 @@ module Durababble
     def request: (String command, payload_map payload) -> serialized_payload
   end
 
+  interface _WorkflowRpcClientFactory
+    def call: (String address, worker_pool: String) -> _RpcRequester
+  end
+
+  interface _WorkflowRpcRouteClientFactory
+    def call: (String worker_id) -> _RpcRequester
+  end
+
   interface _LeaseStarter
     def call: (workflow_id: String) -> workflow_row
   end
@@ -187,6 +195,9 @@ module Durababble
     attr_reader schema: String
     attr_reader connection_pool: _ActiveRecordConnectionPool
     attr_accessor rpc_client_factory: _RpcClientFactory
+    attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
+    attr_accessor local_workflow_rpc_node_id: String?
+    attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
     def self.from_active_record: (connection_pool: _ActiveRecordConnectionPool, ?schema: String, ?owner: _ActiveRecordOwner?) -> Store
@@ -196,6 +207,7 @@ module Durababble
     def migrate!: () -> self
     def drop_schema!: () -> void
     def close: () -> void
+    def with_dedicated_connection: () { (Store store) -> serialized_payload } -> serialized_payload
     def current_time: () -> Time
     def enqueue_workflow: (name: String, input: serialized_payload, ?id: String?, ?worker_pool: String) -> String
     def create_workflow: (name: String, input: serialized_payload, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
@@ -272,6 +284,7 @@ module Durababble
 
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
+    def __durababble_with_query_context__: () { () -> serialized_payload } -> serialized_payload
     def execute: (Input input) -> Output
     def step_context: () -> StepContext
     def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
@@ -337,14 +350,14 @@ module Durababble
     attr_reader store: Store
     attr_reader worker_pool: String
 
-    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?, ?worker_pool: String) -> void
+    def initialize: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?migrate: bool, ?crash_after: Symbol?, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def enqueue: [Input] (singleton(Workflow) workflow_class, input: Input, ?id: String?) -> String
     def run: [Input, Output] (singleton(Workflow) workflow_class, input: Input) -> Run[Output]
     def resume: [Input, Output] (singleton(Workflow) workflow_class, workflow_id: String, ?claimed: workflow_row?) -> Run[Output]
   end
 
   class Worker
-    def initialize: (store: Store, workflows: workflow_registry, worker_id: String, ?objects: object_registry, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String) -> void
+    def initialize: (store: Store, workflows: workflow_registry, worker_id: String, ?objects: object_registry, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def tick: () -> Symbol
     def deliver_target: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Symbol
     def run_until_idle: (?max_ticks: Integer) -> Integer
@@ -429,14 +442,25 @@ module Durababble
     end
 
     class Router
-      def initialize: (store: Store, rpc_clients: Hash[String, _RpcRequester], ?retry_on_stale: bool, ?start_workflow: _LeaseStarter?) -> void
+      def initialize: (store: Store, ?rpc_clients: Hash[String, _RpcRequester], ?rpc_client_factory: _WorkflowRpcRouteClientFactory?, ?retry_on_stale: bool, ?start_workflow: _LeaseStarter?, ?start_on_no_active_lease: bool) -> void
       def request: (workflow_id: String, command: String, ?payload: payload_map) -> serialized_payload
+    end
+
+    class LocalClient
+      def initialize: (store: Store, node_id: String, handlers: Hash[String, _WorkflowRpcHandler]) -> void
+      def request: (String command, payload_map payload) -> serialized_payload
     end
 
     class Handler
       def initialize: (store: Store, node_id: String, handlers: Hash[String, _WorkflowRpcHandler]) -> void
       def call: (payload_map payload) -> serialized_payload
     end
+  end
+
+  class WorkflowQueryRegistry
+    def initialize: () -> void
+    def register: (String workflow_id, singleton(Workflow) workflow_class, Workflow[serialized_payload, serialized_payload] workflow) { () -> serialized_payload } -> serialized_payload
+    def call: (workflow_id: String, method_name: String | Symbol, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
   end
 
   module Rpc

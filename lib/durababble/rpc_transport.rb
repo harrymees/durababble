@@ -421,11 +421,22 @@ module Durababble
           "command" => request["method"],
           "payload" => load_request_args(request, context: "CallTransient #{request["method"]} args") || {},
         }
-        WorkflowRpc::Handler.new(
-          store: @store,
-          node_id: @node_id,
-          handlers: @workflow_handlers,
-        ).call(payload)
+        with_store do |store|
+          WorkflowRpc::Handler.new(
+            store:,
+            node_id: @node_id,
+            handlers: @workflow_handlers,
+          ).call(payload)
+        end
+      end
+
+      #: () { (untyped) -> untyped } -> untyped
+      def with_store(&block)
+        if @store.respond_to?(:with_dedicated_connection)
+          @store.with_dedicated_connection(&block)
+        else
+          block.call(@store)
+        end
       end
 
       #: (Object) -> Object?

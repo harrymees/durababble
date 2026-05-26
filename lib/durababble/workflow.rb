@@ -119,6 +119,8 @@ module Durababble
         alias_method(original, method_name)
         define_method(method_name) do |*args, **kwargs, &block|
           workflow = self #: as untyped
+          raise Error, "cannot call workflow steps from an exposed query" if workflow.instance_variable_get(:@__durababble_query_context)
+
           execution = workflow.__durababble_execution__
           execution.call_step(workflow, method_name:, args:, kwargs:) do
             workflow.send(original, *args, **kwargs, &block)
@@ -139,6 +141,15 @@ module Durababble
       @__durababble_execution__ || raise(Error, "durable step #{self.class.name}##{label} called outside workflow execution")
     end
 
+    #: () { () -> untyped } -> untyped
+    def __durababble_with_query_context__(&block)
+      previous = @__durababble_query_context
+      @__durababble_query_context = true
+      block.call
+    ensure
+      @__durababble_query_context = previous
+    end
+
     #: () -> untyped
     def step_context
       __durababble_execution__.step_context
@@ -146,21 +157,29 @@ module Durababble
 
     #: (untyped, ?untyped) -> untyped
     def wait_until(time, context = {})
+      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+
       Durababble.wait_until(time, context)
     end
 
     #: (untyped, ?untyped) -> untyped
     def sleep_until(time, context = {})
+      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+
       Durababble.sleep_until(time, context)
     end
 
     #: (untyped, ?untyped) -> untyped
     def sleep(duration, context = {})
+      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+
       Durababble.sleep(duration, context)
     end
 
     #: (?timeout: untyped) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
+      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+
       Durababble.wait_condition(timeout:, &block)
     end
   end
@@ -207,10 +226,10 @@ module Durababble
     #: (untyped, *untyped, **untyped) { (?) -> untyped } -> untyped
     def method_missing(method_name, *args, **kwargs, &block)
       if @workflow_class.exposed_queries.key?(method_name)
-        instance = @workflow_class.new #: as untyped
-        instance.instance_variable_set(:@__durababble_ref_store, @store)
-        instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
-        instance.public_send(method_name, *args, **kwargs, &block)
+        raise ArgumentError, "workflow query #{method_name} does not accept idempotency_key:" if kwargs.key?(:idempotency_key)
+        raise ArgumentError, "workflow query #{method_name} does not accept blocks" if block
+
+        route_query(method_name, args:, kwargs:)
       elsif @workflow_class.exposed_commands.key?(method_name)
         idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
@@ -241,6 +260,38 @@ module Durababble
     #: (untyped, ?untyped) -> untyped
     def respond_to_missing?(method_name, include_private = false)
       @workflow_class.exposed_queries.key?(method_name) || @workflow_class.exposed_commands.key?(method_name) || super
+    end
+
+    private
+
+    #: (untyped, args: untyped, kwargs: untyped) -> untyped
+    def route_query(method_name, args:, kwargs:)
+      payload = {
+        "workflow_id" => @workflow_id,
+        "method" => method_name.to_s,
+        "args" => args,
+        "kwargs" => kwargs,
+      }
+      router = WorkflowRpc::Router.new(
+        store: @store,
+        rpc_client_factory: method(:workflow_rpc_client_for),
+        retry_on_stale: true,
+        start_on_no_active_lease: false,
+      )
+      router.request(workflow_id: @workflow_id, command: method_name.to_s, payload:)
+    end
+
+    #: (untyped) -> untyped
+    def workflow_rpc_client_for(worker_id)
+      if @store.local_workflow_rpc_node_id == worker_id && @store.local_workflow_rpc_handlers
+        return WorkflowRpc::LocalClient.new(
+          store: @store,
+          node_id: worker_id,
+          handlers: @store.local_workflow_rpc_handlers,
+        )
+      end
+
+      @store.workflow_rpc_client_factory.call(worker_id, worker_pool: "default")
     end
   end
 end

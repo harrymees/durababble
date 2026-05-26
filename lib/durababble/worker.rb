@@ -10,14 +10,15 @@ module Durababble
     # racing on the same activation does not retry in lockstep.
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
 
-    #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped, ?worker_pool: String) -> void
-    def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default")
+    #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped, ?worker_pool: String, ?workflow_query_registry: untyped) -> void
+    def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default", workflow_query_registry: nil)
       @store = store
       @workflows = normalize_workflows(workflows)
       @objects = normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @worker_pool = worker_pool
+      @workflow_query_registry = workflow_query_registry
       @store.migrate! if migrate
     end
 
@@ -39,7 +40,7 @@ module Durababble
         end
 
         workflow = @workflows.fetch(claimed.fetch("name"))
-        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool: @worker_pool, workflow_query_registry: @workflow_query_registry).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
         Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
         :worked
       end
@@ -93,7 +94,7 @@ module Durababble
       workflow_id = activation.fetch("target_id")
       workflow = @workflows.fetch(activation.fetch("target_type"))
       worker_pool = activation_worker_pool(activation)
-      engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
+      engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:, workflow_query_registry: @workflow_query_registry)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
       engine.resume(workflow, workflow_id:, claimed:) if claimed
       target = activation_target(activation, worker_pool:)

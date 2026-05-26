@@ -66,6 +66,8 @@ module Durababble
       @rpc_address = nil
       @worker_store = nil
       @rpc_store = nil
+      @workflow_query_registry = WorkflowQueryRegistry.new
+      @workflow_rpc_handlers = workflow_rpc_handlers
     end
 
     #: () -> untyped
@@ -84,7 +86,16 @@ module Durababble
         )
         start_rpc_server
         worker = begin
-          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
+          Worker.new(
+            store: worker_store,
+            workflows: @workflows,
+            objects: @objects,
+            worker_id: @worker_id,
+            lease_seconds: @lease_seconds,
+            migrate: @migrate,
+            worker_pool: @worker_pool,
+            workflow_query_registry: @workflow_query_registry,
+          )
         rescue StandardError
           stop_rpc_server
           raise
@@ -160,6 +171,7 @@ module Durababble
         node_id: nil,
         store: rpc_store,
         worker_pool: @worker_pool,
+        workflow_handlers: @workflow_rpc_handlers,
         host: @rpc_host,
         port: @rpc_port,
         credentials: @rpc_credentials,
@@ -170,6 +182,7 @@ module Durababble
       ).start
       @rpc_address = @rpc_server.address
       @worker_id = @rpc_server.node_id
+      configure_local_workflow_rpc(@store)
     end
 
     #: () -> untyped
@@ -179,7 +192,54 @@ module Durababble
 
       @rpc_server = nil
       @rpc_address = nil
+      clear_local_workflow_rpc(@store)
       server.stop
+    end
+
+    #: () -> Hash[String, Object]
+    def workflow_rpc_handlers
+      handlers = {}
+      normalize_workflows(@workflows).each_value do |workflow_class|
+        workflow_class = workflow_class #: as untyped
+        workflow_class.exposed_queries.each_key do |method_name|
+          handlers[method_name.to_s] = lambda do |payload|
+            @workflow_query_registry.call(
+              workflow_id: payload.fetch("workflow_id"),
+              method_name: payload.fetch("method", method_name.to_s),
+              args: payload.fetch("args", []),
+              kwargs: payload.fetch("kwargs", {}),
+            )
+          end
+        end
+      end
+      handlers
+    end
+
+    #: (untyped) -> Hash[String, Object]
+    def normalize_workflows(workflows)
+      case workflows
+      when Hash
+        workflows.transform_keys(&:to_s)
+      else
+        Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
+      end
+    end
+
+    #: (untyped) -> void
+    def configure_local_workflow_rpc(store)
+      return unless store.respond_to?(:local_workflow_rpc_node_id=)
+
+      store.local_workflow_rpc_node_id = @worker_id
+      store.local_workflow_rpc_handlers = @workflow_rpc_handlers
+    end
+
+    #: (untyped) -> void
+    def clear_local_workflow_rpc(store)
+      return unless store.respond_to?(:local_workflow_rpc_node_id)
+      return unless store.local_workflow_rpc_node_id == @worker_id
+
+      store.local_workflow_rpc_node_id = nil
+      store.local_workflow_rpc_handlers = nil
     end
 
     #: (**untyped) -> untyped
