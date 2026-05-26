@@ -89,6 +89,7 @@ module Durababble
         verify_fence_invariants!(fences_state)
         verify_inbox_invariants!(inbox_state)
         verify_activation_invariants!(activations_state)
+        verify_activation_inbox_consistency!(inbox_state, activations_state)
         verify_liveness!(workflows_state, waits_state) if @expect_settled
         verify_effect_expectations!
       end
@@ -138,6 +139,45 @@ module Durababble
             violations << "stuck target activation #{target} held by #{activation["locked_by"].inspect} with expired lease never reclaimed"
           end
         end
+      end
+
+      # Activation/inbox consistency (the #69 wakeup contract). `reconcile_target_activation`
+      # maintains the invariant that a target has a `target_activations` row iff its
+      # inbox head (lowest-`sequence` row among pending/failed/running/dead_lettered —
+      # i.e. INBOX_STATUSES, matching `inbox_head_for_update`) is *not* dead-lettered.
+      # Both are written/reconciled inside the same transaction as the inbox change,
+      # so at end of run an activatable head with no activation can only mean a lost
+      # wakeup: a mailbox with claimable work that no worker will ever be woken to
+      # drain. (A dead-lettered head intentionally wedges the FIFO mailbox and gets no
+      # activation, so it is not flagged. The crashed-holder case — a `running`
+      # activation whose lease expired — is covered by verify_activation_invariants!.)
+      #: (untyped, untyped) -> untyped
+      def verify_activation_inbox_consistency!(inbox_state, activations_state)
+        activation_keys = activations_state.map { |activation| target_key(activation) }
+
+        by_target = Hash.new { |hash, key| hash[key] = [] }
+        inbox_state.each_value do |message|
+          next if message["target_type"].nil?
+
+          by_target[target_key(message)] << message
+        end
+
+        by_target.each do |key, messages|
+          head_candidates = messages.select { |message| INBOX_STATUSES.include?(message.fetch("status")) }
+          head = head_candidates.min_by { |message| message.fetch("sequence") }
+          next if head.nil? || head.fetch("status") == InboxStatus::DEAD_LETTERED
+
+          unless activation_keys.include?(key)
+            violations << "inbox head for #{key.join("/")} is #{head.fetch("status")} but no target activation exists (lost wakeup — mailbox never drained)"
+          end
+        end
+      end
+
+      # The composite identity of a target shared by the inbox and target_activations
+      # tables: (worker_pool, target_kind, target_type, target_id).
+      #: (untyped) -> Array[untyped]
+      def target_key(row)
+        [row["worker_pool"] || "default", row.fetch("target_kind"), row.fetch("target_type"), row.fetch("target_id")]
       end
 
       # A fence still `running` at end of run whose lease has expired and was

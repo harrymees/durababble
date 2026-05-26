@@ -398,6 +398,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes failures.first.last.join("\n"), "stuck target activation"
   end
 
+  test "flags an activatable inbox head with no target activation as a lost wakeup" do
+    failures = Durababble::Deterministic.search("bug_lost_wakeup", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "lost wakeup"
+  end
+
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
     result = Durababble::Deterministic.prove("fence_holder_crash_and_reclaim", seed: 7)
 
