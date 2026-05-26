@@ -131,7 +131,6 @@ module Durababble
       raise ArgumentError, "connection_pool must respond to with_connection" unless connection_pool.respond_to?(:with_connection)
 
       @connection_pool = connection_pool
-      @connection_key = :"durababble_store_connection_#{object_id}"
       @schema = schema
       @owner = owner
       @migrated = false
@@ -219,18 +218,7 @@ module Durababble
 
     #: () { (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> Object? } -> Object?
     def with_connection(&block)
-      current = Thread.current[@connection_key] #: as ActiveRecord::ConnectionAdapters::AbstractAdapter?
-      return block.call(current) if current
-
-      connection_pool = @connection_pool
-      connection_pool.with_connection do |active_record_connection|
-        Thread.current[@connection_key] = active_record_connection
-        begin
-          block.call(active_record_connection)
-        ensure
-          Thread.current[@connection_key] = nil
-        end
-      end
+      connection_pool.with_connection(&block)
     end
 
     #: (**Object?) { () -> Object? } -> Object?

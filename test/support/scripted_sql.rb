@@ -28,12 +28,20 @@ module DurababbleScriptedSqlSupport
     def initialize(connection)
       @connection = connection
       @checked_out = 0
+      @checkout_depth = 0
       @disconnected = false
     end
 
     def with_connection
+      return yield @connection if @checkout_depth.positive?
+
       @checked_out += 1
-      yield @connection
+      @checkout_depth += 1
+      begin
+        yield @connection
+      ensure
+        @checkout_depth -= 1
+      end
     end
 
     def disconnect!
@@ -42,7 +50,7 @@ module DurababbleScriptedSqlSupport
     end
 
     def active_connection?
-      false
+      @checkout_depth.positive?
     end
   end
 
