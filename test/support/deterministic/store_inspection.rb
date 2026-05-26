@@ -26,6 +26,11 @@ module Durababble
     #   all_inbox     -> { inbox_id => message_row }   target-oriented (no workflow_id);
     #                                         "status","locked_by"/"locked_until" where
     #                                         the backend models leases
+    #   all_target_activations -> [ activation_row, ... ]  the #69 coordination row;
+    #                                         composite-keyed (worker_pool/target_kind/
+    #                                         target_type/target_id), "status" plus
+    #                                         "locked_by"/"locked_until" where the
+    #                                         backend models leases
     module StoreInspection
       #: () -> untyped
       def all_workflows = raise(NotImplementedError, "#{self.class}#all_workflows")
@@ -41,6 +46,8 @@ module Durababble
       def all_fences = raise(NotImplementedError, "#{self.class}#all_fences")
       #: () -> untyped
       def all_inbox = raise(NotImplementedError, "#{self.class}#all_inbox")
+      #: () -> untyped
+      def all_target_activations = raise(NotImplementedError, "#{self.class}#all_target_activations")
     end
   end
 end

@@ -44,6 +44,23 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "grpc_wakeup_fault_matrix",
   ].freeze
 
+  # The full fuzz sweep (every FUZZ_SCENARIOS target × these seeds) dominates the
+  # DST suite's wall time. Locally it runs in full; CI sharding sets DST_FUZZ_SEEDS
+  # (e.g. "1..50") so parallel jobs each cover a slice of the seed space without
+  # dropping any scenario. The default keeps the complete 1..100 sweep for anyone
+  # running `rake dst` directly.
+  DEFAULT_FUZZ_SEEDS = (1..100)
+
+  def fuzz_seeds
+    spec = ENV.fetch("DST_FUZZ_SEEDS", nil)
+    return DEFAULT_FUZZ_SEEDS if spec.nil? || spec.empty?
+
+    first, last = spec.split("..", 2).map { |part| Integer(part.strip) }
+    raise ArgumentError, "invalid DST_FUZZ_SEEDS=#{spec.inspect}" if last.nil?
+
+    first..last
+  end
+
   def assert_scenarios_hold(scenarios, seeds:)
     scenarios.each do |scenario|
       failures = Durababble::Deterministic.search(scenario, seeds:)
@@ -374,6 +391,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes failures.first.last.join("\n"), "stuck inbox"
   end
 
+  test "flags a stuck target activation whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_activation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck target activation"
+  end
+
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
     result = Durababble::Deterministic.prove("fence_holder_crash_and_reclaim", seed: 7)
 
@@ -411,7 +435,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
   end
 
   test "fuzzes each unique scenario target across many deterministic seeds" do
-    assert_scenarios_hold(FUZZ_SCENARIOS, seeds: 1..100)
+    assert_scenarios_hold(FUZZ_SCENARIOS, seeds: fuzz_seeds)
   end
 
   test "runs deterministic contract scenarios once" do

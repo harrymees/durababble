@@ -50,6 +50,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # The fuzz sweep (every scenario × 100 seeds) dominates wall time and was
+    # pushing a single job past the 20-minute cap. Shard the seed space across
+    # parallel jobs via DST_FUZZ_SEEDS so each shard covers every scenario over a
+    # slice of seeds; together they exercise the full 1..100 range.
+    strategy:
+      fail-fast: false
+      matrix:
+        seeds: ["1..50", "51..100"]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -63,6 +72,8 @@ jobs:
       # service and no SimpleCov. Kept out of the coverage gate because its
       # seed sweeps add ~no incremental coverage but dominate wall time.
       - name: Run deterministic simulation suite
+        env:
+          DST_FUZZ_SEEDS: ${{ matrix.seeds }}
         run: bundle exec rake dst
 
   lint-typecheck:

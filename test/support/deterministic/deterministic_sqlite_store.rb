@@ -70,6 +70,7 @@ module Durababble
         @injected_outbox = {} #: Hash[String, Hash[String, Object?]]
         @injected_fences = [] #: Array[Hash[String, Object?]]
         @injected_inbox = {} #: Hash[String, Hash[String, Object?]]
+        @injected_target_activations = [] #: Array[Hash[String, Object?]]
         @write_crash_percent = 0
         @txn_depth = 0
         @crashes_armed = false
@@ -451,6 +452,11 @@ module Durababble
         @injected_inbox[row.fetch("id").to_s] = row
       end
 
+      #: (Hash[String, Object?]) -> void
+      def inject_target_activation(row)
+        @injected_target_activations << row
+      end
+
       # --- StoreInspection ---------------------------------------------------
 
       #: () -> Hash[String, Hash[String, Object?]]
@@ -515,6 +521,11 @@ module Durababble
       def all_inbox
         base = select_all("inbox").to_h { |row| [row.fetch("id"), row] }
         base.merge(@injected_inbox)
+      end
+
+      #: () -> Array[Hash[String, Object?]]
+      def all_target_activations
+        select_all("target_activations", order: "worker_pool, target_kind, target_type, target_id") + @injected_target_activations
       end
 
       #: () -> Hash[Symbol, Object?]

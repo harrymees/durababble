@@ -80,6 +80,7 @@ module Durababble
         outbox_state = store.all_outbox
         fences_state = store.all_fences
         inbox_state = store.all_inbox
+        activations_state = store.all_target_activations
 
         verify_workflow_invariants!(workflows_state)
         verify_step_invariants!(workflows_state, steps_state, attempts_state)
@@ -87,6 +88,7 @@ module Durababble
         verify_outbox_invariants!(workflows_state, outbox_state)
         verify_fence_invariants!(fences_state)
         verify_inbox_invariants!(inbox_state)
+        verify_activation_invariants!(activations_state)
         verify_liveness!(workflows_state, waits_state) if @expect_settled
         verify_effect_expectations!
       end
@@ -110,6 +112,30 @@ module Durababble
 
           if locked_until < final_time
             violations << "stuck inbox #{inbox_id} held by #{message["locked_by"].inspect} with expired lease never reclaimed"
+          end
+        end
+      end
+
+      # A target_activation (the #69 wakeup-coordination row) still `running` at
+      # end of run whose lease has expired and was never reclaimed is the same
+      # crashed-holder-never-reclaimed bug class as the stuck fence/outbox/inbox:
+      # a worker claimed the activation, crashed, and `claim_expired_target_activation`
+      # never took it over, so the target is wedged with pending inbox work nobody
+      # will ever drain. Only judged when the backend models a lease (`locked_until`).
+      #: (untyped) -> untyped
+      def verify_activation_invariants!(activations_state)
+        final_time = scheduler.time
+        activations_state.each do |activation|
+          status = activation.fetch("status")
+          target = "#{activation["target_kind"]}/#{activation["target_type"]}/#{activation["target_id"]}"
+          violations << "target activation #{target} has unknown status #{status.inspect}" unless ACTIVATION_STATUSES.include?(status)
+          next unless status == "running"
+
+          locked_until = activation["locked_until"]
+          next if locked_until.nil?
+
+          if locked_until < final_time
+            violations << "stuck target activation #{target} held by #{activation["locked_by"].inspect} with expired lease never reclaimed"
           end
         end
       end
@@ -197,6 +223,9 @@ module Durababble
       OUTBOX_STATUSES = OutboxStatus::ALL
       # InboxStatus has no ALL constant; enumerate its states for validation.
       INBOX_STATUSES = [InboxStatus::PENDING, InboxStatus::FAILED, InboxStatus::RUNNING, InboxStatus::DEAD_LETTERED].freeze
+      # target_activations rows only ever hold these two statuses (see store_queries):
+      # `pending` (enqueued/reconciled, unleased) and `running` (claimed, leased).
+      ACTIVATION_STATUSES = ["pending", "running"].freeze
       TERMINAL_WORKFLOW_STATUSES = [WorkflowStatus::COMPLETED, WorkflowStatus::CANCELED, WorkflowStatus::TERMINATED, WorkflowStatus::FAILED].freeze
 
       #: (untyped) -> untyped
