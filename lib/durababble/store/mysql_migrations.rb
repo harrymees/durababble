@@ -143,7 +143,7 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (worker_pool, object_type, object_id)
+          PRIMARY KEY (object_type, object_id)
         )
       SQL
       execute(<<~SQL)
@@ -195,7 +195,7 @@ module Durababble
           target_id VARCHAR(191) NOT NULL,
           last_sequence BIGINT NOT NULL DEFAULT 0,
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
+          PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
@@ -225,11 +225,10 @@ module Durababble
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           dead_lettered_at DATETIME(6),
-          UNIQUE KEY #{quote_column_name(index_name("inbox", "target_sequence_unique"))} (worker_pool, target_kind, target_type, target_id, sequence),
+          UNIQUE KEY #{quote_column_name(index_name("inbox", "target_sequence_unique"))} (target_kind, target_type, target_id, sequence),
           UNIQUE KEY #{quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash),
-          INDEX #{quote_column_name(index_name("inbox", "target_status_sequence"))} (worker_pool, target_kind, target_type, target_id, status, sequence),
-          INDEX #{quote_column_name(index_name("inbox", "target_sequence"))} (worker_pool, target_kind, target_type, target_id, sequence),
-          INDEX #{quote_column_name(index_name("inbox", "ready"))} (worker_pool, status, ready_at, created_at),
+          INDEX #{quote_column_name(index_name("inbox", "target_status_sequence"))} (target_kind, target_type, target_id, status, sequence),
+          INDEX #{quote_column_name(index_name("inbox", "ready"))} (status, ready_at, created_at),
           INDEX #{quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)
         )
       SQL
@@ -245,7 +244,7 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id),
+          PRIMARY KEY (target_kind, target_type, target_id),
           INDEX #{quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
           INDEX #{quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
           INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
