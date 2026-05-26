@@ -254,7 +254,10 @@ class AgentLoopExampleTest < DurababbleTestCase
     stop = false
     errors = Queue.new
     object_thread = Thread.new do
-      object_worker.tick until stop
+      until stop
+        result = object_worker.tick
+        sleep(0.01) if result == :idle
+      end
     rescue StandardError => e
       errors << e
     end
