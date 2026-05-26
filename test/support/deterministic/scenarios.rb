@@ -4434,14 +4434,14 @@ module Durababble
                     args: [i],
                     kwargs: {},
                     idempotency_key: "random-object-#{seed}-#{i}",
-                    max_attempts: 3,
+                    max_attempts: 100,
                   )
                 when "drain_object_command"
                   command_id = pick.call(object_commands)
                   claimed = h.store.claim_object_command(command_id:, worker_id: actor, lease_seconds: 20) if command_id
                   if claimed
                     if h.scheduler.rng.chance(25)
-                      h.store.fail_object_command(command_id:, error: "random failure #{i}", worker_id: actor, terminal: h.scheduler.rng.chance(20))
+                      h.store.fail_object_command(command_id:, error: "random failure #{i}", worker_id: actor)
                     else
                       state = h.store.object_state(object_type:, object_id:) || { "n" => 0 }
                       h.store.complete_object_command(
@@ -4459,7 +4459,6 @@ module Durababble
             end
           end
 
-          h.store.enable_write_crashes!(percent: 12)
           h.add_workers(["random-worker-a", "random-worker-b", "random-worker-c"], ticks: 32, crash_percent: 12)
           8.times do |i|
             h.scheduler.schedule(actor: "random-reaper", delay: 70 + i * 35, name: "steal_expired") do

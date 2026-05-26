@@ -417,15 +417,18 @@ module Durababble
 
             # A `scheduled` step is durably recorded but not yet started, so it
             # legitimately has no attempt yet (a worker crashed between
-            # record_step_scheduled and record_step_started). Every other status
-            # implies at least one attempt.
+            # record_step_scheduled and record_step_started). Terminal cleanup can
+            # also cancel that not-yet-started step before any attempt exists.
             attempts = attempts_state[workflow_id].select { |attempt| attempt.fetch("position") == position }
+            workflow = workflows_state[workflow_id]
+            terminal_workflow = TERMINAL_WORKFLOW_STATUSES.include?(workflow&.fetch("status"))
             scheduled = status == StepStatus::SCHEDULED
             wait_backed = wait_positions[workflow_id].key?(position)
-            if attempts.empty? && !scheduled && !wait_backed
+            canceled_before_start = status == StepStatus::CANCELED && terminal_workflow
+            if attempts.empty? && !scheduled && !wait_backed && !canceled_before_start
               violations << "step #{workflow_id}/#{position} has no attempt history"
             end
-            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && (scheduled || AttemptStatus.live?(status))
+            if terminal_workflow && (scheduled || AttemptStatus.live?(status))
               violations << "#{workflows_state.fetch(workflow_id).fetch("status")} workflow #{workflow_id} has live step #{position}"
             end
 
