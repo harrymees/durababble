@@ -168,10 +168,22 @@ module Durababble
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
         out = super
-        trace_event("step_failed", id: workflow_id, command_id: normalize_command_id(command_id, position), error:)
+        trace_event("step_failed", id: workflow_id, command_id: normalize_command_id(command_id, position), error:, terminal:)
+        out
+      end
+
+      # The atomic retry write (record_step_failed_without_transaction +
+      # schedule_workflow_retry) bypasses the public record_step_failed wrapper,
+      # so emit the "step_failed" trace here to keep the retry path's trace
+      # coherent with the exhausted path. schedule_workflow_retry still traces
+      # "workflow_retry_scheduled" from inside the transaction via its own wrapper.
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Object?) -> Object?
+      def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+        out = super
+        trace_event("step_failed", id: workflow_id, command_id: normalize_command_id(command_id, position), error:, terminal: false)
         out
       end
 

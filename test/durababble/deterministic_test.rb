@@ -24,6 +24,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "waits_fences_and_outbox",
     "fenced_side_effect_once",
     "fence_holder_crash_and_reclaim",
+    "step_failure_crash_matrix",
     "outbox_lease_expiry",
     "store_fault_after_step_completed",
     "store_fault_after_wait_recorded",
@@ -367,6 +368,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "crashed_holding_fence"
     assert_includes result.trace, "fence_reclaimed"
     assert_includes result.trace, "fence_completed"
+  end
+
+  test "recovers atomic step-failure outcomes after a crash at :step_failed_recorded" do
+    result = Durababble::Deterministic.prove("step_failure_crash_matrix", seed: 11)
+
+    assert_empty result.violations
+    assert_includes result.trace, "crashed_after_retry_scheduled"
+    assert_includes result.trace, "crashed_after_terminal_failure"
+    # Retry path recovered with no lease-stealing reaper involved.
+    refute_includes result.trace, "retry_recover_blocked"
   end
 
   test "flags abandoned-but-runnable workflows under an expect_settled scenario" do

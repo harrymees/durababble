@@ -124,25 +124,66 @@ module Durababble
       step = step #: as untyped
       message = "#{error.class}: #{error.message}"
       assert_workflow_lease!
-      synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
         "error.type" => error.class.name,
       )
       Observability.count("durababble.workflow.step.failures", attributes)
-      return error unless step.retry_policy.retryable?(error, attempt_number:)
+      unless step.retry_policy.retryable?(error, attempt_number:)
+        return record_final_step_failure(command_id, message:, fallback_error: error)
+      end
 
       delay = step.retry_policy.delay_for_attempt(attempt_number)
       Observability.count(
         "durababble.workflow.step.retries",
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
+      # Record the failed attempt and the retry scheduling in one transaction so a
+      # crash cannot strand a failed step under a still-leased workflow with no
+      # retry queued. crash!(:step_failed_recorded) then exposes the post-write
+      # crash window the matrix scenario drives.
       synchronize_store do
-        scheduled = @store.schedule_workflow_retry(workflow_id: @workflow_id, worker_id: @worker_id, run_at: @retry_run_at.call(delay))
-        raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
+        run_at = @retry_run_at.call(delay)
+        @store.record_step_failed_and_schedule_retry(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          run_at:,
+        )
       end
-      StepRetryScheduled.new(message)
+      crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
+    end
+
+    # Persists an exhausted step failure as terminal history (so crash recovery
+    # replays the recorded failure rather than re-running the step) and returns
+    # the original error for the engine to finalize the workflow — workflow code
+    # may still rescue it, run compensation, or observe sibling async branches.
+    #: (Integer, message: String, fallback_error: StandardError) -> StandardError
+    def record_final_step_failure(command_id, message:, fallback_error:)
+      synchronize_store do
+        @store.record_step_failed(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          terminal: true,
+          error_class: fallback_error.class.name,
+          error_message: fallback_error.message,
+        )
+      end
+      crash_or(:step_failed_recorded, fallback_error)
+    end
+
+    # Fires the crash point after a durable write; if a crash is injected there,
+    # surface it as the rejection so the worker dies with the outcome persisted.
+    #: (Symbol, StandardError) -> StandardError
+    def crash_or(point, error)
+      crash!(point)
+      error
+    rescue InjectedCrash => crash
+      crash
     end
 
     #: (Integer) -> Heartbeat
