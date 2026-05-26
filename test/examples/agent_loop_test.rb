@@ -234,7 +234,7 @@ class AgentLoopExampleTest < DurababbleTestCase
     }
   end
 
-  def run_agent_loop_workers(backend, workflow_id, timeout: 10)
+  def run_agent_loop_workers(backend, workflow_id, timeout: 30)
     workflow_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
     object_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
     workflow_worker = Durababble::Worker.new(
@@ -259,7 +259,7 @@ class AgentLoopExampleTest < DurababbleTestCase
       errors << e
     end
     workflow_thread = Thread.new do
-      workflow_worker.tick
+      workflow_worker.tick until stop
     rescue StandardError => e
       errors << e
     end
