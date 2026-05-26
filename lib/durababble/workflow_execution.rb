@@ -545,9 +545,11 @@ module Durababble
       case event.fetch("kind")
       when "workflow_command_completed"
         result = invoke_workflow_command(method_name, args:, kwargs:)
-        # History recorded before result persistence omits "result"; tolerate it
-        # rather than failing replay, since there is nothing recorded to diverge from.
-        return unless payload.key?("result")
+        # complete_workflow_command always records the result (include_result: true), so a
+        # completed event without one is malformed history, not a divergence we can skip.
+        unless payload.key?("result")
+          raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with no recorded result"
+        end
         return if result == payload.fetch("result")
 
         raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different result than recorded history"

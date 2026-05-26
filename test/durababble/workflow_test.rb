@@ -184,6 +184,34 @@ class DurababbleWorkflowTest < DurababbleTestCase
     assert_match(/different result/, error.message)
   end
 
+  test "workflow command replay requires a recorded result for completed commands" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+    )
+    refute(event.fetch("payload").key?("result"), "fixture should omit the result so the assertion is exercised")
+
+    error = assert_raises(Durababble::NonDeterminismError) do
+      execution.send(:replay_workflow_command_event, event)
+    end
+    assert_match(/no recorded result/, error.message)
+  end
+
+  test "workflow command replay accepts a matching recorded nil result" do
+    execution = replay_execution_for(ApiTestApprovalWorkflow)
+    execution.instance_variable_get(:@workflow).define_singleton_method(:approve) { |**| nil }
+    event = workflow_command_history_event(
+      "workflow_command_completed",
+      method_name: "approve",
+      kwargs: { reason: "operator" },
+    )
+    event["payload"]["result"] = nil
+
+    assert_nil(execution.send(:replay_workflow_command_event, event))
+  end
+
   test "workflow command replay validates failed command error shape" do
     execution = replay_execution_for(ApiTestApprovalWorkflow)
     event = workflow_command_history_event(
