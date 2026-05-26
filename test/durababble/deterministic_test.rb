@@ -416,6 +416,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes failures.first.last.join("\n"), "lost wakeup"
   end
 
+  test "flags a target activation over an empty mailbox as an orphaned wakeup" do
+    failures = Durababble::Deterministic.search("bug_orphaned_activation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "orphaned wakeup"
+  end
+
   test "delivers async workflow commands exactly once and retires the wakeup row" do
     result = Durababble::Deterministic.prove("workflow_command_async_delivery", seed: 7)
 

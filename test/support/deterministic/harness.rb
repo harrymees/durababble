@@ -171,6 +171,26 @@ module Durababble
             violations << "inbox head for #{key.join("/")} is #{head.fetch("status")} but no target activation exists (lost wakeup — mailbox never drained)"
           end
         end
+
+        # Reverse direction of the IFF: an activation whose mailbox has no
+        # activatable (non-dead-lettered) inbox head is an *orphaned* wakeup — a
+        # worker will be woken to drain a mailbox with nothing claimable.
+        # reconcile_target_activation deletes the activation when the head is
+        # completed/absent (the "else" branch) or dead-lettered, so a surviving
+        # activation here means a reconcile was skipped (e.g. a crash between the
+        # inbox write and the reconcile) and never repaired. This is the dual of
+        # the lost-wakeup check above and the same crashed-holder bug class.
+        activations_state.each do |activation|
+          key = target_key(activation)
+          activatable = by_target[key].select { |message| INBOX_HEAD_STATUSES.include?(message.fetch("status")) }
+          head = activatable.min_by { |message| message.fetch("sequence") }
+
+          if head.nil?
+            violations << "target activation #{key.join("/")} exists but its mailbox has no activatable head (orphaned wakeup — never reconciled away)"
+          elsif head.fetch("status") == InboxStatus::DEAD_LETTERED
+            violations << "target activation #{key.join("/")} exists but its inbox head is dead-lettered (should have been reconciled away)"
+          end
+        end
       end
 
       # The composite identity of a target shared by the inbox and target_activations
