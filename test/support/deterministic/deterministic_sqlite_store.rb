@@ -69,7 +69,47 @@ module Durababble
         @injected_waits = {} #: Hash[String, Hash[String, Object?]]
         @injected_outbox = {} #: Hash[String, Hash[String, Object?]]
         @injected_fences = [] #: Array[Hash[String, Object?]]
+        @write_crash_percent = 0
+        @txn_depth = 0
+        @crashes_armed = false
         super(connection, schema:, owner:)
+      end
+
+      # --- Seed-driven crash-after-write fuzz mode ---------------------------
+      # Off unless a scenario opts in. When enabled, durable writes performed
+      # inside a #crashable block draw from the seeded RNG and may raise
+      # InjectedCrash *after* the write lands — modelling a worker that dies
+      # between two state transitions. The window depends on transaction depth:
+      #
+      #   * :after_statement — an autocommitted write (depth 0); the row is durable.
+      #   * :after_commit    — the outermost transaction just committed; all its
+      #                        writes are durable.
+      #   * :mid_transaction — a write inside an open transaction; the raise
+      #                        propagates out, so ActiveRecord ROLLBACKs every
+      #                        write in that transaction (nothing lands).
+      #
+      # This is the systematic version of the hand-placed engine crash points:
+      # it exercises every inter-write window without foreknowledge, so a
+      # non-atomic write (e.g. the original step-failure bug) gets caught when a
+      # :mid_transaction crash that should roll back both writes instead strands
+      # a half-applied state.
+
+      #: (percent: Integer) -> void
+      def enable_write_crashes!(percent:)
+        @write_crash_percent = percent
+      end
+
+      # Arms crash injection for the duration of the block. Callers (the sim
+      # worker around #resume) must rescue InjectedCrash — the virtual scheduler
+      # does not, so an unguarded crash would abort the whole run. Setup writes
+      # (enqueue, timer wakes) run unarmed and never crash.
+      #: [T] () { () -> T } -> T
+      def crashable(&block)
+        previous = @crashes_armed
+        @crashes_armed = true
+        block.call
+      ensure
+        @crashes_armed = previous
       end
 
       # --- Deterministic clock / identity seams ------------------------------
@@ -442,6 +482,46 @@ module Durababble
       end
 
       private
+
+      # Track transaction depth so the crash proxy can tell an autocommitted
+      # write from one inside an open transaction, and only fire :after_commit
+      # when the outermost transaction has actually committed.
+      #: (**Object?) { () -> Object? } -> Object?
+      def transaction(**options, &block)
+        @txn_depth += 1
+        begin
+          result = super
+        rescue StandardError
+          @txn_depth -= 1
+          raise
+        end
+        @txn_depth -= 1
+        maybe_crash_after_write(:after_commit) if @txn_depth.zero?
+        result
+      end
+
+      #: (String, Array[Object?]) -> untyped
+      def execute_store_query_sql(sql, params)
+        result = super
+        maybe_crash_after_write(@txn_depth.positive? ? :mid_transaction : :after_statement) if wrote?(result)
+        result
+      end
+
+      #: (Object?) -> bool
+      def wrote?(result)
+        result = result #: as untyped
+        result.respond_to?(:affected_rows) && result.affected_rows.to_i.positive?
+      end
+
+      #: (Symbol) -> void
+      def maybe_crash_after_write(window)
+        return if @write_crash_percent.zero?
+        return unless @crashes_armed
+        return unless scheduler.rng.chance(@write_crash_percent)
+
+        trace_event("store_crash", window:)
+        raise InjectedCrash, "injected store crash #{window}"
+      end
 
       # Collapse the wall-clock interval to ticks: integer ticks pass through,
       # and any Time (the `now: Time.now` defaults) becomes the current tick.

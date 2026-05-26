@@ -1621,6 +1621,11 @@ module Durababble
             h.network.send(source: "client-#{i}", target: "db", type: "enqueue") { h.store.enqueue_workflow(name:, input:) }
             h.scheduler.schedule(actor: "timer-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
           end
+          # Crash workers mid-resume between durable writes (not just whole-tick
+          # skips), so every inter-write window is exercised under chaos. The
+          # reaper + repeated ticks must still drive every workflow to a
+          # crash-consistent state.
+          h.store.enable_write_crashes!(percent: 20)
           h.add_workers(["worker-a", "worker-b", "worker-c", "worker-d"], ticks: 30, crash_percent: 15)
           8.times do |i|
             h.scheduler.schedule(actor: "reaper", delay: 60 + i * 50, name: "steal_expired") { h.store.steal_expired_leases!(now: h.scheduler.time + 61) }

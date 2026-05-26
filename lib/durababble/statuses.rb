@@ -57,14 +57,18 @@ module Durababble
   end
 
   module StepStatus
+    SCHEDULED = "scheduled"
     RUNNING = "running"
     WAITING = "waiting"
     CANCELED = "canceled"
     FAILED = "failed"
     COMPLETED = "completed"
 
-    ALL = [RUNNING, WAITING, CANCELED, FAILED, COMPLETED].freeze
-    LIVE = [RUNNING, WAITING].freeze
+    # `scheduled` is the durable state a step occupies between record_step_scheduled
+    # and record_step_started — a worker that crashes in that window leaves the row
+    # here with no attempt yet.
+    ALL = [SCHEDULED, RUNNING, WAITING, CANCELED, FAILED, COMPLETED].freeze
+    LIVE = [SCHEDULED, RUNNING, WAITING].freeze
   end
 
   module AttemptStatus

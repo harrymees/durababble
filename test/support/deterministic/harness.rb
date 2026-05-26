@@ -203,11 +203,16 @@ module Durababble
               violations << "step #{workflow_id}/#{position} has inconsistent identity"
             end
 
+            # A `scheduled` step is durably recorded but not yet started, so it
+            # legitimately has no attempt yet (a worker crashed between
+            # record_step_scheduled and record_step_started). Every other status
+            # implies at least one attempt.
             attempts = attempts_state[workflow_id].select { |attempt| attempt.fetch("position") == position }
-            if attempts.empty?
+            scheduled = status == StepStatus::SCHEDULED
+            if attempts.empty? && !scheduled
               violations << "step #{workflow_id}/#{position} has no attempt history"
             end
-            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && AttemptStatus.live?(status)
+            if TERMINAL_WORKFLOW_STATUSES.include?(workflows_state[workflow_id]&.fetch("status")) && (scheduled || AttemptStatus.live?(status))
               violations << "#{workflows_state.fetch(workflow_id).fetch("status")} workflow #{workflow_id} has live step #{position}"
             end
 
