@@ -307,6 +307,36 @@ module Durababble
         out
       end
 
+      # Crash window A in the async command-delivery drain loop (#69): the
+      # worker has *durably* leased the wakeup row (claim_target_activation
+      # commits its own transaction) but has not yet claimed any inbox message.
+      # Firing the fault here models a worker that died holding only the
+      # activation lease. Because the lease is committed, recovery cannot
+      # proceed until `locked_until` passes the virtual clock — then another
+      # worker reclaims the expired activation (claim_expired_target_activation)
+      # and drains the still-pending mailbox. Gated on an actual claim so an
+      # empty poll neither traces nor faults.
+      #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Object?, ?worker_pool: String) -> Object?
+      def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
+        out = super
+        fault_plan.after(:claim_target_activation) if out
+        out
+      end
+
+      # Crash window B: the worker has durably leased *both* the activation and
+      # the inbox head message (claim_inbox_messages commits its own
+      # transaction marking the row running+leased) but has not yet completed
+      # the command. A crash here leaves the message `running` with a live
+      # lease; recovery waits for the lease to expire, then re-claims the
+      # expired-but-running head (inbox_row_claimable? treats it as reclaimable)
+      # and completes it — exactly once. Gated on a non-empty claim.
+      #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Integer, ?limit: Integer, ?now: Object?, ?worker_pool: String) -> Array[Hash[String, Object?]]
+      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
+        out = super
+        fault_plan.after(:claim_inbox_messages) unless out.empty?
+        out
+      end
+
       #: (workflow_id: String, worker_id: String, run_at: Object?) -> Object?
       def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         result = super
