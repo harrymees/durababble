@@ -166,7 +166,14 @@ module Durababble
         columns = result_set.columns
         rows = result_set.to_a
         rows = rows.map { |row| row.is_a?(Hash) ? columns.map { |column| row[column] } : row } unless columns.empty?
-        ActiveRecord::Result.new(columns, rows, affected_rows: db.changes)
+        # SQLite's changes() counts the most recent INSERT/UPDATE/DELETE and is
+        # NOT reset by a SELECT, so reading db.changes after a query returns a
+        # stale count from an earlier write. A statement that yields result
+        # columns is a read (this store sets supports_returning? = false, so DML
+        # never returns columns); report 0 affected rows for it and only trust
+        # db.changes for the column-less DML statements.
+        affected_rows = columns.empty? ? db.changes : 0
+        ActiveRecord::Result.new(columns, rows, affected_rows: affected_rows)
       rescue SQLite3::ConstraintException => e
         # The raw sqlite3 driver bypasses ActiveRecord, so a unique violation
         # surfaces as SQLite3::ConstraintException rather than the
