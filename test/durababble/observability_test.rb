@@ -100,6 +100,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class RuntimeStore
+    include Durababble::TestSupport::FakeStoreCommandClaiming
+
     attr_reader :workflows, :steps, :attempts, :history
 
     def initialize
@@ -113,9 +115,9 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def migrate! = self
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, worker_pool: "default") = nil
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       @next_id += 1
-      id = "wf-#{@next_id}"
+      id ||= "wf-#{@next_id}"
       @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "pending", "input" => input, "created_at" => Time.now }
       id
     end
@@ -151,6 +153,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def workflow_cancellation(_workflow_id) = nil
+    def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default") = nil
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default") = []
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
     def workflow_history_for(workflow_id) = history[workflow_id]

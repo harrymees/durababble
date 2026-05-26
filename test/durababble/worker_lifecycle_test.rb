@@ -3,6 +3,8 @@
 
 require_relative "../test_helper"
 require "thread"
+require "stringio"
+require "logger"
 
 class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class RuntimeBranchStore
@@ -86,7 +88,8 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     )
 
     assert_same runtime, runtime.start
-    assert_equal runtime.rpc_address, runtime.worker_id
+    assert_equal runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id)
+    assert_match(/\Adefault-[0-9a-f]{12}@#{Regexp.escape(runtime.rpc_address)}\z/, runtime.worker_id)
     first_thread = runtime.wait(timeout: 0.05)
     assert(first_thread.is_a?(Thread) || first_thread.nil?, "expected wait to return a thread or nil")
     assert_same runtime, runtime.start
@@ -136,7 +139,27 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_equal false, store.closed
   end
 
-  test "uses isolated store connections for worker and rpc paths when it owns the store" do
+  test "logs unexpected polling errors so recurring failures are not silent" do
+    log_output = StringIO.new
+    previous_logger = Durababble.logger
+    Durababble.logger = Logger.new(log_output)
+    store = RuntimeBranchStore.new(tick_results: [RuntimeError.new("boom"), RuntimeError.new("boom")])
+    runtime = Durababble::WorkerRuntime.new(
+      store:,
+      workflows: {},
+      worker_pool: "default",
+      poll_interval: 0.01,
+      migrate: false,
+    )
+
+    runtime.start
+    eventually(timeout: 3) { assert_match(/boom/, log_output.string) }
+  ensure
+    runtime&.close
+    Durababble.logger = previous_logger
+  end
+
+  test "uses one pool-backed store for worker and rpc paths when it owns the store" do
     runtime = Durababble::WorkerRuntime.new(
       database_url:,
       schema:,
@@ -151,13 +174,8 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
     refute_nil(worker_store)
     refute_nil(rpc_store)
-    refute_same(runtime.store, worker_store)
-    refute_same(runtime.store, rpc_store)
-    refute_same(worker_store, rpc_store)
-    assert_equal(true, worker_store.pooled_connections?)
-    assert_equal(true, rpc_store.pooled_connections?)
-    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(worker_store))
-    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(rpc_store))
+    assert_same(runtime.store, worker_store)
+    assert_same(runtime.store, rpc_store)
     owner = runtime.store.instance_variable_get(:@owner)
     runtime.close
     refute(owner.connection_pool.active_connection?)
@@ -342,7 +360,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end
@@ -356,14 +379,14 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_port: 0,
     )
     runtime.start
-    assert_equal(runtime.rpc_address, runtime.worker_id)
+    assert_equal(runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id))
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
-    store.claim_workflow(workflow_id:, worker_id: runtime.rpc_address, lease_seconds: 30)
+    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30)
     assert_hash_includes(
       store.workflow(workflow_id),
       "status" => "running",
-      "locked_by" => runtime.rpc_address,
+      "locked_by" => runtime.worker_id,
     )
 
     caller_store = Durababble::Store.connect(database_url:, schema:)
@@ -389,7 +412,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-pool-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end
@@ -405,7 +433,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     runtime.start
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime.rpc_address, lease_seconds: 30, worker_pool: "pool-a")
+    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30, worker_pool: "pool-a")
     message_id = store.enqueue_workflow_command(
       workflow_id:,
       workflow_name: workflow.workflow_name,
@@ -444,7 +472,12 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     workflow = Class.new(Durababble::Workflow) do
       workflow_name "runtime-rpc-forward-command"
 
+      def execute(_input)
+        wait_condition(timeout: 60) { @approved_by }
+      end
+
       expose_command def approve(reason:)
+        @approved_by = reason
         { "approved_by" => reason }
       end
     end
@@ -471,7 +504,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     runtime_b.start
 
     workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime_a.rpc_address, lease_seconds: 30, worker_pool: "pool-a")
+    store.claim_workflow(workflow_id:, worker_id: runtime_a.worker_id, lease_seconds: 30, worker_pool: "pool-a")
     caller_store = Durababble::Store.connect(database_url:, schema:)
     caller_store.rpc_client_factory = ->(_address) { ForcedUnavailableDeliveryClient.new }
     def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.01, timeout: 3)
@@ -506,12 +539,6 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
   def runtime_store
     @runtime_store ||= Durababble::Store.connect(database_url:, schema:)
-  end
-
-  def connection_id_from_thread(store)
-    ids = Queue.new
-    Thread.new { ids << store.connection.object_id }.join
-    ids.pop
   end
 
   def eventually(timeout:)

@@ -6,6 +6,8 @@ require_relative "core"
 module Durababble
   module Deterministic
     class VirtualYugabyte
+      include Durababble::TestSupport::FakeStoreCommandClaiming
+
       #: untyped
       attr_reader :scheduler, :fault_plan
 
@@ -36,9 +38,11 @@ module Durababble
       #: () -> untyped
       def current_time = scheduler.time
 
-      #: (name: untyped, input: untyped, ?worker_pool: untyped) -> untyped
-      def enqueue_workflow(name:, input:, worker_pool: "default")
-        id = next_id("wf")
+      #: (name: untyped, input: untyped, ?id: untyped, ?worker_pool: untyped) -> untyped
+      def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+        id ||= next_id("wf")
+        raise WorkflowAlreadyExists, "workflow #{id} already exists" if @workflows.key?(id)
+
         @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "pending", "input" => deep(input), "result" => nil, "error" => nil, "locked_by" => nil, "locked_until" => nil, "next_run_at" => nil }
         trace("enqueue_workflow", id:, name:)
         id
@@ -367,6 +371,16 @@ module Durababble
       def outbox_message(outbox_id) = deep(@outbox.fetch(outbox_id))
       #: (untyped) -> untyped
       def workflow(workflow_id) = deep(@workflows.fetch(workflow_id))
+
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped) -> untyped
+      def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
+        nil
+      end
+
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, limit: untyped) -> untyped
+      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default")
+        []
+      end
 
       #: (workflow_id: untyped, worker_id: untyped) -> untyped
       def workflow_owned?(workflow_id:, worker_id:)

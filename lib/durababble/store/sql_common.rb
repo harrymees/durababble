@@ -5,14 +5,15 @@ module Durababble
   class SqlStore < Store
     TIMER_WAKE_BATCH_SIZE = 100
 
-    #: (name: String, input: Object?, ?worker_pool: String) -> String
-    def enqueue_workflow(name:, input:, worker_pool: "default")
-      insert_workflow(name:, input:, status: "pending", worker_pool:)
+    #: (name: String, input: Object?, ?id: String?, ?worker_pool: String) -> String
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      id ||= SecureRandom.uuid
+      insert_workflow(name:, input:, status: "pending", id:, worker_pool:)
     end
 
     #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
     def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
-      insert_workflow(name:, input:, status: "running", worker_id:, lease_seconds:, worker_pool:)
+      insert_workflow(name:, input:, status: "running", id: SecureRandom.uuid, worker_id:, lease_seconds:, worker_pool:)
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
@@ -105,6 +106,17 @@ module Durababble
         break if completed < batch_size
       end
       total
+    end
+
+    # Flip every workflow whose timer just fired back to pending in a single statement.
+    # Called once per wake batch instead of once per wait to avoid an N+1 of single-row UPDATEs.
+    #: (Array[Hash[String, Object?]]) -> void
+    def mark_waits_workflows_pending(waits)
+      workflow_ids = waits.map { |wait| wait.fetch("workflow_id") }.uniq
+      return if workflow_ids.empty?
+
+      placeholders = workflow_ids.each_index.map { |index| placeholder(index + 1) }.join(", ")
+      execute_store_query(:mark_waits_workflows_pending, workflow_ids, placeholders:)
     end
 
     #: (String) -> Array[Hash[String, Object?]]
@@ -223,6 +235,27 @@ module Durababble
       result #: as Array[Hash[String, Object?]]
     end
 
+    #: (workflow_id: String, worker_id: String) -> bool
+    def workflow_owned?(workflow_id:, worker_id:)
+      !!execute_store_query(:workflow_owned, [workflow_id, worker_id]).first
+    end
+
+    #: (worker_pool: String, workflow_name: String, workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
+      return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
+      raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow command claim" unless workflow_owned?(workflow_id:, worker_id:)
+
+      claim_inbox_messages(
+        worker_pool:,
+        target_kind: "workflow",
+        target_type: workflow_name,
+        target_id: workflow_id,
+        worker_id:,
+        lease_seconds:,
+        limit: 1,
+      ).first
+    end
+
     #: (String) -> Hash[String, Object?]?
     def inbox_message(message_id)
       row = execute_store_query(:inbox_message, [message_id]).first
@@ -316,7 +349,7 @@ module Durababble
           kind: "workflow_command_completed",
           name: command["method_name"],
           attempt_id: message_id,
-          payload: { "message_id" => message_id, "result" => result },
+          payload: workflow_command_history_payload(command, message_id:, result:, include_result: true),
         )
         updated = complete_inbox_message_without_transaction(message_id:, result:)
         reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
@@ -342,7 +375,7 @@ module Durababble
           kind: "workflow_command_failed",
           name: command["method_name"],
           attempt_id: message_id,
-          payload: { "message_id" => message_id },
+          payload: workflow_command_history_payload(command, message_id:),
           error:,
         )
         updated = dead_letter_inbox_message_without_transaction(message_id:, error:)
@@ -385,8 +418,8 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (name: String, input: Object?, status: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
       raise NotImplementedError
     end
 
@@ -523,6 +556,23 @@ module Durababble
     #: (message_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_inbox_message_for_completion(message_id:, worker_id:)
       raise NotImplementedError
+    end
+
+    #: (Hash[String, Object?], message_id: String, ?result: Object?, ?include_result: bool) -> Hash[String, Object?]
+    def workflow_command_history_payload(command, message_id:, result: nil, include_result: false)
+      command = decode_row(command) if command.key?("payload") && !command["payload"].is_a?(Hash)
+      payload = command["payload"].is_a?(Hash) ? command.fetch("payload") : {}
+      payload = payload #: as untyped
+      history_payload = {
+        "message_id" => message_id,
+        "method" => command["method_name"] || payload["method"] || payload["method_name"],
+        "args" => payload.fetch("args", []),
+        "kwargs" => payload.fetch("kwargs", {}),
+        "shape_hash" => command["shape_hash"],
+        "sequence" => command["sequence"],
+      }
+      history_payload["result"] = result if include_result
+      history_payload
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?

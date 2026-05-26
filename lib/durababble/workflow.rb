@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "securerandom"
+
 require_relative "durable_method_dsl"
 
 module Durababble
@@ -8,6 +10,7 @@ module Durababble
 
   class StepRetryScheduled < Error; end
   class WorkflowSuspended < Error; end
+  class WorkflowCommandDelivered < Error; end
 
   class Workflow
     extend DurableMethodDSL
@@ -36,24 +39,26 @@ module Durababble
         workflow_name
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
-      def enqueue(input, store: nil, engine: nil, worker_pool: nil)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil)
         if worker_pool
-          Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, worker_pool:)
+          workflow_id = id || SecureRandom.uuid
+          Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
         else
-          Durababble.engine_for(store:, engine:).enqueue(self, input:)
+          Durababble.engine_for(store:, engine:).enqueue(self, input:, id:)
         end
       end
 
-      #: (untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
-      def start(input, store: nil, engine: nil, worker_pool: nil)
+      #: (untyped, ?id: untyped, ?store: untyped, ?engine: untyped, ?worker_pool: String?) -> untyped
+      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil)
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
-          workflow_id = resolved_store.enqueue_workflow(name: workflow_name, input:, worker_pool:)
+          workflow_id = id || SecureRandom.uuid
+          resolved_store.enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
           handle(workflow_id, store: resolved_store, worker_pool:)
         else
           resolved_engine = Durababble.engine_for(store:, engine:)
-          workflow_id = resolved_engine.enqueue(self, input:)
+          workflow_id = resolved_engine.enqueue(self, input:, id:)
           handle(workflow_id, engine: resolved_engine)
         end
       end
@@ -116,11 +121,7 @@ module Durababble
           workflow = self #: as untyped
           execution = workflow.__durababble_execution__
           execution.call_step(workflow, method_name:, args:, kwargs:) do
-            if kwargs.empty?
-              workflow.send(original, *args, &block)
-            else
-              workflow.send(original, *args, **kwargs, &block)
-            end
+            workflow.send(original, *args, **kwargs, &block)
           end
         end
       ensure
@@ -209,7 +210,7 @@ module Durababble
         instance = @workflow_class.new #: as untyped
         instance.instance_variable_set(:@__durababble_ref_store, @store)
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
-        kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
+        instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
         idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }

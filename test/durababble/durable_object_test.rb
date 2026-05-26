@@ -570,8 +570,8 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new)) }
 
     unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
-    assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
-    assert_nil CleanCommandObject.handle("clean", store: Object.new).send(:inbox_max_attempts, unbounded)
+    assert_nil unbounded.maximum_attempts_limit
+    assert_equal 3, Durababble::RetryPolicy.new(maximum_attempts: 3).maximum_attempts_limit
   end
 
   test "durable object handles and tells use default and explicit engines" do

@@ -5,6 +5,9 @@ require "time"
 
 module Durababble
   class Worker
+    # Base delay before re-attempting to forward a target activation that could
+    # not be delivered. Applied through Backoff.jittered so a fleet of workers
+    # racing on the same activation does not retry in lockstep.
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
 
     #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped, ?worker_pool: String) -> void
@@ -92,34 +95,21 @@ module Durababble
       worker_pool = activation_worker_pool(activation)
       engine = Engine.new(store: @store, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
       claimed = @store.claim_workflow_for_activation(workflow_id:, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
-      engine.drain_workflow_inbox(workflow, workflow_id:, claimed:) if claimed
+      engine.resume(workflow, workflow_id:, claimed:) if claimed
+      target = activation_target(activation, worker_pool:)
       if advisory
         if claimed
-          @store.reconcile_target_activation(
-            target_kind: activation.fetch("target_kind"),
-            target_type: activation.fetch("target_type"),
-            target_id: workflow_id,
-            worker_pool:,
-          )
+          @store.reconcile_target_activation(**target)
         else
           forward_target_activation(activation)
-          @store.rearm_target_activation(
-            target_kind: activation.fetch("target_kind"),
-            target_type: activation.fetch("target_type"),
-            target_id: workflow_id,
-            worker_pool:,
-            ready_at: activation_retry_time(workflow_id),
-          )
+          @store.rearm_target_activation(**target, ready_at: activation_retry_time(workflow_id))
         end
         return
       end
 
       forward_target_activation(activation) unless claimed
       @store.complete_target_activation(
-        target_kind: activation.fetch("target_kind"),
-        target_type: activation.fetch("target_type"),
-        target_id: workflow_id,
-        worker_pool:,
+        **target,
         worker_id: @worker_id,
         now: claimed ? Time.now : activation_retry_time(workflow_id),
       )
@@ -132,51 +122,33 @@ module Durababble
       worker_pool = activation_worker_pool(activation)
       executor = DurableObjectExecutor.new(store: @store, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
       drained = executor.drain_object_inbox(object_type, object_id:)
+      target = activation_target(activation, worker_pool:)
       if advisory
         if drained.positive?
-          @store.reconcile_target_activation(
-            target_kind: activation.fetch("target_kind"),
-            target_type: object_type,
-            target_id: object_id,
-            worker_pool:,
-          )
+          @store.reconcile_target_activation(**target)
         else
           forward_target_activation(activation)
-          @store.rearm_target_activation(
-            target_kind: activation.fetch("target_kind"),
-            target_type: object_type,
-            target_id: object_id,
-            worker_pool:,
-            ready_at: Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
-          )
+          @store.rearm_target_activation(**target, ready_at: Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
         end
         return
       end
 
       forward_target_activation(activation) if drained.zero?
       @store.complete_target_activation(
-        target_kind: activation.fetch("target_kind"),
-        target_type: object_type,
-        target_id: object_id,
-        worker_pool:,
+        **target,
         worker_id: @worker_id,
-        now: drained.positive? ? Time.now : Time.now + ACTIVATION_FORWARD_RETRY_SECONDS,
+        now: drained.positive? ? Time.now : Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS),
       )
     end
 
     #: (untyped) -> untyped
     def forward_target_activation(activation)
-      @store.deliver_target_message(
-        worker_pool: activation_worker_pool(activation),
-        target_kind: activation.fetch("target_kind"),
-        target_type: activation.fetch("target_type"),
-        target_id: activation.fetch("target_id"),
-      )
+      @store.deliver_target_message(**activation_target(activation, worker_pool: activation_worker_pool(activation)))
     end
 
     #: (untyped) -> untyped
     def activation_retry_time(workflow_id)
-      retry_at = Time.now + ACTIVATION_FORWARD_RETRY_SECONDS
+      retry_at = Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS)
       row = @store.workflow(workflow_id)
       locked_until = row["locked_until"]
       if row.fetch("status") == "running" && locked_until
@@ -236,6 +208,19 @@ module Durababble
     #: (untyped) -> String
     def activation_worker_pool(activation)
       String(activation.fetch("worker_pool", @worker_pool))
+    end
+
+    # The target-identity keywords every reconcile/rearm/complete/deliver store
+    # call shares for a given activation. Splat with `**` and add the call's own
+    # keywords (ready_at:, now:, worker_id:) so the four-key bundle lives once.
+    #: (untyped, worker_pool: String) -> Hash[Symbol, untyped]
+    def activation_target(activation, worker_pool:)
+      {
+        target_kind: activation.fetch("target_kind"),
+        target_type: activation.fetch("target_type"),
+        target_id: activation.fetch("target_id"),
+        worker_pool:,
+      }
     end
 
     #: (target_kind: untyped, target_type: untyped) -> bool

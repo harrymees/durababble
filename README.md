@@ -12,7 +12,7 @@ The docs site source starts at [docs/content/README.md](docs/content/README.md).
 - [Workflows](docs/content/workflows.md)
 - [Durable Objects](docs/content/durable-objects.md)
 - [Object Patterns](docs/content/object-patterns.md)
-- [Storage](docs/content/storage.md)
+- [Storage and payload limits](docs/content/storage.md)
 - [Observability](docs/content/observability.md)
 - [Testing](docs/content/testing.md)
 - [Reference](docs/content/reference.md)
