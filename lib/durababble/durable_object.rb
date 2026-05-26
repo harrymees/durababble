@@ -61,7 +61,7 @@ module Durababble
             kwargs:,
             message_kind: "tell",
             idempotency_key:,
-            max_attempts: inbox_max_attempts(retry_policy),
+            max_attempts: retry_policy.maximum_attempts_limit,
           )
           store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: String(durable_id))
           message_id
@@ -82,6 +82,18 @@ module Durababble
         state.nil? ? UNINITIALIZED : state
       end
 
+      # Single source for the object-command observability attribute bundle, so
+      # the attribute key names are defined once and shared by both the class
+      # (tell) and instance (DurableObjectRef) command paths.
+      #: (object_type: String, object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
+      def command_attributes(object_type:, object_id:, method_name:)
+        {
+          "durababble.object.type" => object_type,
+          "durababble.object.id" => object_id,
+          "durababble.object.method" => method_name,
+        }
+      end
+
       private
 
       #: (Engine?) -> String
@@ -91,19 +103,9 @@ module Durababble
         String(engine.worker_pool)
       end
 
-      #: (RetryPolicy) -> Integer?
-      def inbox_max_attempts(retry_policy)
-        attempts = retry_policy.maximum_attempts
-        attempts.finite? ? attempts.to_i : nil
-      end
-
       #: (object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
       def object_command_attributes(object_id:, method_name:)
-        {
-          "durababble.object.type" => object_type,
-          "durababble.object.id" => object_id,
-          "durababble.object.method" => method_name,
-        }
+        command_attributes(object_type:, object_id:, method_name:)
       end
     end
 
@@ -191,7 +193,7 @@ module Durababble
         state = DurableObject.state_from_store(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
-        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+        object.public_send(method_name, *args, **kwargs, &block)
       end
     end
 
@@ -209,17 +211,11 @@ module Durababble
           kwargs:,
           message_kind: "ask",
           idempotency_key:,
-          max_attempts: inbox_max_attempts(retry_policy),
+          max_attempts: retry_policy.maximum_attempts_limit,
         )
         @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
-    end
-
-    #: (RetryPolicy) -> Integer?
-    def inbox_max_attempts(retry_policy)
-      attempts = retry_policy.maximum_attempts
-      attempts.finite? ? attempts.to_i : nil
     end
 
     #: (RetryPolicy) -> Numeric?
@@ -233,11 +229,7 @@ module Durababble
 
     #: (method_name: Symbol | String) -> Hash[String, Object?]
     def object_attributes(method_name:)
-      {
-        "durababble.object.type" => @object_class.object_type,
-        "durababble.object.id" => @durable_id,
-        "durababble.object.method" => method_name,
-      }
+      DurableObject.command_attributes(object_type: @object_class.object_type, object_id: @durable_id, method_name:)
     end
   end
 
@@ -313,7 +305,7 @@ module Durababble
       Observability.trace("durababble.object.command", attributes) do
         object = build_object(object_class, object_id:, message:)
         args, kwargs = object_args(message)
-        result = kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
+        result = object.public_send(method_name, *args, **kwargs)
         complete_message(object, message, result:, attributes:)
         Observability.count("durababble.object.command.successes", attributes)
         result

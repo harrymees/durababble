@@ -115,9 +115,9 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def migrate! = self
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, worker_pool: "default") = nil
 
-    def enqueue_workflow(name:, input:, worker_pool: "default")
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
       @next_id += 1
-      id = "wf-#{@next_id}"
+      id ||= "wf-#{@next_id}"
       @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "pending", "input" => input, "created_at" => Time.now }
       id
     end

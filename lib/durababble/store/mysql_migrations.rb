@@ -24,10 +24,10 @@ module Durababble
           cancel_delivered_at DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "queue"))} (worker_pool, status, created_at),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "runnable_due"))} (worker_pool, status, next_run_at, created_at),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
-          INDEX #{@connection.quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
+          INDEX #{quote_column_name(index_name("workflows", "queue"))} (worker_pool, status, created_at),
+          INDEX #{quote_column_name(index_name("workflows", "runnable_due"))} (worker_pool, status, next_run_at, created_at),
+          INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )
       SQL
       add_column_if_missing("workflows", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
@@ -46,7 +46,7 @@ module Durababble
           error TEXT,
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           PRIMARY KEY (workflow_id, event_index),
-          INDEX #{@connection.quote_column_name(index_name("workflow_history", "command"))} (workflow_id, command_id, event_index),
+          INDEX #{quote_column_name(index_name("workflow_history", "command"))} (workflow_id, command_id, event_index),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
@@ -78,8 +78,8 @@ module Durababble
           heartbeat_cursor LONGBLOB,
           started_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
-          INDEX #{@connection.quote_column_name(index_name("step_attempts", "workflow_started_position"))} (workflow_id, started_at, position),
-          INDEX #{@connection.quote_column_name(index_name("step_attempts", "workflow_position_status_started"))} (workflow_id, position, status, started_at),
+          INDEX #{quote_column_name(index_name("step_attempts", "workflow_started_position"))} (workflow_id, started_at, position),
+          INDEX #{quote_column_name(index_name("step_attempts", "workflow_position_status_started"))} (workflow_id, position, status, started_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
@@ -110,9 +110,9 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           processed_at DATETIME(6),
-          INDEX #{@connection.quote_column_name(index_name("outbox", "queue"))} (status, created_at),
-          INDEX #{@connection.quote_column_name(index_name("outbox", "expired_lease"))} (status, locked_until, created_at),
-          INDEX #{@connection.quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by),
+          INDEX #{quote_column_name(index_name("outbox", "queue"))} (status, created_at),
+          INDEX #{quote_column_name(index_name("outbox", "expired_lease"))} (status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
@@ -129,9 +129,9 @@ module Durababble
           status VARCHAR(32) NOT NULL,
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
-          INDEX #{@connection.quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
-          INDEX #{@connection.quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
-          INDEX #{@connection.quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
+          INDEX #{quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
+          INDEX #{quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
+          INDEX #{quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
@@ -165,7 +165,7 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
-          INDEX #{@connection.quote_column_name(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
+          INDEX #{quote_column_name(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
         )
       SQL
       create_performance_indexes!
@@ -187,7 +187,7 @@ module Durababble
       SQL
       return if exists
 
-      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{@connection.quote_column_name(column_name.to_s)} #{column_type}")
+      execute("ALTER TABLE #{table(table_name)} ADD COLUMN #{quote_column_name(column_name.to_s)} #{column_type}")
     end
 
     #: () -> untyped
@@ -230,12 +230,12 @@ module Durababble
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           dead_lettered_at DATETIME(6),
-          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "target_sequence_unique"))} (worker_pool, target_kind, target_type, target_id, sequence),
-          UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "target_status_sequence"))} (worker_pool, target_kind, target_type, target_id, status, sequence),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "target_sequence"))} (worker_pool, target_kind, target_type, target_id, sequence),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "ready"))} (worker_pool, status, ready_at, created_at),
-          INDEX #{@connection.quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)
+          UNIQUE KEY #{quote_column_name(index_name("inbox", "target_sequence_unique"))} (worker_pool, target_kind, target_type, target_id, sequence),
+          UNIQUE KEY #{quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash),
+          INDEX #{quote_column_name(index_name("inbox", "target_status_sequence"))} (worker_pool, target_kind, target_type, target_id, status, sequence),
+          INDEX #{quote_column_name(index_name("inbox", "target_sequence"))} (worker_pool, target_kind, target_type, target_id, sequence),
+          INDEX #{quote_column_name(index_name("inbox", "ready"))} (worker_pool, status, ready_at, created_at),
+          INDEX #{quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)
         )
       SQL
       execute(<<~SQL)
@@ -251,9 +251,9 @@ module Durababble
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           PRIMARY KEY (worker_pool, target_kind, target_type, target_id),
-          INDEX #{@connection.quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
-          INDEX #{@connection.quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
-          INDEX #{@connection.quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
+          INDEX #{quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
+          INDEX #{quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
         )
       SQL
       add_column_if_missing("mailbox_sequences", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
@@ -262,7 +262,7 @@ module Durababble
       add_column_if_missing("target_activations", "worker_pool", "VARCHAR(191) NOT NULL DEFAULT 'default'")
       backfill_inbox_idempotency_hashes!
       drop_index_if_present("inbox", "idempotency_key")
-      add_index_if_missing("inbox", index_name("inbox", "idempotency_hash_unique"), "UNIQUE KEY #{@connection.quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash)")
+      add_index_if_missing("inbox", index_name("inbox", "idempotency_hash_unique"), "UNIQUE KEY #{quote_column_name(index_name("inbox", "idempotency_hash_unique"))} (idempotency_hash)")
     end
 
     #: () -> untyped
@@ -297,10 +297,10 @@ module Durababble
 
     #: () -> untyped
     def create_performance_indexes!
-      add_index_if_missing("workflows", index_name("workflows", "worker_lease"), "INDEX #{@connection.quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("outbox", index_name("outbox", "worker_lease"), "INDEX #{@connection.quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("inbox", index_name("inbox", "worker_lease"), "INDEX #{@connection.quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)")
-      add_index_if_missing("target_activations", index_name("target_activations", "worker_lease"), "INDEX #{@connection.quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)")
+      add_index_if_missing("workflows", index_name("workflows", "worker_lease"), "INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)")
+      add_index_if_missing("outbox", index_name("outbox", "worker_lease"), "INDEX #{quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by)")
+      add_index_if_missing("inbox", index_name("inbox", "worker_lease"), "INDEX #{quote_column_name(index_name("inbox", "worker_lease"))} (status, locked_by)")
+      add_index_if_missing("target_activations", index_name("target_activations", "worker_lease"), "INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)")
     end
 
     #: (untyped, untyped, untyped) -> untyped
@@ -330,7 +330,7 @@ module Durababble
       SQL
       return unless exists
 
-      execute("DROP INDEX #{@connection.quote_column_name(index_name.to_s)} ON #{table(table_name)}")
+      execute("DROP INDEX #{quote_column_name(index_name.to_s)} ON #{table(table_name)}")
     end
   end
 end
