@@ -629,8 +629,8 @@ module Durababble
         record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-        execute_store_query(:mark_wait_workflow_pending, [wait.fetch("workflow_id")])
       end
+      mark_waits_workflows_pending(rows)
       Observability.count("durababble.waits.completed", by: rows.length)
       rows.length
     end
