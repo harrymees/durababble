@@ -154,11 +154,14 @@ module Durababble
 
   class Store
     attr_reader schema: String
+    attr_reader connection_pool: Object
     attr_accessor rpc_client_factory: _RpcClientFactory
 
     def self.connect: (database_url: String, ?schema: String) -> Store
+    def self.from_active_record: (connection_pool: Object, ?schema: String, ?owner: Object?) -> Store
+    def self.new: (connection_pool: Object, schema: String, ?owner: Object?) -> Store
 
-    def initialize: (Object connection, schema: String) -> void
+    def initialize: (Object connection_pool, schema: String, ?owner: Object?) -> void
     def migrate!: () -> self
     def drop_schema!: () -> void
     def close: () -> void

@@ -164,33 +164,11 @@ module Durababble
         )
       SQL
       create_performance_indexes!
-      migrate_serialized_columns!
       @migrated = true
       self
     end
 
     private
-
-    #: () -> untyped
-    def migrate_serialized_columns!
-      migrate_serialized_column!("workflows", "input", not_null: true)
-      migrate_serialized_column!("workflows", "result")
-      migrate_serialized_column!("workflow_history", "payload")
-      migrate_serialized_column!("steps", "result")
-      migrate_serialized_column!("steps", "heartbeat_cursor")
-      migrate_serialized_column!("step_attempts", "result")
-      migrate_serialized_column!("step_attempts", "heartbeat_cursor")
-      migrate_serialized_column!("waits", "context", not_null: true)
-      migrate_serialized_column!("waits", "payload")
-      migrate_serialized_column!("fences", "result")
-      migrate_serialized_column!("outbox", "payload", not_null: true)
-      migrate_serialized_column!("durable_objects", "state")
-      migrate_serialized_column!("durable_object_commands", "args", not_null: true)
-      migrate_serialized_column!("durable_object_commands", "kwargs", not_null: true)
-      migrate_serialized_column!("durable_object_commands", "result")
-      migrate_serialized_column!("inbox", "payload", not_null: true)
-      migrate_serialized_column!("inbox", "result")
-    end
 
     #: () -> untyped
     def create_inbox_tables!
@@ -356,51 +334,6 @@ module Durababble
       prefix = schema.to_s.gsub(/[^A-Za-z0-9_]/, "_")
       prefix_length = max_identifier_length - logical.length - 1
       "#{prefix[0, prefix_length]}_#{logical}"
-    end
-
-    #: (untyped, untyped, ?not_null: untyped) -> untyped
-    def migrate_serialized_column!(table_name, column_name, not_null: false)
-      column = execute_params(<<~SQL, [schema, table_name, column_name]).first
-        SELECT data_type, is_nullable
-        FROM information_schema.columns
-        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
-      SQL
-      return unless column
-      return if column.fetch("data_type") == "bytea"
-
-      temporary_column = "#{column_name}__paquito"
-      execute("ALTER TABLE #{table(table_name)} ADD COLUMN IF NOT EXISTS #{@connection.quote_column_name(temporary_column.to_s)} bytea")
-      rows = execute("SELECT * FROM #{table(table_name)}")
-      primary_keys = primary_key_columns(table_name)
-      rows.each do |row|
-        raw = row[column_name]
-        value = raw.nil? ? nil : JSON.parse(raw)
-        execute_params(<<~SQL, primary_keys.map { |key| row.fetch(key) } + [dump_serialized(value)])
-          UPDATE #{table(table_name)}
-          SET #{@connection.quote_column_name(temporary_column.to_s)} = $#{primary_keys.length + 1}::bytea
-          WHERE #{primary_keys.each_with_index.map { |key, index| "#{@connection.quote_column_name(key.to_s)} = $#{index + 1}" }.join(" AND ")}
-        SQL
-      end
-      if not_null
-        execute_params(
-          "UPDATE #{table(table_name)} SET #{@connection.quote_column_name(temporary_column.to_s)} = $1::bytea WHERE #{@connection.quote_column_name(temporary_column.to_s)} IS NULL",
-          [dump_serialized({})],
-        )
-      end
-      execute("ALTER TABLE #{table(table_name)} DROP COLUMN #{@connection.quote_column_name(column_name.to_s)}")
-      execute("ALTER TABLE #{table(table_name)} RENAME COLUMN #{@connection.quote_column_name(temporary_column.to_s)} TO #{@connection.quote_column_name(column_name.to_s)}")
-      execute("ALTER TABLE #{table(table_name)} ALTER COLUMN #{@connection.quote_column_name(column_name.to_s)} SET NOT NULL") if not_null
-    end
-
-    #: (untyped) -> untyped
-    def primary_key_columns(table_name)
-      execute_params(<<~SQL, [schema, table_name]).map { |row| row.fetch("column_name") }
-        SELECT a.attname AS column_name
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = ($1 || '.' || $2)::regclass AND i.indisprimary
-        ORDER BY array_position(i.indkey, a.attnum)
-      SQL
     end
   end
 end

@@ -3,7 +3,6 @@
 
 require "active_record"
 require "digest"
-require "json"
 require "paquito"
 require "securerandom"
 require "time"
@@ -18,38 +17,64 @@ module Durababble
     GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
     GENERATED_CONNECTION_CLASSES = {}
 
-    class PooledConnections
-      #: (Store) -> void
-      def initialize(template)
-        @template = template
+    class ConnectionPoolProxy
+      #: (Object) -> void
+      def initialize(connection_pool)
+        @connection_pool = connection_pool
+        @connection_key = :"durababble_store_connection_#{object_id}"
       end
 
-      #: () -> void
-      def close
+      #: () -> Object
+      def pool
+        @connection_pool
       end
 
-      #: () -> bool
-      def pooled_connections?
-        true
+      #: () { (Object) -> Object? } -> Object?
+      def with_connection(&block)
+        current = Thread.current[@connection_key]
+        return block.call(current) if current
+
+        connection_pool = @connection_pool #: as untyped
+        connection_pool.with_connection do |connection|
+          Thread.current[@connection_key] = connection
+          begin
+            block.call(connection)
+          ensure
+            Thread.current[@connection_key] = nil
+          end
+        end
+      end
+
+      #: (*untyped, **untyped) { () -> Object? } -> Object?
+      def transaction(*args, **kwargs, &block)
+        with_connection do |connection|
+          connection = connection #: as untyped
+          connection.transaction(*args, **kwargs, &block)
+        end
       end
 
       #: (Symbol, *untyped, **untyped) ?{ (*untyped) -> untyped } -> untyped
       def method_missing(name, *args, **kwargs, &block)
-        @template.send(:with_connection_store) do |store|
-          store.public_send(name, *args, **kwargs, &block)
+        with_connection do |connection|
+          connection = connection #: as untyped
+          connection.public_send(name, *args, **kwargs, &block)
         end
       end
 
       #: (Symbol, ?bool) -> bool
       def respond_to_missing?(name, include_private = false)
-        @template.respond_to?(name, include_private)
+        result = with_connection do |connection|
+          connection = connection #: as untyped
+          connection.respond_to?(name, include_private)
+        end
+        result #: as bool
       end
     end
 
     #: String
     attr_reader :schema
     #: Object
-    attr_reader :connection
+    attr_reader :connection_pool
     #: Object
     attr_accessor :rpc_client_factory
 
@@ -58,39 +83,41 @@ module Durababble
       def new(*args, **kwargs, &block)
         return super unless equal?(Store)
 
-        connection = args.first || kwargs[:connection]
-        raise ArgumentError, "Durababble::Store.new requires a connection" unless connection
+        raise ArgumentError, "Durababble::Store.new requires connection_pool:" if args.any?
 
-        from_active_record(connection:, schema: kwargs.fetch(:schema).to_s, owner: kwargs[:owner])
+        connection_pool = kwargs[:connection_pool]
+        raise ArgumentError, "Durababble::Store.new requires connection_pool:" unless connection_pool
+
+        store = from_active_record(connection_pool:, schema: kwargs.fetch(:schema).to_s, owner: kwargs[:owner])
+        store #: as Store
       end
 
       #: (database_url: String, ?schema: String) -> Store
       def connect(database_url:, schema: Durababble.default_schema)
         active_record_class = active_record_class_for(database_url)
         active_record_class = active_record_class #: as untyped
-        from_active_record(connection_pool: active_record_class.connection_pool, schema:, owner: active_record_class)
+        store = from_active_record(connection_pool: active_record_class.connection_pool, schema:, owner: active_record_class)
+        store #: as Store
       rescue StandardError
         remove_active_record_class_const(active_record_class) if active_record_class
         raise
       end
 
-      #: (?connection: Object?, ?connection_pool: Object?, ?schema: String, ?owner: Object?) -> Store
-      def from_active_record(connection: nil, connection_pool: nil, schema: Durababble.default_schema, owner: nil)
+      #: (connection_pool: Object, ?schema: String, ?owner: Object?) -> Store
+      def from_active_record(connection_pool:, schema: Durababble.default_schema, owner: nil)
         connection_pool = connection_pool #: as untyped
-        connection ||= connection_pool&.lease_connection
-        raise ArgumentError, "provide connection: or connection_pool:" unless connection
+        raise ArgumentError, "provide connection_pool:" unless connection_pool&.respond_to?(:with_connection)
 
-        connection = connection #: as untyped
-        adapter = connection.adapter_name.to_s.downcase
+        adapter = connection_pool.with_connection { |active_connection| active_connection.adapter_name.to_s.downcase }
         if adapter.include?("mysql") || adapter.include?("trilogy")
-          return MysqlStore.new(connection, schema:, owner:)
+          return MysqlStore.new(connection_pool, schema:, owner:)
         end
 
         if adapter.include?("postgres") || adapter.include?("yugabyte")
-          return PostgresStore.new(connection, schema:, owner:)
+          return PostgresStore.new(connection_pool, schema:, owner:)
         end
 
-        raise ArgumentError, "unsupported ActiveRecord adapter for Durababble store: #{connection.adapter_name}"
+        raise ArgumentError, "unsupported ActiveRecord adapter for Durababble store: #{adapter}"
       end
 
       private
@@ -141,6 +168,7 @@ module Durababble
         else
           uri.scheme
         end
+        query_options = uri.query ? URI.decode_www_form(uri.query.to_s).to_h.transform_keys(&:to_sym) : {}
         {
           adapter:,
           host: uri.host,
@@ -148,13 +176,16 @@ module Durababble
           username: username && URI.decode_www_form_component(username),
           password: password && URI.decode_www_form_component(password),
           database: path.delete_prefix("/"),
-        }.compact
+        }.compact.merge(query_options)
       end
     end
 
     #: (Object, schema: String, ?owner: Object?) -> void
-    def initialize(connection, schema:, owner: nil)
-      @connection = connection #: as untyped
+    def initialize(connection_pool, schema:, owner: nil)
+      raise ArgumentError, "connection_pool must respond to with_connection" unless connection_pool.respond_to?(:with_connection)
+
+      @connection_pool = connection_pool
+      @connection = ConnectionPoolProxy.new(connection_pool) #: as untyped
       @schema = schema
       @owner = owner
       @migrated = false
@@ -173,11 +204,6 @@ module Durababble
 
     #: () -> Time
     def current_time = Time.now
-
-    #: () -> PooledConnections
-    def pooled_connections
-      PooledConnections.new(self)
-    end
 
     #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: Object?) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
@@ -244,26 +270,6 @@ module Durababble
     end
 
     private
-
-    #: () -> Object?
-    def active_record_connection_pool
-      owner = @owner #: as untyped
-      return owner.connection_pool if owner&.respond_to?(:connection_pool)
-      return @connection.pool if @connection.respond_to?(:pool)
-
-      nil
-    end
-
-    #: () { (?) -> Object? } -> Object?
-    def with_connection_store(&block)
-      pool = active_record_connection_pool
-      raise Error, "Durababble store cannot checkout an isolated connection without an ActiveRecord connection pool" unless pool
-
-      pool = pool #: as untyped
-      pool.with_connection do |connection|
-        block.call(self.class.from_active_record(connection:, schema: @schema))
-      end
-    end
 
     #: () { () -> Object? } -> Object?
     def transaction(&block)

@@ -63,7 +63,7 @@ store = Durababble::Store.from_active_record(
 store.migrate!
 ```
 
-`from_active_record` also accepts a bare `connection:` for cases where you already hold a checked-out ActiveRecord connection. The adapter is detected from `connection.adapter_name`, so the same call works for MySQL, PostgreSQL, and YugabyteDB.
+Durababble checks out connections as needed from the configured ActiveRecord pool. When you share an application pool, Durababble contends with the rest of the application the same way as other database users in the same process.
 
 ## Workers And Cluster Addresses
 

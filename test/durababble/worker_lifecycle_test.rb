@@ -137,7 +137,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_equal false, store.closed
   end
 
-  test "uses isolated store connections for worker and rpc paths when it owns the store" do
+  test "uses one pool-backed store for worker and rpc paths when it owns the store" do
     runtime = Durababble::WorkerRuntime.new(
       database_url:,
       schema:,
@@ -152,13 +152,8 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
     refute_nil(worker_store)
     refute_nil(rpc_store)
-    refute_same(runtime.store, worker_store)
-    refute_same(runtime.store, rpc_store)
-    refute_same(worker_store, rpc_store)
-    assert_equal(true, worker_store.pooled_connections?)
-    assert_equal(true, rpc_store.pooled_connections?)
-    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(worker_store))
-    refute_equal(runtime.store.connection.object_id, connection_id_from_thread(rpc_store))
+    assert_same(runtime.store, worker_store)
+    assert_same(runtime.store, rpc_store)
     owner = runtime.store.instance_variable_get(:@owner)
     runtime.close
     refute(owner.connection_pool.active_connection?)
@@ -507,12 +502,6 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
   def runtime_store
     @runtime_store ||= Durababble::Store.connect(database_url:, schema:)
-  end
-
-  def connection_id_from_thread(store)
-    ids = Queue.new
-    Thread.new { ids << store.connection.object_id }.join
-    ids.pop
   end
 
   def eventually(timeout:)

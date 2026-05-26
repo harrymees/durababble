@@ -22,6 +22,30 @@ module DurababbleScriptedSqlSupport
     end
   end
 
+  class ScriptedConnectionPool
+    attr_reader :connection, :checked_out, :disconnected
+
+    def initialize(connection)
+      @connection = connection
+      @checked_out = 0
+      @disconnected = false
+    end
+
+    def with_connection
+      @checked_out += 1
+      yield @connection
+    end
+
+    def disconnect!
+      @disconnected = true
+      @connection.close if @connection.respond_to?(:close)
+    end
+
+    def active_connection?
+      false
+    end
+  end
+
   class ScriptedPgConnection
     attr_reader :exec_params_calls, :exec_calls, :closed
 
@@ -154,7 +178,7 @@ module DurababbleScriptedSqlSupport
     attr_reader :executed
 
     def initialize(schema:, columns: {})
-      super(ScriptedMysqlConnection.new, schema:)
+      super(ScriptedConnectionPool.new(ScriptedMysqlConnection.new), schema:)
       @columns = columns
       @executed = []
     end
@@ -185,5 +209,9 @@ module DurababbleScriptedSqlSupport
     Durababble::Store::SERIALIZER.dump(value).then { |bytes| "\\x#{bytes.unpack1("H*")}" }
   end
 
-  private :sql_result, :pg_dump
+  def scripted_pool(connection)
+    DurababbleScriptedSqlSupport::ScriptedConnectionPool.new(connection)
+  end
+
+  private :sql_result, :pg_dump, :scripted_pool
 end
