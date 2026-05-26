@@ -53,6 +53,14 @@ class DurababbleStoreTest < DurababbleTestCase
     store.send(:execute_params, "SELECT ?", [1])
 
     assert_operator pool.checked_out, :>, before_query
+
+    before_transaction = pool.checked_out
+    store.send(:transaction) do
+      store.send(:execute_params, "SELECT ?", [1])
+      store.send(:execute_params, "SELECT ?", [2])
+    end
+
+    assert_equal before_transaction + 1, pool.checked_out
   end
 
   test "database url query parameters are preserved in active record config" do

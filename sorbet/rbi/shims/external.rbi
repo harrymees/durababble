@@ -171,6 +171,7 @@ module Durababble
     def execute(sql); end
     def execute_params(sql, params); end
     def index_name(table_name, suffix); end
+    def quote_column_name(identifier); end
     def raw_table_name(name); end
     def table(name); end
     def table_prefix; end
@@ -180,6 +181,7 @@ module Durababble
     def dump_serialized(value); end
     def execute(sql); end
     def execute_params(sql, params); end
+    def quote_column_name(identifier); end
     def quoted_schema; end
     def schema; end
     def table(name); end

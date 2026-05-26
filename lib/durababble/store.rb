@@ -17,60 +17,6 @@ module Durababble
     GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
     GENERATED_CONNECTION_CLASSES = {}
 
-    class ConnectionPoolProxy
-      #: (Object) -> void
-      def initialize(connection_pool)
-        @connection_pool = connection_pool
-        @connection_key = :"durababble_store_connection_#{object_id}"
-      end
-
-      #: () -> Object
-      def pool
-        @connection_pool
-      end
-
-      #: () { (Object) -> Object? } -> Object?
-      def with_connection(&block)
-        current = Thread.current[@connection_key]
-        return block.call(current) if current
-
-        connection_pool = @connection_pool #: as untyped
-        connection_pool.with_connection do |connection|
-          Thread.current[@connection_key] = connection
-          begin
-            block.call(connection)
-          ensure
-            Thread.current[@connection_key] = nil
-          end
-        end
-      end
-
-      #: (*untyped, **untyped) { () -> Object? } -> Object?
-      def transaction(*args, **kwargs, &block)
-        with_connection do |connection|
-          connection = connection #: as untyped
-          connection.transaction(*args, **kwargs, &block)
-        end
-      end
-
-      #: (Symbol, *untyped, **untyped) ?{ (*untyped) -> untyped } -> untyped
-      def method_missing(name, *args, **kwargs, &block)
-        with_connection do |connection|
-          connection = connection #: as untyped
-          connection.public_send(name, *args, **kwargs, &block)
-        end
-      end
-
-      #: (Symbol, ?bool) -> bool
-      def respond_to_missing?(name, include_private = false)
-        result = with_connection do |connection|
-          connection = connection #: as untyped
-          connection.respond_to?(name, include_private)
-        end
-        result #: as bool
-      end
-    end
-
     #: String
     attr_reader :schema
     #: Object
@@ -185,7 +131,7 @@ module Durababble
       raise ArgumentError, "connection_pool must respond to with_connection" unless connection_pool.respond_to?(:with_connection)
 
       @connection_pool = connection_pool
-      @connection = ConnectionPoolProxy.new(connection_pool) #: as untyped
+      @connection_key = :"durababble_store_connection_#{object_id}"
       @schema = schema
       @owner = owner
       @migrated = false
@@ -271,14 +217,35 @@ module Durababble
 
     private
 
-    #: () { () -> Object? } -> Object?
-    def transaction(&block)
-      @connection.transaction(requires_new: true, &block)
+    #: () { (Object) -> Object? } -> Object?
+    def with_connection(&block)
+      current = Thread.current[@connection_key]
+      return block.call(current) if current
+
+      connection_pool = @connection_pool #: as untyped
+      connection_pool.with_connection do |active_record_connection|
+        Thread.current[@connection_key] = active_record_connection
+        begin
+          block.call(active_record_connection)
+        ensure
+          Thread.current[@connection_key] = nil
+        end
+      end
+    end
+
+    #: (**Object?) { () -> Object? } -> Object?
+    def transaction(**options, &block)
+      with_connection do |active_record_connection|
+        active_record_connection = active_record_connection #: as untyped
+        active_record_connection.transaction(requires_new: true, **options, &block)
+      end
     end
 
     #: (Symbol | String, ?Array[Object?], **Object?) -> untyped
     def execute_store_query(id, params = [], **locals)
-      execute_store_query_sql(store_query_sql(id, **locals), params)
+      with_connection do
+        execute_store_query_sql(store_query_sql(id, **locals), params)
+      end
     end
 
     #: (Symbol | String, **Object?) -> String
@@ -303,6 +270,15 @@ module Durababble
     #: (String, Array[Object?]) -> untyped
     def execute_store_query_sql(sql, params)
       raise NotImplementedError
+    end
+
+    #: (String | Symbol) -> String
+    def quote_column_name(identifier)
+      result = with_connection do |active_record_connection|
+        active_record_connection = active_record_connection #: as untyped
+        active_record_connection.quote_column_name(identifier.to_s)
+      end
+      result #: as String
     end
 
     #: (target_kind: String, target_type: String, target_id: String, worker_pool: String) -> Hash[String, Object?]?

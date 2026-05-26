@@ -73,7 +73,7 @@ module DurababbleScriptedSqlSupport
       end
     end
 
-    def transaction(requires_new: true)
+    def transaction(requires_new: true, **_options)
       yield
     end
 
@@ -116,7 +116,7 @@ module DurababbleScriptedSqlSupport
       @result_for_query&.call(sql) || DurababbleScriptedSqlSupport.sql_result
     end
 
-    def transaction(requires_new: true)
+    def transaction(requires_new: true, **_options)
       yield
     end
 

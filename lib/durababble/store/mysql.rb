@@ -718,7 +718,10 @@ module Durababble
 
     #: (String) -> untyped
     def execute(sql)
-      @connection.exec_query(sql)
+      with_connection do |active_record_connection|
+        active_record_connection = active_record_connection #: as untyped
+        active_record_connection.exec_query(sql)
+      end
     end
 
     #: () -> Symbol
@@ -728,10 +731,14 @@ module Durababble
 
     #: (String, Array[Object?]) -> untyped
     def execute_store_query_sql(sql, params)
-      if trilogy_connection?
-        @connection.exec_query(sanitizer_class.send(:sanitize_sql_array, [sql, *params]), "Durababble SQL")
-      else
-        @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+      with_connection do |active_record_connection|
+        active_record_connection = active_record_connection #: as untyped
+        if trilogy_connection?(active_record_connection)
+          sanitized_sql = sanitizer_class(active_record_connection).send(:sanitize_sql_array, [sql, *params])
+          active_record_connection.exec_query(sanitized_sql, "Durababble SQL")
+        else
+          active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+        end
       end
     end
 
@@ -744,7 +751,7 @@ module Durababble
     def transaction(**options, &block)
       attempts = 0
       begin
-        @connection.transaction(requires_new: true, **options, &block)
+        super(**options, &block)
       rescue StandardError => error
         if retryable_mysql_error?(error) && attempts < MAX_TRANSACTION_RETRY_ATTEMPTS
           attempts += 1
@@ -780,7 +787,7 @@ module Durababble
 
     #: (String) -> Object?
     def table(name)
-      @connection.quote_column_name("#{table_prefix}_#{name}")
+      quote_column_name("#{table_prefix}_#{name}")
     end
 
     #: (String) -> Object?
@@ -820,19 +827,19 @@ module Durababble
         error.class.name == "ActiveRecord::LockWaitTimeout"
     end
 
-    #: () -> bool
-    def trilogy_connection?
-      @connection.adapter_name.to_s.downcase.include?("trilogy")
+    #: (Object) -> bool
+    def trilogy_connection?(active_record_connection)
+      active_record_connection = active_record_connection #: as untyped
+      active_record_connection.adapter_name.to_s.downcase.include?("trilogy")
     end
 
-    #: () -> Class
-    def sanitizer_class
-      durababble_connection = @connection
-      @sanitizer_class ||= Class.new do
+    #: (Object) -> Class
+    def sanitizer_class(active_record_connection)
+      Class.new do
         extend ActiveRecord::Sanitization::ClassMethods
 
         define_singleton_method(:with_connection) do |&block|
-          block.call(durababble_connection)
+          block.call(active_record_connection)
         end
       end
     end

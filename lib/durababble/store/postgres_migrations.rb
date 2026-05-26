@@ -312,7 +312,7 @@ module Durababble
       return if exists
 
       execute("SET search_path TO #{quoted_schema}")
-      execute("CREATE #{"UNIQUE " if unique}INDEX IF NOT EXISTS #{@connection.quote_column_name(index_name)} #{definition}")
+      execute("CREATE #{"UNIQUE " if unique}INDEX IF NOT EXISTS #{quote_column_name(index_name)} #{definition}")
     ensure
       execute("RESET search_path")
     end
@@ -320,7 +320,7 @@ module Durababble
     #: (untyped) -> untyped
     def drop_postgres_index(name)
       [name.to_s, postgres_index_name(name)].uniq.each do |index_name|
-        execute("DROP INDEX IF EXISTS #{quoted_schema}.#{@connection.quote_column_name(index_name)}")
+        execute("DROP INDEX IF EXISTS #{quoted_schema}.#{quote_column_name(index_name)}")
       end
     end
 

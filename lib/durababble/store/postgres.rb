@@ -69,7 +69,7 @@ module Durababble
 
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
-      @connection.transaction(requires_new: true) do
+      transaction do
         workflows = execute_store_query(:release_workflow_leases, [worker_id]).affected_rows
         outbox = execute_store_query(:release_outbox_leases, [worker_id]).affected_rows
         inbox = execute_store_query(:release_inbox_leases, [worker_id]).affected_rows
@@ -101,7 +101,7 @@ module Durababble
 
     #: (workflow_id: String, reason: String) -> Object?
     def request_workflow_cancellation(workflow_id:, reason:)
-      @connection.transaction(requires_new: true) do
+      transaction do
         row = execute_store_query(:lock_workflow_for_update, [workflow_id]).first
         raise KeyError, "workflow not found: #{workflow_id}" unless row
 
@@ -125,7 +125,7 @@ module Durababble
     #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
     def request_workflow_termination(workflow_id:, reason: nil)
       error = workflow_termination_error(reason)
-      result = @connection.transaction(requires_new: true) do
+      result = transaction do
         row = execute_store_query(:lock_workflow_for_termination, [workflow_id]).first
         raise KeyError, "workflow not found: #{workflow_id}" unless row
 
@@ -155,7 +155,7 @@ module Durababble
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
-      renewed = @connection.transaction(requires_new: true) do
+      renewed = transaction do
         workflow = execute_store_query(:heartbeat_step_workflow, [workflow_id, worker_id, lease_seconds]).first
         next nil unless workflow
 
@@ -166,6 +166,7 @@ module Durababble
         execute_store_query(:heartbeat_latest_attempt, [workflow_id, command_id, serialized_cursor])
         workflow
       end
+      renewed = renewed #: as untyped
       renewed&.fetch("locked_until")
     end
 
@@ -239,7 +240,7 @@ module Durababble
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
         execute_store_query(:insert_scheduled_step, [workflow_id, command_id, name])
@@ -249,7 +250,7 @@ module Durababble
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
     def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:supersede_running_step_attempts, [workflow_id, command_id])
         execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
@@ -270,7 +271,7 @@ module Durababble
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
     def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:cancel_step, [workflow_id, command_id, error])
         update_latest_attempt_serialized(workflow_id:, command_id:, status: "canceled", serialized_result: dump_serialized(nil), error:)
@@ -281,7 +282,7 @@ module Durababble
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
         wait_id = SecureRandom.uuid
@@ -359,7 +360,7 @@ module Durababble
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox(worker_id:, lease_seconds:)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
+        transaction do
           candidates = []
           candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
           candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
@@ -394,7 +395,7 @@ module Durababble
 
       filter_sql, filter_params = target_activation_filter(target_kinds:, target_types:, offset: 3)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
+        transaction do
           candidates = []
           candidates.concat(execute_store_query(:claim_pending_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
           candidates.concat(execute_store_query(:claim_expired_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
@@ -410,7 +411,7 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
-      @connection.transaction(requires_new: true) do
+      transaction do
         activation = execute_store_query(:lock_target_activation_for_completion, [worker_pool, target_kind, target_type, target_id, worker_id]).first
         next nil unless activation
 
@@ -626,10 +627,12 @@ module Durababble
 
     #: (Time, Integer) -> Integer
     def complete_timer_waits(now, batch_size)
-      @connection.transaction(requires_new: true) do
+      completed = transaction do
         returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
         finish_completed_waits(returning, {})
       end
+      completed = completed #: as Integer
+      completed
     end
 
     #: (Object, Hash[String, Object?]) -> Integer
@@ -706,7 +709,10 @@ module Durababble
     def execute(sql)
       attempts = 0
       begin
-        @connection.exec_query(sql)
+        with_connection do |active_record_connection|
+          active_record_connection = active_record_connection #: as untyped
+          active_record_connection.exec_query(sql)
+        end
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
         raise if attempts >= MAX_STATEMENT_RETRY_ATTEMPTS
@@ -723,7 +729,10 @@ module Durababble
 
     #: (String, Array[Object?]) -> untyped
     def execute_store_query_sql(sql, params)
-      @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+      with_connection do |active_record_connection|
+        active_record_connection = active_record_connection #: as untyped
+        active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+      end
     end
 
     #: (String, Array[Object?]) -> untyped
@@ -731,9 +740,9 @@ module Durababble
       execute_store_query_sql(sql, params)
     end
 
-    #: () { () -> Object? } -> Object?
-    def transaction(&block)
-      retry_serialization_failures { @connection.transaction(requires_new: true, &block) }
+    #: (**Object?) { () -> Object? } -> Object?
+    def transaction(**options, &block)
+      retry_serialization_failures { super(**options, &block) }
     end
 
     #: (Array[String]?, ?offset: Integer) -> [String, Array[String]]
@@ -755,12 +764,12 @@ module Durababble
 
     #: (String) -> Object?
     def table(name)
-      "#{quoted_schema}.#{@connection.quote_column_name(name.to_s)}"
+      "#{quoted_schema}.#{quote_column_name(name.to_s)}"
     end
 
     #: () -> Object?
     def quoted_schema
-      @connection.quote_column_name(schema.to_s)
+      quote_column_name(schema.to_s)
     end
 
     #: (Object?) -> Object?
