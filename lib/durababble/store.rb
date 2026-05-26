@@ -19,7 +19,7 @@ module Durababble
 
     #: String
     attr_reader :schema
-    #: Object
+    #: ActiveRecord::ConnectionAdapters::ConnectionPool
     attr_reader :connection_pool
     #: Object
     attr_accessor :rpc_client_factory
@@ -34,6 +34,7 @@ module Durababble
         connection_pool = kwargs[:connection_pool]
         raise ArgumentError, "Durababble::Store.new requires connection_pool:" unless connection_pool
 
+        connection_pool = connection_pool #: as ActiveRecord::ConnectionAdapters::ConnectionPool
         store = from_active_record(connection_pool:, schema: kwargs.fetch(:schema).to_s, owner: kwargs[:owner])
         store #: as Store
       end
@@ -49,10 +50,9 @@ module Durababble
         raise
       end
 
-      #: (connection_pool: Object, ?schema: String, ?owner: Object?) -> Store
+      #: (connection_pool: ActiveRecord::ConnectionAdapters::ConnectionPool, ?schema: String, ?owner: Object?) -> Store
       def from_active_record(connection_pool:, schema: Durababble.default_schema, owner: nil)
-        connection_pool = connection_pool #: as untyped
-        raise ArgumentError, "provide connection_pool:" unless connection_pool&.respond_to?(:with_connection)
+        raise ArgumentError, "provide connection_pool:" unless connection_pool.respond_to?(:with_connection)
 
         adapter = connection_pool.with_connection { |active_connection| active_connection.adapter_name.to_s.downcase }
         if adapter.include?("mysql") || adapter.include?("trilogy")
@@ -126,7 +126,7 @@ module Durababble
       end
     end
 
-    #: (Object, schema: String, ?owner: Object?) -> void
+    #: (ActiveRecord::ConnectionAdapters::ConnectionPool, schema: String, ?owner: Object?) -> void
     def initialize(connection_pool, schema:, owner: nil)
       raise ArgumentError, "connection_pool must respond to with_connection" unless connection_pool.respond_to?(:with_connection)
 
@@ -217,12 +217,12 @@ module Durababble
 
     private
 
-    #: () { (Object) -> Object? } -> Object?
+    #: () { (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> Object? } -> Object?
     def with_connection(&block)
-      current = Thread.current[@connection_key]
+      current = Thread.current[@connection_key] #: as ActiveRecord::ConnectionAdapters::AbstractAdapter?
       return block.call(current) if current
 
-      connection_pool = @connection_pool #: as untyped
+      connection_pool = @connection_pool
       connection_pool.with_connection do |active_record_connection|
         Thread.current[@connection_key] = active_record_connection
         begin
@@ -236,7 +236,6 @@ module Durababble
     #: (**Object?) { () -> Object? } -> Object?
     def transaction(**options, &block)
       with_connection do |active_record_connection|
-        active_record_connection = active_record_connection #: as untyped
         active_record_connection.transaction(requires_new: true, **options, &block)
       end
     end
@@ -275,7 +274,6 @@ module Durababble
     #: (String | Symbol) -> String
     def quote_column_name(identifier)
       result = with_connection do |active_record_connection|
-        active_record_connection = active_record_connection #: as untyped
         active_record_connection.quote_column_name(identifier.to_s)
       end
       result #: as String

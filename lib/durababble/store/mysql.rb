@@ -719,7 +719,6 @@ module Durababble
     #: (String) -> untyped
     def execute(sql)
       with_connection do |active_record_connection|
-        active_record_connection = active_record_connection #: as untyped
         active_record_connection.exec_query(sql)
       end
     end
@@ -732,7 +731,6 @@ module Durababble
     #: (String, Array[Object?]) -> untyped
     def execute_store_query_sql(sql, params)
       with_connection do |active_record_connection|
-        active_record_connection = active_record_connection #: as untyped
         if trilogy_connection?(active_record_connection)
           sanitized_sql = sanitizer_class(active_record_connection).send(:sanitize_sql_array, [sql, *params])
           active_record_connection.exec_query(sanitized_sql, "Durababble SQL")
@@ -827,13 +825,12 @@ module Durababble
         error.class.name == "ActiveRecord::LockWaitTimeout"
     end
 
-    #: (Object) -> bool
+    #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> bool
     def trilogy_connection?(active_record_connection)
-      active_record_connection = active_record_connection #: as untyped
       active_record_connection.adapter_name.to_s.downcase.include?("trilogy")
     end
 
-    #: (Object) -> Class
+    #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> Class
     def sanitizer_class(active_record_connection)
       Class.new do
         extend ActiveRecord::Sanitization::ClassMethods

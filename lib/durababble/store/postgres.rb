@@ -710,7 +710,6 @@ module Durababble
       attempts = 0
       begin
         with_connection do |active_record_connection|
-          active_record_connection = active_record_connection #: as untyped
           active_record_connection.exec_query(sql)
         end
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
@@ -730,7 +729,6 @@ module Durababble
     #: (String, Array[Object?]) -> untyped
     def execute_store_query_sql(sql, params)
       with_connection do |active_record_connection|
-        active_record_connection = active_record_connection #: as untyped
         active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
       end
     end
