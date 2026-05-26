@@ -42,15 +42,7 @@ module Durababble
         worker_id: @worker_id,
         lease_seconds: @lease_seconds,
         root_task: @root_task,
-        futures: @futures,
-        step_contexts: @step_contexts,
-        synchronize_store: ->(&block) { synchronize_store(&block) },
-        raise_if_cancel_requested: -> { raise_if_cancel_requested! },
-        assert_workflow_lease: -> { assert_workflow_lease! },
-        suspend_workflow_immediately: -> { suspend_workflow_immediately? },
-        defer_workflow_suspension: ->(command_id) { defer_workflow_suspension(command_id) },
-        retry_run_at: ->(delay) { retry_run_at(delay) },
-        crash: ->(point) { crash!(point) },
+        execution: self,
       )
       register_workflow_task(root_task)
     end
@@ -230,7 +222,38 @@ module Durababble
       @replay_history.validate_complete!(workflow_id: @workflow_id, next_command_id: @next_command_id)
     end
 
-    private
+    # --- WorkflowStepRunner collaboration surface ---
+    # WorkflowExecution owns the command futures, the per-task step contexts, and
+    # all workflow-level policy (lease, cancellation, suspend, retry timing, crash
+    # injection). WorkflowStepRunner runs one step attempt and reports its outcome
+    # back through these methods. They are public solely for WorkflowStepRunner;
+    # no other caller should reach for them. The policy methods below double as
+    # internal helpers and are called from elsewhere in this class too.
+
+    #: (Integer, Object?) -> void
+    def resolve_command(command_id, value)
+      @futures.fetch(command_id).resolve(value)
+    end
+
+    #: (Integer, StandardError) -> void
+    def reject_command(command_id, error)
+      @futures.fetch(command_id).reject(error)
+    end
+
+    #: (untyped, StepContext) -> void
+    def register_step_context(task, context)
+      @step_contexts[task] = context
+    end
+
+    #: (untyped) -> void
+    def clear_step_context(task)
+      @step_contexts.delete(task)
+    end
+
+    #: () { -> untyped } -> untyped
+    def synchronize_store(&block)
+      WorkflowDeterminism.allow_host_operations { @store_mutex.synchronize(&block) }
+    end
 
     #: () -> untyped
     def raise_if_cancel_requested!
@@ -241,6 +264,36 @@ module Durababble
 
       raise cancellation_error_from(cancellation)
     end
+
+    #: () -> untyped
+    def assert_workflow_lease!
+      return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
+
+      raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
+    end
+
+    #: () -> bool
+    def suspend_workflow_immediately?
+      @workflow_task_count <= 1
+    end
+
+    #: (Integer) -> void
+    def defer_workflow_suspension(command_id)
+      @deferred_suspension_command_ids[command_id] = true
+      reject_deferred_suspensions_if_quiescent!
+    end
+
+    #: (untyped) -> untyped
+    def retry_run_at(delay)
+      @store.current_time + delay
+    end
+
+    #: (untyped) -> untyped
+    def crash!(point)
+      raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
+    end
+
+    private
 
     #: (untyped) -> void
     def assert_workflow_task!(operation)
@@ -362,17 +415,6 @@ module Durababble
       else
         defer_workflow_suspension(command_id)
       end
-    end
-
-    #: () -> bool
-    def suspend_workflow_immediately?
-      @workflow_task_count <= 1
-    end
-
-    #: (Integer) -> void
-    def defer_workflow_suspension(command_id)
-      @deferred_suspension_command_ids[command_id] = true
-      reject_deferred_suspensions_if_quiescent!
     end
 
     #: () -> void
@@ -670,18 +712,6 @@ module Durababble
       !@replay_history.recorded_schedule_matches?(@next_command_id, shape)
     end
 
-    #: () -> untyped
-    def assert_workflow_lease!
-      return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
-
-      raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
-    end
-
-    #: (untyped) -> untyped
-    def retry_run_at(delay)
-      @store.current_time + delay
-    end
-
     #: (untyped) -> untyped
     def wait_condition_wake_at(timeout)
       WorkflowDeterminism.allow_host_operations do
@@ -699,16 +729,6 @@ module Durababble
       return if ["sleep", "wait_condition"].include?(name.to_s)
 
       wait_request.wake_at
-    end
-
-    #: () { -> untyped } -> untyped
-    def synchronize_store(&block)
-      WorkflowDeterminism.allow_host_operations { @store_mutex.synchronize(&block) }
-    end
-
-    #: (untyped) -> untyped
-    def crash!(point)
-      raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end
   end
 end
