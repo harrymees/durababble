@@ -191,9 +191,8 @@ module Durababble
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       renewed = transaction do
-        next nil unless workflow_owned?(workflow_id:, worker_id:)
-
-        execute_store_query(:heartbeat_step_workflow, [lease_seconds, workflow_id, worker_id])
+        renewal = execute_store_query(:heartbeat_step_workflow, [lease_seconds, workflow_id, worker_id])
+        next nil unless renewal.affected_rows == 1
 
         serialized_cursor = dump_serialized(cursor)
         step = execute_store_query(:running_step_exists, [workflow_id, command_id]).first

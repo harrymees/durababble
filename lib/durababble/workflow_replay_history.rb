@@ -27,6 +27,11 @@ module Durababble
       @blocking_event_indexes = (@scheduled.values + @terminal_events)
         .filter_map { |event| event["event_index"]&.to_i }
         .sort
+      # Blocking indexes are consumed monotonically as replay advances, so a single
+      # cursor over the sorted array answers "still blocked?" in amortized O(1)
+      # instead of rescanning the whole array on every safe point. The cursor marks
+      # the first index not yet known to be consumed; everything before it is.
+      @blocking_cursor = 0
     end
 
     #: (Integer) -> bool
@@ -94,7 +99,8 @@ module Durababble
 
     #: () -> bool
     def blocked_by_replay_history?
-      @blocking_event_indexes.any? { |index| !@consumed_event_indexes[index] }
+      advance_blocking_cursor!
+      @blocking_cursor < @blocking_event_indexes.length
     end
 
     #: (Integer) -> void
@@ -160,7 +166,11 @@ module Durababble
     #: (Hash[String, Object?]) -> bool
     def workflow_command_event_deliverable?(event)
       event_index = event.fetch("event_index").to_s.to_i
-      blocking_event_indexes_before(event_index).all? { |index| @consumed_event_indexes[index] }
+      advance_blocking_cursor!
+      # Every blocking index below event_index is consumed exactly when the first
+      # unconsumed blocking index (the cursor) is at or past event_index. The array
+      # is sorted, so this is the same answer the old per-call select produced.
+      @blocking_cursor >= @blocking_event_indexes.length || @blocking_event_indexes.fetch(@blocking_cursor) >= event_index
     end
 
     #: (Hash[String, Object?]) -> bool
@@ -175,9 +185,15 @@ module Durababble
       workflow_command_event_deliverable?(workflow_command)
     end
 
-    #: (Integer) -> Array[Integer]
-    def blocking_event_indexes_before(event_index)
-      @blocking_event_indexes.select { |index| index < event_index }
+    # Advance the cursor past every blocking index already consumed. Consumption is
+    # monotonic, so the cursor only moves forward and the total work across a whole
+    # replay is O(blocking indexes) rather than O(blocking indexes) per safe point.
+    #: () -> void
+    def advance_blocking_cursor!
+      indexes = @blocking_event_indexes
+      cursor = @blocking_cursor
+      cursor += 1 while cursor < indexes.length && @consumed_event_indexes[indexes.fetch(cursor)]
+      @blocking_cursor = cursor
     end
 
     #: (Hash[String, Object?]) -> void

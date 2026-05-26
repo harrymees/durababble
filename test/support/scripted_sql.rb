@@ -182,33 +182,6 @@ module DurababbleScriptedSqlSupport
     end
   end
 
-  class MysqlMigrationProbeStore < Durababble::MysqlStore
-    attr_reader :executed
-
-    def initialize(schema:, columns: {})
-      super(ScriptedConnectionPool.new(ScriptedMysqlConnection.new), schema:)
-      @columns = columns
-      @executed = []
-    end
-
-    def execute_params(sql, params)
-      @executed << [:execute_params, sql, params]
-      table = params.first
-      column = params[1]
-      rows = if sql.include?("information_schema.columns")
-        @columns.fetch(table, []).include?(column) ? [{ "exists" => 1 }] : []
-      else
-        []
-      end
-      DurababbleScriptedSqlSupport.sql_result(rows)
-    end
-
-    def execute(sql)
-      @executed << [:execute, sql]
-      DurababbleScriptedSqlSupport.sql_result
-    end
-  end
-
   def sql_result(rows = [], affected_rows: rows.length)
     DurababbleScriptedSqlSupport.sql_result(rows, affected_rows:)
   end
