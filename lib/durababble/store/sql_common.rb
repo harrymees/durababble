@@ -108,6 +108,17 @@ module Durababble
       total
     end
 
+    # Flip every workflow whose timer just fired back to pending in a single statement.
+    # Called once per wake batch instead of once per wait to avoid an N+1 of single-row UPDATEs.
+    #: (Array[Hash[String, Object?]]) -> void
+    def mark_waits_workflows_pending(waits)
+      workflow_ids = waits.map { |wait| wait.fetch("workflow_id") }.uniq
+      return if workflow_ids.empty?
+
+      placeholders = workflow_ids.each_index.map { |index| placeholder(index + 1) }.join(", ")
+      execute_store_query(:mark_waits_workflows_pending, workflow_ids, placeholders:)
+    end
+
     #: (String) -> Array[Hash[String, Object?]]
     def waits_for(workflow_id)
       execute_store_query(:waits_for_workflow, [workflow_id])

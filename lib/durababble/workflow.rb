@@ -120,11 +120,7 @@ module Durababble
           workflow = self #: as untyped
           execution = workflow.__durababble_execution__
           execution.call_step(workflow, method_name:, args:, kwargs:) do
-            if kwargs.empty?
-              workflow.send(original, *args, &block)
-            else
-              workflow.send(original, *args, **kwargs, &block)
-            end
+            workflow.send(original, *args, **kwargs, &block)
           end
         end
       ensure
@@ -213,7 +209,7 @@ module Durababble
         instance = @workflow_class.new #: as untyped
         instance.instance_variable_set(:@__durababble_ref_store, @store)
         instance.instance_variable_set(:@__durababble_ref_workflow_id, @workflow_id)
-        kwargs.empty? ? instance.public_send(method_name, *args, &block) : instance.public_send(method_name, *args, **kwargs, &block)
+        instance.public_send(method_name, *args, **kwargs, &block)
       elsif @workflow_class.exposed_commands.key?(method_name)
         idempotency_key = kwargs.delete(:idempotency_key)
         payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }

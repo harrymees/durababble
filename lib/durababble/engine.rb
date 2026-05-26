@@ -97,6 +97,23 @@ module Durababble
 
     private
 
+    # Number of backtrace frames retained in a persisted failure. The innermost
+    # frames (where the error was raised) sit at the top, so capping the tail
+    # keeps the column bounded without losing the frames that matter for debugging.
+    ERROR_BACKTRACE_LIMIT = 50
+
+    # Render an exception into the single `error` string we persist on a failed
+    # workflow/command, embedding the backtrace so failures are diagnosable from
+    # storage alone instead of just `"Class: message"`.
+    #: (Exception) -> String
+    def format_error(error)
+      message = "#{error.class}: #{error.message}"
+      backtrace = error.backtrace
+      return message if backtrace.nil? || backtrace.empty?
+
+      [message, *backtrace.first(ERROR_BACKTRACE_LIMIT)].join("\n")
+    end
+
     #: (untyped) -> bool
     def terminal_workflow_row?(row)
       WorkflowStatus.terminal?(row)
@@ -136,10 +153,10 @@ module Durababble
 
       args = payload.fetch("args", [])
       kwargs = payload.fetch("kwargs", {})
-      result = kwargs.empty? ? workflow.public_send(method_name, *args) : workflow.public_send(method_name, *args, **kwargs)
+      result = workflow.public_send(method_name, *args, **kwargs)
       @store.complete_workflow_command(message_id: message.fetch("id"), workflow_id:, result:, worker_id: @worker_id)
     rescue StandardError => e
-      @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: "#{e.class}: #{e.message}", worker_id: @worker_id)
+      @store.fail_workflow_command(message_id: message.fetch("id"), workflow_id:, error: format_error(e), worker_id: @worker_id)
     end
 
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
@@ -221,7 +238,7 @@ module Durababble
     rescue StandardError => e
       raise if e.is_a?(InjectedCrash) || e.is_a?(LeaseConflict)
 
-      message = "#{e.class}: #{e.message}"
+      message = format_error(e)
       @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
       Observability.count("durababble.workflow.failures", (attributes || {}).merge("durababble.workflow.status" => "failed", "error.type" => e.class.name))
       snapshot(workflow_id)

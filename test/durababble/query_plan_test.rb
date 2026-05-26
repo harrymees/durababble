@@ -136,7 +136,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_mailbox_sequence_for_update,
     :mysql_make_workflow_due,
     :mysql_mark_inbox_row_running,
-    :mysql_mark_wait_workflow_pending,
+    :mysql_mark_waits_workflows_pending,
     :mysql_mark_workflow_canceling_for_request,
     :mysql_mark_workflow_cancellation_delivered,
     :mysql_mark_workflow_running,
