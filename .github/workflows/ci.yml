@@ -53,11 +53,13 @@ jobs:
     # The fuzz sweep (every scenario × 100 seeds) dominates wall time and was
     # pushing a single job past the 20-minute cap. Shard the seed space across
     # parallel jobs via DST_FUZZ_SEEDS so each shard covers every scenario over a
-    # slice of seeds; together they exercise the full 1..100 range.
+    # slice of seeds; together they exercise the full 1..100 range. Split into
+    # three shards (~34 seeds each) as the scenario count grows, keeping each
+    # shard comfortably under the cap.
     strategy:
       fail-fast: false
       matrix:
-        seeds: ["1..50", "51..100"]
+        seeds: ["1..34", "35..67", "68..100"]
 
     steps:
       - uses: actions/checkout@v4

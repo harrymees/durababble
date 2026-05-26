@@ -33,6 +33,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
     "workflow_command_async_delivery",
+    "workflow_command_delivery_crash_recovery",
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
@@ -410,6 +411,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("workflow_command_async_delivery", seed: 7)
 
     assert_empty result.violations
+  end
+
+  test "reclaims a crashed delivery worker's leases and delivers each command exactly once" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_crash_recovery", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "delivery_worker_crashed"
   end
 
   test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
