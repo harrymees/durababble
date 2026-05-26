@@ -88,6 +88,7 @@ module Durababble
         verify_outbox_invariants!(workflows_state, outbox_state)
         verify_fence_invariants!(fences_state)
         verify_inbox_invariants!(inbox_state)
+        verify_inbox_sequence_invariants!(inbox_state)
         verify_activation_invariants!(activations_state)
         verify_activation_inbox_consistency!(inbox_state, activations_state)
         verify_liveness!(workflows_state, waits_state) if @expect_settled
@@ -106,13 +107,66 @@ module Durababble
           inbox_id = message.fetch("id")
           status = message.fetch("status")
           violations << "inbox #{inbox_id} has unknown status #{status.inspect}" unless INBOX_STATUSES.include?(status)
-          next unless status == InboxStatus::RUNNING
-
+          locked_by = message["locked_by"]
           locked_until = message["locked_until"]
-          next if locked_until.nil?
+          if locked_by.nil? != locked_until.nil?
+            violations << "inbox #{inbox_id} has partial lease"
+          end
+          if status != InboxStatus::RUNNING
+            violations << "#{status} inbox #{inbox_id} still locked" if locked_by || locked_until
+            next
+          end
+
+          if locked_by.nil? || locked_until.nil?
+            violations << "running inbox #{inbox_id} has no complete lease"
+            next
+          end
 
           if locked_until < final_time
-            violations << "stuck inbox #{inbox_id} held by #{message["locked_by"].inspect} with expired lease never reclaimed"
+            violations << "stuck inbox #{inbox_id} held by #{locked_by.inspect} with expired lease never reclaimed"
+          end
+        end
+      end
+
+      # Mailbox sequencing is the durable FIFO contract: every target has a
+      # positive, unique, contiguous sequence stream. Gaps strand later messages
+      # behind a missing head; duplicates make delivery order ambiguous.
+      #: (untyped) -> untyped
+      def verify_inbox_sequence_invariants!(inbox_state)
+        by_target = Hash.new { |hash, key| hash[key] = [] }
+        inbox_state.each_value do |message|
+          next if message["target_type"].nil?
+
+          by_target[target_key(message)] << message
+        end
+
+        by_target.each do |key, messages|
+          sequences = []
+          messages.each do |message|
+            sequence = parse_sequence(message["sequence"])
+            if sequence.nil?
+              violations << "inbox #{message.fetch("id")} for #{key.join("/")} has invalid sequence #{message["sequence"].inspect}"
+              next
+            end
+            if sequence <= 0
+              violations << "inbox #{message.fetch("id")} for #{key.join("/")} has non-positive sequence #{sequence}"
+            end
+            sequences << sequence
+          end
+          next if sequences.empty?
+
+          duplicates = sequences.tally.select { |_sequence, count| count > 1 }.keys
+          unless duplicates.empty?
+            violations << "mailbox #{key.join("/")} has duplicate inbox sequence(s) #{duplicates.sort.join(",")}"
+          end
+
+          positive = sequences.select(&:positive?)
+          next if positive.empty?
+
+          expected = (1..positive.max).to_a
+          missing = expected - positive
+          unless missing.empty?
+            violations << "mailbox #{key.join("/")} has non-contiguous inbox sequence(s), missing #{missing.join(",")}"
           end
         end
       end
@@ -130,13 +184,23 @@ module Durababble
           status = activation.fetch("status")
           target = "#{activation["target_kind"]}/#{activation["target_type"]}/#{activation["target_id"]}"
           violations << "target activation #{target} has unknown status #{status.inspect}" unless ACTIVATION_STATUSES.include?(status)
-          next unless status == "running"
-
+          locked_by = activation["locked_by"]
           locked_until = activation["locked_until"]
-          next if locked_until.nil?
+          if locked_by.nil? != locked_until.nil?
+            violations << "target activation #{target} has partial lease"
+          end
+          if status != "running"
+            violations << "#{status} target activation #{target} still locked" if locked_by || locked_until
+            next
+          end
+
+          if locked_by.nil? || locked_until.nil?
+            violations << "running target activation #{target} has no complete lease"
+            next
+          end
 
           if locked_until < final_time
-            violations << "stuck target activation #{target} held by #{activation["locked_by"].inspect} with expired lease never reclaimed"
+            violations << "stuck target activation #{target} held by #{locked_by.inspect} with expired lease never reclaimed"
           end
         end
       end
@@ -208,13 +272,23 @@ module Durababble
       def verify_fence_invariants!(fences_state)
         final_time = scheduler.time
         fences_state.each do |fence|
-          next unless fence.fetch("status") == "running"
-
+          status = fence.fetch("status")
+          label = "#{fence.fetch("workflow_id")}/#{fence.fetch("key")}"
+          violations << "fence #{label} has unknown status #{status.inspect}" unless FENCE_STATUSES.include?(status)
+          locked_by = fence["locked_by"]
           locked_until = fence["locked_until"]
-          next if locked_until.nil?
+          if locked_by.nil? != locked_until.nil?
+            violations << "fence #{label} has partial lease"
+          end
+          next unless status == "running"
+
+          if locked_by.nil? || locked_until.nil?
+            violations << "running fence #{label} has no complete lease"
+            next
+          end
 
           if locked_until < final_time
-            violations << "stuck fence #{fence.fetch("workflow_id")}/#{fence.fetch("key")} held by #{fence["locked_by"].inspect} with expired lease never reclaimed"
+            violations << "stuck fence #{label} held by #{locked_by.inspect} with expired lease never reclaimed"
           end
         end
       end
@@ -276,11 +350,19 @@ module Durababble
         next_run_at.nil? || next_run_at <= final_time
       end
 
+      #: (untyped) -> Integer?
+      def parse_sequence(value)
+        Integer(value)
+      rescue ArgumentError, TypeError
+        nil
+      end
+
       WORKFLOW_STATUSES = WorkflowStatus::ALL
       STEP_STATUSES = StepStatus::ALL
       ATTEMPT_STATUSES = AttemptStatus::ALL
       WAIT_STATUSES = WaitStatus::ALL
       OUTBOX_STATUSES = OutboxStatus::ALL
+      FENCE_STATUSES = ["running", "completed", "failed"].freeze
       # Every valid persisted inbox status, including the retained `completed`
       # terminal state — used to flag genuinely unknown statuses.
       INBOX_STATUSES = InboxStatus::ALL

@@ -1,6 +1,16 @@
 -- mysql_ack_outbox
 UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?
 
+-- mysql_cancel_live_step_attempts_for_workflow
+UPDATE `durababble_mysql_snapshot_step_attempts`
+SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
+WHERE workflow_id = ? AND status IN ('running', 'waiting')
+
+-- mysql_cancel_live_steps_for_workflow
+UPDATE `durababble_mysql_snapshot_steps`
+SET status = 'canceled', error = 'workflow cancellation requested', updated_at = NOW(6)
+WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting')
+
 -- mysql_cancel_pending_waits_for_workflow
 UPDATE `durababble_mysql_snapshot_waits`
 SET status = 'canceled', completed_at = NOW(6)

@@ -1,6 +1,16 @@
 -- pg_ack_outbox
 UPDATE "durababble_pg_snapshot"."outbox" SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2
 
+-- pg_cancel_live_step_attempts_for_workflow
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET status = 'canceled', error = 'workflow cancellation requested', completed_at = now()
+WHERE workflow_id = $1 AND status IN ('running', 'waiting')
+
+-- pg_cancel_live_steps_for_workflow
+UPDATE "durababble_pg_snapshot"."steps"
+SET status = 'canceled', error = 'workflow cancellation requested', updated_at = now()
+WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')
+
 -- pg_cancel_pending_waits_for_workflow
 UPDATE "durababble_pg_snapshot"."waits"
 SET status = 'canceled', completed_at = now()

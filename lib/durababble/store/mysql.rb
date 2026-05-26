@@ -293,7 +293,7 @@ module Durababble
         # cancellation/failure/termination do (the timer-firing path instead
         # completes the wait+step before the workflow finishes, so this is a no-op
         # there).
-        cancel_pending_waits_for_workflow(workflow_id)
+        cancel_live_workflow_dependents(workflow_id)
         update
       end
     end
@@ -315,7 +315,7 @@ module Durababble
         # wait and suspended into 'canceling'. Finalization here is the one place
         # guaranteed to leave a clean terminal, so it repeats the idempotent,
         # status-gated cleanup that the cancellation request runs.
-        cancel_pending_waits_for_workflow(workflow_id)
+        cancel_live_workflow_dependents(workflow_id)
         result_set
       end
     end
@@ -336,7 +336,7 @@ module Durababble
         # failed workflow lands clean, exactly as cancellation and termination do
         # (an abandoned parked branch is terminalized as 'canceled'; the real failure
         # lives on the workflow's own error column).
-        cancel_pending_waits_for_workflow(workflow_id)
+        cancel_live_workflow_dependents(workflow_id)
         result_set
       end
     end
@@ -528,6 +528,13 @@ module Durababble
       execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
+    end
+
+    #: (String) -> Object?
+    def cancel_live_workflow_dependents(workflow_id)
+      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
+      execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
+      execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
     end
 
     #: (String, error: String) -> void

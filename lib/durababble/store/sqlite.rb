@@ -2,6 +2,8 @@
 # frozen_string_literal: true
 
 require "sqlite3"
+require_relative "../store" unless defined?(Durababble::MysqlStore)
+require_relative "sqlite_migrations"
 
 module Durababble
   # A real-SQL SQLite store. Test-only: it is NOT registered in

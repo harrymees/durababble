@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "durababble"
+require "durababble/store/sqlite"
 require_relative "core"
 require_relative "store_inspection"
 

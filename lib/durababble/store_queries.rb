@@ -948,6 +948,22 @@ module Durababble
       SQL
     end
 
+    define(:pg_cancel_live_steps_for_workflow, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "steps")}
+        SET status = 'canceled', error = 'workflow cancellation requested', updated_at = now()
+        WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')
+      SQL
+    end
+
+    define(:pg_cancel_live_step_attempts_for_workflow, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET status = 'canceled', error = 'workflow cancellation requested', completed_at = now()
+        WHERE workflow_id = $1 AND status IN ('running', 'waiting')
+      SQL
+    end
+
     define(:pg_claim_pending_target_activation, backend: :postgres) do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
@@ -1606,6 +1622,22 @@ module Durababble
         UPDATE #{table(store, "step_attempts")}
         SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
         WHERE workflow_id = ? AND status = 'waiting'
+      SQL
+    end
+
+    define(:mysql_cancel_live_steps_for_workflow, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "steps")}
+        SET status = 'canceled', error = 'workflow cancellation requested', updated_at = NOW(6)
+        WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting')
+      SQL
+    end
+
+    define(:mysql_cancel_live_step_attempts_for_workflow, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
+        WHERE workflow_id = ? AND status IN ('running', 'waiting')
       SQL
     end
 

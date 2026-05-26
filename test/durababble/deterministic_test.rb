@@ -62,6 +62,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "grpc_workflow_rpc_response_matrix",
     "grpc_workflow_rpc_transport_fault_matrix",
     "grpc_workflow_rpc_transport_fault_reroute",
+    "random_operation_sequence",
     "chaos",
   ].freeze
 
@@ -95,15 +96,21 @@ class DurababbleDeterministicTest < DurababbleTestCase
     end
   end
 
-  test "proves full determinism by replaying the same scenario twice for the same seed" do
-    first = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
-    second = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
+  def assert_scenario_deterministic(scenario, seed:)
+    first = Durababble::Deterministic.prove(scenario, seed:)
+    second = Durababble::Deterministic.prove(scenario, seed:)
 
-    assert_equal second.digest, first.digest
-    assert_equal second.trace, first.trace
-    assert_empty first.violations
-    assert_equal 8, first.summary.fetch(:completed_workflows)
-    assert_equal 8, first.trace.scan("workflow_claimed").length
+    assert_equal(first.trace, second.trace, "scenario #{scenario.inspect} produced a different trace on the second run")
+    assert_equal(first.digest, second.digest, "scenario #{scenario.inspect} produced a different digest on the second run")
+    assert_equal(first.summary, second.summary, "scenario #{scenario.inspect} produced a different summary on the second run")
+    assert_equal(first.violations, second.violations, "scenario #{scenario.inspect} produced different violations on the second run")
+    assert_empty(first.violations, "scenario #{scenario.inspect} had invariant violations: #{first.violations.inspect}")
+  end
+
+  test "proves exact trace determinism for every clean scenario target" do
+    (FUZZ_SCENARIOS + CONTRACT_SCENARIOS).uniq.each do |scenario|
+      assert_scenario_deterministic(scenario, seed: 12_345)
+    end
   end
 
   test "uses the seed to control delivery order and failure schedule" do
@@ -423,6 +430,26 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 1, failures.length
     assert_includes failures.first.last.join("\n"), "stuck target activation"
+  end
+
+  test "flags partial leases on mailbox coordination rows" do
+    failures = Durababble::Deterministic.search("bug_partial_mailbox_leases", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "inbox partial-inbox-1 has partial lease"
+    assert_includes messages, "target activation workflow/counter/partial-activation-1 has partial lease"
+    assert_includes messages, "fence "
+    assert_includes messages, "has partial lease"
+  end
+
+  test "flags duplicate or gapped mailbox sequences" do
+    failures = Durababble::Deterministic.search("bug_mailbox_sequence_gap", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "duplicate inbox sequence"
+    assert_includes messages, "non-contiguous inbox sequence"
   end
 
   test "flags an activatable inbox head with no target activation as a lost wakeup" do
