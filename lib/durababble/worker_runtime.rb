@@ -71,8 +71,6 @@ module Durababble
       @consecutive_errors = 0
       @rpc_server = nil
       @rpc_address = nil
-      @worker_store = nil
-      @rpc_store = nil
     end
 
     #: () -> untyped
@@ -92,7 +90,7 @@ module Durababble
         )
         start_rpc_server
         worker = begin
-          Worker.new(store: worker_store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
+          Worker.new(store: @store, workflows: @workflows, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, migrate: @migrate, worker_pool: @worker_pool)
         rescue StandardError
           stop_rpc_server
           raise
@@ -158,20 +156,10 @@ module Durababble
     private
 
     #: () -> untyped
-    def worker_store
-      @worker_store ||= @store
-    end
-
-    #: () -> untyped
-    def rpc_store
-      @rpc_store ||= @store
-    end
-
-    #: () -> untyped
     def start_rpc_server
       @rpc_server = Rpc::Server.new(
         node_id: nil,
-        store: rpc_store,
+        store: @store,
         worker_pool: @worker_pool,
         host: @rpc_host,
         port: @rpc_port,
