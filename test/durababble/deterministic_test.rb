@@ -38,6 +38,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_claim_window_crash_matrix",
     "workflow_command_retry_then_complete",
     "workflow_command_terminal_failure",
+    "workflow_command_terminal_failure_crash_fuzz",
     "workflow_command_delivery_to_terminal_workflow",
     "object_command_failure_exhaustion",
     "object_command_claim_contention",
@@ -458,6 +459,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("workflow_command_retry_then_complete", seed: 7)
 
     assert_empty result.violations
+  end
+
+  test "dead-letters a terminally-failed command exactly once with a single history entry through crashes" do
+    result = Durababble::Deterministic.prove("workflow_command_terminal_failure_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "terminal_failure_crashed"
   end
 
   test "dead-letters an object command once it exhausts its attempts" do
