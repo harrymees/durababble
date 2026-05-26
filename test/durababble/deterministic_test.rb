@@ -40,6 +40,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
     "object_command_failure_exhaustion",
+    "object_command_claim_contention",
     "object_command_crash_fuzz",
     "object_command_state_crash_fuzz",
     "grpc_workflow_rpc_response_matrix",
@@ -452,6 +453,14 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("object_command_failure_exhaustion", seed: 7)
 
     assert_empty result.violations
+  end
+
+  test "blocks a second worker from stealing a live object-command lease" do
+    result = Durababble::Deterministic.prove("object_command_claim_contention", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "b_blocked_by_lease"
+    refute_includes result.trace, "b_stole_live_lease"
   end
 
   test "drives an object command to a consistent terminal state through store crashes" do
