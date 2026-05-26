@@ -378,7 +378,10 @@ module Durababble
     #: () -> void
     def reject_deferred_suspensions_if_quiescent!
       return if @deferred_suspension_command_ids.empty?
-      return if @workflow_tasks.any? { |task, _registered| !@blocked_workflow_tasks.key?(task) }
+      # @blocked_workflow_tasks is always a subset of @workflow_tasks, so a registered
+      # task is still runnable iff the live count exceeds the blocked count. This avoids
+      # scanning every task on each defer/unregister/block to find one that is unblocked.
+      return if @workflow_task_count > @blocked_workflow_tasks.size
       return if @futures.any? { |command_id, future| !@deferred_suspension_command_ids.key?(command_id) && !future.done? }
 
       command_ids = @deferred_suspension_command_ids.keys
