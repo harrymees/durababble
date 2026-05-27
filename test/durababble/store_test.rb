@@ -1093,6 +1093,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal ["", []], store.send(:workflow_name_filter, nil)
     malicious_name = "a'); DROP TABLE workflows; --"
     assert_equal ["AND name IN ($1, $2)", [malicious_name, "b"]], store.send(:workflow_name_filter, [malicious_name, "b"])
+    assert_equal ["", []], store.send(:workflow_exclusion_filter, nil)
+    assert_equal ["AND id NOT IN ($3, $4)", ["wf'); DROP TABLE workflows; --", "safe"]], store.send(:workflow_exclusion_filter, ["wf'); DROP TABLE workflows; --", "safe"], offset: 3)
     assert_nil store.send(:timestamp_or_nil, nil)
   end
 
@@ -1177,6 +1179,8 @@ class DurababbleStoreTest < DurababbleTestCase
     store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
     assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
     assert_equal ["AND name IN (?, ?)", ["x'; DROP TABLE workflows; --", "safe"]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["", []], store.send(:workflow_exclusion_filter, [])
+    assert_equal ["AND id NOT IN (?)", ["wf'; DROP TABLE workflows; --"]], store.send(:workflow_exclusion_filter, ["wf'; DROP TABLE workflows; --"])
     assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
     assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
