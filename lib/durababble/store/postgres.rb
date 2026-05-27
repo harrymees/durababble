@@ -551,13 +551,13 @@ module Durababble
       execute_store_query(:set_target_activation_pending, [worker_pool, target_kind, target_type, target_id, ready_timestamp])
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> [Integer, String]
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       execute_store_query(:insert_mailbox_sequence, [worker_pool, target_kind, target_type, target_id])
       row = execute_store_query(:mailbox_sequence_for_update, [target_kind, target_type, target_id]).first
       sequence = row.fetch("last_sequence").to_i + 1
       execute_store_query(:update_mailbox_sequence, [sequence, target_kind, target_type, target_id])
-      sequence
+      [sequence, row.fetch("worker_pool").to_s]
     end
 
     #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?

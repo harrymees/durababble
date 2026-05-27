@@ -143,11 +143,11 @@ module Durababble
         reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
         next reused if reused
 
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
         id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type:,
           target_id:,
@@ -161,7 +161,7 @@ module Durababble
           ready_at:,
           max_attempts:,
         )
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:, ready_at:)
         id
       end
       result #: as String
@@ -183,11 +183,11 @@ module Durababble
 
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
 
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
         id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type: workflow_name,
           target_id: workflow_id,
@@ -199,7 +199,7 @@ module Durababble
           shape_hash:,
           payload:,
         )
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type: workflow_name, target_id: workflow_id)
         id
       end
       result #: as String
@@ -571,7 +571,7 @@ module Durababble
     #: (Array[Hash[String, Object?]]) -> Integer
     def deliver_due_object_wakeups(wakeups)
       wakeups.each do |wakeup|
-        worker_pool = row_worker_pool(wakeup)
+        wakeup_worker_pool = row_worker_pool(wakeup)
         target_kind = "object"
         target_type = wakeup.fetch("object_type") #: as String
         target_id = wakeup.fetch("object_id") #: as String
@@ -579,11 +579,10 @@ module Durababble
         message_kind = "wake"
         payload = wakeup.fetch("payload")
         message_id = SecureRandom.uuid
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
-        sequence = sequence #: as Integer
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool: wakeup_worker_pool, target_kind:, target_type:, target_id:)
         insert_inbox_message_without_transaction(
           id: message_id,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type:,
           target_id:,
@@ -595,8 +594,8 @@ module Durababble
           shape_hash: inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name: name, payload:),
           payload:,
         )
-        delete_object_wakeup_without_transaction(worker_pool:, object_type: target_type, object_id: target_id, name:)
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
+        delete_object_wakeup_without_transaction(worker_pool: wakeup_worker_pool, object_type: target_type, object_id: target_id, name:)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:)
       end
       wakeups.length
     end
@@ -630,7 +629,7 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Integer
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> [Integer, String]
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       raise NotImplementedError
     end

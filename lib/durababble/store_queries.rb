@@ -1064,7 +1064,7 @@ module Durababble
 
     define(:pg_mailbox_sequence_for_update, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT last_sequence
+        SELECT worker_pool, last_sequence
         FROM #{table(store, "mailbox_sequences")}
         WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
         FOR UPDATE
@@ -1747,7 +1747,7 @@ module Durababble
 
     define(:mysql_mailbox_sequence_for_update, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT last_sequence
+        SELECT worker_pool, last_sequence
         FROM #{table(store, "mailbox_sequences")}
         WHERE target_kind = ? AND target_type = ? AND target_id = ?
         FOR UPDATE

@@ -603,6 +603,40 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "keeps object inbox messages on the first materialized worker pool with #{backend.name}" do
+      with_durababble_store(backend, "object_inbox_first_pool") do |store|
+        first_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["a"], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+        second_id = store.enqueue_inbox_message(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["b"], "kwargs" => {} },
+          idempotency_key: "pool-b-message",
+        )
+
+        messages = store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "same")
+        assert_equal ["pool-a", "pool-a"], messages.map { |message| message.fetch("worker_pool") }
+        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
+
+        activation = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same"
+        claimed = store.claim_inbox_messages(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "pool-a-worker", lease_seconds: 30, limit: 10)
+        assert_equal [first_id, second_id], claimed.map { |message| message.fetch("id") }
+      end
+    end
+
     test "does not claim future target activations until ready with #{backend.name}" do
       with_durababble_store(backend, "target_activation_future") do |store|
         store.migrate!

@@ -413,7 +413,7 @@ SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 SELECT id FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 
 -- mysql_mailbox_sequence_for_update
-SELECT last_sequence
+SELECT worker_pool, last_sequence
 FROM `durababble_mysql_snapshot_mailbox_sequences`
 WHERE target_kind = ? AND target_type = ? AND target_id = ?
 FOR UPDATE

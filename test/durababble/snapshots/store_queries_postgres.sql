@@ -405,7 +405,7 @@ SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
 SELECT id FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
 
 -- pg_mailbox_sequence_for_update
-SELECT last_sequence
+SELECT worker_pool, last_sequence
 FROM "durababble_pg_snapshot"."mailbox_sequences"
 WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 FOR UPDATE
