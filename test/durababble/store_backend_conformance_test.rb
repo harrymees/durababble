@@ -649,15 +649,16 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "scopes object state, mailbox sequence, and inbox idempotency by worker pool with #{backend.name}" do
-      with_durababble_store(backend, "object_pool_routing") do |store|
+    test "treats object state, mailbox sequence, and inbox idempotency as globally unique regardless of worker pool with #{backend.name}" do
+      with_durababble_store(backend, "object_global_identity") do |store|
         store.save_object_state(worker_pool: "pool-a", object_type: "counter", object_id: "same", state: { "pool" => "a" })
         store.save_object_state(worker_pool: "pool-b", object_type: "counter", object_id: "same", state: { "pool" => "b" })
 
-        assert_equal({ "pool" => "a" }, store.object_state(worker_pool: "pool-a", object_type: "counter", object_id: "same"))
-        assert_equal({ "pool" => "b" }, store.object_state(worker_pool: "pool-b", object_type: "counter", object_id: "same"))
-        assert_nil store.object_state(worker_pool: "default", object_type: "counter", object_id: "same")
+        # Object identity is global: the same (object_type, object_id) is one row regardless of pool,
+        # so the second write updates the same record (last write wins) rather than creating a sibling.
+        assert_equal({ "pool" => "b" }, store.object_state(object_type: "counter", object_id: "same"))
 
+        payload = { "method_name" => "write", "args" => ["x"], "kwargs" => {} }
         pool_a_message = store.enqueue_inbox_message(
           worker_pool: "pool-a",
           target_kind: "object",
@@ -665,7 +666,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           target_id: "same",
           message_kind: "tell",
           method_name: "write",
-          payload: { "method_name" => "write", "args" => ["a"], "kwargs" => {} },
+          payload:,
           idempotency_key: "natural-key",
         )
         pool_b_message = store.enqueue_inbox_message(
@@ -675,19 +676,19 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           target_id: "same",
           message_kind: "tell",
           method_name: "write",
-          payload: { "method_name" => "write", "args" => ["b"], "kwargs" => {} },
+          payload:,
           idempotency_key: "natural-key",
         )
 
-        refute_equal pool_a_message, pool_b_message
-        assert_equal [1], store.inbox_messages_for(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same").map { |message| message.fetch("sequence").to_i }
-        assert_equal [1], store.inbox_messages_for(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same").map { |message| message.fetch("sequence").to_i }
+        # Idempotency is global too: the same natural key on the same target dedupes across pools,
+        # leaving a single mailbox sequence entry.
+        assert_equal pool_a_message, pool_b_message
+        assert_equal [1], store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "same").map { |message| message.fetch("sequence").to_i }
 
-        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "default")
-        activation_a = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
-        activation_b = store.claim_target_activation(worker_id: "pool-b-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
-        assert_hash_includes activation_a, "worker_pool" => "pool-a", "target_id" => "same"
-        assert_hash_includes activation_b, "worker_pool" => "pool-b", "target_id" => "same"
+        # worker_pool survives as routing metadata: set by the first writer and used to filter claims.
+        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
+        activation = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same"
       end
     end
 

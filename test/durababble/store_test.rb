@@ -483,7 +483,6 @@ class DurababbleStoreTest < DurababbleTestCase
     store = pg_store
     shape_hash = store.send(
       :inbox_shape_hash,
-      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -557,7 +556,6 @@ class DurababbleStoreTest < DurababbleTestCase
     payload = { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } }
     shape_hash = store.send(
       :inbox_shape_hash,
-      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -638,7 +636,6 @@ class DurababbleStoreTest < DurababbleTestCase
     store = mysql_store
     shape_hash = store.send(
       :inbox_shape_hash,
-      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -762,7 +759,7 @@ class DurababbleStoreTest < DurababbleTestCase
     )
 
     helper = pg_store
-    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, worker_pool: "default", target_kind: "workflow", target_type: "approval", target_id: "wf")
+    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert helper.send(:activatable_inbox_status?, "pending")
     refute helper.send(:activatable_inbox_status?, "completed")
     assert_equal ["", []], helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)

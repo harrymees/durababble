@@ -68,15 +68,15 @@ module Durababble
         .map { |row| with_command_id(decode_row(row)) }
     end
 
-    #: (object_type: String, object_id: String, ?worker_pool: String) -> Object?
-    def object_state(object_type:, object_id:, worker_pool: "default")
-      state = object_state_entry(worker_pool:, object_type:, object_id:)
+    #: (object_type: String, object_id: String) -> Object?
+    def object_state(object_type:, object_id:)
+      state = object_state_entry(object_type:, object_id:)
       state.equal?(Store::NO_OBJECT_STATE) ? nil : state
     end
 
-    #: (object_type: String, object_id: String, ?worker_pool: String) -> Object?
-    def object_state_entry(object_type:, object_id:, worker_pool: "default")
-      row = execute_store_query(:object_state, [worker_pool, object_type, object_id]).first
+    #: (object_type: String, object_id: String) -> Object?
+    def object_state_entry(object_type:, object_id:)
+      row = execute_store_query(:object_state, [object_type, object_id]).first
       row ? decode_row(row).fetch("state") : Store::NO_OBJECT_STATE
     end
 
@@ -139,9 +139,9 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: Object?, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?, ?worker_pool: String) -> String
     def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, worker_pool: "default")
-      shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       result = transaction do
-        reused = reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:, shape_hash:)
+        reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
         next reused if reused
 
         sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
@@ -178,8 +178,8 @@ module Durababble
         worker_pool = row_worker_pool(decoded_workflow)
         target_kind = "workflow"
         message_kind = "workflow_command"
-        shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
-        reused = reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id, shape_hash:)
+        shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
+        reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id, shape_hash:)
         next reused if reused
 
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
@@ -265,7 +265,7 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Array[Hash[String, Object?]]
     def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: "default")
-      execute_store_query(:inbox_messages_for, [worker_pool, target_kind, target_type, target_id]).map { |row| decode_row(row) }
+      execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
     end
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
@@ -393,7 +393,7 @@ module Durababble
 
     #: (target_kind: Object?, target_type: Object?, target_id: Object?, ?worker_pool: String) -> Hash[String, Object?]?
     def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
-      row = execute_store_query(:target_activation, [worker_pool, target_kind, target_type, target_id]).first
+      row = execute_store_query(:target_activation, [target_kind, target_type, target_id]).first
       decode_row(row) if row
     end
 
@@ -404,9 +404,9 @@ module Durababble
     # prior message exists. Raises IdempotencyKeyConflict when the key was used
     # for a message with a different shape. Callers run this inside the enqueue
     # transaction and short-circuit (`next`) when an id comes back.
-    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String, shape_hash: String) -> String?
-    def reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:, shape_hash:)
-      existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+    #: (String?, target_kind: String, target_type: String, target_id: String, shape_hash: String) -> String?
+    def reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
+      existing = existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       return unless existing
 
       unless existing.fetch("shape_hash") == shape_hash
@@ -616,7 +616,7 @@ module Durababble
           method_name: name,
           operation_id: message_id,
           idempotency_key: nil,
-          shape_hash: inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name: name, payload:),
+          shape_hash: inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name: name, payload:),
           payload:,
         )
         delete_object_wakeup_without_transaction(worker_pool:, object_type: target_type, object_id: target_id, name:)
@@ -659,8 +659,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Hash[String, Object?]?
-    def existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+    #: (String?, target_kind: String, target_type: String, target_id: String) -> Hash[String, Object?]?
+    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       raise NotImplementedError
     end
 
