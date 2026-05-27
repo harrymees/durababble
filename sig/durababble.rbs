@@ -1,3 +1,10 @@
+module Async
+  module HTTP
+    class Client
+    end
+  end
+end
+
 module Durababble
   type serialized_payload = Object?
   type payload_map = Hash[String | Symbol, serialized_payload]
@@ -51,7 +58,7 @@ module Durababble
 
   interface _RpcDeliverMessageClient
     def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
-    def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+    def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
   end
 
   interface _RpcClientFactory
@@ -475,6 +482,9 @@ module Durababble
 
     def self.dump: (serialized_payload value, ?surface: Symbol?, ?context: String?) -> String
     def self.load: (String? bytes) -> serialized_payload
+    def self.http_client_for: (String address) -> Async::HTTP::Client
+    def self.http_client_cached?: (String address) -> bool
+    def self.shutdown_http_clients!: () -> void
 
     class Error < Durababble::Error
     end
@@ -494,35 +504,81 @@ module Durababble
       def rpc_address_for: (String node_id) -> String?
     end
 
-    module Proto
-      class Message
+    module Messages
+      class AwakenBatchRequest
+        attr_reader worker_pool: String
+        attr_reader workflow_ids: Array[String]
+        def initialize: (?worker_pool: String, ?workflow_ids: Array[String]) -> void
       end
 
-      class AwakenBatchResponse < Message
+      class AwakenBatchResponse
       end
 
-      class DeliverMessageResponse < Message
+      class TargetRequest
+        attr_reader worker_pool: String
+        attr_reader target_kind: String
+        attr_reader target_class: String
+        attr_reader target_id: String
+        attr_reader expected_worker_id: String
+        def initialize: (?worker_pool: String, ?target_kind: String, ?target_class: String, ?target_id: String, ?expected_worker_id: String) -> void
       end
 
-      class EvictLeaseResponse < Message
+      class EvictLeaseRequest < TargetRequest
       end
 
-      class TransientResponse < Message
+      class EvictLeaseResponse
       end
 
-      class Stub
+      class DeliverMessageRequest < TargetRequest
+      end
+
+      class DeliverMessageResponse
+      end
+
+      class TransientRequest
+        attr_reader worker_pool: String
+        attr_reader class_name: String
+        attr_reader durable_object_id: String
+        attr_reader workflow_id: String
+        attr_reader args: String?
+        attr_reader deadline_ms: Integer
+        attr_reader expected_worker_id: String
+        def initialize: (?worker_pool: String, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?method: String, ?args: String?, ?deadline_ms: Integer, ?expected_worker_id: String) -> void
+        def []: (String | Symbol key) -> Object?
+      end
+
+      class LeaseMoved
+        attr_reader new_rpc_address: String
+        attr_reader new_node_id: String
+        def initialize: (?new_rpc_address: String, ?new_node_id: String) -> void
+      end
+
+      class RemoteError
+        attr_reader klass: String
+        attr_reader message: String
+        attr_reader backtrace: Array[String]
+        def initialize: (?klass: String, ?message: String, ?backtrace: Array[String]) -> void
+      end
+
+      class TransientResponse
+        attr_reader ok: String?
+        attr_reader err: RemoteError?
+        attr_reader not_running: bool
+        attr_reader moved: LeaseMoved?
+        def initialize: (?ok: String?, ?err: RemoteError?, ?not_running: bool, ?moved: LeaseMoved?) -> void
+        def result: () -> Symbol?
       end
     end
 
     class Client
       attr_reader address: String
 
-      def initialize: (address: String, ?credentials: credentials, ?timeout: Numeric, ?stub: Proto::Stub?) -> void
+      def initialize: (address: String, ?credentials: credentials?, ?timeout: Numeric, ?http_client: Object?) -> void
       def awaken_batch: (worker_pool: String, workflow_ids: Array[String]) -> true
       def evict_lease: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
       def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
-      def call_transient_response: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> Proto::TransientResponse
-      def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+      def call_transient_response: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> Messages::TransientResponse
+      def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
     end
 
     class WorkflowClient
@@ -535,7 +591,7 @@ module Durababble
       attr_reader host: String
       attr_reader port: Integer?
 
-      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: credentials, ?pool_size: Integer, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
+      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: credentials?, ?pool_size: Integer?, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
       def start: () -> self
       def stop: () -> void
       def address: () -> String

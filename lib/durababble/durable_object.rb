@@ -209,11 +209,13 @@ module Durababble
     class TransientRequest
       #: String
       attr_reader :class_name, :worker_pool
+      #: String
+      attr_reader :durable_object_id
 
       #: (class_name: String, object_id: String, method: String, worker_pool: String) -> void
       def initialize(class_name:, object_id:, method:, worker_pool:)
         @class_name = class_name
-        @object_id = object_id
+        @durable_object_id = object_id
         @method = method
         @worker_pool = worker_pool
       end
@@ -224,7 +226,7 @@ module Durababble
         when "method"
           @method
         when "object_id"
-          @object_id
+          @durable_object_id
         end
       end
     end
@@ -317,7 +319,7 @@ module Durababble
       client.call_transient(
         worker_pool: @worker_pool,
         class_name: @object_class.object_type,
-        object_id: @durable_id,
+        durable_object_id: @durable_id,
         method: method_name.to_s,
         args: { "args" => args, "kwargs" => kwargs },
       )
@@ -402,7 +404,7 @@ module Durababble
     #: (request: untyped, args: untyped) -> untyped
     def call(request:, args:)
       object_type = request.class_name
-      object_id = request["object_id"]
+      object_id = durable_object_id(request)
       method_name = request["method"].to_sym
       worker_pool = worker_pool_for(request)
       object_class = @objects.fetch(object_type) do
@@ -452,6 +454,11 @@ module Durababble
       return request.worker_pool.to_s if request.respond_to?(:worker_pool) && !request.worker_pool.to_s.empty?
 
       "default"
+    end
+
+    #: (untyped) -> String
+    def durable_object_id(request)
+      request.respond_to?(:durable_object_id) ? request.durable_object_id.to_s : request["object_id"].to_s
     end
 
     #: (untyped, worker_pool: untyped, object_id: untyped, method_name: untyped, payload: untyped) -> untyped

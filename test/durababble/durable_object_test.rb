@@ -860,7 +860,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         {
           worker_pool: "priority",
           class_name: QueryRoutingObject.object_type,
-          object_id: "object-1",
+          durable_object_id: "object-1",
           method: "value",
           args: { "args" => [], "kwargs" => { prefix: "seen" } },
         },

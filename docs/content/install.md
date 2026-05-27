@@ -69,7 +69,7 @@ Durababble checks out connections as needed from the configured ActiveRecord poo
 
 A `Durababble::Worker` is enough for a single process: it polls the store, claims leases, and drains workflows and object inboxes. In production you usually run many workers across many pods, and they need to reach each other over the network so that simple RPCs (`expose`) and live command delivery (`expose_command`) can land on the worker that currently owns the workflow or durable object.
 
-`Durababble::WorkerRuntime` wraps a `Worker` with a gRPC server and is the production-shaped entry point. Each runtime advertises a worker identity in the form `worker-id@host:port`; the random worker id distinguishes this process incarnation, and the address suffix is the routable gRPC endpoint. The lease row written when the runtime claims a workflow records that full identity as the owner. Any other worker that wants to RPC into the lease holder reads the same row, dials the address suffix, and sends the full expected identity so a new worker at a recycled address rejects messages meant for the old process:
+`Durababble::WorkerRuntime` wraps a `Worker` with an HTTP/2 RPC server (built on `async-http`) and is the production-shaped entry point. Each runtime advertises a worker identity in the form `worker-id@host:port`; the random worker id distinguishes this process incarnation, and the address suffix is the routable RPC endpoint. The lease row written when the runtime claims a workflow records that full identity as the owner. Any other worker that wants to RPC into the lease holder reads the same row, dials the address suffix, and sends the full expected identity so a new worker at a recycled address rejects messages meant for the old process:
 
 ```ruby
 runtime = Durababble::WorkerRuntime.start(
@@ -82,7 +82,7 @@ runtime = Durababble::WorkerRuntime.start(
 )
 ```
 
-The address suffix is the worker's public endpoint, so `rpc_host` must be a value other pods can actually connect to. In Kubernetes this is typically the pod IP exposed through the downward API; on bare metal it is the host's routable address. The defaults (`rpc_host: "127.0.0.1"`, `rpc_port: 0`) are fine for single-process examples and tests but leave the worker unreachable from anywhere else. `rpc_credentials:` defaults to insecure local-only credentials; production deployments should pass mTLS credentials through this argument.
+The address suffix is the worker's public endpoint, so `rpc_host` must be a value other pods can actually connect to. In Kubernetes this is typically the pod IP exposed through the downward API; on bare metal it is the host's routable address. The defaults (`rpc_host: "127.0.0.1"`, `rpc_port: 0`) are fine for single-process examples and tests but leave the worker unreachable from anywhere else. The transport is currently cleartext HTTP/2 (h2c) with no built-in peer authentication, so the RPC port must only be reachable inside a trusted pod network — see ["Transport Security" in Cluster RPC](cluster-rpc.md#transport-security) for what's planned to harden this.
 
 For more on how peer-to-peer routing works once workers are wired up — and why Durababble routes simple RPC and live command delivery through the cluster mesh rather than the database — see [Cluster RPC](cluster-rpc.md).
 

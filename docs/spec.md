@@ -29,7 +29,7 @@ The contract specifies behavior, not a mandatory internal isolation technology. 
 
 - **Durable target:** a workflow execution or durable object instance addressed by class/type, id, and worker pool.
 - **Worker pool:** a persisted routing and execution boundary. Workers in a pool may claim, route, wake, and execute only targets assigned to that pool.
-- **Lease:** a persisted ownership record for a durable target, with the owner worker identity, a lease token, and a deadline. Production `WorkerRuntime` identities are compact parseable strings in the form `worker-id@host:port`, where the random worker id distinguishes a process incarnation and the address suffix is the routable gRPC endpoint.
+- **Lease:** a persisted ownership record for a durable target, with the owner worker identity, a lease token, and a deadline. Production `WorkerRuntime` identities are compact parseable strings in the form `worker-id@host:port`, where the random worker id distinguishes a process incarnation and the address suffix is the routable HTTP/2 RPC endpoint.
 - **Workflow command:** a deterministic workflow operation such as a step schedule, timer wait, workflow command delivery, child workflow command, or patch marker.
 - **Command id:** the replay identity assigned by deterministic workflow execution order.
 - **Attempt id:** the execution identity for one concrete try of a command. Retries create new attempts for the same command id.
@@ -392,8 +392,8 @@ Query-shape and transaction requirements:
 - Persist immutable `worker_pool` on durable targets whose routing, claiming, scheduling, listing, or recovery semantics are pool-scoped.
 - Include `worker_pool` in primary keys and indexes when query patterns need to filter, route, claim, recover, or list by worker pool. Do not add it to keys whose query patterns do not care about worker pool.
 - Workflow/object ownership uses the unified leases table keyed by pool-scoped target identity, with the owner worker identity plus `lease_token` and `lease_until`.
-- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row, dials the gRPC address suffix from the stored worker identity, and sends the full identity as `expected_worker_id`; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
-- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the gRPC address suffix in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
+- Durababble does not require a separate nodes table for direct target routing. A caller that needs to wake or RPC a target reads the target's fresh lease row, dials the HTTP/2 RPC address suffix from the stored worker identity, and sends the full identity as `expected_worker_id`; when no fresh lease exists, the durable target activation remains the correctness path until a worker claims it.
+- A worker that claims a target activation for a target currently leased by another fresh owner must forward `DeliverMessage` to the HTTP/2 RPC address suffix in the lease row and re-arm the activation on a bounded retry, rather than parking it until lease expiry.
 - Object asks/tells/wakes and workflow commands use the unified inbox. Inbox rows are durable message/result records, not a second globally polled work queue.
 - Sequence allocation, inbox insert, and ready-target activation upsert commit in one transaction.
 - Per-target mailbox sequence state lets `enqueue_message` allocate a monotonic sequence and lets target executors drain only a contiguous ready prefix from the head.
@@ -436,7 +436,7 @@ Expired leases are reclaimed by claim paths or recovery sweeps. Recovery does no
 - If a class declares a default pool, that pool wins unless the caller overrides while creating a new durable unit. Once the row exists, the persisted pool wins.
 - Worker pools are the routing and multiregion boundary. A pod in another pool cannot claim, route, or wake a target unless the target is explicitly relocated.
 - Scheduler scans filter by pools served by the local pod.
-- `DeliverMessage` and `CallTransient` route to the gRPC address suffix in the target's fresh lease row and include the full lease owner as `expected_worker_id`. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
+- `DeliverMessage` and `CallTransient` route to the RPC address suffix in the target's fresh lease row and include the full lease owner as `expected_worker_id`. `AwakenBatch` is sent only to explicitly configured peers in the target pool.
 - Automatic cross-pool stealing is forbidden. Regional failover is explicit `relocate_worker_pool` operator/runtime work that quiesces the target, releases the old lease, updates the row, and wakes it in the new pool.
 
 ### Sticky placement
@@ -452,86 +452,38 @@ Routing keeps hot ids on the pod that already has them in memory:
 
 ## Inter-node RPC
 
-Remote intranode/inter-pod communication uses gRPC over mTLS/Spiffe. Each pod runs a dedicated `Durababble::RpcServer` using the `grpc` gem's `GRPC::RpcServer`, bound to `rpc_host:rpc_port` with its own thread pool. Peer identity comes from Spiffe, and Durababble additionally authorizes peers through an allowed service-account list.
+Remote intranode/inter-pod communication uses HTTP/2 (via `async-http`), one path per RPC method, with Paquito/Marshal value-object payloads (Ruby-to-Ruby — durababble does not carry cross-language interop, so it does not pay the protobuf tax). Each pod runs a dedicated `Durababble::Rpc::Server` (an `Async::HTTP::Server` on a reactor thread), bound to `rpc_host:rpc_port`. The transport is currently cleartext h2c with no built-in peer authentication; an optional `authorize:` hook on `Rpc::Server` runs at the application layer. Production hardening (mTLS / SPIFFE identity, ideally provided by the deployment's service mesh) is target work — see [Cluster RPC § Transport Security](content/cluster-rpc.md#transport-security).
 
-The service shape is part of the runtime contract:
+The four-method service shape is part of the runtime contract:
 
-```proto
-syntax = "proto3";
-package durababble.v1;
+| Method | Path | Request | Response |
+| --- | --- | --- | --- |
+| `AwakenBatch` | `POST /durababble/v1/awaken_batch` | `Messages::AwakenBatchRequest` | `Messages::AwakenBatchResponse` |
+| `EvictLease` | `POST /durababble/v1/evict_lease` | `Messages::EvictLeaseRequest` | `Messages::EvictLeaseResponse` |
+| `DeliverMessage` | `POST /durababble/v1/deliver_message` | `Messages::DeliverMessageRequest` | `Messages::DeliverMessageResponse` |
+| `CallTransient` | `POST /durababble/v1/call_transient` | `Messages::TransientRequest` | `Messages::TransientResponse` |
 
-service Durababble {
-  rpc AwakenBatch(AwakenBatchRequest) returns (AwakenBatchResponse);
-  rpc EvictLease(EvictLeaseRequest) returns (EvictLeaseResponse);
-  rpc CallTransient(TransientRequest) returns (TransientResponse);
-  rpc DeliverMessage(DeliverMessageRequest) returns (DeliverMessageResponse);
-}
+All bodies are `Durababble::Rpc.dump`/`Rpc.load` (Paquito with a single-byte version prefix wrapping Marshal). The `Messages` value-object fields (see `lib/durababble/rpc_messages.rb`):
 
-message RemoteError {
-  string klass = 1;
-  string message = 2;
-  repeated string backtrace = 3;
-}
-
-message LeaseMoved {
-  string new_rpc_address = 1;
-  string new_node_id = 2;
-}
-
-message AwakenBatchRequest {
-  string worker_pool = 1;
-  repeated string workflow_ids = 2;
-}
-message AwakenBatchResponse {}
-
-message EvictLeaseRequest {
-  string worker_pool = 1;
-  string target_kind = 2;  // object | workflow
-  string target_class = 3; // empty for workflows
-  string target_id = 4;
-  string expected_worker_id = 5;
-}
-message EvictLeaseResponse {}
-
-message TransientRequest {
-  string worker_pool = 1;
-  string class_name = 2;
-  string object_id = 3;
-  string workflow_id = 4;
-  string method = 5;
-  bytes args = 6;          // paquito-encoded
-  int64 deadline_ms = 7;
-  string expected_worker_id = 8;
-}
-
-message TransientResponse {
-  oneof result {
-    bytes ok = 1;          // paquito-encoded
-    RemoteError err = 2;
-    bool not_running = 3;
-    LeaseMoved moved = 4;
-  }
-}
-
-message DeliverMessageRequest {
-  string worker_pool = 1;
-  string target_kind = 2;  // object | workflow
-  string target_class = 3; // empty for workflows
-  string target_id = 4;
-  string expected_worker_id = 5;
-}
-message DeliverMessageResponse {}
-```
+- `AwakenBatchRequest { worker_pool, workflow_ids }`
+- `EvictLeaseRequest { worker_pool, target_kind, target_class, target_id, expected_worker_id }` (target_kind: `"object" | "workflow"`; target_class empty for workflows)
+- `DeliverMessageRequest` — same shape as `EvictLeaseRequest`
+- `TransientRequest { worker_pool, class_name, durable_object_id, workflow_id, method, args, deadline_ms, expected_worker_id }` (`args` is a nested Paquito blob; `durable_object_id` is the prefix to avoid shadowing `Object#object_id` on the value class)
+- `TransientResponse` — discriminated, exactly one of `{ ok: <paquito_bytes>, err: RemoteError, not_running: true, moved: LeaseMoved }`; `#result` reports which (mirrors the former protobuf oneof accessor)
+- `RemoteError { klass, message, backtrace }`
+- `LeaseMoved { new_rpc_address, new_node_id }`
 
 RPC semantics:
 
 - **AwakenBatch** is a latency optimization after workflow starts or matured scheduler rows. It never replaces durable DB state or scheduler correctness.
-- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload, but it does carry `expected_worker_id` so a fresh worker at a recycled address can ignore a wake intended for the previous process incarnation. The receiver queries durable inbox rows and schedules an owner-local target activation without blocking the gRPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
+- **DeliverMessage** wakes an owner for already-committed inbox rows. It carries no user payload, but it does carry `expected_worker_id` so a fresh worker at a recycled address can ignore a wake intended for the previous process incarnation. The receiver queries durable inbox rows and schedules an owner-local target activation without blocking the RPC handler on user code. If the receiver no longer owns the lease, it returns success without work and scheduler recovery remains the correctness path.
 - **CallTransient** is non-durable RPC for exposed methods against the active owner. It carries `expected_worker_id`; the receiver rejects the call as stale before invoking user code if its local worker identity does not match. It returns a Paquito result, a remote error, `not_running`, or `LeaseMoved`.
 - **EvictLease** asks a pod to drop a cached lease it may no longer own. It also carries `expected_worker_id` and is ignored by workers whose local identity does not match the intended lease owner.
 - Connection failure to an owner causes short retry, lease re-check, and reroute. If wakeup still fails after the retry budget, the already-committed target activation remains the correctness path and is eventually claimed by a worker in the target pool.
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
-- gRPC is required for production cross-pod calls because strongly typed protos catch shape drift and mTLS is available. Auxiliary test transports must not be used for production intranode communication.
+- Auxiliary test transports must not be used for production intranode communication.
+
+**Retry policy (only known errors are retried).** Routing layers retry only typed routing failures (`NodeUnavailable` for transport-level unavailability — connection refused / timeout / HTTP/2 stream reset / server-returned 503; `StaleLease` for a moved lease; `NoActiveLease` for an unowned workflow). An unexpected raise inside a handler is returned as HTTP 500 and surfaces on the client as `Rpc::Error` (deliberately not a subclass of `Rpc::Unavailable`); the router does **not** retry. The rationale is to avoid amplifying load against a peer that has just hit an unforeseen bug — a stampede caused by automatic retries can compound a single bad node into a cluster-wide failure.
 
 ## Configuration, limits, and operations
 
@@ -543,10 +495,8 @@ Durababble.configure do |c|
   c.node_id = SecureRandom.uuid
   c.worker_pools = ENV.fetch("DURABABBLE_WORKER_POOLS", "default").split(",")
   c.default_worker_pool = "default"
-  c.allowed_peer_service_accounts = ["agent-server"]
   c.rpc_host = ENV.fetch("POD_IP")
   c.rpc_port = ENV.fetch("DURABABBLE_RPC_PORT", "50051").to_i
-  c.rpc_thread_pool_size = 32
   c.scheduler_tick_ms = 3_000
   c.scheduler_tick_jitter_pct = 25
   c.scheduler_batch = 50
@@ -574,7 +524,7 @@ end
 
 The current Ruby API exposes payload limits as one process-wide override hash: `Durababble.payload_limits = { workflow_input: bytes, workflow_result: bytes, step_output: bytes, object_state: bytes, inbox_payload: bytes, rpc_argument: bytes }`. Matching environment variables are `DURABABBLE_MAX_WORKFLOW_INPUT_BYTES`, `DURABABBLE_MAX_WORKFLOW_RESULT_BYTES`, `DURABABBLE_MAX_STEP_OUTPUT_BYTES`, `DURABABBLE_MAX_OBJECT_STATE_BYTES`, `DURABABBLE_MAX_INBOX_PAYLOAD_BYTES`, and `DURABABBLE_MAX_RPC_ARGUMENT_BYTES`; `workflow_args` and `DURABABBLE_MAX_WORKFLOW_ARGS_BYTES` remain compatibility aliases for workflow input bytes. Every default is `4 * 1024 * 1024` serialized bytes, and every configured value must be positive.
 
-Size guards are production requirements. Durababble raises `Durababble::PayloadTooLarge` when serialized workflow inputs, workflow results, step outputs, durable object state, inbox payload/result bytes, or `CallTransient` RPC arguments exceed the configured maximum. Checks run after Paquito serialization against the exact byte string that will be written to MySQL/MariaDB `LONGBLOB`, PostgreSQL/YSQL `bytea`, or sent as protobuf `bytes`; PostgreSQL's client-side hex literal text is not counted as payload size. The error message identifies the surface and context such as workflow id, object id, inbox message id, or RPC method, but it must not include the serialized payload or original Ruby value. Rejected writes happen before the durable mutation or inside a rolled-back SQL transaction, so oversized workflow rows, history completions, inbox rows, object-state updates, and RPC handler side effects are not partially persisted. The runtime does not silently spill oversized values to blob storage.
+Size guards are production requirements. Durababble raises `Durababble::PayloadTooLarge` when serialized workflow inputs, workflow results, step outputs, durable object state, inbox payload/result bytes, or `CallTransient` RPC arguments exceed the configured maximum. Checks run after Paquito serialization against the exact byte string that will be written to MySQL/MariaDB `LONGBLOB`, PostgreSQL/YSQL `bytea`, or sent over the inter-node RPC channel as the HTTP/2 request body; PostgreSQL's client-side hex literal text is not counted as payload size. The error message identifies the surface and context such as workflow id, object id, inbox message id, or RPC method, but it must not include the serialized payload or original Ruby value. Rejected writes happen before the durable mutation or inside a rolled-back SQL transaction, so oversized workflow rows, history completions, inbox rows, object-state updates, and RPC handler side effects are not partially persisted. RPC servers re-check the `rpc_argument` limit on the inbound leg before deserializing, so a peer that skipped the client-side guard still cannot push oversized payloads through; the server surfaces the rejection as an `err` frame in the `TransientResponse`. The runtime does not silently spill oversized values to blob storage.
 
 The workflow-history guard is a replay-cost and correctness guard, not a retention system. Applications should alert on the warning log at `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS`, alert on `Durababble::WorkflowHistoryLimitExceeded`, inspect the workflow type/id and history count, and remediate by splitting the workflow into smaller durable runs/objects, pruning or compacting old terminal histories with an explicit operator tool, or raising `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` only after the long-history benchmark shows acceptable replay latency and allocation cost.
 
@@ -589,12 +539,12 @@ Observability requirements:
 - Stable span and metric attributes use the `durababble.*` namespace and may include workflow id/name/status, step name/index/attempt, object type/id/method, worker pool/id, lease owner, wait kind, retry delay, store backend for higher-level queue metrics, RPC method/target shape, and `error.type`. Instrumentation must not attach SQL text, serialized payload bytes, raw user arguments, secret-bearing values, or unbounded free-form payload data.
 - Metrics include workflow start/completion/failure/cancellation counters, step attempt/success/failure/retry counters, wait start/completion counters and wait latency histograms, queue claim latency, lease heartbeat/conflict/expired-recovery counters, outbox pending/processed/failure counters, worker tick duration/counts, and workflow replay/history size measurements. Cancellation/termination, explicit outbox delivery failure, richer replay cost, and object mailbox queue-depth metrics remain reserved where the runtime feature is not implemented yet. Applications should use ActiveRecord/database OpenTelemetry instrumentation for SQL operation latency/error metrics.
 - StatsD counters/timers cover command ask latency, exposed method latency, mailbox queue/execution latency, `CallTransient`, step execution, replay frequency, recovery sweeps, sleep dispatch, lease acquisitions/forwardings/takeovers, lease-cache hit ratio, and object-cache hit ratio.
-- OpenTelemetry spans wrap public calls, workflow executions, steps, durable-object commands/queries, workflow RPC routing, and inbound gRPC requests. Spans include worker pool, class, target id, and lease owner where relevant.
-- Bugsnag/error integration reports unhandled exceptions inside commands, exposed methods, steps, and gRPC handlers.
+- OpenTelemetry spans wrap public calls, workflow executions, steps, durable-object commands/queries, workflow RPC routing, and inbound RPC requests. Spans include worker pool, class, target id, and lease owner where relevant.
+- Bugsnag/error integration reports unhandled exceptions inside commands, exposed methods, steps, and RPC handlers.
 - Slow-step warnings are emitted.
 - Routing health metrics cover wakeup error rate, wakeup latency, and lease takeover frequency.
 - Circuit breakers around database connections cause public methods to raise a typed error such as `Durababble::CircuitBreakerOpen` when the durable store is unavailable before commit.
-- gRPC server health metrics cover in-flight requests, handler-thread saturation, and dropped requests.
+- RPC server health metrics cover in-flight requests, reactor saturation, and dropped requests.
 
 ## Guarantee matrix
 
@@ -622,11 +572,11 @@ Observability requirements:
 | Timer waits survive process exit | Timer wait rows store wake time and serialized context. | Timer wait tests |
 | Side effects can be fenced by key | A fence records `running` before yielding and exposes operator-visible recovery for abandoned owners. | Fence concurrency spec plus owner-crash spec |
 | Outbox delivery is durable and leased | Outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry. | Outbox specs |
-| Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side broadcast wait is required. | Workflow command mailbox specs plus gRPC wakeup specs |
+| Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side broadcast wait is required. | Workflow command mailbox specs plus RPC wakeup specs |
 | Synchronous durable commands return results | Ask rows store serialized result/error and caller retries with the same idempotency key reattach. | Workflow/object ask specs |
 | Inbox is not a second global polling queue | Workers poll coalesced target activations and target owners drain inbox rows for their own target. | Query-plan and mailbox specs |
-| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus gRPC transport spec plus DST scenarios |
-| Inter-pod RPC uses full four-method gRPC service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` with production credentials/auth callbacks. | gRPC integration/contract tests plus DST response scenarios |
+| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus HTTP/2 RPC transport spec plus DST scenarios |
+| Inter-pod RPC uses full four-method HTTP/2 service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` over async-http with an optional application-layer authorize hook. | RPC transport integration/contract tests plus DST response scenarios |
 | Multi-row state transitions are transactional | Step start/finish/failure, wait transitions, inbox enqueue, mailbox advancement, and state/result writes commit atomically where required. | Implementation plus regression suite |
 | Runtime values are Paquito bytes | Runtime payloads use Paquito bytes in `bytea` / `LONGBLOB`, not JSONB. | Payload storage specs |
 | MySQL/MariaDB honors common store semantics | MySQL/MariaDB and PostgreSQL/YSQL satisfy the same store behavior contract. | Backend conformance spec |
@@ -680,7 +630,7 @@ Correctness claims must be backed by tests:
 - Backend-specific tests pin SQL behavior that differs by adapter, including lock/claim semantics and EXPLAIN-backed query-plan assertions for hot paths when practical.
 - Deterministic simulation tests are useful for exploring lease/race schedules, but any storage bug found through simulation must be pinned by a real backend regression test.
 - Subprocess crash harnesses cover real process death around durable boundaries.
-- RPC tests cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, gRPC serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
+- RPC tests cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, Paquito serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
 - Object mailbox tests cover strict FIFO, blocked head behavior, ask/tell ordering, wake ordering, idempotency conflicts, owner crash, lease takeover, dead-letter, and operator repair paths.
 - Workflow command tests cover history acceptance, deterministic replay order, timeout behavior, terminal-workflow rejection, and idempotency dedup.
 - Workflow patch-marker tests cover first-run marker recording, no-marker `false` branches, marker-history `true` branches, missing-marker nondeterminism failures, `deprecate_patch` cleanup, duplicate-id handling, backend conformance, and crash after marker commit.
@@ -708,7 +658,7 @@ These constraints are part of the contract:
 - No streams API without a concrete consumer requirement.
 - No automatic cross-pool routing; relocation/failover is explicit.
 - No silent payload spill to blob storage; oversized values fail loudly.
-- No production RPC transport other than the four-method gRPC service.
+- No production RPC transport other than the four-method HTTP/2 service over `async-http`.
 - No runtime loading or validation of user RBS.
 - MySQL/MariaDB support is required for the common public contract.
 - Worker registry misses are avoided by claiming only workflow/object classes present in the supplied registry. Enqueuing a workflow name with no corresponding worker pool leaves it pending until an appropriate pool starts.

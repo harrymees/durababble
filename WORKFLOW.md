@@ -127,7 +127,7 @@ Non-negotiables:
 1. Persist state before and after every durable boundary; do not fake durable behavior with process-local state.
 2. When touching storage semantics, run or add tests against the real Yugabyte/PostgreSQL-compatible path whenever possible, and preserve backend conformance with MySQL/MariaDB where relevant.
 3. Prefer end-to-end behavioral/regression tests over assertions that only restate metadata or docs.
-4. Preserve the settled API direction in `docs/spec.md`: `Workflow.start` / `Workflow.handle`, `DurableObject.at` / `DurableObject.tell`, method/order step identity, unified inbox, and the full four-method gRPC direction.
+4. Preserve the settled API direction in `docs/spec.md`: `Workflow.start` / `Workflow.handle`, `DurableObject.at` / `DurableObject.tell`, method/order step identity, unified inbox, and the full four-method HTTP/2 RPC service (`AwakenBatch`, `EvictLease`, `CallTransient`, `DeliverMessage`).
 5. Keep payload serialization through Paquito/binary storage unless deliberately changing the spec and implementation together.
 6. Update `docs/spec.md`, `docs/content/architecture.md`, the relevant `docs/content/` pages, and `README.md` when behavior, API, storage guarantees, or operational expectations change.
 7. Treat the project as a correctness-oriented prototype rather than a production Temporal replacement; do not silently widen scope beyond the ticket.
