@@ -226,6 +226,13 @@ SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_target_activations` FOR
 -- mysql_count_workflow_leases
 SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (<index>) WHERE status = 'running' AND locked_by = ?
 
+-- mysql_current_object_activation_lease
+SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
+FROM `durababble_mysql_snapshot_target_activations`
+WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+  AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+LIMIT 1
+
 -- mysql_current_object_lease
 SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
 FROM `durababble_mysql_snapshot_inbox`
