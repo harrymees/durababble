@@ -14,3 +14,4 @@ Each tutorial assumes you have followed [Installation](../install.md) and have a
 Tutorials currently available:
 
 - [Build A Durable Agent Loop](agent-loop.md) — write an LLM tool-calling agent whose conversation, tool calls, and file-system state all survive process restarts.
+- [Build A Durable Chat Room](chat-room.md) — build a multi-user room whose message log is durable and whose scheduled announcements resume after worker restarts.
