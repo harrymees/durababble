@@ -99,7 +99,7 @@ module Durababble
     # Control-flow errors are rejected onto the future unchanged; only an
     # ordinary step failure is run through retry/terminal handling. Cancellation
     # additionally records the canceled step before propagating.
-    PASS_THROUGH_STEP_ERRORS = [InjectedCrash, LeaseConflict, WorkflowSuspended, StepRetryScheduled, NonDeterminismError].freeze
+    PASS_THROUGH_STEP_ERRORS = [InjectedCrash, LeaseConflict, WorkflowSuspended, StepRetryScheduled, ReplayDivergenceError].freeze
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void
     def reject_step_error(error, command_id:, step:, attributes:)

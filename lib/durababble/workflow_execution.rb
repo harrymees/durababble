@@ -539,7 +539,7 @@ module Durababble
         if missing_command_id && !other_workflow_task_can_schedule?(Async::Task.current)
           message = "workflow #{@workflow_id} history resolved command #{missing_command_id} before command #{command_id}, " \
             "but current replay has not scheduled command #{missing_command_id}"
-          raise NonDeterminismError, message
+          raise ReplayDivergenceError, message
         end
 
         block_current_workflow_task { WorkflowDeterminism.allow_host_operations { future.wait } }
@@ -666,7 +666,7 @@ module Durababble
       kwargs = payload.fetch("kwargs", {})
 
       unless @workflow_class.exposed_commands.key?(method_name)
-        raise NonDeterminismError, "workflow #{@workflow_id} replay reached unknown workflow command #{method_name}"
+        raise ReplayDivergenceError, "workflow #{@workflow_id} replay reached unknown workflow command #{method_name}"
       end
 
       case event.fetch("kind")
@@ -675,11 +675,11 @@ module Durababble
         # complete_workflow_command always records the result (include_result: true), so a
         # completed event without one is malformed history, not a divergence we can skip.
         unless payload.key?("result")
-          raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with no recorded result"
+          raise ReplayDivergenceError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with no recorded result"
         end
         return if result == payload.fetch("result")
 
-        raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different result than recorded history"
+        raise ReplayDivergenceError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different result than recorded history"
       when "workflow_command_failed"
         begin
           invoke_workflow_command(method_name, args:, kwargs:)
@@ -687,9 +687,9 @@ module Durababble
           expected = event["error"]
           return if expected.nil? || expected == "#{e.class}: #{e.message}"
 
-          raise NonDeterminismError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different error than recorded history"
+          raise ReplayDivergenceError, "workflow #{@workflow_id} replay reached workflow command #{method_name} with a different error than recorded history"
         end
-        raise NonDeterminismError, "workflow #{@workflow_id} replay expected workflow command #{method_name} to fail"
+        raise ReplayDivergenceError, "workflow #{@workflow_id} replay expected workflow command #{method_name} to fail"
       end
     end
 

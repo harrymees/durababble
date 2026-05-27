@@ -169,7 +169,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         run = Durababble::Engine.new(store:, worker_id: "replay-worker").resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
         assert_empty store.step_attempts_for(workflow_id)
       end
@@ -701,7 +701,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         end
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/resolved command 1 before command 0/, run.error)
       end
     end
@@ -740,7 +740,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         end
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/resolved command 1 before command 0/, run.error)
       end
     end

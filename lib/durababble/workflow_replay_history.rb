@@ -61,7 +61,7 @@ module Durababble
 
       message = "workflow #{workflow_id} replay reached command #{command_id} #{shape.fetch("name").inspect} " \
         "with a different durable command shape than recorded history"
-      raise NonDeterminismError, message
+      raise ReplayDivergenceError, message
     end
 
     #: (Integer, step_name: String, shape: Hash[String, Object?]) -> Hash[String, Object?]
@@ -117,7 +117,7 @@ module Durababble
       return if extra.empty?
 
       rendered = extra.map { |command_id| "#{command_id}:#{@scheduled.fetch(command_id).fetch("name")}" }.join(", ")
-      raise NonDeterminismError, "workflow #{workflow_id} replay completed without consuming durable command history: #{rendered}"
+      raise ReplayDivergenceError, "workflow #{workflow_id} replay completed without consuming durable command history: #{rendered}"
     end
 
     #: (Hash[Integer, CommandFuture]) { (Hash[String, Object?], CommandFuture) -> Object? } -> void

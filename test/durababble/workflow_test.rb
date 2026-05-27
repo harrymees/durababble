@@ -288,7 +288,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     assert_nil execution.send(:replay_workflow_command_event, event)
 
     event["payload"]["result"] = { "approved_by" => "someone-else" }
-    error = assert_raises(Durababble::NonDeterminismError) do
+    error = assert_raises(Durababble::ReplayDivergenceError) do
       execution.send(:replay_workflow_command_event, event)
     end
     assert_match(/different result/, error.message)
@@ -303,7 +303,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     )
     refute(event.fetch("payload").key?("result"), "fixture should omit the result so the assertion is exercised")
 
-    error = assert_raises(Durababble::NonDeterminismError) do
+    error = assert_raises(Durababble::ReplayDivergenceError) do
       execution.send(:replay_workflow_command_event, event)
     end
     assert_match(/no recorded result/, error.message)
@@ -334,7 +334,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     assert_nil execution.send(:replay_workflow_command_event, event)
 
     event["error"] = "RuntimeError: different"
-    error = assert_raises(Durababble::NonDeterminismError) do
+    error = assert_raises(Durababble::ReplayDivergenceError) do
       execution.send(:replay_workflow_command_event, event)
     end
     assert_match(/different error/, error.message)
@@ -344,7 +344,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
     execution = replay_execution_for(ApiTestApprovalWorkflow)
     unknown = workflow_command_history_event("workflow_command_completed", method_name: "missing")
 
-    error = assert_raises(Durababble::NonDeterminismError) do
+    error = assert_raises(Durababble::ReplayDivergenceError) do
       execution.send(:replay_workflow_command_event, unknown)
     end
     assert_match(/unknown workflow command missing/, error.message)
@@ -355,7 +355,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
       kwargs: { reason: "operator" },
       error: "RuntimeError: expected",
     )
-    error = assert_raises(Durababble::NonDeterminismError) do
+    error = assert_raises(Durababble::ReplayDivergenceError) do
       execution.send(:replay_workflow_command_event, successful)
     end
     assert_match(/expected workflow command approve to fail/, error.message)
