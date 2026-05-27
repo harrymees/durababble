@@ -15,6 +15,7 @@ module Durababble
     # set once per column per row, so it is a Set for O(1) membership rather than
     # a linear array scan.
     SERIALIZED_COLUMNS = Set["input", "result", "payload", "context", "heartbeat_cursor", "state", "args", "kwargs"].freeze
+    INTERNAL_COLUMNS = Set["queue_available_at"].freeze
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     NO_OBJECT_STATE = Object.new.freeze
     GENERATED_CONNECTION_CONST_IVAR = :@durababble_store_connection_const_name
@@ -657,6 +658,8 @@ module Durababble
     #: (Hash[String, Object?]) -> Hash[String, Object?]
     def decode_row(row)
       row.each_with_object({}) do |(column, value), decoded|
+        next if INTERNAL_COLUMNS.include?(column)
+
         decoded[column] = SERIALIZED_COLUMNS.include?(column) ? load_serialized(value) : value
       end
     end

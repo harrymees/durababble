@@ -41,12 +41,7 @@ module Durababble
         exclusion_sql, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids)
         workflow_sql = "#{name_sql} #{exclusion_sql}"
         workflow_params = name_params + exclusion_params
-        candidates = []
-        candidates.concat(execute_store_query(:claim_pending_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
-        candidates.concat(execute_store_query(:claim_failed_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
-        candidates.concat(execute_store_query(:claim_canceling_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
-        candidates.concat(execute_store_query(:claim_expired_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = execute_store_query(:claim_runnable_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).first
         next unless candidate
 
         updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_seconds, candidate.fetch("id"), worker_pool])

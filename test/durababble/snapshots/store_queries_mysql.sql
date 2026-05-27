@@ -43,16 +43,6 @@ SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_
   cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 
--- mysql_claim_canceling_workflow
-SELECT id, created_at FROM `durababble_mysql_snapshot_workflows`
-WHERE worker_pool = ?
-  AND status = 'canceling'
-  AND (next_run_at IS NULL OR next_run_at <= NOW(6))
-  <name_sql>
-ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
 -- mysql_claim_expired_fence
 UPDATE `durababble_mysql_snapshot_fences`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), result = NULL, error = NULL, completed_at = NULL
@@ -70,26 +60,6 @@ SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FR
 WHERE worker_pool = ? AND status = 'running' AND locked_until < ?
   <filter_sql>
 ORDER BY ready_at, created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
--- mysql_claim_expired_workflow
-SELECT id, created_at FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_expired_lease_idx)
-WHERE worker_pool = ?
-  AND status = 'running' AND locked_until < NOW(6)
-  <name_sql>
-ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
--- mysql_claim_failed_workflow
-SELECT id, created_at FROM `durababble_mysql_snapshot_workflows`
-WHERE worker_pool = ?
-  AND status = 'failed'
-  AND next_run_at IS NOT NULL
-  AND next_run_at <= NOW(6)
-  <name_sql>
-ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
@@ -114,13 +84,11 @@ ORDER BY ready_at, created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
--- mysql_claim_pending_workflow
-SELECT id, created_at FROM `durababble_mysql_snapshot_workflows`
+-- mysql_claim_runnable_workflow
+SELECT id, created_at FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_claim_idx)
 WHERE worker_pool = ?
-  AND status = 'pending'
-  AND (next_run_at IS NULL OR next_run_at <= NOW(6))
+  AND queue_available_at <= NOW(6)
   <name_sql>
-ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
@@ -139,7 +107,7 @@ UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND worker_pool = ?
   AND (
-    status = 'pending'
+    (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
     OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'running' AND locked_until < NOW(6))

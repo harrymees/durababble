@@ -69,7 +69,7 @@ module Durababble
     HOT_QUERY_COVERAGE = {
       "workflow queue claim" => {
         methods: ["Store.claim_runnable_workflow", "MysqlStore.claim_runnable_workflow"],
-        indexes: ["workflows_queue_idx", "workflows_runnable_due_idx", "workflows_expired_lease_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
+        indexes: ["workflows_claim_idx", "workflows_queue_idx", "workflows_runnable_due_idx", "workflows_expired_lease_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
         assertions: ["no sequential/full table scan", "allowed queue indexes", "LIMIT 1 probes", "FOR UPDATE SKIP LOCKED"],
         benchmarks: ["claim_runnable_workflows", "large_table_claim_scan"],
       },
@@ -506,53 +506,12 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_pending_workflow, backend: :mysql, description: "Probe the pending workflow queue for the oldest runnable candidate in this worker pool.") do |store, name_sql:|
+    define(:mysql_claim_runnable_workflow, backend: :mysql, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_sql:|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")}
+        SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
         WHERE worker_pool = ?
-          AND status = 'pending'
-          AND (next_run_at IS NULL OR next_run_at <= NOW(6))
+          AND queue_available_at <= NOW(6)
           #{name_sql}
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:mysql_claim_failed_workflow, backend: :mysql, description: "Probe failed workflows whose retry backoff is due.") do |store, name_sql:|
-      <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")}
-        WHERE worker_pool = ?
-          AND status = 'failed'
-          AND next_run_at IS NOT NULL
-          AND next_run_at <= NOW(6)
-          #{name_sql}
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:mysql_claim_canceling_workflow, backend: :mysql, description: "Probe canceling workflows that are ready for cleanup work.") do |store, name_sql:|
-      <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")}
-        WHERE worker_pool = ?
-          AND status = 'canceling'
-          AND (next_run_at IS NULL OR next_run_at <= NOW(6))
-          #{name_sql}
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:mysql_claim_expired_workflow, backend: :mysql, description: "Probe running workflows whose worker lease has expired.") do |store, name_sql:|
-      <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")})
-        WHERE worker_pool = ?
-          AND status = 'running' AND locked_until < NOW(6)
-          #{name_sql}
-        ORDER BY created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
@@ -564,7 +523,7 @@ module Durababble
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
           AND (
-            status = 'pending'
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
             OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'running' AND locked_until < NOW(6))
