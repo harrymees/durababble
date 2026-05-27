@@ -74,7 +74,7 @@ module Durababble
       #: (workflow_id: untyped) { -> untyped } -> untyped
       def enforce(workflow_id:, &block)
         trace = TracePoint.new(:call, :c_call) do |event|
-          check_event!(workflow_id, event, locations: caller_locations(1, 24) || [])
+          check_event!(workflow_id, event)
         end
 
         enable_trace(trace, &block)
@@ -92,11 +92,13 @@ module Durababble
 
       private
 
-      #: (untyped, untyped, locations: Array[Thread::Backtrace::Location]) -> void
-      def check_event!(workflow_id, event, locations:)
-        return unless WorkflowExecutionContext.current
+      #: (untyped, untyped, ?locations: Array[Thread::Backtrace::Location]?) -> void
+      def check_event!(workflow_id, event, locations: nil)
         return if allowed_host_operation?
+        return unless WorkflowExecutionContext.current
+        return unless violation_candidate?(event)
 
+        locations ||= caller_locations(1, 24) || []
         callsite = callsite_location(locations)
         violation = violation_for(event, callsite:)
         return unless violation
@@ -122,6 +124,27 @@ module Durababble
       def allowed_host_operation?
         fiber = Fiber.current #: as untyped
         fiber.durababble_determinism_allow_depth.to_i.positive?
+      end
+
+      #: (untyped) -> bool
+      def violation_candidate?(event)
+        method_id = event.method_id
+        receiver = event.self
+        defined_class = event.defined_class
+
+        if SLEEP_METHODS.include?(method_id) || KERNEL_IO_METHODS.include?(method_id) || RANDOM_METHODS.include?(method_id)
+          return true if kernel_receiver?(receiver, defined_class)
+        end
+
+        return true if RANDOM_METHODS.include?(method_id) && module_receiver_named?(receiver, "Random", "SecureRandom")
+        return true if method_id == :initialize && class_named?(defined_class, "Random::Base")
+        return true if method_id == :initialize && defined_class == Time
+        return true if TIME_METHODS.include?(method_id) && module_receiver_named?(receiver, "Time", "Date", "DateTime")
+        return true if PROCESS_METHODS.include?(method_id) && module_receiver_named?(receiver, "Process")
+        return true if IO_METHODS.include?(method_id) && io_receiver?(receiver)
+        return true if FILE_SYSTEM_METHODS.include?(method_id) && file_system_receiver?(receiver)
+
+        false
       end
 
       #: (untyped, callsite: untyped) -> String?

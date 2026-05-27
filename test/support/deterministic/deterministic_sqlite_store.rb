@@ -35,10 +35,14 @@ module Durababble
       #: untyped
       attr_reader :scheduler, :fault_plan
 
+      MIGRATED_TEMPLATE_MUTEX = Mutex.new
+      MIGRATED_TEMPLATES = {}
+      CONNECTION_NAME_MUTEX = Mutex.new
+
       class << self
         #: (scheduler: untyped, ?fault_plan: untyped, ?schema: String) -> DeterministicSqliteStore
         def build(scheduler:, fault_plan: nil, schema: "durababble")
-          connection_name = "DeterministicSqliteStoreConnection#{Process.pid}#{object_id}#{SecureRandom.hex(4)}"
+          connection_name = next_connection_name
           connection_class = Class.new(ActiveRecord::Base) do
             self.abstract_class = true
             self.connection_class = true
@@ -48,12 +52,41 @@ module Durababble
           Durababble.const_set(connection_name, connection_class)
           begin
             connection_class.establish_connection(adapter: "sqlite3", database: ":memory:", pool: 1)
-            store = new(connection_class.connection_pool, scheduler:, fault_plan:, schema:, owner: connection_class)
-            store.migrate!
+            connection_pool = connection_class.connection_pool
+            disable_query_cache_dirtying!(connection_pool)
+            store = new(connection_pool, scheduler:, fault_plan:, schema:, owner: connection_class)
+            store.send(:load_migrated_template!, migrated_template(schema))
             store
           rescue StandardError
             Store.send(:remove_active_record_class_const, connection_class)
             raise
+          end
+        end
+
+        private
+
+        #: () -> String
+        def next_connection_name
+          CONNECTION_NAME_MUTEX.synchronize do
+            @connection_name_sequence = @connection_name_sequence.to_i + 1
+            "DeterministicSqliteStoreConnection#{Process.pid}#{object_id}#{@connection_name_sequence}"
+          end
+        end
+
+        # Query caching is never enabled for the private in-memory DST store; clearing
+        # every ActiveRecord pool on each write only adds harness overhead.
+        #: (untyped) -> void
+        def disable_query_cache_dirtying!(connection_pool)
+          connection_pool.define_singleton_method(:dirties_query_cache) { false }
+        end
+
+        #: (String) -> SqliteStore
+        def migrated_template(schema)
+          MIGRATED_TEMPLATE_MUTEX.synchronize do
+            MIGRATED_TEMPLATES[schema] ||= begin
+              template = SqliteStore.build_in_memory(schema:)
+              template.migrate!
+            end
           end
         end
       end
@@ -127,12 +160,18 @@ module Durababble
       # process-global stub is safe for the length of one run.
       #: [T] () { () -> T } -> T
       def with_deterministic_uuids(&block)
+        singleton_class = SecureRandom.singleton_class
         original = SecureRandom.method(:uuid)
+        restore_singleton_uuid = singleton_class.public_method_defined?(:uuid, false)
         store = self
+        singleton_class.__send__(:remove_method, :uuid) if restore_singleton_uuid
         SecureRandom.define_singleton_method(:uuid) { store.send(:generate_uuid) }
         block.call
       ensure
-        SecureRandom.define_singleton_method(:uuid, original) if original
+        if singleton_class&.public_method_defined?(:uuid, false)
+          singleton_class.__send__(:remove_method, :uuid)
+        end
+        SecureRandom.define_singleton_method(:uuid, original) if restore_singleton_uuid
       end
 
       # --- Deterministic clock / identity seams ------------------------------
