@@ -1,7 +1,7 @@
 # typed: true
 # frozen_string_literal: true
 
-require_relative "virtual_yugabyte"
+require_relative "deterministic_sqlite_store"
 
 module Durababble
   module Deterministic
@@ -37,9 +37,17 @@ module Durababble
           next unless claimed
 
           workflow = @workflows.fetch(claimed.fetch("name"))
-          Engine.new(store: @store, worker_id: @id).resume(workflow, workflow_id: claimed.fetch("id"))
+          # Arm the store crash proxy for the resume so a worker can die between
+          # any two durable writes mid-workflow (not just at crash_before_tick).
+          # The crash is caught here, modelling a process death; a later tick or
+          # the reaper reclaims the lease and replay drives the workflow forward.
+          @store.crashable do
+            Engine.new(store: @store, worker_id: @id).resume(workflow, workflow_id: claimed.fetch("id"))
+          end
         rescue LeaseConflict => e
           @scheduler.trace.event(@scheduler.time, @id, "lease_conflict", error: e.message)
+        rescue InjectedCrash => e
+          @scheduler.trace.event(@scheduler.time, @id, "crashed_mid_resume", error: e.message)
         end
       end
     end

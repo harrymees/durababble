@@ -17,7 +17,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
   end
 
-  durababble_store_backends.each do |backend|
+  durababble_conformance_store_backends.each do |backend|
     test "migrates, enqueues, claims, completes, and decodes serialized workflow state with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "conformance", input: { "count" => 1 })
@@ -95,6 +95,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "concurrent duplicate explicit workflow id enqueues create one workflow row with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; this test spins up concurrent independent Store.connect handles") if backend.sqlite?
+
       with_durababble_store(backend, "explicit_workflow_id_race") do |store|
         workflow_id = "wf-race-#{SecureRandom.hex(4)}"
         queue = Queue.new
@@ -717,6 +719,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; a second Store.connect handle is a separate database") if backend.sqlite?
+
       with_durababble_store(backend, "inbox_crash_after_commit") do |store|
         store.migrate!
         message_id = store.enqueue_inbox_message(
@@ -741,6 +745,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "allocates unique contiguous mailbox sequences under concurrent enqueue with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; this test spins up concurrent independent connections") if backend.sqlite?
+
       with_durababble_store(backend, "inbox_concurrent") do |store|
         store.migrate!
         errors = Queue.new

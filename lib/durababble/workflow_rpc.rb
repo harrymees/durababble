@@ -96,12 +96,14 @@ module Durababble
     end
 
     class Router
-      #: (store: untyped, rpc_clients: untyped, ?retry_on_stale: untyped, ?start_workflow: untyped) -> void
-      def initialize(store:, rpc_clients:, retry_on_stale: false, start_workflow: nil)
+      #: (store: untyped, ?rpc_clients: untyped, ?rpc_client_factory: untyped, ?retry_on_stale: untyped, ?start_workflow: untyped, ?start_on_no_active_lease: untyped) -> void
+      def initialize(store:, rpc_clients: {}, rpc_client_factory: nil, retry_on_stale: false, start_workflow: nil, start_on_no_active_lease: true)
         @store = store
         @rpc_clients = rpc_clients
+        @rpc_client_factory = rpc_client_factory
         @retry_on_stale = retry_on_stale
         @start_workflow = start_workflow
+        @start_on_no_active_lease = start_on_no_active_lease
       end
 
       #: (workflow_id: untyped, command: untyped, ?payload: untyped) -> untyped
@@ -118,11 +120,12 @@ module Durababble
           rescue StaleLease, NoActiveLease, NodeUnavailable => e
             Observability.count("durababble.workflow_rpc.reroutes", attributes.merge("error.type" => e.class.name))
             raise unless @retry_on_stale
+            raise if e.is_a?(NoActiveLease) && !@start_on_no_active_lease
 
             attempts += 1
             raise if attempts > 3
 
-            start_workflow!(workflow_id) if e.is_a?(NoActiveLease)
+            start_workflow!(workflow_id) if e.is_a?(NoActiveLease) && @start_on_no_active_lease
             retry
           end
         end
@@ -136,9 +139,7 @@ module Durababble
         raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
 
         worker_id = lease.fetch("worker_id")
-        client = @rpc_clients.fetch(worker_id) do
-          raise NodeUnavailable, "workflow #{workflow_id} is leased by unavailable node #{worker_id}"
-        end
+        client = rpc_client_for(worker_id, workflow_id:)
         client.request("workflow_rpc", {
           "workflow_id" => workflow_id,
           "expected_worker_id" => worker_id,
@@ -155,9 +156,52 @@ module Durababble
         starter.call(workflow_id:)
       end
 
+      #: (untyped, workflow_id: untyped) -> untyped
+      def rpc_client_for(worker_id, workflow_id:)
+        if @rpc_clients.respond_to?(:fetch)
+          sentinel = Object.new
+          client = @rpc_clients.fetch(worker_id, sentinel)
+          return client unless client.equal?(sentinel)
+        end
+
+        factory = @rpc_client_factory
+        return factory.call(worker_id) if factory
+
+        raise NodeUnavailable, "workflow #{workflow_id} is leased by unavailable node #{worker_id}"
+      end
+
       #: (untyped) -> untyped
       def translate_remote_error(error)
         WorkflowRpc.remote_error_from_message(error.message) || error
+      end
+    end
+
+    class LocalClient
+      #: (store: untyped, node_id: untyped, handlers: untyped) -> void
+      def initialize(store:, node_id:, handlers:)
+        @store = store
+        @node_id = node_id
+        @handlers = handlers
+      end
+
+      #: (untyped, untyped) -> untyped
+      def request(command, payload)
+        raise UnknownCommand, command unless command == "workflow_rpc"
+
+        with_store do |store|
+          Handler.new(store:, node_id: @node_id, handlers: @handlers).call(payload)
+        end
+      end
+
+      private
+
+      #: () { (untyped) -> untyped } -> untyped
+      def with_store(&block)
+        if @store.respond_to?(:with_dedicated_connection)
+          @store.with_dedicated_connection(&block)
+        else
+          block.call(@store)
+        end
       end
     end
 

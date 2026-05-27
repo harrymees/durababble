@@ -25,6 +25,8 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
     "fenced_side_effect_once",
+    "fence_holder_crash_and_reclaim",
+    "step_failure_crash_matrix",
     "outbox_lease_expiry",
     "store_fault_after_step_completed",
     "store_fault_after_wait_recorded",
@@ -32,9 +34,37 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "duplicate_delivery_timer_and_outbox",
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
+    "cancellation_cleanup_crash_fuzz",
+    "cancellation_during_suspend_race",
+    "parallel_branch_failure_orphans_step",
+    "parallel_wait_with_retrying_sibling",
+    "wait_condition_command_wakeup",
+    "wait_condition_sequential_command_wakeups",
+    "wait_condition_timer_command_race",
+    "record_step_canceled_crash_fuzz",
+    "workflow_termination_dependents_crash_fuzz",
+    "stolen_lease_write_rejection",
+    "timer_wakeup_batch_crash_fuzz",
+    "workflow_command_async_delivery",
+    "workflow_command_delivery_crash_recovery",
+    "workflow_command_delivery_crash_matrix",
+    "workflow_command_claim_window_crash_matrix",
+    "workflow_command_retry_then_complete",
+    "workflow_command_terminal_failure",
+    "workflow_command_terminal_failure_crash_fuzz",
+    "workflow_command_delivery_to_terminal_workflow",
+    "object_command_failure_exhaustion",
+    "object_command_claim_contention",
+    "object_command_crash_fuzz",
+    "object_command_state_crash_fuzz",
+    "object_command_retry_then_apply_crash_fuzz",
+    "object_command_activation_driven_drain",
+    "object_command_idempotent_enqueue",
+    "object_command_multi_target_isolation",
     "rpc_workflow_rpc_response_matrix",
     "rpc_workflow_rpc_transport_fault_matrix",
     "rpc_workflow_rpc_transport_fault_reroute",
+    "random_operation_sequence",
     "chaos",
   ].freeze
 
@@ -44,6 +74,23 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "rpc_wakeup_fault_matrix",
   ].freeze
 
+  # The full fuzz sweep (every FUZZ_SCENARIOS target × these seeds) dominates the
+  # DST suite's wall time. Locally it runs in full; CI sharding sets DST_FUZZ_SEEDS
+  # (e.g. "1..50") so parallel jobs each cover a slice of the seed space without
+  # dropping any scenario. The default keeps the complete 1..100 sweep for anyone
+  # running `rake dst` directly.
+  DEFAULT_FUZZ_SEEDS = (1..100)
+
+  def fuzz_seeds
+    spec = ENV.fetch("DST_FUZZ_SEEDS", nil)
+    return DEFAULT_FUZZ_SEEDS if spec.nil? || spec.empty?
+
+    first, last = spec.split("..", 2).map { |part| Integer(part.strip) }
+    raise ArgumentError, "invalid DST_FUZZ_SEEDS=#{spec.inspect}" if last.nil?
+
+    first..last
+  end
+
   def assert_scenarios_hold(scenarios, seeds:)
     scenarios.each do |scenario|
       failures = Durababble::Deterministic.search(scenario, seeds:)
@@ -51,15 +98,21 @@ class DurababbleDeterministicTest < DurababbleTestCase
     end
   end
 
-  test "proves full determinism by replaying the same scenario twice for the same seed" do
-    first = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
-    second = Durababble::Deterministic.prove("multi_worker_counter", seed: 12_345)
+  def assert_scenario_deterministic(scenario, seed:)
+    first = Durababble::Deterministic.prove(scenario, seed:)
+    second = Durababble::Deterministic.prove(scenario, seed:)
 
-    assert_equal second.digest, first.digest
-    assert_equal second.trace, first.trace
-    assert_empty first.violations
-    assert_equal 8, first.summary.fetch(:completed_workflows)
-    assert_equal 8, first.trace.scan("workflow_claimed").length
+    assert_equal(first.trace, second.trace, "scenario #{scenario.inspect} produced a different trace on the second run")
+    assert_equal(first.digest, second.digest, "scenario #{scenario.inspect} produced a different digest on the second run")
+    assert_equal(first.summary, second.summary, "scenario #{scenario.inspect} produced a different summary on the second run")
+    assert_equal(first.violations, second.violations, "scenario #{scenario.inspect} produced different violations on the second run")
+    assert_empty(first.violations, "scenario #{scenario.inspect} had invariant violations: #{first.violations.inspect}")
+  end
+
+  test "proves exact trace determinism for every clean scenario target" do
+    (FUZZ_SCENARIOS + CONTRACT_SCENARIOS).uniq.each do |scenario|
+      assert_scenario_deterministic(scenario, seed: 12_345)
+    end
   end
 
   test "uses the seed to control delivery order and failure schedule" do
@@ -79,7 +132,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:side_effects)
     assert_equal 1, result.summary.fetch(:processed_outbox)
     assert_includes result.trace, "network.send"
-    assert_includes result.trace, "virtual_yugabyte"
+    assert_includes result.trace, "store"
   end
 
   test "reclaims expired workflow leases deterministically" do
@@ -222,10 +275,10 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:canceled_workflows)
   end
 
-  test "virtual store keeps command history coherent for deferred waits and cancellation" do
+  test "deterministic store keeps command history coherent for deferred waits and cancellation" do
     trace = Durababble::Deterministic::Trace.new
     scheduler = Durababble::Deterministic::Scheduler.new(seed: 61, trace:)
-    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+    store = Durababble::Deterministic::DeterministicSqliteStore.build(scheduler:)
 
     workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
@@ -284,10 +337,10 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_nil store.workflow_cancellation(completed_id)
   end
 
-  test "virtual store no-op lease and queue paths stay inert" do
+  test "deterministic store no-op lease and queue paths stay inert" do
     trace = Durababble::Deterministic::Trace.new
     scheduler = Durababble::Deterministic::Scheduler.new(seed: 62, trace:)
-    store = Durababble::Deterministic::VirtualYugabyte.new(scheduler:)
+    store = Durababble::Deterministic::DeterministicSqliteStore.build(scheduler:)
 
     workflow_id = store.enqueue_workflow(name: "virtual-noops", input: {})
 
@@ -297,7 +350,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_nil store.claim_outbox(worker_id: "sender", lease_seconds: 10)
 
     outbox_id = store.enqueue_outbox(workflow_id:, topic: "topic", payload: {}, key: "key")
-    assert_nil store.ack_outbox(outbox_id, worker_id: "wrong-sender")
+    assert_equal 0, store.ack_outbox(outbox_id, worker_id: "wrong-sender").affected_rows
     assert_equal "pending", store.outbox_message(outbox_id).fetch("status")
 
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
@@ -371,8 +424,290 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes messages, "processing outbox"
   end
 
+  test "flags a stuck fence whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_fence", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck fence"
+  end
+
+  test "flags a stuck outbox message whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_outbox", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck outbox"
+  end
+
+  test "flags a stuck inbox message whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_inbox", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck inbox"
+  end
+
+  test "flags a stuck target activation whose expired lease was never reclaimed" do
+    failures = Durababble::Deterministic.search("bug_stuck_activation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "stuck target activation"
+  end
+
+  test "flags partial leases on mailbox coordination rows" do
+    failures = Durababble::Deterministic.search("bug_partial_mailbox_leases", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "inbox partial-inbox-1 has partial lease"
+    assert_includes messages, "target activation workflow/counter/partial-activation-1 has partial lease"
+    assert_includes messages, "fence "
+    assert_includes messages, "has partial lease"
+  end
+
+  test "flags duplicate or gapped mailbox sequences" do
+    failures = Durababble::Deterministic.search("bug_mailbox_sequence_gap", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "duplicate inbox sequence"
+    assert_includes messages, "non-contiguous inbox sequence"
+  end
+
+  test "flags an activatable inbox head with no target activation as a lost wakeup" do
+    failures = Durababble::Deterministic.search("bug_lost_wakeup", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "lost wakeup"
+  end
+
+  test "flags a target activation over an empty mailbox as an orphaned wakeup" do
+    failures = Durababble::Deterministic.search("bug_orphaned_activation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "orphaned wakeup"
+  end
+
+  test "delivers async workflow commands exactly once and retires the wakeup row" do
+    result = Durababble::Deterministic.prove("workflow_command_async_delivery", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "reclaims a crashed delivery worker's leases and delivers each command exactly once" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_crash_recovery", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "delivery_worker_crashed"
+  end
+
+  test "resumes command delivery after an injected post-commit crash without losing or re-delivering" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_crash_matrix", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "fault.injected"
+    assert_includes result.trace, "delivery_crashed_after_commit"
+  end
+
+  test "dead-letters a terminally-failed command while completing the rest" do
+    result = Durababble::Deterministic.prove("workflow_command_terminal_failure", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "re-delivers and completes a command exactly once after a transient retry" do
+    result = Durababble::Deterministic.prove("workflow_command_retry_then_complete", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "dead-letters a terminally-failed command exactly once with a single history entry through crashes" do
+    result = Durababble::Deterministic.prove("workflow_command_terminal_failure_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "terminal_failure_crashed"
+  end
+
+  test "atomically cancels waits steps and attempts when cancellation requests crash" do
+    result = Durababble::Deterministic.prove("cancellation_cleanup_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "cancel_request_crashed"
+    assert_includes result.trace, "cancellation_crashed"
+    assert_equal 1, result.summary.fetch(:canceled_workflows)
+  end
+
+  test "records a running step cancellation exactly once across the three-write transaction through crashes" do
+    result = Durababble::Deterministic.prove("record_step_canceled_crash_fuzz", seed: 6)
+
+    assert_empty result.violations
+    assert_includes result.trace, "record_cancel_crashed"
+  end
+
+  test "leaves no live step when cancellation lands while running before the step suspends" do
+    result = Durababble::Deterministic.prove("cancellation_during_suspend_race", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "terminalizes a parked parallel branch when a sibling fails the workflow" do
+    result = Durababble::Deterministic.prove("parallel_branch_failure_orphans_step", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "re-parks a parallel wait branch across a sibling step's retry and settles" do
+    result = Durababble::Deterministic.prove("parallel_wait_with_retrying_sibling", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "completes a wait_condition satisfied by a command without stranding its wait" do
+    result = Durababble::Deterministic.prove("wait_condition_command_wakeup", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "reconciles a wait_condition timer wake racing a crashed command worker holding the lease" do
+    result = Durababble::Deterministic.prove("wait_condition_timer_command_race", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "claimed_then_crashed"
+  end
+
+  test "replays a leftover waiting wait across resumes for sequential command-satisfied wait_conditions" do
+    result = Durababble::Deterministic.prove("wait_condition_sequential_command_wakeups", seed: 1)
+
+    assert_empty result.violations
+  end
+
+  test "atomically terminates dependents when termination requests crash" do
+    result = Durababble::Deterministic.prove("workflow_termination_dependents_crash_fuzz", seed: 6)
+
+    assert_empty result.violations
+    assert_includes result.trace, "terminate_request_crashed"
+  end
+
+  test "rejects every durable write from a worker whose lease was stolen" do
+    result = Durababble::Deterministic.prove("stolen_lease_write_rejection", seed: 1)
+
+    assert_empty result.violations
+    refute_includes result.trace, "stale_accepted"
+  end
+
+  test "atomically wakes a batch of due timers through crashes without stranding waiters" do
+    result = Durababble::Deterministic.prove("timer_wakeup_batch_crash_fuzz", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wake_crashed"
+  end
+
+  test "dead-letters an object command once it exhausts its attempts" do
+    result = Durababble::Deterministic.prove("object_command_failure_exhaustion", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "blocks a second worker from stealing a live object-command lease" do
+    result = Durababble::Deterministic.prove("object_command_claim_contention", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "b_blocked_by_lease"
+    refute_includes result.trace, "b_stole_live_lease"
+  end
+
+  test "drives an object command to a consistent terminal state through store crashes" do
+    result = Durababble::Deterministic.prove("object_command_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_command_crashed"
+  end
+
+  test "applies durable object state exactly once per command through store crashes" do
+    result = Durababble::Deterministic.prove("object_command_state_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_state_crashed"
+  end
+
+  test "applies object state exactly once when commands retry transiently before completing through crashes" do
+    result = Durababble::Deterministic.prove("object_command_retry_then_apply_crash_fuzz", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_retry_crashed"
+  end
+
+  test "delivers object commands exactly once through the activation-driven loop with head handoff" do
+    result = Durababble::Deterministic.prove("object_command_activation_driven_drain", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_delivery_crashed"
+  end
+
+  test "isolates concurrent object mailboxes so commands never cross-contaminate targets" do
+    result = Durababble::Deterministic.prove("object_command_multi_target_isolation", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "multi_target_crashed"
+  end
+
+  test "collapses repeated idempotent enqueues to one exactly-once delivery through crashes" do
+    result = Durababble::Deterministic.prove("object_command_idempotent_enqueue", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "enqueue_crashed"
+  end
+
+  test "dead-letters queued commands when their workflow terminated before delivery" do
+    result = Durababble::Deterministic.prove("workflow_command_delivery_to_terminal_workflow", seed: 7)
+
+    assert_empty result.violations
+  end
+
+  test "reclaims durably-leased rows after an injected crash inside a claim window" do
+    result = Durababble::Deterministic.prove("workflow_command_claim_window_crash_matrix", seed: 7)
+
+    assert_empty result.violations
+    assert_includes result.trace, "fault.injected"
+    assert_includes result.trace, "claim_window_crashed"
+  end
+
+  test "reclaims a fence abandoned by a crashed holder and runs the effect exactly once" do
+    result = Durababble::Deterministic.prove("fence_holder_crash_and_reclaim", seed: 7)
+
+    assert_empty result.violations
+    assert_equal 1, result.summary.fetch(:side_effects)
+    assert_includes result.trace, "crashed_holding_fence"
+    assert_includes result.trace, "fence_reclaimed"
+    assert_includes result.trace, "fence_completed"
+  end
+
+  test "recovers atomic step-failure outcomes after a crash at :step_failed_recorded" do
+    result = Durababble::Deterministic.prove("step_failure_crash_matrix", seed: 11)
+
+    assert_empty result.violations
+    assert_includes result.trace, "crashed_after_retry_scheduled"
+    assert_includes result.trace, "crashed_after_terminal_failure"
+    # Retry path recovered with no lease-stealing reaper involved.
+    refute_includes result.trace, "retry_recover_blocked"
+  end
+
+  test "flags abandoned-but-runnable workflows under an expect_settled scenario" do
+    failures = Durababble::Deterministic.search("bug_abandoned_runnable_workflow", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    assert_includes failures.first.last.join("\n"), "pending and runnable"
+  end
+
+  test "flags unmet exactly-once effect expectations" do
+    failures = Durababble::Deterministic.search("bug_unmet_effect_expectation", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "expected 1 side effect"
+    assert_includes messages, "expected 1 processed outbox"
+  end
+
   test "fuzzes each unique scenario target across many deterministic seeds" do
-    assert_scenarios_hold(FUZZ_SCENARIOS, seeds: 1..100)
+    assert_scenarios_hold(FUZZ_SCENARIOS, seeds: fuzz_seeds)
   end
 
   test "runs deterministic contract scenarios once" do

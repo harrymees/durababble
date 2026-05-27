@@ -277,33 +277,36 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      update = if worker_id
-        execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
-      else
-        execute_store_query(:complete_workflow, [serialized_result, workflow_id])
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow completion") do
+        if worker_id
+          execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
+        else
+          execute_store_query(:complete_workflow, [serialized_result, workflow_id])
+        end
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
     end
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:, context: "cancellation result")
-      update = if worker_id
-        execute_store_query(:cancel_workflow_with_worker, [serialized_result, reason, reason, workflow_id, worker_id])
-      else
-        execute_store_query(:cancel_workflow, [serialized_result, reason, reason, workflow_id])
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow cancellation") do
+        if worker_id
+          execute_store_query(:cancel_workflow_with_worker, [serialized_result, reason, reason, workflow_id, worker_id])
+        else
+          execute_store_query(:cancel_workflow, [serialized_result, reason, reason, workflow_id])
+        end
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
     end
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      update = if worker_id
-        execute_store_query(:fail_workflow_with_worker, [error, workflow_id, worker_id])
-      else
-        execute_store_query(:fail_workflow, [error, workflow_id])
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+        if worker_id
+          execute_store_query(:fail_workflow_with_worker, [error, workflow_id, worker_id])
+        else
+          execute_store_query(:fail_workflow, [error, workflow_id])
+        end
       end
-      require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
@@ -502,13 +505,6 @@ module Durababble
     #: (workflow_id: String, worker_id: String) -> bool
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
-    end
-
-    #: (String) -> Object?
-    def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
     end
 
     #: (String, error: String) -> void

@@ -29,7 +29,15 @@ module Durababble
     #: ActiveRecord::ConnectionAdapters::ConnectionPool
     attr_reader :connection_pool
     #: Object
-    attr_accessor :rpc_client_factory, :local_worker_id, :local_transient_handler
+    attr_accessor :rpc_client_factory
+    #: Object
+    attr_accessor :local_worker_id, :local_transient_handler
+    #: Object
+    attr_accessor :workflow_rpc_client_factory
+    #: String?
+    attr_accessor :local_workflow_rpc_node_id
+    #: Hash[String, Object]?
+    attr_accessor :local_workflow_rpc_handlers
 
     class << self
       #: (*Object?, **Object?) ?{ (Object?) -> Object? } -> Store
@@ -154,6 +162,9 @@ module Durababble
       @rpc_client_factory = ->(address) { Durababble::Rpc::Client.new(address:) }
       @local_worker_id = nil
       @local_transient_handler = nil
+      @workflow_rpc_client_factory = ->(address, worker_pool:) { Durababble::Rpc::WorkflowClient.new(address:, worker_pool:) }
+      @local_workflow_rpc_node_id = nil
+      @local_workflow_rpc_handlers = nil
     end
 
     #: () -> void
@@ -164,6 +175,11 @@ module Durababble
       ensure
         self.class.send(:remove_active_record_class_const, owner)
       end
+    end
+
+    #: () { (Store) -> Object? } -> Object?
+    def with_dedicated_connection(&block)
+      block.call(self)
     end
 
     #: () -> Time
