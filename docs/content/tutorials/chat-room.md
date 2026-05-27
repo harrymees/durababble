@@ -34,8 +34,14 @@ You should already have Durababble installed and a database the store can connec
 require "durababble"
 require "json"
 require "time"
+require "active_support/isolated_execution_state"
 
-Durababble.configure(database_url: Durababble.default_database_url)
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
+
+database_url = Durababble.default_database_url
+schema = Durababble.default_schema
+
+Durababble.configure(database_url:, schema:)
 store = Durababble.store
 store.migrate!
 ```
@@ -270,43 +276,53 @@ A few things to notice:
 
 ## Step 4: Running It
 
-A worker process needs to know about both classes. In a real app this lives in your worker boot code; here we run a worker just long enough to drain the room commands and finish one zero-delay announcement.
+The runtime needs to know about both classes. The announcement workflow calls the room object with synchronous durable commands, so the runtime needs enough concurrency to keep draining object mailbox work while the workflow fiber waits for the command result. In a real app this lives in your worker boot code; here we start one local runtime with both registries and `concurrency: 2`, then shut it down when the script is done.
 
 ```ruby
-worker = Durababble::Worker.new(
-  store:,
+TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
+
+runtime = Durababble::WorkerRuntime.start(
+  database_url:,
+  schema:,
   workflows: [ScheduledAnnouncementWorkflow],
   objects: [ChatRoom],
-  worker_id: "chat-room-tutorial-worker",
+  worker_pool: "default",
+  concurrency: 2,
+  poll_interval: 0.05,
   migrate: false,
 )
 
-ChatRoom.tell("lobby", :join, "u1", "Alice", store:, idempotency_key: "join-alice")
-ChatRoom.tell("lobby", :set_topic, "u1", "Durable chat", store:, idempotency_key: "topic-1")
-ChatRoom.tell("lobby", :post_message, "u1", "hello from the room object", store:, idempotency_key: "message-1")
-worker.run_until_idle
+begin
+  room = ChatRoom.at("lobby")
+  room.join("u1", "Alice", idempotency_key: "join-alice")
+  room.set_topic("u1", "Durable chat", idempotency_key: "topic-1")
+  room.post_message("u1", "hello from the room object", idempotency_key: "message-1")
 
-handle = ScheduledAnnouncementWorkflow.start({
-  "room" => "lobby",
-  "text" => "Daily standup starts now.",
-  "delay_seconds" => 0,
-})
+  handle = ScheduledAnnouncementWorkflow.start({
+    "room" => "lobby",
+    "text" => "Daily standup starts now.",
+    "delay_seconds" => 0,
+  })
 
-worker.run_until_idle
-room = ChatRoom.at("lobby")
-puts JSON.pretty_generate(
-  "announcement" => handle.result,
-  "room" => room.snapshot,
-)
+  sleep(0.05) until TERMINAL_STATUSES.include?(handle.status)
+  raise handle.error if handle.status == "failed"
+
+  puts JSON.pretty_generate(
+    "announcement" => handle.result,
+    "room" => room.snapshot,
+  )
+ensure
+  runtime.shutdown
+end
 ```
 
-The output includes the seeded chat messages, the "announcement queued" system message, and the final announcement. If the process dies after the scheduled message is recorded but before the announcement is posted, starting a worker again resumes from the persisted workflow history and the room's persisted mailbox state.
+The output includes the seeded chat messages, the "announcement queued" system message, and the final announcement. `WorkerRuntime` keeps one active work item per durable target identity inside the process, so two commands for the same room still run in order while unrelated workflow and object work can use the other concurrency slots. If the process dies after the scheduled message is recorded but before the announcement is posted, starting a worker again resumes from the persisted workflow history and the room's persisted mailbox state.
 
 For non-zero delays, something also needs to wake due timers. The full example's server runs a tiny timer loop around `store.wake_due_timers(now: Time.now)`; production deployments usually wire the same call into whichever scheduler or worker heartbeat owns timer advancement.
 
 ## Where To Go Next
 
-The real [`examples/chat-room`](https://github.com/harrymees/durababble-gamma/tree/main/examples/chat-room) adds a small HTTP API, a static web UI, separate `WorkerRuntime` pools for workflows and room objects, and an announcement status endpoint that returns both workflow status and the latest room snapshot. The durable object and workflow shape are the same as what you just built.
+The real [`examples/chat-room`](https://github.com/harrymees/durababble-gamma/tree/main/examples/chat-room) adds a small HTTP API, a static web UI, worker-pool routing for the web server, and an announcement status endpoint that returns both workflow status and the latest room snapshot. The durable object and workflow shape are the same as what you just built.
 
 From here, useful directions:
 
