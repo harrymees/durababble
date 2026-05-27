@@ -1361,11 +1361,11 @@ module Durababble
     end
 
     define(:mysql_insert_workflow, backend: :mysql, description: "Insert a pending workflow row with serialized input.") do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(6), NOW(6))"
     end
 
     define(:mysql_insert_workflow_with_worker, backend: :mysql, description: "Insert a running workflow row with an initial worker lease.") do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), NOW(6), NOW(6))"
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql, description: "Move a workflow to running and attach a worker lease.") do |store|
