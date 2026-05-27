@@ -9,6 +9,11 @@ end
 module Async
   class TimeoutError < StandardError; end
 
+  class Scheduler
+    def interrupt; end
+    def terminate; end
+  end
+
   class Condition
     def initialize; end
     def wait; end
@@ -19,8 +24,50 @@ module Async
     def self.current; end
     def async(&blk); end
     def wait; end
-    def with_timeout(duration, &blk); end
+    def with_timeout(duration, exception = nil, message = nil, &blk); end
   end
+
+  module HTTP
+    class Endpoint
+      def self.parse(string, **options); end
+      def bound; end
+      def protocol; end
+      def scheme; end
+    end
+
+    class Client
+      def initialize(endpoint, **options); end
+      def post(path, headers = nil, body = nil); end
+      def get(path, headers = nil, body = nil); end
+      def close; end
+    end
+
+    class Server
+      def initialize(app, endpoint, **options); end
+      def run; end
+    end
+
+    module Protocol
+      class HTTP1; end
+      class HTTP2; end
+    end
+  end
+end
+
+module Protocol
+  module HTTP
+    class Response
+      def self.[](status, headers = nil, body = nil); end
+    end
+  end
+
+  module HTTP2
+    class Error < StandardError; end
+  end
+end
+
+class Fiber
+  def self.scheduler; end
 end
 
 module ActiveRecord
@@ -92,71 +139,12 @@ end
 
 module Kernel
   def Async(&blk); end
-end
-
-module Google
-  module Protobuf
-    class DescriptorPool
-      def self.generated_pool; end
-      def build(&blk); end
-      def lookup(name); end
-    end
-
-    class Descriptor
-      def msgclass; end
-    end
-
-    class FileDescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class DescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class FieldDescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class OneofDescriptorProto
-      def initialize(**kwargs); end
-    end
-  end
+  def Sync(&blk); end
 end
 
 module Prism
   module LexCompat
     class Result; end
-  end
-end
-
-module GRPC
-  class BadStatus < StandardError; end
-  class BadStatus
-    def details; end
-  end
-
-  class DeadlineExceeded < BadStatus; end
-  class Unauthenticated < BadStatus; end
-  class Unavailable < BadStatus; end
-
-  module GenericService
-    mixes_in_class_methods(ClassMethods)
-
-    module ClassMethods
-      attr_accessor :marshal_class_method, :unmarshal_class_method, :service_name
-
-      def rpc(name, request_class, response_class); end
-      def rpc_stub_class; end
-    end
-  end
-
-  class RpcServer
-    def initialize(**kwargs); end
-    def add_http2_port(address, credentials); end
-    def handle(service); end
-    def run; end
-    def stop; end
   end
 end
 
@@ -241,26 +229,5 @@ module Durababble
     def execute(sql); end
     def index_name(table_name, suffix); end
     def table(name); end
-  end
-
-  module Rpc
-    module Proto
-      class Message
-        def initialize(**kwargs); end
-        def self.decode(value); end
-        def self.encode(value); end
-      end
-
-      class AwakenBatchRequest < Message; end
-      class AwakenBatchResponse < Message; end
-      class DeliverMessageRequest < Message; end
-      class DeliverMessageResponse < Message; end
-      class EvictLeaseRequest < Message; end
-      class EvictLeaseResponse < Message; end
-      class LeaseMoved < Message; end
-      class RemoteError < Message; end
-      class TransientRequest < Message; end
-      class TransientResponse < Message; end
-    end
   end
 end

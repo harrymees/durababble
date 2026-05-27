@@ -5,8 +5,8 @@ module Durababble
   module Deterministic
     module Scenarios
       #: (untyped) -> untyped
-      def grpc_workflow_rpc_transport_fault_matrix(seed)
-        run(seed, "grpc_workflow_rpc_transport_fault_matrix") do |h|
+      def rpc_workflow_rpc_transport_fault_matrix(seed)
+        run(seed, "rpc_workflow_rpc_transport_fault_matrix") do |h|
           faults = [
             "timeout",
             "deadline_exceeded",
@@ -22,9 +22,9 @@ module Durababble
             id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed + index })
             node_id = "worker-#{index}"
             h.store.claim_workflow(workflow_id: id, worker_id: node_id, lease_seconds: 60)
-            client = grpc_workflow_rpc_client(h, node_id, faults: [fault]) do |payload|
+            client = rpc_workflow_rpc_client(h, node_id, faults: [fault]) do |payload|
               handler_calls[fault] += 1
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.handler", fault:, target: node_id)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.handler", fault:, target: node_id)
               workflow_rpc_handler(h, node_id).call(payload)
             end
             router = Durababble::WorkflowRpc::Router.new(
@@ -32,23 +32,23 @@ module Durababble
               rpc_clients: { node_id => client },
               retry_on_stale: true,
             )
-            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "grpc_fault:#{fault}") do
+            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "rpc_fault:#{fault}") do
               router.request(workflow_id: id, command: "status", payload: { "fault" => fault })
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.transport_retry_success", fault:)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.transport_retry_success", fault:)
             end
           end
 
-          h.check("timeout transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.timeout") }
-          h.check("deadline transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.deadline_exceeded") }
-          h.check("RST transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.rst") }
-          h.check("EOF transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.eof") }
-          h.check("unavailable transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.unavailable") }
+          h.check("timeout transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.timeout") }
+          h.check("deadline transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.deadline_exceeded") }
+          h.check("RST transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.rst") }
+          h.check("EOF transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.eof") }
+          h.check("unavailable transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.unavailable") }
           h.check("response-timeout fault was injected after handler execution") do
-            h.scheduler.trace.to_s.include?("grpc.response_timeout")
+            h.scheduler.trace.to_s.include?("rpc.response_timeout")
           end
-          h.check("duplicate response delivery was modeled") { h.scheduler.trace.to_s.include?("grpc.duplicate_response") }
+          h.check("duplicate response delivery was modeled") { h.scheduler.trace.to_s.include?("rpc.duplicate_response") }
           h.check("each transport fault retried to success") do
-            h.scheduler.trace.to_s.scan("grpc.transport_retry_success").length == faults.length
+            h.scheduler.trace.to_s.scan("rpc.transport_retry_success").length == faults.length
           end
           h.check("lost response can duplicate a transient handler invocation") do
             handler_calls["response_timeout"] == 2

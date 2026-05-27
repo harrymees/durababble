@@ -5,8 +5,8 @@ module Durababble
   module Deterministic
     module Scenarios
       #: (untyped) -> untyped
-      def grpc_service_contract(seed)
-        run(seed, "grpc_service_contract") do |h|
+      def rpc_service_contract(seed)
+        run(seed, "rpc_service_contract") do |h|
           id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.claim_workflow(workflow_id: id, worker_id: "worker-a", lease_seconds: 10)
           events = []
@@ -23,38 +23,38 @@ module Durababble
             deliver_message: ->(**event) { events << [:deliver_message, event] },
           )
 
-          h.scheduler.schedule(actor: "caller", delay: 1, name: "grpc_awaken_batch") do
+          h.scheduler.schedule(actor: "caller", delay: 1, name: "rpc_awaken_batch") do
             service.awaken_batch(
-              Durababble::Rpc::Proto::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: [id]),
+              Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: [id]),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.awaken_batch")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.awaken_batch")
           end
-          h.scheduler.schedule(actor: "caller", delay: 2, name: "grpc_evict_lease") do
+          h.scheduler.schedule(actor: "caller", delay: 2, name: "rpc_evict_lease") do
             service.evict_lease(
-              Durababble::Rpc::Proto::EvictLeaseRequest.new(
+              Durababble::Rpc::Messages::EvictLeaseRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
               ),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.evict_lease")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.evict_lease")
           end
-          h.scheduler.schedule(actor: "caller", delay: 3, name: "grpc_deliver_message") do
+          h.scheduler.schedule(actor: "caller", delay: 3, name: "rpc_deliver_message") do
             service.deliver_message(
-              Durababble::Rpc::Proto::DeliverMessageRequest.new(
+              Durababble::Rpc::Messages::DeliverMessageRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
               ),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.deliver_message")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.deliver_message")
           end
-          h.scheduler.schedule(actor: "caller", delay: 4, name: "grpc_call_transient") do
+          h.scheduler.schedule(actor: "caller", delay: 4, name: "rpc_call_transient") do
             response = service.call_transient(
-              Durababble::Rpc::Proto::TransientRequest.new(
+              Durababble::Rpc::Messages::TransientRequest.new(
                 worker_pool: "default",
                 workflow_id: id,
                 method: "status",
@@ -63,28 +63,28 @@ module Durababble
               nil,
             )
             decoded = Durababble::Rpc::Client.decode_transient_response(response)
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.call_transient_ok", decoded:)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.call_transient_ok", decoded:)
           end
-          h.scheduler.schedule(actor: "caller", delay: 5, name: "grpc_call_object_transient") do
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "rpc_call_object_transient") do
             response = service.call_transient(
-              Durababble::Rpc::Proto::TransientRequest.new(
+              Durababble::Rpc::Messages::TransientRequest.new(
                 worker_pool: "default",
                 class_name: "Counter",
-                object_id: "counter-1",
+                durable_object_id: "counter-1",
                 method: "balance",
                 args: Durababble::Rpc.dump({ "seed" => seed }),
               ),
               nil,
             )
             decoded = Durababble::Rpc::Client.decode_transient_response(response)
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.call_object_transient_ok", decoded:)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.call_object_transient_ok", decoded:)
           end
-          h.scheduler.schedule(actor: "caller", delay: 6, name: "grpc_stale_deliver_message") do
+          h.scheduler.schedule(actor: "caller", delay: 6, name: "rpc_stale_deliver_message") do
             before = events.length
             h.store.steal_expired_leases!(now: 11)
             h.store.claim_workflow(workflow_id: id, worker_id: "worker-b", lease_seconds: 60)
             service.deliver_message(
-              Durababble::Rpc::Proto::DeliverMessageRequest.new(
+              Durababble::Rpc::Messages::DeliverMessageRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
@@ -93,19 +93,19 @@ module Durababble
             )
             h.scheduler.trace.event(
               h.scheduler.time,
-              "grpc",
-              events.length == before ? "grpc.deliver_message_stale_ack" : "grpc.deliver_message_stale_work",
+              "rpc",
+              events.length == before ? "rpc.deliver_message_stale_ack" : "rpc.deliver_message_stale_work",
             )
           end
-          h.check("AwakenBatch was served") { h.scheduler.trace.to_s.include?("grpc.awaken_batch") }
-          h.check("EvictLease was served") { h.scheduler.trace.to_s.include?("grpc.evict_lease") }
-          h.check("DeliverMessage was served for the active owner") { h.scheduler.trace.to_s.include?("grpc.deliver_message") }
-          h.check("CallTransient decoded a workflow response") { h.scheduler.trace.to_s.include?("grpc.call_transient_ok") }
+          h.check("AwakenBatch was served") { h.scheduler.trace.to_s.include?("rpc.awaken_batch") }
+          h.check("EvictLease was served") { h.scheduler.trace.to_s.include?("rpc.evict_lease") }
+          h.check("DeliverMessage was served for the active owner") { h.scheduler.trace.to_s.include?("rpc.deliver_message") }
+          h.check("CallTransient decoded a workflow response") { h.scheduler.trace.to_s.include?("rpc.call_transient_ok") }
           h.check("CallTransient decoded an object response") do
-            h.scheduler.trace.to_s.include?("grpc.call_object_transient_ok")
+            h.scheduler.trace.to_s.include?("rpc.call_object_transient_ok")
           end
           h.check("stale DeliverMessage returned without doing work") do
-            h.scheduler.trace.to_s.include?("grpc.deliver_message_stale_ack")
+            h.scheduler.trace.to_s.include?("rpc.deliver_message_stale_ack")
           end
         end
       end

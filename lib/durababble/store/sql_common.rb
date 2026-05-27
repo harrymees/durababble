@@ -433,9 +433,9 @@ module Durababble
     # made by a leased worker it must still own the row, and the workflow must
     # not strand live waits, steps, or attempts after becoming terminal.
     #: (workflow_id: String, worker_id: String?, operation: String) { () -> Object? } -> Object?
-    def finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation:)
+    def finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation:, &block)
       transaction do
-        result = yield
+        result = block.call
         require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)
         cancel_live_workflow_dependents(workflow_id)
         result

@@ -5,8 +5,8 @@ module Durababble
   module Deterministic
     module Scenarios
       #: (untyped) -> untyped
-      def grpc_wakeup_fault_matrix(seed)
-        run(seed, "grpc_wakeup_fault_matrix") do |h|
+      def rpc_wakeup_fault_matrix(seed)
+        run(seed, "rpc_wakeup_fault_matrix") do |h|
           h.workflows["counter"] = counter_workflow
           active_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           recovery_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed + 1 })
@@ -35,12 +35,12 @@ module Durababble
           ].rotate(h.scheduler.rng.int(7))
 
           operations.each_with_index do |(method_name, fault), index|
-            h.scheduler.schedule(actor: "caller", delay: index * 3, name: "grpc_wakeup:#{method_name}:#{fault}") do
-              grpc_faulty_unary(h, method_name, target: "worker-a", fault:) do
-                call_grpc_service_method(service, method_name, workflow_id: active_id)
+            h.scheduler.schedule(actor: "caller", delay: index * 3, name: "rpc_wakeup:#{method_name}:#{fault}") do
+              rpc_faulty_unary(h, method_name, target: "worker-a", fault:) do
+                call_rpc_service_method(service, method_name, workflow_id: active_id)
               end
             rescue Durababble::WorkflowRpc::NodeUnavailable
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.wakeup_fault_observed", method: method_name, fault:)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.wakeup_fault_observed", method: method_name, fault:)
             end
           end
 
@@ -48,9 +48,9 @@ module Durababble
           h.scheduler.schedule(actor: "reaper", delay: 80, name: "release_active_for_recovery") do
             h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
           end
-          h.check("wakeup drop was injected") { h.scheduler.trace.to_s.include?("grpc.drop") }
-          h.check("wakeup duplicate was injected") { h.scheduler.trace.to_s.include?("grpc.duplicate") }
-          h.check("wakeup timeout was observed") { h.scheduler.trace.to_s.include?("grpc.wakeup_fault_observed") }
+          h.check("wakeup drop was injected") { h.scheduler.trace.to_s.include?("rpc.drop") }
+          h.check("wakeup duplicate was injected") { h.scheduler.trace.to_s.include?("rpc.duplicate") }
+          h.check("wakeup timeout was observed") { h.scheduler.trace.to_s.include?("rpc.wakeup_fault_observed") }
           h.check("polling completed workflow despite wakeup transport faults") do
             h.store.workflow(recovery_id).fetch("status") == "completed"
           end
