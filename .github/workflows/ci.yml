@@ -120,13 +120,17 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.0
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
+          cache: pnpm
 
       - name: Install Node dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Run RuboCop, RBS validation, typecheck, and Markdown format check
         run: bundle exec rake lint

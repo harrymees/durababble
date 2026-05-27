@@ -232,6 +232,25 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf", worker_pool: "default")
   end
 
+  test "current lease lookups ignore worker pool because target ids identify leases" do
+    connection = ScriptedPgConnection.new(params_results: [
+      lambda do |sql, params|
+        assert_equal(["wf"], params)
+        refute_match(/worker_pool\s*=/, sql)
+        sql_result([{ "workflow_id" => "wf", "worker_pool" => "pool-a", "worker_id" => "worker-a", "locked_until" => Time.now + 60 }])
+      end,
+      lambda do |sql, params|
+        assert_equal(["counter", "object-1"], params)
+        refute_match(/worker_pool\s*=/, sql)
+        sql_result([{ "worker_pool" => "pool-a", "object_id" => "object-1", "worker_id" => "worker-a", "locked_until" => Time.now + 60 }])
+      end,
+    ])
+    store = pg_store(connection)
+
+    assert_hash_includes store.current_workflow_lease("wf", worker_pool: "pool-b"), "workflow_id" => "wf", "worker_pool" => "pool-a"
+    assert_hash_includes store.current_object_lease("counter", "object-1", worker_pool: "pool-b"), "object_id" => "object-1", "worker_pool" => "pool-a"
+  end
+
   test "postgres enqueue_workflow inserts the pending row in one statement" do
     connection = ScriptedPgConnection.new
     store = pg_store(connection, schema: "durababble_test")
@@ -532,7 +551,7 @@ class DurababbleStoreTest < DurababbleTestCase
     new_connection = ScriptedPgConnection.new(params_results: [
       sql_result,
       sql_result,
-      sql_result([{ "last_sequence" => "0" }]),
+      sql_result([{ "worker_pool" => "default", "last_sequence" => "0" }]),
       sql_result,
       sql_result,
     ])
@@ -603,10 +622,10 @@ class DurababbleStoreTest < DurababbleTestCase
       payload:,
     )
     new_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result,
-      sql_result([{ "last_sequence" => "0" }]),
+      sql_result([{ "worker_pool" => "default", "last_sequence" => "0" }]),
       sql_result,
       sql_result,
       sql_result,
@@ -623,7 +642,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
@@ -635,7 +654,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-command", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "id" => "pending-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_workflow_command(
@@ -649,7 +668,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+        sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
         sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_workflow_command(
         workflow_id: "wf-1",
@@ -666,7 +685,7 @@ class DurababbleStoreTest < DurababbleTestCase
     end
     assert_raises_matching(Durababble::Error, /terminal/) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "wf-1", "status" => "completed", "next_run_at" => nil }]),
+        sql_result([{ "id" => "wf-1", "name" => "approval", "status" => "completed", "next_run_at" => nil }]),
       ])).enqueue_workflow_command(workflow_id: "wf-1", workflow_name: "approval", method_name: "approve", payload:)
     end
   end
@@ -683,7 +702,7 @@ class DurababbleStoreTest < DurababbleTestCase
       payload: { "approved" => true },
     )
     new_connection = ScriptedMysqlConnection.new do |sql|
-      sql_result([{ "last_sequence" => 0 }]) if sql.include?("SELECT last_sequence")
+      sql_result([{ "worker_pool" => "default", "last_sequence" => 0 }]) if sql.include?("SELECT worker_pool, last_sequence")
     end
     new_id = mysql_store(new_connection).enqueue_inbox_message(
       target_kind: "workflow",
@@ -919,6 +938,41 @@ class DurababbleStoreTest < DurababbleTestCase
       target_type: "account",
       target_id: "acct-1",
       client_factory: ->(_address) { raise "no lease should skip client construction" },
+    )
+  end
+
+  test "advisory object delivery uses the active lease worker pool" do
+    client = FlakyDeliveryClient.new(failures: 0)
+    connection = ScriptedPgConnection.new(params_results: [
+      lambda do |_sql, params|
+        assert_equal(["counter", "same"], params)
+        sql_result([{ "worker_pool" => "pool-a", "object_id" => "same", "worker_id" => "127.0.0.1:34567", "locked_until" => Time.now + 60 }])
+      end,
+    ])
+
+    delivered = pg_store(connection).deliver_target_message(
+      worker_pool: "pool-b",
+      target_kind: "object",
+      target_type: "counter",
+      target_id: "same",
+      client_factory: lambda do |address|
+        assert_equal("127.0.0.1:34567", address)
+        client
+      end,
+    )
+
+    assert_equal true, delivered
+    assert_equal(
+      [
+        {
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_class: "counter",
+          target_id: "same",
+          expected_worker_id: "127.0.0.1:34567",
+        },
+      ],
+      client.deliveries,
     )
   end
 

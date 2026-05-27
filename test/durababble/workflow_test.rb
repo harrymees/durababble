@@ -134,6 +134,36 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  class MaterializedWorkflowMailboxPoolStore
+    attr_reader :commands, :deliveries, :waits
+
+    def initialize(worker_pool:)
+      @worker_pool = worker_pool
+      @commands = []
+      @deliveries = []
+      @waits = []
+    end
+
+    def enqueue_workflow_command(**kwargs)
+      @commands << kwargs
+      "msg-#{@commands.length}"
+    end
+
+    def inbox_message(message_id)
+      { "id" => message_id, "worker_pool" => @worker_pool }
+    end
+
+    def deliver_target_message(**kwargs)
+      @deliveries << kwargs
+      true
+    end
+
+    def wait_for_inbox_message(message_id)
+      @waits << message_id
+      "waited:#{message_id}"
+    end
+  end
+
   class WorkerPoolEnqueueStore
     attr_reader :enqueued
 
@@ -192,6 +222,38 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
     assert_match(/terminal/, error.message)
     refute store.enqueued
+  end
+
+  test "workflow commands deliver through the persisted mailbox worker pool" do
+    store = MaterializedWorkflowMailboxPoolStore.new(worker_pool: "materialized")
+
+    result = ApiTestApprovalWorkflow.handle("wf-1", store:, worker_pool: "requested").approve(reason: "ok")
+
+    assert_equal "waited:msg-1", result
+    assert_equal ["msg-1"], store.waits
+    assert_equal(
+      [
+        {
+          workflow_id: "wf-1",
+          workflow_name: "api-test-approval-workflow",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } },
+          idempotency_key: nil,
+        },
+      ],
+      store.commands,
+    )
+    assert_equal(
+      [
+        {
+          worker_pool: "materialized",
+          target_kind: "workflow",
+          target_type: "api-test-approval-workflow",
+          target_id: "wf-1",
+        },
+      ],
+      store.deliveries,
+    )
   end
 
   test "worker pool class helpers enqueue through the store without per-pool engines" do
@@ -484,6 +546,26 @@ class DurababbleWorkflowTest < DurababbleTestCase
         assert_equal 1, clients.fetch("worker-a").requests.length
         assert_equal 1, clients.fetch("worker-b").requests.length
         assert_empty store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id)
+      end
+    end
+
+    test "exposed workflow queries route RPC clients with the active lease worker pool for #{backend.name}" do
+      with_durababble_store(backend, "workflow_query_lease_pool") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(
+          name: ApiTestQueryableWorkflow.workflow_name,
+          input: { "state" => "pool" },
+          worker_pool: "priority",
+        )
+        store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 60, worker_pool: "priority")
+        pools = []
+        store.workflow_rpc_client_factory = lambda do |_address, worker_pool:|
+          pools << worker_pool
+          WorkflowQueryFakeClient.new { |_command, _payload| { "pool" => worker_pool } }
+        end
+
+        assert_equal({ "pool" => "priority" }, ApiTestQueryableWorkflow.handle(workflow_id, store:, worker_pool: "stale").snapshot(prefix: "pool"))
+        assert_equal ["priority"], pools
       end
     end
 

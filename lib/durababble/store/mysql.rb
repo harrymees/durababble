@@ -216,13 +216,13 @@ module Durababble
 
     #: (String, ?worker_pool: String?) -> Object?
     def current_workflow_lease(workflow_id, worker_pool: nil)
-      worker_pool_sql = worker_pool ? "AND worker_pool = ?" : ""
-      params = worker_pool ? [workflow_id, worker_pool] : [workflow_id]
-      execute_store_query(:current_workflow_lease, params, worker_pool_sql:).first
+      _ = worker_pool
+      execute_store_query(:current_workflow_lease, [workflow_id]).first
     end
 
-    #: (Object?, Object?) -> Object?
-    def current_object_lease(object_type, object_id)
+    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    def current_object_lease(object_type, object_id, worker_pool: nil)
+      _ = worker_pool
       execute_store_query(:current_object_lease, [object_type, object_id]).first
     end
 
@@ -470,7 +470,7 @@ module Durababble
         candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
         next unless candidate
 
-        execute_store_query(:claim_selected_target_activation, [worker_id, lease_seconds, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
+        execute_store_query(:claim_selected_target_activation, [worker_id, lease_seconds, worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
         target_activation(worker_pool:, target_kind: candidate.fetch("target_kind"), target_type: candidate.fetch("target_type"), target_id: candidate.fetch("target_id"))
       end
     end
@@ -478,7 +478,7 @@ module Durababble
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
       transaction do
-        activation = execute_store_query(:lock_target_activation_for_completion, [target_kind, target_type, target_id, worker_id]).first
+        activation = execute_store_query(:lock_target_activation_for_completion, [worker_pool, target_kind, target_type, target_id, worker_id]).first
         next nil unless activation
 
         reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:)
@@ -557,7 +557,7 @@ module Durababble
         return
       end
 
-      head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
+      head = execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
@@ -590,7 +590,7 @@ module Durababble
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
+      execute_store_query(:delete_target_activation, [worker_pool, target_kind, target_type, target_id])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
@@ -599,13 +599,13 @@ module Durababble
       execute_store_query(:set_target_activation_pending, [worker_pool, target_kind, target_type, target_id, ready_time])
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> [Integer, String]
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       execute_store_query(:insert_mailbox_sequence, [worker_pool, target_kind, target_type, target_id])
       row = execute_store_query(:mailbox_sequence_for_update, [target_kind, target_type, target_id]).first
       sequence = row.fetch("last_sequence").to_i + 1
       execute_store_query(:update_mailbox_sequence, [sequence, target_kind, target_type, target_id])
-      sequence
+      [sequence, row.fetch("worker_pool").to_s]
     end
 
     #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
@@ -631,12 +631,12 @@ module Durababble
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
     def inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
       # ActiveRecord quotes MySQL sanitized numeric binds, which is invalid in LIMIT.
-      execute_store_query(:inbox_claim_rows_for_update, [target_kind, target_type, target_id], limit:).to_a
+      execute_store_query(:inbox_claim_rows_for_update, [worker_pool, target_kind, target_type, target_id], limit:).to_a
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
+      execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
     end
 
     #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
