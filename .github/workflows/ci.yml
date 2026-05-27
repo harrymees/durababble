@@ -7,8 +7,14 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.backend }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [mysql, postgres]
 
     services:
       mysql:
@@ -23,6 +29,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -34,14 +53,17 @@ jobs:
 
       - name: Run coverage gate
         env:
+          DURABABBLE_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:postgres@127.0.0.1:5432/postgres' || 'mysql://root@127.0.0.1:3306/sidekick_server_test' }}
           DURABABBLE_MYSQL_HOST: 127.0.0.1
+          DURABABBLE_POSTGRES_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:postgres@127.0.0.1:5432/postgres' || '' }}
+          DURABABBLE_TEST_BACKENDS: ${{ matrix.backend }}
         run: bundle exec rake test:coverage
 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
+          name: coverage-report-${{ matrix.backend }}
           path: coverage/
           if-no-files-found: ignore
           include-hidden-files: true

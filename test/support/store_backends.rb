@@ -35,6 +35,14 @@ def durababble_mysql_database_url
   end
 end
 
+def durababble_postgres_database_url
+  ENV.fetch("DURABABBLE_POSTGRES_DATABASE_URL")
+end
+
+def durababble_postgres_enabled?
+  !ENV["DURABABBLE_POSTGRES_DATABASE_URL"].to_s.empty?
+end
+
 def durababble_yugabyte_database_url
   ENV.fetch("DURABABBLE_YUGABYTE_DATABASE_URL")
 end
@@ -43,22 +51,54 @@ def durababble_yugabyte_enabled?
   !ENV["DURABABBLE_YUGABYTE_DATABASE_URL"].to_s.empty?
 end
 
+def durababble_test_backend_names
+  names = ENV.fetch("DURABABBLE_TEST_BACKENDS", "")
+    .split(",")
+    .map { |name| name.strip.downcase }
+    .reject(&:empty?)
+  unknown = names - ["mysql", "postgres", "yugabyte"]
+  raise ArgumentError, "unknown DURABABBLE_TEST_BACKENDS value(s): #{unknown.join(", ")}" unless unknown.empty?
+
+  names
+end
+
+def durababble_backend_selected?(name)
+  names = durababble_test_backend_names
+  names.empty? || names.include?(name)
+end
+
+def durababble_backend_requested?(name)
+  durababble_test_backend_names.include?(name)
+end
+
 def durababble_store_backends
-  backends = [
-    DurababbleStoreBackend.new(
+  backends = []
+
+  if durababble_backend_selected?("mysql")
+    backends << DurababbleStoreBackend.new(
       name: "mysql",
       database_url: durababble_mysql_database_url,
       default_schema_prefix: "durababble_mysql",
-    ),
-  ]
+    )
+  end
 
-  if durababble_yugabyte_enabled?
+  if durababble_backend_requested?("postgres")
+    backends << DurababbleStoreBackend.new(
+      name: "postgres",
+      database_url: durababble_postgres_database_url,
+      default_schema_prefix: "durababble_pg",
+    )
+  end
+
+  if durababble_backend_selected?("yugabyte") && (durababble_yugabyte_enabled? || durababble_backend_requested?("yugabyte"))
     backends << DurababbleStoreBackend.new(
       name: "yugabyte",
       database_url: durababble_yugabyte_database_url,
       default_schema_prefix: "durababble_yb",
     )
   end
+
+  raise ArgumentError, "no Durababble store backends selected" if backends.empty?
 
   backends
 end

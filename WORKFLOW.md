@@ -23,8 +23,10 @@ hooks:
   after_create: |
     git clone --depth 1 {{SOURCE_REPO_URL}} .
     workspace_path=$(pwd -P)
-    database_url=${DURABABBLE_DATABASE_URL:-postgresql://yugabyte@127.0.0.1:15433/yugabyte}
-    export workspace_path database_url
+    database_url=${DURABABBLE_DATABASE_URL:-postgresql://postgres@127.0.0.1:5432/postgres}
+    postgres_database_url=${DURABABBLE_POSTGRES_DATABASE_URL:-$database_url}
+    yugabyte_database_url=${DURABABBLE_YUGABYTE_DATABASE_URL:-}
+    export workspace_path database_url postgres_database_url yugabyte_database_url
     workspace_schema=$(python3 <<'PY'
     import hashlib
     import os
@@ -45,14 +47,16 @@ hooks:
     import os
     from pathlib import Path
 
-    Path("mise.local.toml").write_text("\n".join([
+    lines = [
         "[env]",
         f"DURABABBLE_DATABASE_URL = {json.dumps(os.environ['database_url'])}",
-        f"DURABABBLE_YUGABYTE_DATABASE_URL = {json.dumps(os.environ['database_url'])}",
+        f"DURABABBLE_POSTGRES_DATABASE_URL = {json.dumps(os.environ['postgres_database_url'])}",
         f"DURABABBLE_WORKSPACE_ROOT = {json.dumps(os.environ['workspace_path'])}",
         f"DURABABBLE_SCHEMA = {json.dumps(os.environ['workspace_schema'])}",
-        "",
-    ]))
+    ]
+    if os.environ["yugabyte_database_url"]:
+        lines.append(f"DURABABBLE_YUGABYTE_DATABASE_URL = {json.dumps(os.environ['yugabyte_database_url'])}")
+    Path("mise.local.toml").write_text("\n".join([*lines, ""]))
     PY
     canonical_agents=/home/airhorns/code/durababble/.agents
     if [ -d "$canonical_agents" ] && [ ! -e .agents ]; then
@@ -65,10 +69,13 @@ hooks:
       mise exec -- bundle install
       cat > .durababble-workspace.env <<EOF
     export DURABABBLE_DATABASE_URL="$database_url"
-    export DURABABBLE_YUGABYTE_DATABASE_URL="$database_url"
+    export DURABABBLE_POSTGRES_DATABASE_URL="$postgres_database_url"
     export DURABABBLE_WORKSPACE_ROOT="$workspace_path"
     export DURABABBLE_SCHEMA="$workspace_schema"
     EOF
+      if [ -n "$yugabyte_database_url" ]; then
+        printf 'export DURABABBLE_YUGABYTE_DATABASE_URL="%s"\n' "$yugabyte_database_url" >> .durababble-workspace.env
+      fi
       mise exec -- bundle exec ruby -Ilib -e 'require "durababble"; store = Durababble::Store.connect(database_url: ENV.fetch("DURABABBLE_DATABASE_URL"), schema: ENV.fetch("DURABABBLE_SCHEMA")); store.migrate!; puts "migrated #{ENV.fetch("DURABABBLE_SCHEMA")}"; store.close'
     else
       echo "mise is required for Durababble's Ruby 4.0.5 toolchain" >&2
@@ -146,7 +153,7 @@ Implementation guidance:
 - Use Ruby 4 through `mise`; do not assume system `ruby` or `bundle` is on `PATH`.
 - Use `mise exec -- bundle exec rake test` as the default full validation command.
 - For targeted work, run the smallest relevant `mise exec -- bundle exec ruby -I lib -I test test/..._test.rb` command first, then the full test suite before handoff when practical.
-- For database/storage changes, use the workspace-selected namespace: `DURABABBLE_SCHEMA` if set, otherwise `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`. Symphony-created workspaces write `mise.local.toml`, trust it, run a migration for the isolated namespace, and leave `.durababble-workspace.env` for inspection/reuse. The host-local Yugabyte/YSQL smoke endpoint is `DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte`; MySQL/MariaDB conformance uses the current `DURABABBLE_MYSQL_*` environment when available.
+- For database/storage changes, use the workspace-selected namespace: `DURABABBLE_SCHEMA` if set, otherwise `Durababble.workspace_schema(DURABABBLE_WORKSPACE_ROOT || Dir.pwd)`. Symphony-created workspaces write `mise.local.toml`, trust it, run a migration for the isolated namespace, and leave `.durababble-workspace.env` for inspection/reuse. The host-local standard PostgreSQL smoke endpoint is `DURABABBLE_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres`; MySQL/MariaDB conformance uses the current `DURABABBLE_MYSQL_*` environment when available, and optional YSQL coverage uses `DURABABBLE_YUGABYTE_DATABASE_URL`.
 - If the real database is required and unavailable, document the exact failing probe/command in the workpad before using the blocked-access escape hatch.
 - Add regression tests for deterministic, crash/recovery, and namespace-isolation bugs.
 - Keep RBS signatures in `sig/durababble.rbs` aligned with public API changes.

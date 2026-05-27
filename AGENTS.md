@@ -22,4 +22,4 @@ Use:
 mise exec -- bundle exec rake test
 ```
 
-Set `DURABABBLE_YUGABYTE_DATABASE_URL` to include optional Yugabyte-backed tests. For the host-local Symphony smoke path, use `DURABABBLE_DATABASE_URL=postgresql://yugabyte@127.0.0.1:15433/yugabyte`.
+Set `DURABABBLE_TEST_BACKENDS=postgres` with `DURABABBLE_POSTGRES_DATABASE_URL` to run standard PostgreSQL-backed tests and `DURABABBLE_YUGABYTE_DATABASE_URL` to include optional Yugabyte-backed tests. For the host-local Symphony smoke path, use `DURABABBLE_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres`.

@@ -436,6 +436,12 @@ UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
 WHERE id = $1 AND worker_pool = $2
 
+-- pg_mark_workflow_running_with_worker
+UPDATE "durababble_pg_snapshot"."workflows"
+SET status = 'running', error = NULL, locked_by = $1,
+    locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+WHERE id = $3 AND worker_pool = $4
+
 -- pg_next_workflow_history_event_index
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
 
