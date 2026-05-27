@@ -46,6 +46,7 @@ module Durababble
   }.freeze
 
   class Error < StandardError; end
+  class ConfigurationError < Error; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
   class DeterminismError < Error; end
@@ -229,6 +230,35 @@ module Durababble
       self.default_store = Store.connect(database_url:, schema:)
     end
 
+    # Durababble runs workflows inside an Async fiber reactor. Each step, handle-RPC
+    # dispatch task, and user-spawned fan-out fiber shares one workflow execution but
+    # needs its OWN ActiveRecord connection — otherwise concurrent fibers interleave
+    # packets on a shared socket and corrupt the wire protocol (trilogy/pg yield to
+    # the fiber scheduler mid-query via rb_wait_for_single_fd).
+    #
+    # ActiveRecord checks connections out per `IsolatedExecutionState.isolation_level`.
+    # The default is :thread, which is wrong for us. Hosts running workflows must run
+    # with :fiber — Falcon's Railtie already sets this defensively even under Puma.
+    #
+    # We don't set it ourselves: it's a process-global affecting the entire host. We
+    # only refuse to boot a workflow if it isn't right. Call this lazily — at workflow
+    # execution time, not at gem load — so the host's initializers (Rails or otherwise)
+    # have had a chance to set it.
+    #: () -> void
+    def assert_fiber_isolation!
+      return if isolated_execution_state_isolation_level == :fiber
+
+      raise ConfigurationError, <<~MSG.tr("\n", " ").strip
+        Durababble requires ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
+        (current: #{isolated_execution_state_isolation_level.inspect}). Workflows run
+        fan-out fibers that each need their own ActiveRecord connection; the default
+        :thread isolation causes wire-protocol corruption when fibers interleave on a
+        shared connection. Set ActiveSupport::IsolatedExecutionState.isolation_level =
+        :fiber in your host before booting a Durababble worker. Falcon's Railtie does
+        this defensively even under Puma.
+      MSG
+    end
+
     #: (?enabled: bool, ?attributes: Hash[String | Symbol, Object?]) -> Observability::Configuration
     def configure_observability(enabled: false, attributes: {})
       Observability.configure(enabled:, attributes:)
@@ -304,6 +334,15 @@ module Durababble
     end
 
     private
+
+    #: () -> Symbol
+    def isolated_execution_state_isolation_level
+      unless defined?(ActiveSupport::IsolatedExecutionState)
+        raise ConfigurationError, "Durababble requires ActiveSupport::IsolatedExecutionState; load active_support before booting a worker."
+      end
+
+      ActiveSupport::IsolatedExecutionState.isolation_level
+    end
 
     #: (Symbol, Integer) -> Integer
     def payload_limit(surface, default_value)

@@ -1,7 +1,13 @@
 # typed: false
 # frozen_string_literal: true
 
+require "active_support/isolated_execution_state"
 require_relative "../lib/durababble"
+
+# Durababble requires :fiber isolation so each reactor fiber checks out its own
+# ActiveRecord connection. In a Rails+Falcon host the Falcon Railtie sets this
+# defensively; standalone scripts like this one set it explicitly.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
 database_url = Durababble.default_database_url
 store = Durababble::Store.connect(database_url:)

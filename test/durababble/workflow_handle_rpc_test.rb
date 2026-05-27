@@ -41,6 +41,10 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
       sleep(3600, input)
     end
 
+    expose def summary(prefix)
+      "#{prefix}:#{@__durababble_ref_workflow_id}"
+    end
+
     expose_command def approve(reason:)
       { "approved_by" => reason }
     end
@@ -104,6 +108,54 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
 
     def execute(input)
       HandleRpcApproval.handle(input.fetch("workflow_id")).approve(reason: "workflow")
+    end
+  end
+
+  class HandleRpcWorkflowQueryCaller < Durababble::Workflow
+    workflow_name "handle-rpc-workflow-query-caller"
+
+    def execute(input)
+      HandleRpcApproval.handle(input.fetch("workflow_id")).summary("queried")
+    end
+  end
+
+  class HandleRpcWorkflowReadCaller < Durababble::Workflow
+    workflow_name "handle-rpc-workflow-read-caller"
+
+    def execute(input)
+      handle = HandleRpcApproval.handle(input.fetch("workflow_id"))
+      { "status" => handle.status, "result" => handle.result, "error" => handle.error }
+    end
+  end
+
+  class HandleRpcWorkflowCancelCaller < Durababble::Workflow
+    workflow_name "handle-rpc-workflow-cancel-caller"
+
+    def execute(input)
+      run = HandleRpcApproval.handle(input.fetch("workflow_id")).cancel(reason: "canceled from workflow")
+      { "status" => run.status }
+    end
+  end
+
+  class HandleRpcWorkflowTerminateCaller < Durababble::Workflow
+    workflow_name "handle-rpc-workflow-terminate-caller"
+
+    def execute(input)
+      run = HandleRpcApproval.handle(input.fetch("workflow_id")).terminate(reason: "terminated from workflow")
+      { "status" => run.status }
+    end
+  end
+
+  class HandleRpcConcurrentObjectCaller < Durababble::Workflow
+    workflow_name "handle-rpc-concurrent-object-caller"
+
+    def execute(input)
+      object_ids = input.fetch("object_ids")
+      Async do |task|
+        object_ids.each_with_index.map do |object_id, index|
+          task.async { HandleRpcCounter.at(object_id).add(index + 1) }
+        end.map(&:wait)
+      end.wait
     end
   end
 
@@ -236,6 +288,126 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
         assert_equal ["failed"], store.steps_for(failing_id).map { |step| step.fetch("status") }
       end
     end
+
+    test "records workflow query handle RPCs from workflow code with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_workflow_query") do |store|
+        approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
+        waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
+        assert_equal "waiting", waiting.status
+
+        caller_id = store.enqueue_workflow(name: HandleRpcWorkflowQueryCaller.workflow_name, input: { "workflow_id" => approval_id })
+        run = Durababble::Engine.new(store:, worker_id: "query-caller", migrate: false).resume(HandleRpcWorkflowQueryCaller, workflow_id: caller_id)
+
+        assert_equal "completed", run.status
+        assert_equal "queried:#{approval_id}", run.result
+        assert_equal ["handle_rpc:workflow:handle-rpc-approval:summary"], store.steps_for(caller_id).map { |step| step.fetch("name") }
+        assert_equal ["completed"], store.steps_for(caller_id).map { |step| step.fetch("status") }
+        assert_empty store.inbox_messages_for(target_kind: "workflow", target_type: HandleRpcApproval.workflow_name, target_id: approval_id)
+      end
+    end
+
+    test "reads workflow status, result, and error from workflow code with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_workflow_reads") do |store|
+        approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
+        waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
+        assert_equal "waiting", waiting.status
+
+        caller_id = store.enqueue_workflow(name: HandleRpcWorkflowReadCaller.workflow_name, input: { "workflow_id" => approval_id })
+        run = Durababble::Engine.new(store:, worker_id: "read-caller", migrate: false).resume(HandleRpcWorkflowReadCaller, workflow_id: caller_id)
+
+        assert_equal "completed", run.status
+        assert_equal({ "status" => "waiting", "result" => nil, "error" => nil }, run.result)
+        assert_equal(
+          [
+            "handle_rpc:workflow:handle-rpc-approval:status",
+            "handle_rpc:workflow:handle-rpc-approval:result",
+            "handle_rpc:workflow:handle-rpc-approval:error",
+          ],
+          store.steps_for(caller_id).map { |step| step.fetch("name") },
+        )
+        assert_equal ["completed"] * 3, store.steps_for(caller_id).map { |step| step.fetch("status") }
+      end
+    end
+
+    test "cancels a workflow from workflow code through in-workflow handle RPCs with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_workflow_cancel") do |store|
+        approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
+        waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
+        assert_equal "waiting", waiting.status
+
+        caller_id = store.enqueue_workflow(name: HandleRpcWorkflowCancelCaller.workflow_name, input: { "workflow_id" => approval_id })
+        run = Durababble::Engine.new(store:, worker_id: "cancel-caller", migrate: false).resume(HandleRpcWorkflowCancelCaller, workflow_id: caller_id)
+
+        assert_equal "completed", run.status
+        assert_equal({ "status" => "canceling" }, run.result)
+        assert_equal ["handle_rpc:workflow:handle-rpc-approval:cancel"], store.steps_for(caller_id).map { |step| step.fetch("name") }
+        assert_equal ["completed"], store.steps_for(caller_id).map { |step| step.fetch("status") }
+
+        canceled = Durababble::Engine.new(store:, worker_id: "approval-finish", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
+        assert_equal "canceled", canceled.status
+      end
+    end
+
+    test "terminates a workflow from workflow code through in-workflow handle RPCs with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_workflow_terminate") do |store|
+        approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
+        waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
+        assert_equal "waiting", waiting.status
+
+        caller_id = store.enqueue_workflow(name: HandleRpcWorkflowTerminateCaller.workflow_name, input: { "workflow_id" => approval_id })
+        run = Durababble::Engine.new(store:, worker_id: "terminate-caller", migrate: false).resume(HandleRpcWorkflowTerminateCaller, workflow_id: caller_id)
+
+        assert_equal "completed", run.status
+        assert_equal({ "status" => "terminated" }, run.result)
+        assert_equal ["handle_rpc:workflow:handle-rpc-approval:terminate"], store.steps_for(caller_id).map { |step| step.fetch("name") }
+        assert_equal ["completed"], store.steps_for(caller_id).map { |step| step.fetch("status") }
+        assert_equal "terminated", store.workflow(approval_id).fetch("status")
+      end
+    end
+
+    test "records concurrent in-workflow handle RPCs fanned out over the shared store with #{backend.name}" do
+      with_durababble_store(backend, "workflow_handle_rpc_concurrent") do |store|
+        object_ids = ["concurrent-counter-0", "concurrent-counter-1", "concurrent-counter-2", "concurrent-counter-3"]
+        workflow_id = store.enqueue_workflow(
+          name: HandleRpcConcurrentObjectCaller.workflow_name,
+          input: { "object_ids" => object_ids },
+        )
+        run = resume_with_worker(backend, HandleRpcConcurrentObjectCaller, workflow_id, objects: [HandleRpcCounter])
+
+        assert_equal "completed", run.status
+        # Each branch increments a distinct counter from 0, so its running total is deterministic
+        # even though the four handle RPCs are in flight against the shared store at once.
+        assert_equal [1, 2, 3, 4], run.result
+        steps = store.steps_for(workflow_id)
+        assert_equal ["handle_rpc:object:handle_rpc_counter:add"] * 4, steps.map { |step| step.fetch("name") }
+        assert_equal ["completed"] * 4, steps.map { |step| step.fetch("status") }
+        object_ids.each_with_index do |object_id, index|
+          assert_equal index + 1, HandleRpcCounter.at(object_id, store:).count
+          assert_equal 1, store.inbox_messages_for(target_kind: "object", target_type: HandleRpcCounter.object_type, target_id: object_id).length
+        end
+      end
+    end
+  end
+
+  test "rejects blocks passed to durable object commands" do
+    error = assert_raises(ArgumentError) do
+      HandleRpcCounter.at("counter-block", store: Object.new).add(1) { :nope }
+    end
+    assert_match(/blocks cannot be passed/, error.message)
+  end
+
+  test "rejects blocks passed to durable object tells" do
+    error = assert_raises(ArgumentError) do
+      HandleRpcCounter.tell("counter-block", :add, 1, store: Object.new) { :nope }
+    end
+    assert_match(/blocks cannot be passed/, error.message)
+  end
+
+  test "rejects blocks passed to workflow commands" do
+    error = assert_raises(ArgumentError) do
+      HandleRpcApproval.handle("wf-block", store: Object.new).approve(reason: "later") { :nope }
+    end
+    assert_match(/blocks cannot be passed/, error.message)
   end
 
   private
