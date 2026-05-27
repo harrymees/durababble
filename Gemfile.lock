@@ -150,6 +150,9 @@ GEM
     sorbet-static (0.6.13248-aarch64-linux)
     sorbet-static (0.6.13248-universal-darwin)
     sorbet-static (0.6.13248-x86_64-linux)
+    sqlite3 (2.9.4-aarch64-linux-gnu)
+    sqlite3 (2.9.4-arm64-darwin)
+    sqlite3 (2.9.4-x86_64-linux-gnu)
     timeout (0.6.1)
     traces (0.18.2)
     trilogy (2.9.0)
@@ -179,6 +182,7 @@ DEPENDENCIES
   rubocop-sorbet (~> 0.10)
   simplecov (~> 0.22)
   sorbet (~> 0.5)
+  sqlite3 (~> 2.1)
 
 BUNDLED WITH
    2.6.7
