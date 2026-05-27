@@ -55,6 +55,19 @@ ORDER BY ready_at, created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
+-- pg_claim_object_lease
+INSERT INTO "durababble_pg_snapshot"."durable_objects"
+  (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
+VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 second'), now(), now())
+ON CONFLICT (object_type, object_id) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = now()
+WHERE "durababble_pg_snapshot"."durable_objects".locked_by IS NULL
+   OR "durababble_pg_snapshot"."durable_objects".locked_until < now()
+   OR "durababble_pg_snapshot"."durable_objects".locked_by = EXCLUDED.locked_by
+RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+
 -- pg_claim_pending_outbox
 SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
 WHERE status = 'pending'
@@ -214,11 +227,10 @@ UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
 
 -- pg_current_object_lease
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM "durababble_pg_snapshot"."inbox"
-WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+SELECT worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+FROM "durababble_pg_snapshot"."durable_objects"
+WHERE object_type = $1 AND object_id = $2
   AND locked_by IS NOT NULL AND locked_until >= now()
-ORDER BY sequence
 LIMIT 1
 
 -- pg_current_workflow_lease
@@ -465,7 +477,7 @@ WHERE id = $3 AND worker_pool = $4
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
 
 -- pg_object_state
-SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2
+SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2 AND state IS NOT NULL
 
 -- pg_outbox_by_key
 SELECT id FROM "durababble_pg_snapshot"."outbox" WHERE key = $1
@@ -481,6 +493,11 @@ UPDATE "durababble_pg_snapshot"."inbox"
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
 WHERE status = 'running' AND locked_by = $1
 
+-- pg_release_object_lease
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE object_type = $1 AND object_id = $2 AND locked_by = $3
+
 -- pg_release_outbox_leases
 UPDATE "durababble_pg_snapshot"."outbox"
 SET status = 'pending', locked_by = NULL, locked_until = NULL
@@ -491,6 +508,11 @@ UPDATE "durababble_pg_snapshot"."target_activations"
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
 WHERE status = 'running' AND locked_by = $1
 
+-- pg_release_worker_object_leases
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE locked_by = $1
+
 -- pg_release_workflow_leases
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = CASE
@@ -499,6 +521,13 @@ SET status = CASE
   END,
   locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
 WHERE status = 'running' AND locked_by = $1
+
+-- pg_renew_object_lease
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_until = now() + ($4::int * interval '1 second'), updated_at = now()
+WHERE object_type = $1 AND object_id = $2
+  AND locked_by = $3 AND locked_until >= now()
+RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
 
 -- pg_request_workflow_cancellation
 UPDATE "durababble_pg_snapshot"."workflows"
@@ -540,6 +569,11 @@ SET status = CASE
   END,
   locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
 WHERE status = 'running' AND locked_until < $1::timestamptz
+
+-- pg_steal_expired_object_leases
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE locked_by IS NOT NULL AND locked_until < $1::timestamptz
 
 -- pg_step_attempt_count_for
 SELECT COUNT(*) AS count FROM "durababble_pg_snapshot"."step_attempts" WHERE workflow_id = $1 AND position = $2

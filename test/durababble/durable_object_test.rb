@@ -46,6 +46,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       @claimed << kwargs
       []
     end
+
+    # drain_object_inbox unconditionally releases the unified object lease in its
+    # ensure block; doubles that don't model the lease return false to no-op it.
+    def release_object_lease(**) = false
   end
 
   class ClaimlessTestObject < Durababble::DurableObject
@@ -101,6 +105,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     def retry_object_command(command_id:, error:, worker_id:, ready_at:)
       @retried << [command_id, error, worker_id, ready_at]
     end
+
+    # See EmptyMailboxStore: drain_object_inbox releases the lease in its ensure
+    # block, so even doubles that don't model leases must answer the call.
+    def release_object_lease(**) = false
   end
 
   class AskWaitStore

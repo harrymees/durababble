@@ -76,7 +76,8 @@ module Durababble
         outbox = execute_store_query(:release_outbox_leases, [worker_id]).affected_rows
         inbox = execute_store_query(:release_inbox_leases, [worker_id]).affected_rows
         target_activations = execute_store_query(:release_target_activation_leases, [worker_id]).affected_rows
-        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
@@ -186,18 +187,55 @@ module Durababble
       row&.transform_values(&:itself)
     end
 
-    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
     def current_object_lease(object_type, object_id, worker_pool: nil)
       _ = worker_pool
       row = execute_store_query(:current_object_lease, [object_type, object_id]).first
       row&.transform_values(&:itself)
     end
 
+    # Atomic upsert-claim against the unified per-object lease in durable_objects.
+    # Returns the row representing this caller's hold on success, or `nil` when a
+    # different live lease blocks the claim. The conditional `DO UPDATE WHERE`
+    # only fires when the lease is free or already ours, and `RETURNING` then
+    # only surfaces the row when the write actually happened.
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      row = execute_store_query(:claim_object_lease, [worker_pool, object_type, object_id, worker_id, lease_seconds.to_i]).first
+      row&.transform_values(&:itself)
+    end
+
+    # Conditional renew. Returns true while the caller still owns the live lease,
+    # false once it has been lost (evicted, stolen, or released). Object identity
+    # is global (`(object_type, object_id)`); pool isn't part of the lease key.
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
+    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      result = execute_store_query(:renew_object_lease, [object_type, object_id, worker_id, lease_seconds.to_i])
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        true
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        false
+      end
+    end
+
+    # Idempotent: only clears the lease when the caller is the current holder.
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def release_object_lease(object_type:, object_id:, worker_id:)
+      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id])
+      result.affected_rows.to_i.positive?
+    end
+
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
-      result = execute_store_query(:steal_expired_leases, [timestamp(now)])
-      Observability.count("durababble.leases.expired_recovery", by: result.affected_rows.to_i)
-      result.affected_rows
+      workflow_result = execute_store_query(:steal_expired_leases, [timestamp(now)])
+      object_result = execute_store_query(:steal_expired_object_leases, [timestamp(now)])
+      stolen = workflow_result.affected_rows.to_i + object_result.affected_rows.to_i
+      Observability.count("durababble.leases.expired_recovery", by: stolen)
+      stolen
     end
 
     #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?

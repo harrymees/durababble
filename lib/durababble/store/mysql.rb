@@ -113,7 +113,8 @@ module Durababble
         target_activation_index = index_name("target_activations", "worker_lease")
         target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
         execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
-        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows.to_i
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
@@ -223,18 +224,60 @@ module Durababble
       execute_store_query(:current_workflow_lease, [workflow_id]).first
     end
 
-    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
     def current_object_lease(object_type, object_id, worker_pool: nil)
       _ = worker_pool
       execute_store_query(:current_object_lease, [object_type, object_id]).first
+    end
+
+    # MySQL has no RETURNING, so claim is split in two: ensure the
+    # `durable_objects` row exists (idempotent INSERT IGNORE), then run a
+    # conditional UPDATE whose WHERE gates on (free OR expired OR same
+    # worker). The UPDATE's affected_rows is the unambiguous win/loss signal
+    # — no follow-up SELECT. A single-statement upsert won't do here because
+    # the trilogy adapter forces CLIENT_FOUND_ROWS, which makes a rejected
+    # "matched but unchanged" branch indistinguishable from a winning fresh
+    # insert (both report affected_rows = 1).
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
+      result = execute_store_query(:claim_object_lease, [worker_id, lease_seconds.to_i, object_type, object_id, worker_id])
+      return unless result.affected_rows.to_i.positive?
+
+      { "worker_pool" => worker_pool, "object_type" => object_type, "object_id" => object_id, "worker_id" => worker_id }
+    end
+
+    # Conditional renew. MySQL reports affected_rows from the UPDATE; 0 means the lease
+    # has been lost (evicted, stolen, or released). Object identity is global —
+    # `worker_pool` isn't part of the lease key.
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
+    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      result = execute_store_query(:renew_object_lease, [lease_seconds.to_i, object_type, object_id, worker_id])
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        true
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        false
+      end
+    end
+
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def release_object_lease(object_type:, object_id:, worker_id:)
+      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id])
+      result.affected_rows.to_i.positive?
     end
 
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
       expired = execute_store_query(:count_expired_workflow_leases, [now]).first.fetch("count").to_i
       execute_store_query(:steal_expired_leases, [now])
-      Observability.count("durababble.leases.expired_recovery", by: expired)
-      expired
+      object_result = execute_store_query(:steal_expired_object_leases, [now])
+      stolen = expired + object_result.affected_rows.to_i
+      Observability.count("durababble.leases.expired_recovery", by: stolen)
+      stolen
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?

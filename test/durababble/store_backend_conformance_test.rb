@@ -1628,6 +1628,119 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal 0, mysql_transaction_depth
       end
     end
+
+    test "claims, renews, releases, and surfaces the unified object lease with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        # claim takes worker_pool as routing metadata; renew/release key only on
+        # (object_type, object_id) since object identity is global.
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "abc" }
+        key = { object_type: "counter", object_id: "abc" }
+        assert_nil store.current_object_lease("counter", "abc")
+
+        first = store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        assert_equal "owner-a", first.fetch("worker_id")
+        assert_hash_includes(
+          store.current_object_lease("counter", "abc"),
+          "worker_id" => "owner-a",
+        )
+
+        # Re-claim by the same worker refreshes the lease (no conflict).
+        same = store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        assert_equal "owner-a", same.fetch("worker_id")
+
+        # A different worker is rejected while a live lease holds the row, and the
+        # rejection surfaces as nil so callers branch on win/loss without having
+        # to compare worker ids. The existing holder is not exposed through this
+        # path; consumers read current_object_lease for routing.
+        assert_nil store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: 30)
+        assert_hash_includes(
+          store.current_object_lease("counter", "abc"),
+          "worker_id" => "owner-a",
+        )
+
+        # Negative or zero lease_seconds are rejected at the public boundary: a
+        # non-positive lease would be expired the moment it was written, which
+        # only confuses the takeover path. Tests that need to seed an expired
+        # row must do so explicitly (see expire_object_lease! below).
+        assert_raises(ArgumentError) do
+          store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: -1)
+        end
+        assert_raises(ArgumentError) do
+          store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: 0)
+        end
+
+        assert_equal true, store.renew_object_lease(**key, worker_id: "owner-a", lease_seconds: 30)
+        # A non-owner cannot renew.
+        assert_equal false, store.renew_object_lease(**key, worker_id: "intruder", lease_seconds: 30)
+
+        # A non-owner cannot release.
+        assert_equal false, store.release_object_lease(**key, worker_id: "intruder")
+        assert_hash_includes(store.current_object_lease("counter", "abc"), "worker_id" => "owner-a")
+
+        # The owner releases cleanly.
+        assert_equal true, store.release_object_lease(**key, worker_id: "owner-a")
+        assert_nil store.current_object_lease("counter", "abc")
+
+        # After release, renew on an empty row returns false.
+        assert_equal false, store.renew_object_lease(**key, worker_id: "owner-a", lease_seconds: 30)
+      end
+    end
+
+    test "takes over an expired object lease and reports it via release_worker_leases / steal with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "expired" }
+
+        # Claim normally, then explicitly backdate `locked_until` to simulate a
+        # crashed owner. This separates the seeding step from the takeover under
+        # test: the previous shortcut (`lease_seconds: -1`) blurred the two and
+        # depended on a since-removed permissive claim path.
+        store.claim_object_lease(**claim_key, worker_id: "crashed-owner", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "expired")
+        assert_nil store.current_object_lease("counter", "expired")
+
+        # A new owner can take over because the existing row is expired.
+        new_holder = store.claim_object_lease(**claim_key, worker_id: "new-owner", lease_seconds: 30)
+        assert_equal "new-owner", new_holder.fetch("worker_id")
+        assert_hash_includes(store.current_object_lease("counter", "expired"), "worker_id" => "new-owner")
+
+        # release_worker_leases! clears the new owner's holds across both tables.
+        counts = store.release_worker_leases!(worker_id: "new-owner")
+        assert_operator counts.fetch("durable_objects").to_i, :>=, 1
+        assert_nil store.current_object_lease("counter", "expired")
+
+        # steal_expired_leases! sweeps stale rows. Seed an expired row again and
+        # confirm the sweep clears it.
+        store.claim_object_lease(**claim_key, worker_id: "another-crashed", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "expired")
+        stolen = store.steal_expired_leases!(now: Time.now)
+        assert_operator stolen, :>=, 1
+        # The next claim succeeds because the stale row was cleared.
+        fresh = store.claim_object_lease(**claim_key, worker_id: "post-steal", lease_seconds: 30)
+        assert_equal "post-steal", fresh.fetch("worker_id")
+      end
+    end
+
+    test "gates claim_inbox_messages for objects on the unified lease with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+
+        # A non-owner is rejected: the claim returns no rows because the lease
+        # acquisition inside the transaction did not award them ownership.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "owner", lease_seconds: 30)
+        rejected = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "abc", worker_id: "intruder", lease_seconds: 30)
+        assert_empty rejected
+
+        # The owner can claim normally.
+        claimed = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "abc", worker_id: "owner", lease_seconds: 30)
+        assert_equal 1, claimed.size
+      end
+    end
   end
 
   def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)
@@ -1682,5 +1795,37 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       ).first
     end
     row.fetch("in_tx").to_i
+  end
+
+  # Backdate a row's locked_until to simulate a crashed owner without relying
+  # on a permissive `claim_object_lease(lease_seconds: -1)` shortcut, which the
+  # public API now rejects. Each backend stores `locked_until` in its own
+  # native form: Postgres takes a literal interval; MySQL uses a DATETIME(6)
+  # string; SQLite stores an integer microsecond epoch (dura_now()'s clock),
+  # so we have to hand it the integer that comparison against dura_now() will
+  # treat as "in the past".
+  def expire_object_lease!(store, backend, object_type, object_id)
+    table = store.send(:table, "durable_objects")
+    if backend.postgres?
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = now() - interval '1 hour' WHERE object_type = $1 AND object_id = $2",
+        [object_type, object_id],
+      )
+    elsif backend.sqlite?
+      expired_at = ((Time.now.to_r - 3600) * 1_000_000).to_i
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE object_type = ? AND object_id = ?",
+        [expired_at, object_type, object_id],
+      )
+    else
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE object_type = ? AND object_id = ?",
+        [expired_at, object_type, object_id],
+      )
+    end
   end
 end
