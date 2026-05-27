@@ -412,53 +412,37 @@ module Durababble
       end
     end
 
-    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, idempotency_key: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_workflow_name: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> Hash[String, Object?]
-    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:, parent_workflow_id: nil, parent_workflow_name: nil, parent_command_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil)
-      link_id = child_workflow_link_id(
-        origin_kind:,
-        parent_workflow_id:,
-        parent_command_id:,
-        parent_object_type:,
-        parent_object_id:,
-        parent_object_command_id:,
-        idempotency_key:,
-      )
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil)
       result = transaction do
-        existing = child_workflow_link_for_update(link_id)
-        if existing
-          decoded = decode_row(existing)
-          validate_child_workflow_link_shape!(
-            decoded,
-            child_workflow_name:,
-            child_workflow_id:,
-            input:,
-            worker_pool:,
-            cancellation_policy:,
-          )
-          next observe_child_workflow_without_transaction(decoded)
+        begin
+          transaction do
+            insert_child_workflow_without_transaction(
+              origin_kind:,
+              parent_workflow_id:,
+              parent_command_id:,
+              parent_object_type:,
+              parent_object_id:,
+              parent_object_command_id:,
+              child_workflow_name:,
+              child_workflow_id:,
+              input:,
+              worker_pool:,
+              cancellation_policy:,
+            )
+          end
+        rescue ActiveRecord::RecordNotUnique
+          existing = child_workflow_by_child_id_for_update(child_workflow_id)
+          unless existing
+            raise WorkflowAlreadyExists, "workflow #{child_workflow_id} already exists"
+          end
+
+          next child_workflow_row(decode_row(existing))
         end
+        created = child_workflow_by_child_id_for_update(child_workflow_id)
+        raise KeyError, "child workflow not found after insert: #{child_workflow_id}" unless created
 
-        insert_workflow(name: child_workflow_name, input:, status: "pending", id: child_workflow_id, worker_pool:)
-        insert_child_workflow_link_without_transaction(
-          id: link_id,
-          origin_kind:,
-          parent_workflow_id:,
-          parent_workflow_name:,
-          parent_command_id:,
-          parent_object_type:,
-          parent_object_id:,
-          parent_object_command_id:,
-          child_workflow_name:,
-          child_workflow_id:,
-          input:,
-          worker_pool:,
-          idempotency_key:,
-          cancellation_policy:,
-        )
-        created = child_workflow_link_for_update(link_id)
-        raise KeyError, "child workflow link not found after insert: #{link_id}" unless created
-
-        observe_child_workflow_without_transaction(decode_row(created))
+        child_workflow_row(decode_row(created))
       end
       result #: as Hash[String, Object?]
     end
@@ -466,22 +450,22 @@ module Durababble
     #: (String) -> Hash[String, Object?]
     def observe_child_workflow(child_workflow_id)
       result = transaction do
-        link = child_workflow_link_by_child_id_for_update(child_workflow_id)
-        raise KeyError, "child workflow link not found: #{child_workflow_id}" unless link
+        row = child_workflow_by_child_id_for_update(child_workflow_id)
+        raise KeyError, "child workflow not found: #{child_workflow_id}" unless row
 
-        observe_child_workflow_without_transaction(decode_row(link))
+        child_workflow_row(decode_row(row))
       end
       result #: as Hash[String, Object?]
     end
 
     #: (parent_workflow_id: String) -> Array[Hash[String, Object?]]
-    def child_workflows_for_parent(parent_workflow_id:)
-      execute_store_query(:child_workflows_for_parent, [parent_workflow_id]).map { |row| decode_row(row) }
+    def child_workflow_rows_for_parent(parent_workflow_id:)
+      execute_store_query(:child_workflow_rows_for_parent, [parent_workflow_id]).map { |row| child_workflow_row(decode_row(row)) }
     end
 
     #: (parent_object_type: String, parent_object_id: String) -> Array[Hash[String, Object?]]
-    def child_workflows_for_object(parent_object_type:, parent_object_id:)
-      execute_store_query(:child_workflows_for_object, [parent_object_type, parent_object_id]).map { |row| decode_row(row) }
+    def child_workflow_rows_for_object(parent_object_type:, parent_object_id:)
+      execute_store_query(:child_workflow_rows_for_object, [parent_object_type, parent_object_id]).map { |row| child_workflow_row(decode_row(row)) }
     end
 
     #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
@@ -965,73 +949,38 @@ module Durababble
       end
     end
 
-    #: (origin_kind: String, parent_workflow_id: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, idempotency_key: String) -> String
-    def child_workflow_link_id(origin_kind:, parent_workflow_id:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, idempotency_key:)
-      Digest::SHA256.hexdigest(SERIALIZER.dump({
-        "origin_kind" => origin_kind,
-        "parent_workflow_id" => parent_workflow_id,
-        "parent_command_id" => parent_command_id,
-        "parent_object_type" => parent_object_type,
-        "parent_object_id" => parent_object_id,
-        "parent_object_command_id" => parent_object_command_id,
-        "idempotency_key" => idempotency_key,
-      }))
-    end
-
-    #: (Hash[String, Object?], child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String) -> void
-    def validate_child_workflow_link_shape!(link, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:)
-      mismatch = link.fetch("child_workflow_name") != child_workflow_name ||
-        link.fetch("child_workflow_id") != child_workflow_id ||
-        link.fetch("input") != input ||
-        link.fetch("worker_pool") != worker_pool ||
-        link.fetch("cancellation_policy") != cancellation_policy
-      return unless mismatch
-
-      raise IdempotencyKeyConflict, "child workflow idempotency key #{link.fetch("idempotency_key")} already used for a different child workflow"
-    end
-
     #: (String) -> Hash[String, Object?]?
-    def child_workflow_link_for_update(link_id)
-      execute_store_query(:child_workflow_link_for_update, [link_id]).first
-    end
-
-    #: (String) -> Hash[String, Object?]?
-    def child_workflow_link_by_child_id_for_update(child_workflow_id)
-      execute_store_query(:child_workflow_link_by_child_id_for_update, [child_workflow_id]).first
+    def child_workflow_by_child_id_for_update(child_workflow_id)
+      execute_store_query(:child_workflow_by_child_id_for_update, [child_workflow_id]).first
     end
 
     #: (Hash[String, Object?]) -> Hash[String, Object?]
-    def observe_child_workflow_without_transaction(link)
-      child = workflow(String(link.fetch("child_workflow_id")))
-      status = child.fetch("status")
-      result = child["result"]
-      error = child["error"]
-      completed_at = WorkflowStatus.terminal?(child) ? timestamp_or_nil(current_time) : nil
-      params = [status, dump_serialized(result), error, timestamp_or_nil(current_time), completed_at, link.fetch("id")]
-      execute_store_query(:update_child_workflow_link_observation, params)
-      link.merge("status" => status, "result" => result, "error" => error, "completed_at" => completed_at)
+    def child_workflow_row(row)
+      row.merge(
+        "origin_kind" => row["child_origin_kind"],
+        "child_workflow_id" => row.fetch("id"),
+        "child_workflow_name" => row.fetch("name"),
+        "cancellation_policy" => row["child_cancellation_policy"],
+      )
     end
 
-    #: (id: String, origin_kind: String, parent_workflow_id: String?, parent_workflow_name: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, idempotency_key: String, cancellation_policy: String) -> Object?
-    def insert_child_workflow_link_without_transaction(id:, origin_kind:, parent_workflow_id:, parent_workflow_name:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:)
+    #: (origin_kind: String, parent_workflow_id: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String) -> Object?
+    def insert_child_workflow_without_transaction(origin_kind:, parent_workflow_id:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:)
       params = [
-        id,
+        child_workflow_id,
+        child_workflow_name,
+        worker_pool,
+        "pending",
+        dump_workflow_input(name: child_workflow_name, input:),
         origin_kind,
         parent_workflow_id,
-        parent_workflow_name,
         parent_command_id,
         parent_object_type,
         parent_object_id,
         parent_object_command_id,
-        child_workflow_name,
-        child_workflow_id,
-        worker_pool,
-        idempotency_key,
         cancellation_policy,
-        dump_workflow_input(name: child_workflow_name, input:),
-        "pending",
       ]
-      execute_store_query(:insert_child_workflow_link, params)
+      execute_store_query(:insert_child_workflow, params)
     end
   end
 end

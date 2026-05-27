@@ -103,7 +103,7 @@ fulfillment.result
 
 ## Enqueuing And Workflow Handles
 
-`Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `id:` when the caller needs to choose a stable workflow id; Durababble persists that exact id and raises `Durababble::WorkflowAlreadyExists` if it is already taken. Pass `engine:` when you want an explicit engine instead of the configured default.
+Outside workflow execution, `Workflow.enqueue` creates a workflow row through the configured default engine and returns the workflow id. In an application, you usually enqueue first and let one or more workers claim the run under SQL leases. Pass `id:` when the caller needs to choose a stable workflow id; Durababble persists that exact id and raises `Durababble::WorkflowAlreadyExists` if it is already taken. Pass `engine:` when you want an explicit engine instead of the configured default.
 
 ```ruby
 workflow_id = FulfillOrder.enqueue(order)
@@ -147,19 +147,18 @@ The calls above are persisted as ordered workflow command history entries with n
 
 ## Child Workflows
 
-Workflow orchestration can start another workflow as a child with `start_child` or `start_workflow`. The call returns a `Durababble::ChildWorkflowHandle`, which has `workflow_id`, `worker_pool`, `status`, `result`, `error`, `await`, `cancel`, `terminate`, and `ref`.
+Workflow orchestration can start another workflow as a child by calling that workflow's normal class helper: `CreateShipment.enqueue(input, ...)` or `CreateShipment.start(input, ...)`. Outside workflow execution, `enqueue` still returns the workflow id and `start` still returns a regular workflow handle; inside workflow execution, both calls schedule a durable child start and return a `Durababble::ChildWorkflowHandle`, which has `workflow_id`, `worker_pool`, `status`, `result`, `error`, `await`, `cancel`, `terminate`, and `ref`.
 
 ```ruby
 class ShipOrder < Durababble::Workflow
   def execute(order)
-    handle = start_child(
-      CreateShipment,
+    handle = CreateShipment.enqueue(
       { "order_id" => order.fetch("id") },
       id: "shipment-#{order.fetch('id')}",
       cancellation: :request_cancel,
     )
 
-    shipment = handle.await
+    shipment = handle.result
     notify_customer(order, shipment)
   end
 
@@ -169,9 +168,9 @@ class ShipOrder < Durababble::Workflow
 end
 ```
 
-Starting a child is itself a durable workflow command. Durababble records the start command before inserting the child workflow row and parent/child link row; if the parent crashes after that point, replay reattaches to the existing child instead of creating another one. Passing `id:` gives the child a deterministic workflow id. If `id:` is omitted, Durababble derives one from the parent workflow id, command id, child workflow name, input, worker pool, and idempotency key.
+Starting a child is safe to retry after crashes. If the parent workflow crashes after asking for the child, replay continues with the same child handle instead of starting another run. Passing `id:` gives the child a stable workflow id that application code can inspect or reuse across systems; if `id:` is omitted, Durababble chooses a stable id for that parent command.
 
-`handle.await` observes the child through recorded workflow commands. If the child is still pending or running, the parent records a timer wait and suspends normally; a crash while waiting resumes from the same child handle. When the child completes, `await` returns the child result. If the child fails, cancels, or is terminated, `await` raises `Durababble::ChildWorkflowFailed`, `Durababble::ChildWorkflowCanceled`, or `Durababble::ChildWorkflowTerminated`, so parent workflow code can rescue and handle the outcome.
+In workflow code, `handle.result` observes the child through recorded workflow commands and durably waits until the child is terminal. If the child is still pending or running, the parent records a timer wait and suspends normally; a crash while waiting resumes from the same child handle. When the child completes, `result` returns the child result. If the child fails, cancels, or is terminated, `result` raises `Durababble::ChildWorkflowFailed`, `Durababble::ChildWorkflowCanceled`, or `Durababble::ChildWorkflowTerminated`, so parent workflow code can rescue and handle the outcome. `handle.await(poll_interval:, timeout:)` remains available when workflow code needs an explicit poll interval or timeout, while external `handle.result` reads the latest stored result without blocking.
 
 Child workflows inherit the parent worker pool unless `worker_pool:` is supplied. A child in another worker pool is not claimed by parent-pool workers, and a child whose workflow class is not registered in any worker remains pending and inspectable until a matching worker is deployed or an operator cancels/terminates it.
 

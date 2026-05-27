@@ -41,8 +41,38 @@ module Durababble
         workflow_name
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?) -> String
-      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle)
+      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        if (execution = WorkflowExecutionContext.current)
+          raise ArgumentError, "workflow child enqueue cannot specify store: or engine:" if store || engine
+
+          return execution.call_child_workflow_start(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+          )
+        end
+
+        if (object = ObjectCommandExecutionContext.current)
+          raise ArgumentError, "object-command workflow enqueue cannot specify store: or engine:" if store || engine
+
+          object = object #: as untyped
+          return object.start_workflow(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation: cancellation.nil? ? :abandon : cancellation,
+          )
+        end
+
+        raise ArgumentError, "idempotency_key: is only supported when enqueue is called from workflow execution or an object command" unless idempotency_key.nil?
+        raise ArgumentError, "cancellation: is only supported when enqueue is called from workflow execution or an object command" unless cancellation.nil?
+
         if worker_pool
           workflow_id = id || SecureRandom.uuid
           Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
@@ -51,8 +81,38 @@ module Durababble
         end
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?) -> WorkflowRef
-      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (WorkflowRef | ChildWorkflowHandle)
+      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        if (execution = WorkflowExecutionContext.current)
+          raise ArgumentError, "workflow child start cannot specify store: or engine:" if store || engine
+
+          return execution.call_child_workflow_start(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+          )
+        end
+
+        if (object = ObjectCommandExecutionContext.current)
+          raise ArgumentError, "object-command workflow start cannot specify store: or engine:" if store || engine
+
+          object = object #: as untyped
+          return object.start_workflow(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation: cancellation.nil? ? :abandon : cancellation,
+          )
+        end
+
+        raise ArgumentError, "idempotency_key: is only supported when start is called from workflow execution or an object command" unless idempotency_key.nil?
+        raise ArgumentError, "cancellation: is only supported when start is called from workflow execution or an object command" unless cancellation.nil?
+
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
           workflow_id = id || SecureRandom.uuid
@@ -245,7 +305,7 @@ module Durababble
     #: () -> Object?
     def result
       if (execution = WorkflowExecutionContext.current)
-        return execution.call_child_workflow_observe(self).fetch("result")
+        return execution.await_child_workflow(self, poll_interval: 1, timeout: nil)
       end
 
       @store.observe_child_workflow(@workflow_id)["result"]
@@ -286,6 +346,20 @@ module Durababble
     #: (?reason: Object?) -> Run
     def terminate(reason: nil)
       ref.terminate(reason:)
+    end
+
+    #: (Symbol, *Object?, **Object?) ?{ (Object?) -> Object? } -> Object?
+    def method_missing(method_name, *args, **kwargs, &block)
+      reference = ref #: as untyped
+      return reference.public_send(method_name, *args, **kwargs, &block) if reference.respond_to?(method_name)
+
+      super
+    end
+
+    #: (Symbol, ?bool) -> bool
+    def respond_to_missing?(method_name, include_private = false)
+      reference = ref #: as untyped
+      reference.respond_to?(method_name, include_private) || super
     end
 
     #: (Hash[String, Object?]) -> Object?

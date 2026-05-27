@@ -10,6 +10,7 @@ require_relative "execution_context"
 require_relative "workflow_determinism"
 require_relative "workflow_replay_history"
 require_relative "workflow_step_runner"
+require_relative "child_workflow_reuse"
 require_relative "workflow"
 
 module Durababble
@@ -231,24 +232,33 @@ module Durababble
       unless @replay_history.terminal_recorded?(command_id)
         reserve_scheduled_followup_events!(scheduled_from_history)
         dispatch_command!(command_id, step: synthetic_step, attributes:) do
-          resolved_id = id || generated_child_workflow_id(command_id:, child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key:)
           resolved_key = idempotency_key || child_workflow_idempotency_key(command_id)
-          @store.start_child_workflow(
+          resolved_id = id || generated_child_workflow_id(command_id:, child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key: resolved_key)
+          link = @store.start_child_workflow(
             origin_kind: "workflow",
             parent_workflow_id: @workflow_id,
-            parent_workflow_name: @workflow_class.workflow_name,
             parent_command_id: command_id,
             child_workflow_name:,
             child_workflow_id: resolved_id,
             input:,
             worker_pool: child_worker_pool,
-            idempotency_key: resolved_key,
             cancellation_policy: normalized_policy,
-          ).slice(
+          )
+          ChildWorkflowReuse.validate!(
+            link,
+            origin_kind: "workflow",
+            parent_workflow_id: @workflow_id,
+            parent_command_id: command_id,
+            child_workflow_name:,
+            child_workflow_id: resolved_id,
+            input:,
+            worker_pool: child_worker_pool,
+            cancellation_policy: normalized_policy,
+          )
+          link.slice(
             "child_workflow_id",
             "child_workflow_name",
             "worker_pool",
-            "idempotency_key",
             "cancellation_policy",
             "status",
             "result",
@@ -967,14 +977,14 @@ module Durababble
 
     #: (Object?) -> void
     def propagate_child_cancellation!(reason)
-      links = synchronize_store { @store.child_workflows_for_parent(parent_workflow_id: @workflow_id) }
-      links.each do |link|
-        next unless link.fetch("cancellation_policy") == "request_cancel"
-        next if WorkflowStatus.terminal?(link)
+      children = synchronize_store { @store.child_workflow_rows_for_parent(parent_workflow_id: @workflow_id) }
+      children.each do |child|
+        next unless child.fetch("cancellation_policy") == "request_cancel"
+        next if WorkflowStatus.terminal?(child)
 
         synchronize_store do
           @store.request_workflow_cancellation(
-            workflow_id: link.fetch("child_workflow_id"),
+            workflow_id: child.fetch("child_workflow_id"),
             reason: reason.to_s.empty? ? "parent workflow #{@workflow_id} canceled" : reason,
           )
         end

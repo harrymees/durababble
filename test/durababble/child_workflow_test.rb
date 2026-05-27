@@ -52,6 +52,24 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
     end
   end
 
+  class ParentEnqueueChildWorkflow < Durababble::Workflow
+    workflow_name "parent-enqueue-child"
+
+    def execute(input)
+      handle = ChildEchoWorkflow.enqueue(input.fetch("child"), id: input["child_id"], cancellation: :request_cancel)
+      { "child_id" => handle.workflow_id, "handle_class" => handle.class.name, "result" => handle.result }
+    end
+  end
+
+  class ParentStartChildWorkflow < Durababble::Workflow
+    workflow_name "parent-start-child"
+
+    def execute(input)
+      handle = ChildEchoWorkflow.start(input.fetch("child"), id: input["child_id"], cancellation: :abandon)
+      { "child_id" => handle.workflow_id, "result" => handle.result }
+    end
+  end
+
   class ParentHandlesFailureWorkflow < Durababble::Workflow
     workflow_name "parent-handles-child-failure"
 
@@ -103,8 +121,20 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
     end
 
     expose_command def start_child(value)
-      handle = start_workflow(ChildEchoWorkflow, { "value" => value })
+      handle = ChildEchoWorkflow.enqueue({ "value" => value })
       schedule_wake(name: "observe-child", at: Time.now, payload: { "child_id" => handle.workflow_id })
+      update_state(current_state.merge("child_id" => handle.workflow_id))
+      handle.workflow_id
+    end
+
+    expose_command def start_child_with_policy(value, policy)
+      handle = ChildEchoWorkflow.enqueue({ "value" => value }, id: "object-policy-#{policy}", cancellation: policy.to_sym)
+      update_state(current_state.merge("child_id" => handle.workflow_id))
+      handle.workflow_id
+    end
+
+    expose_command def start_child_with_id(value, child_id)
+      handle = ChildEchoWorkflow.enqueue({ "value" => value }, id: child_id)
       update_state(current_state.merge("child_id" => handle.workflow_id))
       handle.workflow_id
     end
@@ -132,11 +162,46 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| step.fetch("name") },
         )
         assert_hash_includes(
-          store.child_workflows_for_parent(parent_workflow_id: workflow_id).first,
+          store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).first,
           "child_workflow_id" => "child-success",
           "status" => "completed",
           "cancellation_policy" => "request_cancel",
         )
+        assert_hash_includes(
+          store.workflow("child-success"),
+          "child_origin_kind" => "workflow",
+          "parent_workflow_id" => workflow_id,
+          "parent_command_id" => 0,
+          "child_cancellation_policy" => "request_cancel",
+        )
+      end
+    end
+
+    test "workflow-context enqueue starts a child and result awaits internally with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_enqueue_api") do |store|
+        workflow_id = store.enqueue_workflow(name: ParentEnqueueChildWorkflow.workflow_name, input: { "child" => { "value" => "enqueued" }, "child_id" => "child-enqueue-api" })
+        run = run_workers_until_terminal(backend, store, workflow_id, workflows: [ParentEnqueueChildWorkflow, ChildEchoWorkflow])
+
+        assert_equal "completed", run.fetch("status")
+        assert_equal(
+          { "child_id" => "child-enqueue-api", "handle_class" => "Durababble::ChildWorkflowHandle", "result" => { "echo" => "enqueued" } },
+          run.fetch("result"),
+        )
+        assert_equal(
+          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "sleep", "child_workflow:workflow:observe"],
+          store.steps_for(workflow_id).map { |step| step.fetch("name") },
+        )
+      end
+    end
+
+    test "workflow-context start returns the same child handle shape with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_start_api") do |store|
+        workflow_id = store.enqueue_workflow(name: ParentStartChildWorkflow.workflow_name, input: { "child" => { "value" => "started" }, "child_id" => "child-start-api" })
+        run = run_workers_until_terminal(backend, store, workflow_id, workflows: [ParentStartChildWorkflow, ChildEchoWorkflow])
+
+        assert_equal "completed", run.fetch("status")
+        assert_equal({ "child_id" => "child-start-api", "result" => { "echo" => "started" } }, run.fetch("result"))
+        assert_equal "abandon", store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).first.fetch("cancellation_policy")
       end
     end
 
@@ -151,7 +216,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         run = run_workers_until_terminal(backend, store, workflow_id, workflows: [ParentAwaitWorkflow, ChildEchoWorkflow])
 
         assert_equal "completed", run.fetch("status")
-        assert_equal 1, store.child_workflows_for_parent(parent_workflow_id: workflow_id).length
+        assert_equal 1, store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).length
         assert_equal 1, store.workflow_history_for("child-replay").count { |event| event.fetch("kind") == "step_scheduled" }
       end
     end
@@ -168,7 +233,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
 
         assert_equal "completed", run.fetch("status")
         assert_equal({ "child_id" => "child-wait-replay", "result" => { "echo" => "ok" } }, run.fetch("result"))
-        assert_equal "completed", store.child_workflows_for_parent(parent_workflow_id: workflow_id).first.fetch("status")
+        assert_equal "completed", store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).first.fetch("status")
       end
     end
 
@@ -179,7 +244,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
 
         assert_equal "completed", run.fetch("status")
         assert_match(/bad child/, run.fetch("result").fetch("handled"))
-        assert_equal "failed", store.child_workflows_for_parent(parent_workflow_id: workflow_id).first.fetch("status")
+        assert_equal "failed", store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).first.fetch("status")
       end
     end
 
@@ -248,11 +313,35 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         child_id = store.inbox_message(message_id).fetch("result")
 
         assert_equal({ "echo" => "from-object" }, store.workflow(child_id).fetch("result"))
+        assert_hash_includes(
+          store.workflow(child_id),
+          "child_origin_kind" => "object",
+          "parent_object_type" => ObjectStarter.object_type,
+          "parent_object_id" => "starter-1",
+          "child_cancellation_policy" => "abandon",
+        )
         assert_equal(
           { "name" => "observe-child", "status" => "completed", "result" => { "echo" => "from-object" } },
           ObjectStarter.at("starter-1", store:).observed,
         )
-        assert_equal 1, store.child_workflows_for_object(parent_object_type: ObjectStarter.object_type, parent_object_id: "starter-1").length
+        assert_equal 1, store.child_workflow_rows_for_object(parent_object_type: ObjectStarter.object_type, parent_object_id: "starter-1").length
+      end
+    end
+
+    test "durable object workflow enqueue records cancellation policy with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_object_policy") do |store|
+        message_id = ObjectStarter.tell("starter-policy", :start_child_with_policy, "policy", "request_cancel", store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectStarter])
+        child_id = store.inbox_message(message_id).fetch("result")
+
+        assert_equal "object-policy-request_cancel", child_id
+        assert_hash_includes(
+          store.workflow(child_id),
+          "child_origin_kind" => "object",
+          "parent_object_type" => ObjectStarter.object_type,
+          "parent_object_id" => "starter-policy",
+          "child_cancellation_policy" => "request_cancel",
+        )
       end
     end
 
@@ -282,35 +371,21 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       end
     end
 
-    test "child workflow idempotency conflicts reject shape changes with #{backend.name}" do
+    test "child workflow id reuse rejects shape and origin changes above the store with #{backend.name}" do
       with_durababble_store(backend, "child_workflow_idempotency_conflict") do |store|
-        store.start_child_workflow(
-          origin_kind: "object",
-          parent_object_type: ObjectStarter.object_type,
-          parent_object_id: "starter-conflict",
-          parent_object_command_id: "command-1",
-          child_workflow_name: ChildEchoWorkflow.workflow_name,
-          child_workflow_id: "child-conflict",
-          input: { "value" => "one" },
-          worker_pool: "default",
-          idempotency_key: "same-key",
-          cancellation_policy: "abandon",
-        )
+        first_message_id = ObjectStarter.tell("starter-conflict", :start_child_with_id, "one", "child-conflict", store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectStarter])
+        assert_equal "completed", store.inbox_message(first_message_id).fetch("status")
 
-        assert_raises(Durababble::IdempotencyKeyConflict) do
-          store.start_child_workflow(
-            origin_kind: "object",
-            parent_object_type: ObjectStarter.object_type,
-            parent_object_id: "starter-conflict",
-            parent_object_command_id: "command-1",
-            child_workflow_name: ChildEchoWorkflow.workflow_name,
-            child_workflow_id: "child-conflict-changed",
-            input: { "value" => "two" },
-            worker_pool: "default",
-            idempotency_key: "same-key",
-            cancellation_policy: "abandon",
-          )
-        end
+        input_conflict_id = ObjectStarter.tell("starter-conflict", :start_child_with_id, "two", "child-conflict", store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectStarter])
+        assert_hash_includes store.inbox_message(input_conflict_id), "status" => "dead_lettered"
+        assert_match(/workflow id child-conflict already used for a different child workflow/, store.inbox_message(input_conflict_id).fetch("error"))
+
+        origin_conflict_id = ObjectStarter.tell("starter-other-origin", :start_child_with_id, "one", "child-conflict", store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectStarter])
+        assert_hash_includes store.inbox_message(origin_conflict_id), "status" => "dead_lettered"
+        assert_match(/workflow id child-conflict already used for a different child workflow/, store.inbox_message(origin_conflict_id).fetch("error"))
 
         assert_raises(KeyError) { store.observe_child_workflow("missing-child-link") }
       end
@@ -329,7 +404,6 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       child_workflow_id: child_id,
       input:,
       worker_pool: "default",
-      idempotency_key: "key-#{child_id}",
       cancellation_policy: "abandon",
     )
     Durababble::ChildWorkflowHandle.new(

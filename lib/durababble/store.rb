@@ -257,8 +257,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, idempotency_key: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_workflow_name: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> Hash[String, Object?]
-    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:, parent_workflow_id: nil, parent_workflow_name: nil, parent_command_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil)
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil)
       raise NotImplementedError
     end
 
@@ -268,12 +268,12 @@ module Durababble
     end
 
     #: (parent_workflow_id: String) -> Array[Hash[String, Object?]]
-    def child_workflows_for_parent(parent_workflow_id:)
+    def child_workflow_rows_for_parent(parent_workflow_id:)
       raise NotImplementedError
     end
 
     #: (parent_object_type: String, parent_object_id: String) -> Array[Hash[String, Object?]]
-    def child_workflows_for_object(parent_object_type:, parent_object_id:)
+    def child_workflow_rows_for_object(parent_object_type:, parent_object_id:)
       raise NotImplementedError
     end
 

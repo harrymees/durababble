@@ -398,6 +398,7 @@ module Durababble
 end
 
 require_relative "durababble/retry_policy"
+require_relative "durababble/child_workflow_reuse"
 require_relative "durababble/workflow"
 require_relative "durababble/workflow_query_registry"
 require_relative "durababble/durable_object"

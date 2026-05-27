@@ -4,6 +4,7 @@
 require "digest"
 
 require_relative "durable_method_dsl"
+require_relative "child_workflow_reuse"
 require_relative "execution_context"
 require_relative "error_formatting"
 
@@ -264,7 +265,18 @@ module Durababble
         child_workflow_id: resolved_id,
         input:,
         worker_pool: child_worker_pool,
-        idempotency_key: resolved_key,
+        cancellation_policy: policy,
+      )
+      ChildWorkflowReuse.validate!(
+        link,
+        origin_kind: "object",
+        parent_object_type: self.class.object_type,
+        parent_object_id: durable_id,
+        parent_object_command_id: context.command_id,
+        child_workflow_name:,
+        child_workflow_id: resolved_id,
+        input:,
+        worker_pool: child_worker_pool,
         cancellation_policy: policy,
       )
       ChildWorkflowHandle.new(
@@ -527,7 +539,9 @@ module Durababble
       Observability.trace("durababble.object.command", attributes) do
         object = build_object(object_class, object_id:, message:)
         args, kwargs = object_args(message)
-        result = object.public_send(method_name, *args, **kwargs)
+        result = ObjectCommandExecutionContext.with_current(object) do
+          object.public_send(method_name, *args, **kwargs)
+        end
         complete_message(object, message, result:, attributes:)
         Observability.count("durababble.object.command.successes", attributes)
         result
@@ -542,7 +556,9 @@ module Durababble
     def dispatch_wake(object_class, object_id:, message:)
       object = build_object(object_class, object_id:, message:)
       result = if object.respond_to?(:on_wake)
-        object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
+        ObjectCommandExecutionContext.with_current(object) do
+          object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
+        end
       end
       complete_message(object, message, result:)
     rescue LeaseConflict

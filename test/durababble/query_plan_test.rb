@@ -12,10 +12,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_cancel_step,
     :pg_cancel_workflow,
     :pg_cancel_workflow_with_worker,
-    :pg_child_workflow_link_by_child_id_for_update,
-    :pg_child_workflow_link_for_update,
-    :pg_child_workflows_for_object,
-    :pg_child_workflows_for_parent,
+    :pg_child_workflow_by_child_id_for_update,
+    :pg_child_workflow_rows_for_object,
+    :pg_child_workflow_rows_for_parent,
     :pg_claim_expired_target_activation,
     :pg_claim_pending_target_activation,
     :pg_claim_selected_target_activation,
@@ -41,7 +40,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_inbox_message,
     :pg_inbox_messages_for,
     :pg_inbox_messages_for_worker_pool,
-    :pg_insert_child_workflow_link,
+    :pg_insert_child_workflow,
     :pg_insert_inbox_message,
     :pg_insert_mailbox_sequence,
     :pg_insert_scheduled_step,
@@ -62,7 +61,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_set_target_activation_pending,
     :pg_step_heartbeat_cursor,
     :pg_target_activation,
-    :pg_update_child_workflow_link_observation,
     :pg_update_mailbox_sequence,
     :pg_upsert_object_wakeup,
     :pg_upsert_target_activation,
@@ -79,10 +77,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_cancel_waiting_steps_for_workflow,
     :mysql_cancel_workflow,
     :mysql_cancel_workflow_with_worker,
-    :mysql_child_workflow_link_by_child_id_for_update,
-    :mysql_child_workflow_link_for_update,
-    :mysql_child_workflows_for_object,
-    :mysql_child_workflows_for_parent,
+    :mysql_child_workflow_by_child_id_for_update,
+    :mysql_child_workflow_rows_for_object,
+    :mysql_child_workflow_rows_for_parent,
     :mysql_claim_expired_outbox,
     :mysql_claim_expired_target_activation,
     :mysql_claim_pending_outbox,
@@ -130,7 +127,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_inbox_message,
     :mysql_inbox_messages_for,
     :mysql_inbox_messages_for_worker_pool,
-    :mysql_insert_child_workflow_link,
+    :mysql_insert_child_workflow,
     :mysql_insert_fence,
     :mysql_insert_inbox_message,
     :mysql_insert_mailbox_sequence,
@@ -179,7 +176,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_supersede_running_step_attempts,
     :mysql_suspend_workflow,
     :mysql_target_activation,
-    :mysql_update_child_workflow_link_observation,
     :mysql_update_latest_attempt,
     :mysql_update_mailbox_sequence,
     :mysql_upsert_object_wakeup,
@@ -629,6 +625,22 @@ class DurababbleQueryPlanTest < DurababbleTestCase
         allowed_indexes: ["workflows_pkey"],
         allow_post_filter_indexes: ["workflows_pkey"],
       },
+      "start_child_workflow_by_id" => {
+        call: lambda do
+          store.start_child_workflow(
+            origin_kind: "workflow",
+            parent_workflow_id: "running-owned",
+            parent_command_id: 42,
+            child_workflow_name: "child-demo",
+	            child_workflow_id: "child-workflow-existing",
+	            input: { "count" => 1 },
+	            worker_pool: "default",
+	            cancellation_policy: "request_cancel",
+	          )
+        end,
+        allowed_indexes: ["workflows_pkey"],
+        allow_post_filter_indexes: ["workflows_pkey"],
+      },
       "steps_for" => {
         call: -> { store.steps_for("running-owned") },
         allowed_indexes: ["steps_pkey"],
@@ -752,6 +764,20 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       VALUES
         ('pending-target', 'demo', 'pending', decode('#{serialized_count}', 'hex'), NULL, NULL, now() - interval '2 hours', now()),
         ('running-owned', 'demo', 'running', decode('#{serialized_count}', 'hex'), 'owner', now() + interval '5 minutes', now() - interval '3 hours', now());
+
+	      INSERT INTO #{quoted_schema}.workflows (
+	        id, name, status, input, worker_pool, child_origin_kind, parent_workflow_id,
+	        parent_command_id, child_cancellation_policy, created_at, updated_at
+	      )
+	      VALUES
+	        ('child-workflow-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'workflow', 'running-owned', 42, 'request_cancel', now() - interval '1 hour', now());
+
+	      INSERT INTO #{quoted_schema}.workflows (
+	        id, name, status, input, worker_pool, child_origin_kind, parent_object_type,
+	        parent_object_id, parent_object_command_id, child_cancellation_policy, created_at, updated_at
+	      )
+	      VALUES
+	        ('child-object-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'object', 'counter', 'object-1', 'command-1', 'abandon', now() - interval '1 hour', now());
 
       INSERT INTO #{quoted_schema}.steps (workflow_id, position, name, status, result, started_at, completed_at, updated_at)
       SELECT 'running-owned', i, 'step-' || i, CASE WHEN i = 0 THEN 'running' ELSE 'completed' END, decode('#{serialized_result}', 'hex'), now() - (i || ' seconds')::interval, now(), now()

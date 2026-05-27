@@ -133,7 +133,7 @@ channel.recent
 
 ## Starting Workflows From Objects
 
-Durable object commands can start workflows with `start_workflow`. This is command-only because starting a workflow mutates durable state; exposed queries and code outside an object command cannot use it.
+Durable object commands can start workflows with the workflow class API: `ImportFile.enqueue(...)` or `ImportFile.start(...)`. This is command-only because starting a workflow mutates durable state; exposed queries and code outside an object command cannot use it.
 
 ```ruby
 class ImportCoordinator < Durababble::DurableObject
@@ -144,7 +144,7 @@ class ImportCoordinator < Durababble::DurableObject
   end
 
   expose_command def begin_import(file_id)
-    child = start_workflow(ImportFile, { "file_id" => file_id }, cancellation: :abandon)
+    child = ImportFile.enqueue({ "file_id" => file_id }, cancellation: :abandon)
     schedule_wake(name: "check-import", at: Time.now + 60, payload: { "child_id" => child.workflow_id })
     update_state(current_state.merge("child_id" => child.workflow_id))
     child.workflow_id
@@ -157,7 +157,7 @@ class ImportCoordinator < Durababble::DurableObject
 end
 ```
 
-The object command persists an object-origin child link using the durable mailbox command id and a generated idempotency key, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
+The object command records the workflow as object-origin work using the durable mailbox command id, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
 
 ## Alarms
 
