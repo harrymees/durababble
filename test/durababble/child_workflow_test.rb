@@ -255,9 +255,91 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         assert_equal 1, store.child_workflows_for_object(parent_object_type: ObjectStarter.object_type, parent_object_id: "starter-1").length
       end
     end
+
+    test "external child handle observes, times out, cancels, and terminates with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_external_handle") do |store|
+        pending = child_handle_for(store, "external-child-pending", input: { "value" => "external" })
+
+        assert_equal "pending", pending.status
+        assert_nil pending.result
+        assert_nil pending.error
+        assert_raises(Durababble::CommandTimeout) { pending.await(poll_interval: 0, timeout: 0) }
+
+        run_workers_until_terminal(backend, store, "external-child-pending", workflows: [ChildEchoWorkflow])
+        assert_equal({ "echo" => "external" }, pending.await(poll_interval: 0))
+        assert_equal "completed", pending.status
+        assert_equal({ "echo" => "external" }, pending.result)
+        assert_nil pending.error
+
+        canceled = child_handle_for(store, "external-child-canceled", input: { "value" => "cancel" })
+        canceled.cancel(reason: "stop child")
+        run_workers_until_terminal(backend, store, "external-child-canceled", workflows: [ChildEchoWorkflow])
+        assert_raises(Durababble::ChildWorkflowCanceled) { canceled.await(poll_interval: 0) }
+
+        terminated = child_handle_for(store, "external-child-terminated", input: { "value" => "terminate" })
+        terminated.terminate(reason: "operator stop")
+        assert_raises(Durababble::ChildWorkflowTerminated) { terminated.await(poll_interval: 0) }
+      end
+    end
+
+    test "child workflow idempotency conflicts reject shape changes with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_idempotency_conflict") do |store|
+        store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: ObjectStarter.object_type,
+          parent_object_id: "starter-conflict",
+          parent_object_command_id: "command-1",
+          child_workflow_name: ChildEchoWorkflow.workflow_name,
+          child_workflow_id: "child-conflict",
+          input: { "value" => "one" },
+          worker_pool: "default",
+          idempotency_key: "same-key",
+          cancellation_policy: "abandon",
+        )
+
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.start_child_workflow(
+            origin_kind: "object",
+            parent_object_type: ObjectStarter.object_type,
+            parent_object_id: "starter-conflict",
+            parent_object_command_id: "command-1",
+            child_workflow_name: ChildEchoWorkflow.workflow_name,
+            child_workflow_id: "child-conflict-changed",
+            input: { "value" => "two" },
+            worker_pool: "default",
+            idempotency_key: "same-key",
+            cancellation_policy: "abandon",
+          )
+        end
+
+        assert_raises(KeyError) { store.observe_child_workflow("missing-child-link") }
+      end
+    end
   end
 
   private
+
+  def child_handle_for(store, child_id, input:)
+    store.start_child_workflow(
+      origin_kind: "object",
+      parent_object_type: ObjectStarter.object_type,
+      parent_object_id: "external-starter",
+      parent_object_command_id: "command-#{child_id}",
+      child_workflow_name: ChildEchoWorkflow.workflow_name,
+      child_workflow_id: child_id,
+      input:,
+      worker_pool: "default",
+      idempotency_key: "key-#{child_id}",
+      cancellation_policy: "abandon",
+    )
+    Durababble::ChildWorkflowHandle.new(
+      ChildEchoWorkflow,
+      child_id,
+      store:,
+      worker_pool: "default",
+      cancellation_policy: "abandon",
+    )
+  end
 
   def run_workers_until_terminal(backend, store, workflow_id, workflows:, objects: [], max_ticks: 100)
     worker = worker_for(backend, store, workflows:, objects:)
