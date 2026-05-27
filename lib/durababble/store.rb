@@ -499,6 +499,8 @@ module Durababble
       result #: as String
     end
 
+    public
+
     #: (target_kind: String, target_type: String, target_id: String, worker_pool: String) -> Hash[String, Object?]?
     def current_target_lease(target_kind:, target_type:, target_id:, worker_pool:)
       case target_kind
@@ -518,6 +520,8 @@ module Durababble
     def current_object_lease(object_type, object_id, worker_pool: nil)
       nil
     end
+
+    private
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
     def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)

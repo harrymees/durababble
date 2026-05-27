@@ -384,6 +384,7 @@ module Durababble
     #: (Hash[String, Object?]) -> bool
     def current_runtime_owns?(lease)
       worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
+      worker_id = worker_id #: as untyped
       worker_id = worker_id.call if worker_id.respond_to?(:call)
       !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
     end
@@ -392,6 +393,7 @@ module Durababble
     def invoke_owned_query(method_name, args:, kwargs:, block:, lease:)
       worker_pool = lease_worker_pool(lease)
       handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
+      handler = handler #: as untyped
       if handler
         return handler.call(
           request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool:),
@@ -407,7 +409,8 @@ module Durababble
     def invoke_remote_query(method_name, args:, kwargs:, lease:)
       worker_id = lease.fetch("worker_id")
       worker_pool = lease_worker_pool(lease)
-      client = @store.rpc_client_factory.call(WorkerIdentity.address_for(worker_id.to_s))
+      rpc_client_factory = @store.rpc_client_factory #: as untyped
+      client = rpc_client_factory.call(WorkerIdentity.address_for(worker_id.to_s))
       client.call_transient(
         worker_pool:,
         class_name: @object_class.object_type,
