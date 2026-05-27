@@ -164,7 +164,7 @@ def execute(order)
 end
 ```
 
-Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::NonDeterminismError` instead of quietly attaching old side effects to new control flow.
+Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::ReplayDivergenceError` instead of quietly attaching old side effects to new control flow.
 
 ### Workflow History Length
 
