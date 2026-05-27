@@ -17,7 +17,7 @@ module Durababble
           h.scheduler.schedule(actor: "crasher", delay: 13, name: "claim_then_crash") do
             messages = h.store.claim_inbox_messages(target_kind: "object", target_type: "alarm", target_id: object_id, worker_id: "crasher", lease_seconds: 10, limit: 1)
             messages.each do |message|
-              if h.scheduler.rng.chance(50)
+              if h.scheduler.rng.int(2).zero?
                 # Crash after running the handler and committing its effect, but before the
                 # message is marked complete: redelivery must re-run on_wake idempotently.
                 state = Durababble::DurableObject.state_from_store(h.store, object_type: "alarm", object_id:)
