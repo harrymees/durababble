@@ -65,6 +65,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "wait_condition_sequential_command_wakeups",
     "mailbox_worker_pool_first_writer",
     "mailbox_worker_pool_isolation",
+    "target_activation_worker_pool_completion_isolation",
     "stolen_lease_write_rejection",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
@@ -649,6 +650,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, 'persisted_pools pools=["pool-a","pool-a"]'
     assert_includes result.trace, "right_pool_claim"
+  end
+
+  test "keeps target activation completion scoped to worker pool" do
+    result = Durababble::Deterministic.prove("target_activation_worker_pool_completion_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wrong_pool_complete completed=false still_active=true visible=false"
   end
 
   test "atomically terminates dependents when termination requests crash" do

@@ -388,7 +388,7 @@ module Durababble
 
     #: (target_kind: Object?, target_type: Object?, target_id: Object?, ?worker_pool: String) -> Hash[String, Object?]?
     def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
-      row = execute_store_query(:target_activation, [target_kind, target_type, target_id]).first
+      row = execute_store_query(:target_activation, [worker_pool, target_kind, target_type, target_id]).first
       decode_row(row) if row
     end
 

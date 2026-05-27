@@ -637,6 +637,31 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not complete target activations across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_completion_pool") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+
+        activation = store.claim_target_activation(worker_id: "shared-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same", "locked_by" => "shared-worker"
+        assert_nil store.target_activation(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same")
+
+        assert_nil store.complete_target_activation(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "shared-worker")
+        assert_hash_includes store.target_activation(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same"), "status" => "running", "locked_by" => "shared-worker"
+
+        claimed = store.claim_inbox_messages(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "shared-worker", lease_seconds: 30, limit: 1)
+        assert_equal [message_id], claimed.map { |message| message.fetch("id") }
+      end
+    end
+
     test "does not claim future target activations until ready with #{backend.name}" do
       with_durababble_store(backend, "target_activation_future") do |store|
         store.migrate!

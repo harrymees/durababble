@@ -1010,8 +1010,8 @@ module Durababble
     define(:pg_claim_selected_target_activation, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
-        SET status = 'running', locked_by = $4, locked_until = now() + ($5::int * interval '1 second'), updated_at = now()
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
         RETURNING *
       SQL
     end
@@ -1019,8 +1019,8 @@ module Durababble
     define(:pg_lock_target_activation_for_completion, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT 1 FROM #{table(store, "target_activations")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-          AND status = 'running' AND locked_by = $4
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+          AND status = 'running' AND locked_by = $5
         FOR UPDATE
       SQL
     end
@@ -1038,7 +1038,7 @@ module Durababble
     end
 
     define(:pg_delete_target_activation, backend: :postgres) do |store|
-      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = $1 AND target_type = $2 AND target_id = $3"
+      "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
 
     # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
@@ -1252,7 +1252,7 @@ module Durababble
     end
 
     define(:pg_target_activation, backend: :postgres) do |store|
-      "SELECT * FROM #{table(store, "target_activations")} WHERE target_kind = $1 AND target_type = $2 AND target_id = $3"
+      "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
 
     define(:mysql_drop_table, backend: :mysql) do |store, table_name:|
@@ -1638,14 +1638,14 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
       SQL
     end
 
     define(:mysql_lock_target_activation_for_completion, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT 1 FROM #{table(store, "target_activations")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status = 'running' AND locked_by = ?
         FOR UPDATE
       SQL
@@ -1723,7 +1723,7 @@ module Durababble
     end
 
     define(:mysql_delete_target_activation, backend: :mysql) do |store|
-      "DELETE FROM #{table(store, "target_activations")} WHERE target_kind = ? AND target_type = ? AND target_id = ?"
+      "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
     # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
@@ -1916,7 +1916,7 @@ module Durababble
     end
 
     define(:mysql_target_activation, backend: :mysql) do |store|
-      "SELECT * FROM #{table(store, "target_activations")} WHERE target_kind = ? AND target_type = ? AND target_id = ?"
+      "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
     # SQLite-specific upsert variants. The SqliteStore resolves every other query

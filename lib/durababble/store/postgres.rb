@@ -420,7 +420,7 @@ module Durababble
           candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
-          execute_store_query(:claim_selected_target_activation, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
+          execute_store_query(:claim_selected_target_activation, [worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
         end
       end
       typed_row = row #: as untyped
@@ -430,7 +430,7 @@ module Durababble
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
       transaction do
-        activation = execute_store_query(:lock_target_activation_for_completion, [target_kind, target_type, target_id, worker_id]).first
+        activation = execute_store_query(:lock_target_activation_for_completion, [worker_pool, target_kind, target_type, target_id, worker_id]).first
         next nil unless activation
 
         reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:)
@@ -542,7 +542,7 @@ module Durababble
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
+      execute_store_query(:delete_target_activation, [worker_pool, target_kind, target_type, target_id])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?

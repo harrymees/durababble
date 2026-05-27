@@ -126,7 +126,7 @@ WHERE id = ?
 -- mysql_claim_selected_target_activation
 UPDATE `durababble_mysql_snapshot_target_activations`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_claim_selected_workflow
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -249,7 +249,7 @@ DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND
 DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND object_type = ? AND object_id = ? AND name = ?
 
 -- mysql_delete_target_activation
-DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE target_kind = ? AND target_type = ? AND target_id = ?
+DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_drop_table
 DROP TABLE IF EXISTS `durababble_mysql_snapshot_workflows`
@@ -399,7 +399,7 @@ FOR UPDATE
 
 -- mysql_lock_target_activation_for_completion
 SELECT 1 FROM `durababble_mysql_snapshot_target_activations`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status = 'running' AND locked_by = ?
 FOR UPDATE
 
@@ -554,7 +554,7 @@ WHERE id = ? AND status = 'running'
   AND (? IS NULL OR (locked_by = ? AND locked_until >= NOW(6)))
 
 -- mysql_target_activation
-SELECT * FROM `durababble_mysql_snapshot_target_activations` WHERE target_kind = ? AND target_type = ? AND target_id = ?
+SELECT * FROM `durababble_mysql_snapshot_target_activations` WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_terminate_workflow
 UPDATE `durababble_mysql_snapshot_workflows`

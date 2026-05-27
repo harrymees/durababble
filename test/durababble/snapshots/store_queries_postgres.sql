@@ -145,8 +145,8 @@ RETURNING *
 
 -- pg_claim_selected_target_activation
 UPDATE "durababble_pg_snapshot"."target_activations"
-SET status = 'running', locked_by = $4, locked_until = now() + ($5::int * interval '1 second'), updated_at = now()
-WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 RETURNING *
 
 -- pg_claim_workflow_already_owned
@@ -236,7 +236,7 @@ DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND
 DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3 AND name = $4
 
 -- pg_delete_target_activation
-DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 
 -- pg_drop_schema
 DROP SCHEMA IF EXISTS "durababble_pg_snapshot" CASCADE
@@ -391,8 +391,8 @@ FOR UPDATE
 
 -- pg_lock_target_activation_for_completion
 SELECT 1 FROM "durababble_pg_snapshot"."target_activations"
-WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-  AND status = 'running' AND locked_by = $4
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+  AND status = 'running' AND locked_by = $5
 FOR UPDATE
 
 -- pg_lock_workflow_for_termination
@@ -544,7 +544,7 @@ WHERE id = $1 AND status = 'running'
   AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
 
 -- pg_target_activation
-SELECT * FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+SELECT * FROM "durababble_pg_snapshot"."target_activations" WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 
 -- pg_terminate_workflow
 UPDATE "durababble_pg_snapshot"."workflows"
