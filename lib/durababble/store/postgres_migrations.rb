@@ -128,7 +128,7 @@ module Durababble
           locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (worker_pool, object_type, object_id)
+          PRIMARY KEY (object_type, object_id)
         )
       SQL
       execute(<<~SQL)
@@ -179,7 +179,7 @@ module Durababble
           target_id text NOT NULL,
           last_sequence bigint NOT NULL DEFAULT 0,
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
+          PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
@@ -209,7 +209,7 @@ module Durababble
           updated_at timestamptz NOT NULL DEFAULT now(),
           completed_at timestamptz,
           dead_lettered_at timestamptz,
-          UNIQUE (worker_pool, target_kind, target_type, target_id, sequence)
+          UNIQUE (target_kind, target_type, target_id, sequence)
         )
       SQL
       execute(<<~SQL)
@@ -224,7 +224,7 @@ module Durababble
           locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
+          PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
     end
@@ -254,9 +254,8 @@ module Durababble
       create_postgres_index("inbox_worker_lease_idx", "ON #{table("inbox")} (status ASC, locked_by ASC)")
       create_postgres_index("target_activations_worker_lease_idx", "ON #{table("target_activations")} (status ASC, locked_by ASC)")
       create_postgres_index("inbox_idempotency_hash_idx", "ON #{table("inbox")} (idempotency_hash) WHERE idempotency_hash IS NOT NULL", unique: true)
-      create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, status, sequence)")
-      create_postgres_index("inbox_target_sequence_idx", "ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, sequence)")
-      create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (worker_pool, status, ready_at, created_at)")
+      create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
+      create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
       create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
       create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
     end

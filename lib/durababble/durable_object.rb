@@ -75,10 +75,12 @@ module Durababble
         end
       end
 
-      #: (Object, object_type: String, object_id: String, ?worker_pool: String) -> Object?
-      def state_from_store(store, object_type:, object_id:, worker_pool: "default")
+      # Object state is keyed by (object_type, object_id) alone; worker_pool is
+      # routing metadata, not identity, so reads never need a worker pool.
+      #: (Object, object_type: String, object_id: String) -> Object?
+      def state_from_store(store, object_type:, object_id:)
         store = store #: as untyped
-        state = store.object_state_entry(worker_pool:, object_type:, object_id:)
+        state = store.object_state_entry(object_type:, object_id:)
         state.equal?(Store::NO_OBJECT_STATE) ? UNINITIALIZED : state
       end
 
@@ -237,7 +239,7 @@ module Durababble
     def invoke_query(method_name, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
-        state = DurableObject.state_from_store(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
+        state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
         object.public_send(method_name, *args, **kwargs, &block)
@@ -379,7 +381,7 @@ module Durababble
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def build_object(object_class, object_id:, message:)
       worker_pool = message.fetch("worker_pool", @worker_pool)
-      state = DurableObject.state_from_store(@store, worker_pool:, object_type: object_class.object_type, object_id:)
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
       context = CommandContext.new(
         object_type: object_class.object_type,
         durable_id: object_id,

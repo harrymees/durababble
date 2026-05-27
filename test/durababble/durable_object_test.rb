@@ -82,9 +82,9 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       message ? [message] : []
     end
 
-    def object_state(object_type:, object_id:, worker_pool: "default") = @state
+    def object_state(object_type:, object_id:) = @state
 
-    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+    def object_state_entry(object_type:, object_id:)
       @state.nil? ? Durababble::Store::NO_OBJECT_STATE : @state
     end
 
