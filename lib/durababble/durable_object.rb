@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "durable_method_dsl"
+require_relative "execution_context"
 require_relative "error_formatting"
 
 module Durababble
@@ -48,8 +49,10 @@ module Durababble
         )
       end
 
-      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) -> String
-      def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs)
+      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) ?{ (?) -> untyped } -> String
+      def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs, &block)
+        raise ArgumentError, "blocks cannot be passed to durable object command `#{method_name}`: command arguments are serialized across nodes and blocks cannot be" if block
+
         store = Durababble.store_for(store:, engine:)
         store = store #: as untyped
         worker_pool ||= engine_worker_pool(engine)
@@ -57,12 +60,50 @@ module Durababble
         retry_policy = @exposed_commands[method_name]
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy
 
-        attributes = object_command_attributes(object_id: String(durable_id), method_name:)
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: object_type,
+            target_id: String(durable_id),
+            method_name:,
+            rpc_kind: "object_tell",
+            args:,
+            kwargs: kwargs.merge(idempotency_key:),
+            retry_policy:,
+          ) do |idempotency_key:, args:, kwargs:|
+            enqueue_tell(
+              store:,
+              worker_pool:,
+              object_id: String(durable_id),
+              method_name:,
+              args:,
+              kwargs:,
+              idempotency_key:,
+              retry_policy:,
+            )
+          end
+        end
+
+        enqueue_tell(
+          store:,
+          worker_pool:,
+          object_id: String(durable_id),
+          method_name:,
+          args:,
+          kwargs:,
+          idempotency_key:,
+          retry_policy:,
+        )
+      end
+
+      #: (store: Store, worker_pool: String, object_id: String, method_name: Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], idempotency_key: String?, retry_policy: RetryPolicy) -> String
+      def enqueue_tell(store:, worker_pool:, object_id:, method_name:, args:, kwargs:, idempotency_key:, retry_policy:)
+        attributes = object_command_attributes(object_id:, method_name:)
         Observability.trace("durababble.object.command.enqueue", attributes) do
           message_id = store.enqueue_object_command(
             worker_pool:,
             object_type: object_type,
-            object_id: String(durable_id),
+            object_id:,
             method_name: method_name.to_s,
             args:,
             kwargs:,
@@ -70,7 +111,7 @@ module Durababble
             idempotency_key:,
             max_attempts: retry_policy.maximum_attempts_limit,
           )
-          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: String(durable_id))
+          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
           message_id
         end
       end
@@ -220,9 +261,40 @@ module Durababble
     #: (Symbol, *Object?, **Object?) ?{ (Object?) -> Object? } -> Object?
     def method_missing(method_name, *args, **kwargs, &block)
       if @object_class.exposed_queries.key?(method_name)
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: @object_class.object_type,
+            target_id: @durable_id,
+            method_name:,
+            rpc_kind: "object_query",
+            args:,
+            kwargs:,
+          ) do |args:, kwargs:, **|
+            invoke_query(method_name, args:, kwargs:, block:)
+          end
+        end
+
         invoke_query(method_name, args:, kwargs:, block:)
       elsif (retry_policy = @object_class.exposed_commands[method_name])
-        invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
+        raise ArgumentError, "blocks cannot be passed to durable object command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
+
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: @object_class.object_type,
+            target_id: @durable_id,
+            method_name:,
+            rpc_kind: "object_command",
+            args:,
+            kwargs:,
+            retry_policy:,
+          ) do |idempotency_key:, args:, kwargs:|
+            invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key:)
+          end
+        end
+
+        invoke_command(method_name, retry_policy:, args:, kwargs:)
       else
         super
       end
@@ -246,20 +318,21 @@ module Durababble
       end
     end
 
-    #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
-    def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
+    #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: Object?) -> Object?
+    def invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key: nil)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
-        idempotency_key = kwargs.key?(:idempotency_key) ? kwargs.delete(:idempotency_key) : @idempotency_key
+        command_kwargs = kwargs.dup
+        command_idempotency_key = idempotency_key || (command_kwargs.key?(:idempotency_key) ? command_kwargs.delete(:idempotency_key) : @idempotency_key)
         command_id = @store.enqueue_object_command(
           worker_pool: @worker_pool,
           object_type: @object_class.object_type,
           object_id: @durable_id,
           method_name: method_name.to_s,
           args:,
-          kwargs:,
+          kwargs: command_kwargs,
           message_kind: "ask",
-          idempotency_key:,
+          idempotency_key: command_idempotency_key,
           max_attempts: retry_policy.maximum_attempts_limit,
         )
         @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)

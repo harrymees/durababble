@@ -9,8 +9,15 @@ require_relative "support/coverage"
 require "minitest/autorun"
 require "mocha/minitest"
 require "securerandom"
+require "active_support/isolated_execution_state"
 require "durababble"
 require "durababble/store/sqlite"
+
+# Durababble requires :fiber isolation so each reactor fiber checks out its own AR
+# connection (see Durababble.assert_fiber_isolation!). In a Rails+Falcon host the Falcon
+# Railtie sets this defensively; in our standalone test suite we set it here to match.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
+
 require_relative "support/test_workflow_helper"
 require_relative "support/store_backends"
 require_relative "support/fake_store_command_claiming"

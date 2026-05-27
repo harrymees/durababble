@@ -1,7 +1,12 @@
 # typed: false
 # frozen_string_literal: true
 
+require "active_support/isolated_execution_state"
 require "durababble"
+
+# Match the test suite / production hosts — Durababble.assert_fiber_isolation! refuses
+# to boot under the default :thread isolation.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
 store = Durababble::Store.connect(
   database_url: ENV.fetch("DURABABBLE_DATABASE_URL"),

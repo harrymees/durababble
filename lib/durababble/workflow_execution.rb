@@ -9,9 +9,13 @@ require_relative "execution_context"
 require_relative "workflow_determinism"
 require_relative "workflow_replay_history"
 require_relative "workflow_step_runner"
+require_relative "workflow"
 
 module Durababble
   class WorkflowExecution
+    #: Object
+    attr_reader :store
+
     #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, workflow_class: untyped, workflow: untyped, worker_pool: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false)
       @store = store
@@ -127,6 +131,73 @@ module Durababble
         record_wait_command!(command_id, name:, wait_request:)
       end
       await_command_result(future, command_id, interrupt_on_command:)
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object? } -> Object?
+    def call_handle_rpc(target_kind:, target_type:, target_id:, method_name:, rpc_kind:, args:, kwargs:, retry_policy: nil, &block)
+      assert_workflow_task!("durable handle RPC #{target_kind}:#{target_type}##{method_name}")
+      command_kwargs = kwargs.dup
+      caller_idempotency_key = command_kwargs.delete(:idempotency_key)
+      name = handle_rpc_command_name(target_kind:, target_type:, method_name:)
+      shape = handle_rpc_command_shape(
+        name:,
+        target_kind:,
+        target_type:,
+        target_id:,
+        method_name:,
+        rpc_kind:,
+        args:,
+        kwargs: command_kwargs,
+        idempotency_key: caller_idempotency_key,
+      )
+      raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
+      command_id, future, scheduled_from_history = synchronize_store do
+        command_id = @next_command_id
+        @next_command_id += 1
+        future = CommandFuture.new(command_id)
+        @futures[command_id] = future
+        scheduled_from_history = schedule_command!(command_id, name:, shape:, event_budget: 3)
+        [command_id, future, scheduled_from_history]
+      end
+      synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(retry_policy))
+      attributes = handle_rpc_attributes(
+        target_kind:,
+        target_type:,
+        target_id:,
+        method_name:,
+        rpc_kind:,
+        command_id:,
+      )
+      observability_attributes = attributes #: as untyped
+      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+
+      unless @replay_history.terminal_recorded?(command_id)
+        if scheduled_from_history
+          ensure_history_limit_allows!(additional_events: 2)
+          @replay_history.reserve_events!(2)
+        end
+        # The handle-RPC block runs OUTSIDE synchronize_store on purpose: it calls
+        # wait_for_inbox_message, which polls with a yielding sleep between SELECTs. Holding
+        # the store mutex across that poll would serialize the whole workflow. Concurrent
+        # sibling fan-out tasks issuing handle RPCs in parallel is safe because each fiber
+        # checks out its OWN ActiveRecord connection — that requires
+        # ActiveSupport::IsolatedExecutionState.isolation_level = :fiber, which
+        # Durababble.assert_fiber_isolation! enforces at Engine#execute entry. Under the
+        # default :thread isolation fibers would share one connection and the trilogy/pg
+        # driver's mid-query fiber yield (via rb_wait_for_single_fd) would interleave
+        # packets and corrupt the wire protocol.
+        dispatch_command!(command_id, step: synthetic_step, attributes:) do
+          idempotency_key = caller_idempotency_key || handle_rpc_idempotency_key(command_id)
+          handle_call = block #: as untyped
+          result = handle_call.call(idempotency_key:, args:, kwargs: command_kwargs.dup)
+          crash!(:handle_rpc_completed)
+          result
+        end
+      end
+      deliver_recorded_resolutions!
+      result = await_with_command_delivery(future, command_id)
+      raise_if_cancel_requested!
+      result
     end
 
     # Awaits a command future, delivering pending workflow commands at the resulting
@@ -294,6 +365,23 @@ module Durababble
       }
     end
 
+    #: (name: String, target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[Object?], kwargs: Hash[Symbol, Object?], idempotency_key: Object?) -> Hash[String, Object?]
+    def handle_rpc_command_shape(name:, target_kind:, target_type:, target_id:, method_name:, rpc_kind:, args:, kwargs:, idempotency_key:)
+      {
+        "name" => name,
+        "args" => args,
+        "kwargs" => kwargs,
+        "handle_rpc" => {
+          "target_kind" => target_kind,
+          "target_type" => target_type,
+          "target_id" => target_id,
+          "method" => method_name.to_s,
+          "rpc_kind" => rpc_kind,
+          "idempotency_key" => idempotency_key,
+        },
+      }
+    end
+
     #: (untyped) -> untyped
     def retry_shape(retry_policy)
       {
@@ -304,6 +392,31 @@ module Durababble
         "schedule" => retry_policy.schedule,
         "non_retryable_errors" => retry_policy.non_retryable_errors.map(&:to_s),
       }
+    end
+
+    #: (target_kind: String, target_type: String, method_name: Symbol) -> String
+    def handle_rpc_command_name(target_kind:, target_type:, method_name:)
+      "handle_rpc:#{target_kind}:#{target_type}:#{method_name}"
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, command_id: Integer) -> Hash[String, Object?]
+    def handle_rpc_attributes(target_kind:, target_type:, target_id:, method_name:, rpc_kind:, command_id:)
+      {
+        "durababble.workflow.id" => @workflow_id,
+        "durababble.step.name" => handle_rpc_command_name(target_kind:, target_type:, method_name:),
+        "durababble.step.index" => command_id,
+        "durababble.worker.id" => @worker_id,
+        "durababble.handle_rpc.target_kind" => target_kind,
+        "durababble.handle_rpc.target_type" => target_type,
+        "durababble.handle_rpc.target_id" => target_id,
+        "durababble.handle_rpc.method" => method_name.to_s,
+        "durababble.handle_rpc.kind" => rpc_kind,
+      }
+    end
+
+    #: (Integer) -> String
+    def handle_rpc_idempotency_key(command_id)
+      "durababble:v1:workflow:#{@workflow_id}:handle-rpc:#{command_id}"
     end
 
     #: (untyped, name: untyped, shape: untyped, event_budget: Integer) -> bool
@@ -712,6 +825,22 @@ module Durababble
       wait_request.wake_at
     end
 
+    # Serializes framework store writes for this workflow execution so that concurrent
+    # reactor fibers (steps, handle-RPC dispatch blocks, raw-Async fan-out tasks) can't
+    # observe each other's partially-applied state changes. Each fiber checks out its OWN
+    # ActiveRecord connection (Durababble requires
+    # ActiveSupport::IsolatedExecutionState.isolation_level = :fiber — enforced at
+    # Engine#execute entry); the mutex protects the in-memory bookkeeping (@futures,
+    # @next_command_id, replay history reservations) plus the small SQL bursts that record
+    # a command being scheduled.
+    #
+    # Load-bearing rule for any block reachable here: it must be SYNCHRONOUS and
+    # NON-YIELDING. This is a plain Mutex; wrapping a sleep/await/cross-node RPC inside it
+    # would serialize the whole workflow and risk a thread-level self-deadlock. Long-running
+    # work (handle-RPC dispatch blocks calling wait_for_inbox_message, etc.) runs OUTSIDE
+    # this mutex on purpose. Pool sizing: per-fiber checkout means each in-flight fan-out
+    # branch consumes a connection, so the pool must be >= max concurrent in-flight
+    # commands + 1.
     #: () { -> untyped } -> untyped
     def synchronize_store(&block)
       WorkflowDeterminism.allow_host_operations { @store_mutex.synchronize(&block) }
