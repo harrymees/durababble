@@ -144,11 +144,11 @@ module Durababble
         reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
         next reused if reused
 
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
         id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type:,
           target_id:,
@@ -162,7 +162,7 @@ module Durababble
           ready_at:,
           max_attempts:,
         )
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:, ready_at:)
         id
       end
       result #: as String
@@ -175,6 +175,9 @@ module Durababble
         raise KeyError, "workflow not found: #{workflow_id}" unless workflow
 
         decoded_workflow = decode_row(workflow)
+        persisted_workflow_name = decoded_workflow.fetch("name")
+        raise Error, "workflow #{workflow_id} is #{persisted_workflow_name}, not #{workflow_name}" unless persisted_workflow_name == workflow_name
+
         worker_pool = row_worker_pool(decoded_workflow)
         target_kind = "workflow"
         message_kind = "workflow_command"
@@ -184,11 +187,11 @@ module Durababble
 
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
 
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
         id = SecureRandom.uuid
         insert_inbox_message_without_transaction(
           id:,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type: workflow_name,
           target_id: workflow_id,
@@ -200,7 +203,7 @@ module Durababble
           shape_hash:,
           payload:,
         )
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type: workflow_name, target_id: workflow_id)
         id
       end
       result #: as String
@@ -263,9 +266,13 @@ module Durababble
       decode_row(row) if row
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Array[Hash[String, Object?]]
-    def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: "default")
-      execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
+    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String?) -> Array[Hash[String, Object?]]
+    def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: nil)
+      if worker_pool
+        execute_store_query(:inbox_messages_for_worker_pool, [worker_pool, target_kind, target_type, target_id]).map { |row| decode_row(row) }
+      else
+        execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
+      end
     end
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
@@ -296,6 +303,7 @@ module Durababble
       transaction do
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
+        next nil unless object_command_completion_target_matches?(command, object_type:, object_id:, state:, wakeup_changes:)
 
         worker_pool = row_worker_pool(command)
         save_object_state(worker_pool:, object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
@@ -337,13 +345,18 @@ module Durababble
     #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
     def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
       transaction do
+        command = lock_inbox_message_for_completion(message_id:, worker_id:)
+        next nil unless command
+        # Reject misrouted workflow_id before the lease guard so an inbox row
+        # belonging to a different workflow is a silent no-op rather than a
+        # LeaseConflict against an unrelated (not-running) workflow row.
+        next nil unless workflow_command_targets_workflow?(command, workflow_id)
+
         workflow = lock_workflow_for_update(workflow_id)
         terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
         # [DURABABBLE-LEASE-4] Workflow command history commits need the workflow and inbox leases.
         # Terminal workflows skip the lease assert so a late completion can dead-letter the inbox row.
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
-        command = lock_inbox_message_for_completion(message_id:, worker_id:)
-        next nil unless command
 
         if terminal
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
@@ -367,13 +380,17 @@ module Durababble
     #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
     def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
       transaction do
+        command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
+        next nil unless command
+        # Reject misrouted workflow_id before the lease guard, mirroring
+        # complete_workflow_command above.
+        next nil unless workflow_command_targets_workflow?(command, workflow_id)
+
         workflow = lock_workflow_for_update(workflow_id)
         terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
         # [DURABABBLE-LEASE-4] Workflow command failure history is also a workflow commit.
         # Terminal workflows skip the lease assert so a late failure can dead-letter the inbox row.
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
-        command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
-        next nil unless command
 
         if terminal
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
@@ -397,7 +414,7 @@ module Durababble
 
     #: (target_kind: Object?, target_type: Object?, target_id: Object?, ?worker_pool: String) -> Hash[String, Object?]?
     def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default")
-      row = execute_store_query(:target_activation, [target_kind, target_type, target_id]).first
+      row = execute_store_query(:target_activation, [worker_pool, target_kind, target_type, target_id]).first
       decode_row(row) if row
     end
 
@@ -636,7 +653,7 @@ module Durababble
     #: (Array[Hash[String, Object?]]) -> Integer
     def deliver_due_object_wakeups(wakeups)
       wakeups.each do |wakeup|
-        worker_pool = row_worker_pool(wakeup)
+        wakeup_worker_pool = row_worker_pool(wakeup)
         target_kind = "object"
         target_type = wakeup.fetch("object_type") #: as String
         target_id = wakeup.fetch("object_id") #: as String
@@ -644,11 +661,10 @@ module Durababble
         message_kind = "wake"
         payload = wakeup.fetch("payload")
         message_id = SecureRandom.uuid
-        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
-        sequence = sequence #: as Integer
+        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool: wakeup_worker_pool, target_kind:, target_type:, target_id:)
         insert_inbox_message_without_transaction(
           id: message_id,
-          worker_pool:,
+          worker_pool: mailbox_worker_pool,
           target_kind:,
           target_type:,
           target_id:,
@@ -660,8 +676,8 @@ module Durababble
           shape_hash: inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name: name, payload:),
           payload:,
         )
-        delete_object_wakeup_without_transaction(worker_pool:, object_type: target_type, object_id: target_id, name:)
-        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
+        delete_object_wakeup_without_transaction(worker_pool: wakeup_worker_pool, object_type: target_type, object_id: target_id, name:)
+        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:)
       end
       wakeups.length
     end
@@ -695,7 +711,7 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Integer
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> [Integer, String]
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       raise NotImplementedError
     end
@@ -785,6 +801,20 @@ module Durababble
       }
       history_payload["result"] = result if include_result
       history_payload
+    end
+
+    #: (Hash[String, Object?], String) -> bool
+    def workflow_command_targets_workflow?(command, workflow_id)
+      command.fetch("target_kind", nil) == "workflow" && command.fetch("target_id", nil) == workflow_id
+    end
+
+    #: (Hash[String, Object?], object_type: String?, object_id: String?, state: Object?, wakeup_changes: Array[ObjectWakeupChange]) -> bool
+    def object_command_completion_target_matches?(command, object_type:, object_id:, state:, wakeup_changes:)
+      target_required = !object_type.nil? || !object_id.nil? || !state.equal?(Store::NO_OBJECT_STATE) || !wakeup_changes.empty?
+      return true unless target_required
+      return true unless command.key?("target_kind")
+
+      command.fetch("target_kind") == "object" && command.fetch("target_type") == object_type && command.fetch("target_id") == object_id
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?

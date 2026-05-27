@@ -306,7 +306,7 @@ module Durababble
       when "workflow"
         current_workflow_lease(target_id, worker_pool:)
       when "object"
-        current_object_lease(target_type, target_id)
+        current_object_lease(target_type, target_id, worker_pool:)
       end
     end
 
@@ -315,8 +315,8 @@ module Durababble
       nil
     end
 
-    #: (String, String) -> Hash[String, Object?]?
-    def current_object_lease(object_type, object_id)
+    #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
+    def current_object_lease(object_type, object_id, worker_pool: nil)
       nil
     end
 

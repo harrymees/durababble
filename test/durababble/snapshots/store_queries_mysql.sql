@@ -126,7 +126,7 @@ WHERE id = ?
 -- mysql_claim_selected_target_activation
 UPDATE `durababble_mysql_snapshot_target_activations`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_claim_selected_workflow
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -243,7 +243,7 @@ LIMIT 1
 -- mysql_current_workflow_lease
 SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
 FROM `durababble_mysql_snapshot_workflows`
-WHERE id = ? <worker_pool_sql> AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
 
 -- mysql_dead_letter_inbox_message
 UPDATE `durababble_mysql_snapshot_inbox` SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?
@@ -255,7 +255,7 @@ DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND
 DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND object_type = ? AND object_id = ? AND name = ?
 
 -- mysql_delete_target_activation
-DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE target_kind = ? AND target_type = ? AND target_id = ?
+DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_drop_table
 DROP TABLE IF EXISTS `durababble_mysql_snapshot_workflows`
@@ -332,7 +332,7 @@ WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
 -- mysql_inbox_claim_rows_for_update
 SELECT *
 FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 100
@@ -341,7 +341,7 @@ FOR UPDATE
 -- mysql_inbox_head_for_update
 SELECT *
 FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 1
@@ -353,6 +353,11 @@ SELECT * FROM `durababble_mysql_snapshot_inbox` WHERE id = ?
 -- mysql_inbox_messages_for
 SELECT * FROM `durababble_mysql_snapshot_inbox`
 WHERE target_kind = ? AND target_type = ? AND target_id = ?
+ORDER BY sequence
+
+-- mysql_inbox_messages_for_worker_pool
+SELECT * FROM `durababble_mysql_snapshot_inbox`
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 ORDER BY sequence
 
 -- mysql_insert_fence
@@ -415,7 +420,7 @@ FOR UPDATE
 
 -- mysql_lock_target_activation_for_completion
 SELECT 1 FROM `durababble_mysql_snapshot_target_activations`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status = 'running' AND locked_by = ?
   AND locked_until >= NOW(6)
 FOR UPDATE
@@ -430,7 +435,7 @@ SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 SELECT id FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 
 -- mysql_mailbox_sequence_for_update
-SELECT last_sequence
+SELECT worker_pool, last_sequence
 FROM `durababble_mysql_snapshot_mailbox_sequences`
 WHERE target_kind = ? AND target_type = ? AND target_id = ?
 FOR UPDATE
@@ -532,7 +537,12 @@ WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 -- mysql_set_target_activation_pending
 INSERT INTO `durababble_mysql_snapshot_target_activations` (worker_pool, target_kind, target_type, target_id, status, ready_at)
 VALUES (?, ?, ?, ?, 'pending', ?)
-ON DUPLICATE KEY UPDATE status = 'pending', ready_at = VALUES(ready_at), locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+ON DUPLICATE KEY UPDATE
+  status = IF(worker_pool = VALUES(worker_pool), 'pending', status),
+  ready_at = IF(worker_pool = VALUES(worker_pool), VALUES(ready_at), ready_at),
+  locked_by = IF(worker_pool = VALUES(worker_pool), NULL, locked_by),
+  locked_until = IF(worker_pool = VALUES(worker_pool), NULL, locked_until),
+  updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
 
 -- mysql_steal_expired_leases
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -572,7 +582,7 @@ WHERE id = ? AND status = 'running'
   AND (? IS NULL OR (locked_by = ? AND locked_until >= NOW(6)))
 
 -- mysql_target_activation
-SELECT * FROM `durababble_mysql_snapshot_target_activations` WHERE target_kind = ? AND target_type = ? AND target_id = ?
+SELECT * FROM `durababble_mysql_snapshot_target_activations` WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_terminate_workflow
 UPDATE `durababble_mysql_snapshot_workflows`

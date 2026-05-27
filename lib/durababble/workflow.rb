@@ -336,7 +336,8 @@ module Durababble
 
     #: (untyped) -> String
     def inbox_worker_pool(message_id)
-      @worker_pool || @store.inbox_message(message_id)&.fetch("worker_pool", "default") || "default"
+      message = @store.inbox_message(message_id) if @store.respond_to?(:inbox_message)
+      message&.fetch("worker_pool", @worker_pool || "default") || @worker_pool || "default"
     end
 
     #: (untyped, ?untyped) -> untyped
@@ -363,8 +364,8 @@ module Durababble
       router.request(workflow_id: @workflow_id, command: method_name.to_s, payload:)
     end
 
-    #: (untyped) -> untyped
-    def workflow_rpc_client_for(worker_id)
+    #: (untyped, worker_pool: String) -> untyped
+    def workflow_rpc_client_for(worker_id, worker_pool:)
       if @store.local_workflow_rpc_node_id == worker_id && @store.local_workflow_rpc_handlers
         return WorkflowRpc::LocalClient.new(
           store: @store,
@@ -373,7 +374,6 @@ module Durababble
         )
       end
 
-      worker_pool = @worker_pool || "default"
       @store.workflow_rpc_client_factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
     end
 
