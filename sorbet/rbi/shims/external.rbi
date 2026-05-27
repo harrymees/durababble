@@ -194,6 +194,14 @@ class Trilogy
 end
 
 module SQLite3
+  class Backup
+    def initialize(destination, destination_name, source, source_name); end
+    def step(pages); end
+    def finish; end
+  end
+
+  class Database; end
+
   class ConstraintException < StandardError; end
 
   class Blob < String
