@@ -338,6 +338,7 @@ module Durababble
       transaction do
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
+        next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
         workflow = lock_workflow_for_update(workflow_id)
         if workflow && WorkflowStatus.terminal?(decode_row(workflow))
@@ -364,6 +365,7 @@ module Durababble
       transaction do
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
+        next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
         workflow = lock_workflow_for_update(workflow_id)
         if workflow && WorkflowStatus.terminal?(decode_row(workflow))
@@ -719,6 +721,11 @@ module Durababble
       }
       history_payload["result"] = result if include_result
       history_payload
+    end
+
+    #: (Hash[String, Object?], String) -> bool
+    def workflow_command_targets_workflow?(command, workflow_id)
+      command.fetch("target_kind", nil) == "workflow" && command.fetch("target_id", nil) == workflow_id
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?

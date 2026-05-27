@@ -567,7 +567,7 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result,
-      sql_result([{ "last_sequence" => "0" }]),
+      sql_result([{ "worker_pool" => "default", "last_sequence" => "0" }]),
       sql_result,
       sql_result,
       sql_result,

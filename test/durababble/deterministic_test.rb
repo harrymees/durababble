@@ -71,6 +71,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_retry_then_complete",
+    "workflow_command_target_identity_isolation",
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
     "object_command_failure_exhaustion",
@@ -575,6 +576,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("workflow_command_retry_then_complete", seed: 7)
 
     assert_empty result.violations
+  end
+
+  test "keeps workflow command completion scoped to the command target" do
+    result = Durababble::Deterministic.prove("workflow_command_target_identity_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wrong_workflow_command_target completed=false failed=false first_status=\"running\" second_status=\"running\" wf_b_history=0"
   end
 
   test "dead-letters a terminally-failed command exactly once with a single history entry through crashes" do

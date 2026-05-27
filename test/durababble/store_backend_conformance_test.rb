@@ -480,6 +480,38 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not complete workflow commands for a different workflow with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_target_identity") do |store|
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-a")
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-b")
+        first = store.enqueue_workflow_command(
+          workflow_id: "wf-a",
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method_name" => "approve", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-a-1",
+        )
+        second = store.enqueue_workflow_command(
+          workflow_id: "wf-a",
+          workflow_name: "approval",
+          method_name: "reject",
+          payload: { "method_name" => "reject", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-a-2",
+        )
+
+        store.claim_target_activation(worker_id: "command-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-a", worker_id: "command-worker", lease_seconds: 30, limit: 2)
+        assert_equal [first, second], claimed.map { |message| message.fetch("id") }
+
+        assert_nil store.complete_workflow_command(message_id: first, workflow_id: "wf-b", result: { "ok" => true }, worker_id: "command-worker")
+        assert_hash_includes store.inbox_message(first), "status" => "running", "locked_by" => "command-worker"
+        assert_nil store.fail_workflow_command(message_id: second, workflow_id: "wf-b", error: "wrong target", worker_id: "command-worker")
+        assert_hash_includes store.inbox_message(second), "status" => "running", "locked_by" => "command-worker"
+        assert_empty store.workflow_history_for("wf-a")
+        assert_empty store.workflow_history_for("wf-b")
+      end
+    end
+
     test "scopes workflow claims and command activations by persisted worker pool with #{backend.name}" do
       with_durababble_store(backend, "workflow_pool_routing") do |store|
         pool_a_workflow = store.enqueue_workflow(name: "shared-workflow", input: { "pool" => "a" }, worker_pool: "pool-a")
