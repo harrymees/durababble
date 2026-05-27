@@ -322,22 +322,26 @@ module Durababble
           next
         end
 
-        active_targets[work_item.target_key] = true
-        scheduled_item = work_item
         scheduled_count += 1
-        task.async do
-          worker.perform_work(scheduled_item)
-          @consecutive_errors = 0
-        rescue LeaseConflict => e
-          record_worker_error(e)
-        rescue StandardError => e
-          record_worker_error(e)
-        ensure
-          active_targets.delete(scheduled_item.target_key)
-          @wakeups.push(:finished)
-        end
+        active_targets[work_item.target_key] = true
+        schedule_work_item(task, worker, active_targets, work_item)
       end
       scheduled_count.positive?
+    end
+
+    #: (untyped, untyped, Hash[Array[String], untyped], untyped) -> void
+    def schedule_work_item(task, worker, active_targets, scheduled_item)
+      task.async do
+        worker.perform_work(scheduled_item)
+        @consecutive_errors = 0
+      rescue LeaseConflict => e
+        record_worker_error(e)
+      rescue StandardError => e
+        record_worker_error(e)
+      ensure
+        active_targets.delete(scheduled_item.target_key)
+        @wakeups.push(:finished)
+      end
     end
 
     #: (untyped) -> untyped

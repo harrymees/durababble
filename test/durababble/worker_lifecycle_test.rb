@@ -96,6 +96,33 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   end
 
+  class YieldingScheduledWorker
+    attr_reader :performed
+
+    def initialize
+      @claims = [
+        Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "yielding", "first"], :first),
+        Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "yielding", "second"], :second),
+      ]
+      @performed = Queue.new
+      @release_first = Queue.new
+    end
+
+    def claim_work(excluding_target_keys: nil)
+      @claims.shift
+    end
+
+    def perform_work(work_item)
+      @performed << work_item.payload
+      case work_item.payload
+      when :first
+        @release_first.pop
+      when :second
+        @release_first << true
+      end
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_worker_lifecycle_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -343,6 +370,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     eventually(timeout: 3) do
       assert_equal(["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") })
     end
+    assert_equal(:stopped, runtime.shutdown(timeout: 1))
   ensure
     release = true
     runtime&.shutdown(timeout: 1)
@@ -368,6 +396,26 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   ensure
     runtime&.shutdown(timeout: 1)
     thread&.join(1)
+  end
+
+  test "clears each active target after concurrently scheduled child work completes" do
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      worker_pool: "default",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    worker = YieldingScheduledWorker.new
+    active_targets = {}
+
+    Async do |task|
+      assert_equal(true, runtime.send(:schedule_available_work, task, worker, active_targets))
+    end
+
+    assert_equal([:first, :second], queue_values(worker.performed, 2))
+    assert_empty(active_targets, "completed child tasks should clear their own active target keys")
   end
 
   test "a single concurrent runtime can make workflow-to-object progress without another process" do
