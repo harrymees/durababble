@@ -23,13 +23,3 @@ The docs site source starts at [docs/content/README.md](docs/content/README.md).
 - [Benchmarks](bench/README.md)
 
 The Zeitung documentation source lives in `docs/content/`; see [docs/README.md](docs/README.md) for local preview and build commands.
-
-## Formal Verification
-
-Formal checks are part of CI and can be run locally:
-
-```sh
-mise exec -- bundle exec rake formal
-```
-
-See [docs/formal-model.md](docs/formal-model.md) for the invariant matrix.
