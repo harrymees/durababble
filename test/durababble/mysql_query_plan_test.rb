@@ -41,18 +41,11 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_access_types: ["range", "eq_ref"],
           max_rows_examined_per_scan: 5,
         },
-        "pending target activation claim probe" => {
-          sql: query_sql(:claim_pending_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
+        "target activation claim probe" => {
+          sql: query_sql(:claim_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
           params: ["default", now, "object", "counter"],
-          expected_key_fragment: "target_activations_queue",
+          expected_key_fragment: "target_activations_claim",
           expected_access_types: ["range"],
-        },
-        "expired target activation claim probe" => {
-          sql: query_sql(:claim_expired_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
-          params: ["default", now, "object", "counter"],
-          expected_key_fragment: "target_activations_expired",
-          expected_access_types: ["range"],
-          allow_filesort: true,
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
@@ -234,10 +227,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       ["status", "locked_until"]
     when "waits_timer_pending"
       ["status", "kind", "wake_at"]
-    when "target_activations_queue"
-      ["worker_pool", "status", "ready_at"]
-    when "target_activations_expired"
-      ["worker_pool", "status", "locked_until"]
+    when "target_activations_claim"
+      ["worker_pool", "target_kind", "target_type", "queue_available_at"]
     when "inbox_target"
       ["target_kind", "target_type", "target_id"]
     when "inbox_idempotency_hash"

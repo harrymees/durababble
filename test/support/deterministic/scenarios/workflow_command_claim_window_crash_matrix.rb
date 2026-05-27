@@ -13,8 +13,8 @@ module Durababble
           # the lease, letting recovery start immediately), a crash here leaves
           # the activation (window A) or the activation + inbox head (window B)
           # leased to the dead worker. Recovery therefore cannot proceed until
-          # the lease expires, then reclaims via claim_expired_target_activation
-          # / the expired-running inbox path and delivers every command exactly
+          # the lease expires, then reclaims via claim_target_activation / the
+          # expired-running inbox path and delivers every command exactly
           # once. This exercises the post-commit fault hooks on the claim
           # methods, systematically covering the inter-transaction gaps the
           # complete-side crash matrix does not.

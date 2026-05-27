@@ -354,7 +354,7 @@ module Durababble
       # Firing the fault here models a worker that died holding only the
       # activation lease. Because the lease is committed, recovery cannot
       # proceed until `locked_until` passes the virtual clock — then another
-      # worker reclaims the expired activation (claim_expired_target_activation)
+      # worker reclaims the expired activation through claim_target_activation
       # and drains the still-pending mailbox. Gated on an actual claim so an
       # empty poll neither traces nor faults.
       #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Object?, ?worker_pool: String) -> Object?

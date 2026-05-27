@@ -456,9 +456,10 @@ module Durababble
       # A target_activation (the #69 wakeup-coordination row) still `running` at
       # end of run whose lease has expired and was never reclaimed is the same
       # crashed-holder-never-reclaimed bug class as the stuck fence/outbox/inbox:
-      # a worker claimed the activation, crashed, and `claim_expired_target_activation`
-      # never took it over, so the target is wedged with pending inbox work nobody
-      # will ever drain. Only judged when the backend models a lease (`locked_until`).
+      # a worker claimed the activation, crashed, and the unified target
+      # activation claim path never took it over, so the target is wedged with
+      # pending inbox work nobody will ever drain. Only judged when the backend
+      # models a lease (`locked_until`).
       #: (untyped) -> untyped
       def verify_activation_invariants!(activations_state)
         final_time = scheduler.time

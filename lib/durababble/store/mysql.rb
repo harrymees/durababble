@@ -499,10 +499,7 @@ module Durababble
 
       transaction do
         filter_sql, filter_params = target_activation_filter_sql(target_kinds:, target_types:)
-        candidates = []
-        candidates.concat(execute_store_query(:claim_pending_target_activation, [worker_pool, now] + filter_params, filter_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_expired_target_activation, [worker_pool, now] + filter_params, filter_sql:).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = execute_store_query(:claim_target_activation, [worker_pool, now] + filter_params, filter_sql:).first
         next unless candidate
 
         execute_store_query(:claim_selected_target_activation, [worker_id, lease_seconds, worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
