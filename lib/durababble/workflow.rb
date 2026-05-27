@@ -8,7 +8,35 @@ require_relative "durable_method_dsl"
 require_relative "execution_context"
 
 module Durababble
-  Step = Data.define(:name, :retry_policy)
+  class Step
+    #: String
+    attr_reader :name
+    #: RetryPolicy
+    attr_reader :retry_policy
+
+    #: (name: String | Symbol, retry_policy: RetryPolicy, ?body: Proc?) -> void
+    def initialize(name:, retry_policy:, body: nil)
+      @name = name.to_s
+      @retry_policy = retry_policy
+      @body = body
+    end
+
+    #: (*Object?, **Object?) -> Object?
+    def call(*args, **kwargs)
+      execution = WorkflowExecutionContext.current || raise(Error, "durable step #{name} called outside workflow execution")
+
+      execution.call_step_object(self, args:, kwargs:)
+    end
+
+    #: (Object, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object?
+    def call_body(receiver, args:, kwargs:)
+      body = @body || raise(Error, "durable step #{name} has no callable body")
+      args = args #: as untyped
+      kwargs = kwargs #: as untyped
+      receiver = receiver #: as untyped
+      receiver.instance_exec(*args, **kwargs, &body)
+    end
+  end
 
   class StepRetryScheduled < Error; end
   class WorkflowSuspended < Error; end

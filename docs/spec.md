@@ -68,11 +68,25 @@ class FulfillOrder < Durababble::Workflow
 end
 ```
 
+Steps may also be defined as named reusable constants outside the workflow class with `Durababble.step`. Calling that object from workflow orchestration schedules the same durable command records as a method step, using the step object's explicit name for replay shape validation and stored step metadata. Reusable steps support the same retry options as method steps, and their body runs with the workflow instance as `self`, so `step_context` is available; `Durababble.step_context` exposes the same context when a step body is factored into plain functions.
+
+```ruby
+ChargeCardStep = Durababble.step("charge_card", retry: { maximum_attempts: 5, schedule: [1, 5, 30] }) do |order|
+  Payments.charge(order, idempotency_key: step_context.idempotency_key)
+end
+
+class FulfillOrder < Durababble::Workflow
+  def execute(order)
+    ChargeCardStep.call(order)
+  end
+end
+```
+
 Outside workflow execution, `Workflow.enqueue(input, id: nil, engine: nil, store: nil, worker_pool: nil)` creates a durable pending execution before any worker can run it and returns the workflow id. `Workflow.start(input, id: nil, engine: nil, store: nil, worker_pool: nil)` enqueues the same durable execution and returns a workflow handle. When `id:` is omitted, Durababble generates a new workflow id above the store boundary; when `id:` is provided, the enqueue path persists that exact id atomically in the selected worker pool and raises `Durababble::WorkflowAlreadyExists` if a workflow row already owns it, without appending workflow history, inbox messages, waits, or target activations. Completed, failed, canceled, and terminated workflow rows still own their ids, so deterministic ids are deduplication keys for the full lifetime of stored workflow state. `Workflow.at(workflow_id, engine: nil)` and `Workflow.handle(workflow_id, engine: nil)` return query/management handles for status, result, cancellation, termination, resume, and exposed methods. When `engine:` is omitted, these helpers use Durababble's configured default engine. Inside workflow execution, `Workflow.enqueue` and `Workflow.start` are child-workflow starts as specified below and do not accept `store:` or `engine:`.
 
 Idempotent start scopes caller keys to worker pool, workflow class, operation kind, and argument fingerprint. The same key with the same shape returns the same handle; the same key with a different shape raises `Durababble::IdempotencyKeyConflict`.
 
-`step_context` is available only while a workflow step is executing. It exposes `workflow_id`, `command_id`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and remain stable across retries of the same logical command.
+`step_context` and `Durababble.step_context` are available only while a workflow step is executing. They expose `workflow_id`, `command_id`, `attempt_number`, `idempotency_key`, and `heartbeat`. Idempotency keys are generated from durable coordinates and remain stable across retries of the same logical command.
 
 `expose` declares non-durable transient methods. Transient methods are invoked through `CallTransient` against the live workflow owner, take an owner-local fast path only when the current runtime owns the workflow lease, must not mutate durable state, must not call workflow steps or waits, and must not accept `idempotency_key:`. A transient workflow query requires an active lease owner; it does not enqueue inbox rows, create workflow rows, warm inactive workflows, or append workflow history, and stale/missing owner, lease handoff, and unavailable-owner failures follow `WorkflowRpc`/gRPC transient error mapping.
 

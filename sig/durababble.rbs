@@ -161,6 +161,9 @@ module Durababble
   class Step
     attr_reader name: String
     attr_reader retry_policy: RetryPolicy
+    def initialize: (name: String | Symbol, retry_policy: RetryPolicy, ?body: Proc?) -> void
+    def call: (*serialized_payload args, **serialized_payload kwargs) -> serialized_payload
+    def call_body: (Object receiver, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
   end
 
   class StepRetryScheduled < Error
@@ -678,6 +681,8 @@ module Durababble
   def self.engine: () -> Engine
   def self.engine_for: (?engine: Engine?, ?store: Store?) -> Engine
   def self.store_for: (?engine: Engine?, ?store: Store?) -> Store
+  def self.step: (String | Symbol name, ?retry: RetryPolicy | retry_config | nil, ?retry_policy: RetryPolicy | retry_config | nil) { (*serialized_payload args, **serialized_payload kwargs) -> serialized_payload } -> Step
+  def self.step_context: () -> StepContext
   def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload

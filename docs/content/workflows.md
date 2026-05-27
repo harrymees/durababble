@@ -5,7 +5,7 @@ weight: 20
 
 # Workflows
 
-Use a durable workflow when you want to describe a process from beginning to end. The workflow's `#execute` method is the recipe, and each `step` method is a checkpoint where Durababble persists what happened when some side effect executed. If a worker dies after step two of five, another worker can replay the workflow, reuse the completed step results from the database, and continue at the next unfinished step instead of starting over.
+Use a durable workflow when you want to describe a process from beginning to end. The workflow's `#execute` method is the recipe, and each step method or reusable step constant is a checkpoint where Durababble persists what happened when some side effect executed. If a worker dies after step two of five, another worker can replay the workflow, reuse the completed step results from the database, and continue at the next unfinished step instead of starting over.
 
 Good workflow-shaped examples include charging then shipping an order, importing a large CSV across several API calls, running a complicated LLM agent turn with tool calls till completion, or an automated review process that sometimes has a human-in-the-loop approval step. The key sign is that the work has a start, an expected finish, and a sequence of durable side effects you do not want to accidentally repeat.
 
@@ -379,6 +379,25 @@ end
 ```
 
 If `fetch_profile(2)` completes before `fetch_profile(1)`, replay resumes the same branch first and records the dependent `score_profile` steps in the same order. If one branch fails after others complete, the completed durable steps stay completed and the failure is recorded against the failing branch.
+
+## Reusable Step Constants
+
+Use `Durababble.step("name") { ... }` when a step should live outside one workflow class, for example in another file that several workflows import. The returned object is an ordinary Ruby constant with `#call`; invoking it from workflow orchestration records the same durable schedule, attempt, retry, and result rows as a method step. Give each reusable step a stable explicit name, because that name is part of replay validation and stored step metadata.
+
+```ruby
+ChargeCardStep = Durababble.step("charge_card", retry: { maximum_attempts: 5, schedule: [1, 5, 30] }) do |order|
+  Payments.charge(order.fetch("card_token"), idempotency_key: step_context.idempotency_key)
+end
+
+class FulfillOrder < Durababble::Workflow
+  def execute(order)
+    payment = ChargeCardStep.call(order)
+    { "payment_id" => payment.fetch("id") }
+  end
+end
+```
+
+Reusable step bodies run with the workflow instance as `self`, so `step_context` works the same way it does in a `step def` method. If a reusable step delegates to plain helper functions, those helpers can call `Durababble.step_context` while the step is executing.
 
 ## RPC
 
