@@ -234,6 +234,14 @@ WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 
 ORDER BY sequence
 LIMIT 1
 
+-- mysql_current_object_lease_for_worker_pool
+SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
+FROM `durababble_mysql_snapshot_inbox`
+WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND worker_pool = ? AND status = 'running'
+  AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+ORDER BY sequence
+LIMIT 1
+
 -- mysql_current_workflow_lease
 SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
 FROM `durababble_mysql_snapshot_workflows`

@@ -864,6 +864,17 @@ module Durababble
       SQL
     end
 
+    define(:pg_current_object_lease_for_worker_pool, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "inbox")}
+        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND worker_pool = $3 AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= now()
+        ORDER BY sequence
+        LIMIT 1
+      SQL
+    end
+
     define(:pg_mark_workflow_running, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
@@ -1405,6 +1416,17 @@ module Durababble
         SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
         FROM #{table(store, "inbox")}
         WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        ORDER BY sequence
+        LIMIT 1
+      SQL
+    end
+
+    define(:mysql_current_object_lease_for_worker_pool, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "inbox")}
+        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND worker_pool = ? AND status = 'running'
           AND locked_by IS NOT NULL AND locked_until >= NOW(6)
         ORDER BY sequence
         LIMIT 1

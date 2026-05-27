@@ -180,9 +180,13 @@ module Durababble
       row&.transform_values(&:itself)
     end
 
-    #: (Object?, Object?) -> Object?
-    def current_object_lease(object_type, object_id)
-      row = execute_store_query(:current_object_lease, [object_type, object_id]).first
+    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    def current_object_lease(object_type, object_id, worker_pool: nil)
+      row = if worker_pool
+        execute_store_query(:current_object_lease_for_worker_pool, [object_type, object_id, worker_pool]).first
+      else
+        execute_store_query(:current_object_lease, [object_type, object_id]).first
+      end
       row&.transform_values(&:itself)
     end
 

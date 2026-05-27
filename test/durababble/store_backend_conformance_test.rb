@@ -956,6 +956,69 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not advisory-deliver object messages across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "object_advisory_delivery_worker_pool") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+        worker_id = "pool-a-worker@127.0.0.1:34567"
+        claimed = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id:,
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_equal [message_id], claimed.map { |message| message.fetch("id") }
+
+        wrong_client = AdvisoryDeliveryClient.new
+        wrong_delivered = store.deliver_target_message(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          client_factory: ->(_address) { wrong_client },
+        )
+        assert_equal false, wrong_delivered
+        assert_empty wrong_client.deliveries
+
+        right_client = AdvisoryDeliveryClient.new
+        right_delivered = store.deliver_target_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          client_factory: lambda do |address|
+            assert_equal("127.0.0.1:34567", address)
+            right_client
+          end,
+        )
+
+        assert_equal true, right_delivered
+        assert_equal(
+          [
+            {
+              worker_pool: "pool-a",
+              target_kind: "object",
+              target_class: "counter",
+              target_id: "same",
+              expected_worker_id: worker_id,
+            },
+          ],
+          right_client.deliveries,
+        )
+      end
+    end
+
     test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
       skip("in-memory SQLite is a single serialized connection; a second Store.connect handle is a separate database") if backend.sqlite?
 

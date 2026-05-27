@@ -66,6 +66,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "inbox_messages_for_worker_pool_isolation",
     "mailbox_worker_pool_first_writer",
     "mailbox_worker_pool_isolation",
+    "object_advisory_delivery_worker_pool_isolation",
     "target_activation_worker_pool_completion_isolation",
     "target_activation_worker_pool_rearm_isolation",
     "stolen_lease_write_rejection",
@@ -679,6 +680,15 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, 'persisted_pools pools=["pool-a","pool-a"]'
     assert_includes result.trace, "right_pool_claim"
+  end
+
+  test "keeps object advisory delivery scoped to worker pool" do
+    result = Durababble::Deterministic.prove("object_advisory_delivery_worker_pool_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_delivery_pool_scope"
+    assert_includes result.trace, "wrong_pool_delivered=false"
+    assert_includes result.trace, 'deliveries=["pool-a"]'
   end
 
   test "keeps target activation completion scoped to worker pool" do
