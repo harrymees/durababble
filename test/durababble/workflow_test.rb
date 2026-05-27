@@ -134,6 +134,36 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  class MaterializedWorkflowMailboxPoolStore
+    attr_reader :commands, :deliveries, :waits
+
+    def initialize(worker_pool:)
+      @worker_pool = worker_pool
+      @commands = []
+      @deliveries = []
+      @waits = []
+    end
+
+    def enqueue_workflow_command(**kwargs)
+      @commands << kwargs
+      "msg-#{@commands.length}"
+    end
+
+    def inbox_message(message_id)
+      { "id" => message_id, "worker_pool" => @worker_pool }
+    end
+
+    def deliver_target_message(**kwargs)
+      @deliveries << kwargs
+      true
+    end
+
+    def wait_for_inbox_message(message_id)
+      @waits << message_id
+      "waited:#{message_id}"
+    end
+  end
+
   class WorkerPoolEnqueueStore
     attr_reader :enqueued
 
@@ -192,6 +222,38 @@ class DurababbleWorkflowTest < DurababbleTestCase
 
     assert_match(/terminal/, error.message)
     refute store.enqueued
+  end
+
+  test "workflow commands deliver through the persisted mailbox worker pool" do
+    store = MaterializedWorkflowMailboxPoolStore.new(worker_pool: "materialized")
+
+    result = ApiTestApprovalWorkflow.handle("wf-1", store:, worker_pool: "requested").approve(reason: "ok")
+
+    assert_equal "waited:msg-1", result
+    assert_equal ["msg-1"], store.waits
+    assert_equal(
+      [
+        {
+          workflow_id: "wf-1",
+          workflow_name: "api-test-approval-workflow",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } },
+          idempotency_key: nil,
+        },
+      ],
+      store.commands,
+    )
+    assert_equal(
+      [
+        {
+          worker_pool: "materialized",
+          target_kind: "workflow",
+          target_type: "api-test-approval-workflow",
+          target_id: "wf-1",
+        },
+      ],
+      store.deliveries,
+    )
   end
 
   test "worker pool class helpers enqueue through the store without per-pool engines" do

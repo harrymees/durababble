@@ -193,6 +193,25 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf", worker_pool: "default")
   end
 
+  test "current lease lookups ignore worker pool because target ids identify leases" do
+    connection = ScriptedPgConnection.new(params_results: [
+      lambda do |sql, params|
+        assert_equal(["wf"], params)
+        refute_match(/worker_pool\s*=/, sql)
+        sql_result([{ "workflow_id" => "wf", "worker_pool" => "pool-a", "worker_id" => "worker-a", "locked_until" => Time.now + 60 }])
+      end,
+      lambda do |sql, params|
+        assert_equal(["counter", "object-1"], params)
+        refute_match(/worker_pool\s*=/, sql)
+        sql_result([{ "worker_pool" => "pool-a", "object_id" => "object-1", "worker_id" => "worker-a", "locked_until" => Time.now + 60 }])
+      end,
+    ])
+    store = pg_store(connection)
+
+    assert_hash_includes store.current_workflow_lease("wf", worker_pool: "pool-b"), "workflow_id" => "wf", "worker_pool" => "pool-a"
+    assert_hash_includes store.current_object_lease("counter", "object-1", worker_pool: "pool-b"), "object_id" => "object-1", "worker_pool" => "pool-a"
+  end
+
   test "postgres enqueue_workflow inserts the pending row in one statement" do
     connection = ScriptedPgConnection.new
     store = pg_store(connection, schema: "durababble_test")
@@ -880,6 +899,41 @@ class DurababbleStoreTest < DurababbleTestCase
       target_type: "account",
       target_id: "acct-1",
       client_factory: ->(_address) { raise "no lease should skip client construction" },
+    )
+  end
+
+  test "advisory object delivery uses the active lease worker pool" do
+    client = FlakyDeliveryClient.new(failures: 0)
+    connection = ScriptedPgConnection.new(params_results: [
+      lambda do |_sql, params|
+        assert_equal(["counter", "same"], params)
+        sql_result([{ "worker_pool" => "pool-a", "object_id" => "same", "worker_id" => "127.0.0.1:34567", "locked_until" => Time.now + 60 }])
+      end,
+    ])
+
+    delivered = pg_store(connection).deliver_target_message(
+      worker_pool: "pool-b",
+      target_kind: "object",
+      target_type: "counter",
+      target_id: "same",
+      client_factory: lambda do |address|
+        assert_equal("127.0.0.1:34567", address)
+        client
+      end,
+    )
+
+    assert_equal true, delivered
+    assert_equal(
+      [
+        {
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_class: "counter",
+          target_id: "same",
+          expected_worker_id: "127.0.0.1:34567",
+        },
+      ],
+      client.deliveries,
     )
   end
 
