@@ -168,6 +168,49 @@ class DurababblePayloadLimitTest < DurababbleTestCase
         assert_equal "running", store.inbox_message(id).fetch("status")
       end
     end
+
+    test "enforces object wakeup payload limits when scheduling a wakeup with #{backend.name}" do
+      with_durababble_store(backend, "payload_object_wakeup") do |store|
+        payload = payload_value("object-wakeup")
+        size = serialized_size(payload)
+        wake_at = Time.utc(2026, 5, 25, 12, 0, 0)
+
+        under_id = store.enqueue_object_command(object_type: "PayloadObject", object_id: "wakeup-under", method_name: "sleep", args: [], kwargs: {})
+        store.claim_object_command(command_id: under_id, worker_id: "worker")
+        with_payload_limit(:inbox_payload, size + 1) do
+          store.complete_object_command(
+            command_id: under_id,
+            result: nil,
+            object_type: "PayloadObject",
+            object_id: "wakeup-under",
+            wakeup_changes: [Durababble::ObjectWakeupChange.new(:schedule, "timer", wake_at, payload)],
+            worker_id: "worker",
+          )
+        end
+        assert_equal 1, count_rows(store, "object_wakeups")
+
+        over_id = store.enqueue_object_command(object_type: "PayloadObject", object_id: "wakeup-over", method_name: "sleep", args: [], kwargs: {})
+        store.claim_object_command(command_id: over_id, worker_id: "worker")
+        before = ["object_wakeups", "inbox"].to_h { |table| [table, count_rows(store, table)] }
+        error = with_payload_limit(:inbox_payload, size - 1) do
+          assert_raises(Durababble::PayloadTooLarge) do
+            store.complete_object_command(
+              command_id: over_id,
+              result: nil,
+              object_type: "PayloadObject",
+              object_id: "wakeup-over",
+              wakeup_changes: [Durababble::ObjectWakeupChange.new(:schedule, "timer", wake_at, payload)],
+              worker_id: "worker",
+            )
+          end
+        end
+        assert_limit_error(error, surface: :inbox_payload, context: "object wakeup PayloadObject/wakeup-over (timer)")
+        # The command transaction rolls back, so no wakeup row is persisted and the sweeper never sees a
+        # poison-pill payload; the command is left running for ordinary retry handling.
+        assert_equal before, before.keys.to_h { |table| [table, count_rows(store, table)] }
+        assert_equal "running", store.inbox_message(over_id).fetch("status")
+      end
+    end
   end
 
   private

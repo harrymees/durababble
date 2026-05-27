@@ -19,6 +19,8 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "incomplete_step_retry_after_crash",
     "attempt_history_append_only",
     "concurrent_timer_wake_once",
+    "multiple_named_object_wakes",
+    "object_wake_survives_worker_crash",
     "timer_and_partition",
     "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
@@ -30,16 +32,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "duplicate_delivery_timer_and_outbox",
     "workflow_rpc_owner_state_matrix",
     "cooperative_cancellation_cleanup",
-    "grpc_workflow_rpc_response_matrix",
-    "grpc_workflow_rpc_transport_fault_matrix",
-    "grpc_workflow_rpc_transport_fault_reroute",
+    "rpc_workflow_rpc_response_matrix",
+    "rpc_workflow_rpc_transport_fault_matrix",
+    "rpc_workflow_rpc_transport_fault_reroute",
     "chaos",
   ].freeze
 
   CONTRACT_SCENARIOS = [
     "rpc_fault_injection",
-    "grpc_service_contract",
-    "grpc_wakeup_fault_matrix",
+    "rpc_service_contract",
+    "rpc_wakeup_fault_matrix",
   ].freeze
 
   def assert_scenarios_hold(scenarios, seeds:)
@@ -132,42 +134,42 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:completed_workflows)
   end
 
-  test "models gRPC workflow RPC transport response variants" do
-    contract = Durababble::Deterministic.prove("grpc_service_contract", seed: 55)
-    response = Durababble::Deterministic.prove("grpc_workflow_rpc_response_matrix", seed: 53)
-    transport_faults = Durababble::Deterministic.prove("grpc_workflow_rpc_transport_fault_matrix", seed: 56)
-    reroute_faults = Durababble::Deterministic.prove("grpc_workflow_rpc_transport_fault_reroute", seed: 57)
-    wakeup_faults = Durababble::Deterministic.prove("grpc_wakeup_fault_matrix", seed: 58)
+  test "models RPC workflow RPC transport response variants" do
+    contract = Durababble::Deterministic.prove("rpc_service_contract", seed: 55)
+    response = Durababble::Deterministic.prove("rpc_workflow_rpc_response_matrix", seed: 53)
+    transport_faults = Durababble::Deterministic.prove("rpc_workflow_rpc_transport_fault_matrix", seed: 56)
+    reroute_faults = Durababble::Deterministic.prove("rpc_workflow_rpc_transport_fault_reroute", seed: 57)
+    wakeup_faults = Durababble::Deterministic.prove("rpc_wakeup_fault_matrix", seed: 58)
 
     assert_empty contract.violations
-    assert_includes contract.trace, "grpc.awaken_batch"
-    assert_includes contract.trace, "grpc.evict_lease"
-    assert_includes contract.trace, "grpc.deliver_message"
-    assert_includes contract.trace, "grpc.call_transient_ok"
-    assert_includes contract.trace, "grpc.call_object_transient_ok"
-    assert_includes contract.trace, "grpc.deliver_message_stale_ack"
+    assert_includes contract.trace, "rpc.awaken_batch"
+    assert_includes contract.trace, "rpc.evict_lease"
+    assert_includes contract.trace, "rpc.deliver_message"
+    assert_includes contract.trace, "rpc.call_transient_ok"
+    assert_includes contract.trace, "rpc.call_object_transient_ok"
+    assert_includes contract.trace, "rpc.deliver_message_stale_ack"
     assert_empty response.violations
-    assert_includes response.trace, "grpc.call_transient"
-    assert_includes response.trace, "grpc.lease_moved"
-    assert_includes response.trace, "grpc.decode_moved"
-    assert_includes response.trace, "grpc.retry_success"
-    assert_includes response.trace, "grpc.unavailable"
-    assert_includes response.trace, "grpc.node_unavailable_observed"
-    assert_includes response.trace, "grpc.not_running"
-    assert_includes response.trace, "grpc.not_running_observed"
+    assert_includes response.trace, "rpc.call_transient"
+    assert_includes response.trace, "rpc.lease_moved"
+    assert_includes response.trace, "rpc.decode_moved"
+    assert_includes response.trace, "rpc.retry_success"
+    assert_includes response.trace, "rpc.unavailable"
+    assert_includes response.trace, "rpc.node_unavailable_observed"
+    assert_includes response.trace, "rpc.not_running"
+    assert_includes response.trace, "rpc.not_running_observed"
     assert_empty transport_faults.violations
-    assert_includes transport_faults.trace, "grpc.timeout"
-    assert_includes transport_faults.trace, "grpc.deadline_exceeded"
-    assert_includes transport_faults.trace, "grpc.rst"
-    assert_includes transport_faults.trace, "grpc.eof"
-    assert_includes transport_faults.trace, "grpc.response_timeout"
-    assert_includes transport_faults.trace, "grpc.duplicate_response"
+    assert_includes transport_faults.trace, "rpc.timeout"
+    assert_includes transport_faults.trace, "rpc.deadline_exceeded"
+    assert_includes transport_faults.trace, "rpc.rst"
+    assert_includes transport_faults.trace, "rpc.eof"
+    assert_includes transport_faults.trace, "rpc.response_timeout"
+    assert_includes transport_faults.trace, "rpc.duplicate_response"
     assert_empty reroute_faults.violations
-    assert_includes reroute_faults.trace, "grpc.transport_reroute_success"
+    assert_includes reroute_faults.trace, "rpc.transport_reroute_success"
     assert_empty wakeup_faults.violations
-    assert_includes wakeup_faults.trace, "grpc.drop"
-    assert_includes wakeup_faults.trace, "grpc.duplicate"
-    assert_includes wakeup_faults.trace, "grpc.wakeup_fault_observed"
+    assert_includes wakeup_faults.trace, "rpc.drop"
+    assert_includes wakeup_faults.trace, "rpc.duplicate"
+    assert_includes wakeup_faults.trace, "rpc.wakeup_fault_observed"
   end
 
   test "models step heartbeat cursor recovery after a crashed invocation" do
@@ -188,6 +190,24 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "step_retry_not_due"
     assert_equal 3, result.trace.scan("step_retry_attempt").length
     assert_equal 1, result.summary.fetch(:completed_workflows)
+  end
+
+  test "models multiple named durable-object wakes delivered once each" do
+    result = Durababble::Deterministic.prove("multiple_named_object_wakes", seed: 71)
+
+    assert_empty result.violations
+    assert_equal 3, result.trace.scan("object_wake_delivered").length
+    assert_includes result.trace, "object_wake_scheduled"
+    assert_equal 3, result.summary.fetch(:object_wakes_delivered)
+    assert_equal result.digest, Durababble::Deterministic.prove("multiple_named_object_wakes", seed: 71).digest
+  end
+
+  test "delivers durable-object wakes at-least-once across a worker crash" do
+    result = Durababble::Deterministic.prove("object_wake_survives_worker_crash", seed: 73)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_wake_delivered"
+    assert_equal result.digest, Durababble::Deterministic.prove("object_wake_survives_worker_crash", seed: 73).digest
   end
 
   test "models cooperative cancellation cleanup" do
