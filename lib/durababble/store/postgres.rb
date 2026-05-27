@@ -504,7 +504,7 @@ module Durababble
         return
       end
 
-      head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
+      head = execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
@@ -587,12 +587,12 @@ module Durababble
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
     def inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
-      execute_store_query(:inbox_claim_rows_for_update, [target_kind, target_type, target_id, limit])
+      execute_store_query(:inbox_claim_rows_for_update, [worker_pool, target_kind, target_type, target_id, limit])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
+      execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
     end
 
     #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?

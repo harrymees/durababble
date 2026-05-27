@@ -63,6 +63,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "parallel_wait_with_retrying_sibling",
     "wait_condition_command_wakeup",
     "wait_condition_sequential_command_wakeups",
+    "mailbox_worker_pool_isolation",
     "stolen_lease_write_rejection",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
@@ -631,6 +632,14 @@ class DurababbleDeterministicTest < DurababbleTestCase
     result = Durababble::Deterministic.prove("wait_condition_sequential_command_wakeups", seed: 1)
 
     assert_empty result.violations
+  end
+
+  test "keeps inbox claims scoped to the persisted worker pool" do
+    result = Durababble::Deterministic.prove("mailbox_worker_pool_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wrong_pool_claim claimed=[]"
+    assert_includes result.trace, "right_pool_claim"
   end
 
   test "atomically terminates dependents when termination requests crash" do

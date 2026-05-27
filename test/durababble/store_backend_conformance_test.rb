@@ -564,6 +564,45 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not claim inbox messages across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "inbox_worker_pool_isolation") do |store|
+        payload = { "method_name" => "write", "args" => [], "kwargs" => {} }
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload:,
+          idempotency_key: "pool-a-message",
+        )
+
+        wrong_pool = store.claim_inbox_messages(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id: "pool-b-worker",
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_empty wrong_pool
+        assert_hash_includes store.inbox_message(message_id), "status" => "pending", "locked_by" => nil
+
+        right_pool = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id: "pool-a-worker",
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_equal [message_id], right_pool.map { |message| message.fetch("id") }
+      end
+    end
+
     test "does not claim future target activations until ready with #{backend.name}" do
       with_durababble_store(backend, "target_activation_future") do |store|
         store.migrate!

@@ -316,7 +316,7 @@ WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
 -- mysql_inbox_claim_rows_for_update
 SELECT *
 FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 100
@@ -325,7 +325,7 @@ FOR UPDATE
 -- mysql_inbox_head_for_update
 SELECT *
 FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = ? AND target_type = ? AND target_id = ?
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 1

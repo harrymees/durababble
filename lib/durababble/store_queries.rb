@@ -1115,10 +1115,10 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
-        LIMIT $4
+        LIMIT $5
         FOR UPDATE
       SQL
     end
@@ -1127,7 +1127,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT 1
@@ -1789,7 +1789,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT #{Integer(limit)}
@@ -1801,7 +1801,7 @@ module Durababble
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
-        WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status IN ('pending', 'failed', 'running', 'dead_lettered')
         ORDER BY sequence
         LIMIT 1

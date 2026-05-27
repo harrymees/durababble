@@ -307,16 +307,16 @@ WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now(
 -- pg_inbox_claim_rows_for_update
 SELECT *
 FROM "durababble_pg_snapshot"."inbox"
-WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
-LIMIT $4
+LIMIT $5
 FOR UPDATE
 
 -- pg_inbox_head_for_update
 SELECT *
 FROM "durababble_pg_snapshot"."inbox"
-WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 1
