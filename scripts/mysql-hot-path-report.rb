@@ -29,6 +29,96 @@ module DurababbleMysqlHotPathReport
     "worker_poll_idle" => "Trace one Worker#tick poll when no workflow work is available.",
     "worker_tick_claim" => "Trace one Worker#tick that polls, claims a workflow, and runs it to completion.",
   }.freeze
+  SQL_KEYWORDS = [
+    "ALL",
+    "AND",
+    "AS",
+    "ASC",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CHARSET",
+    "COALESCE",
+    "COLLATE",
+    "COUNT",
+    "CREATE",
+    "CURRENT_TIMESTAMP",
+    "DATE_ADD",
+    "DATETIME",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DO",
+    "ELSE",
+    "END",
+    "ENGINE",
+    "EXISTS",
+    "FORCE",
+    "FOR",
+    "FROM",
+    "GREATEST",
+    "GROUP",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IN",
+    "INDEX",
+    "INSERT",
+    "INTERVAL",
+    "INTO",
+    "IS",
+    "JOIN",
+    "KEY",
+    "LEAST",
+    "LIMIT",
+    "LOCKED",
+    "LONGBLOB",
+    "MAX",
+    "MIN",
+    "NOT",
+    "NOW",
+    "NULL",
+    "ON",
+    "OR",
+    "ORDER",
+    "PRIMARY",
+    "SELECT",
+    "SET",
+    "SKIP",
+    "TABLE",
+    "TEXT",
+    "THEN",
+    "UNIQUE",
+    "UPDATE",
+    "VALUES",
+    "VARCHAR",
+    "WHEN",
+    "WHERE",
+  ].freeze
+  SQL_TOKEN_PATTERN = %r{
+    --[^\n]*
+    |\/\*.*?\*\/
+    |`(?:``|[^`])*`
+    |'(?:''|\\.|[^'\\])*'
+    |"(?:""|\\.|[^"\\])*"
+    |\b(?:#{Regexp.union(SQL_KEYWORDS).source})\b
+    |\b\d+(?:\.\d+)?\b
+    |\$[0-9]+|\?
+  }imx
+  EXPLAIN_COLUMNS = [
+    ["id", "ID"],
+    ["select_type", "Select"],
+    ["table", "Table"],
+    ["partitions", "Partitions"],
+    ["type", "Access"],
+    ["possible_keys", "Possible keys"],
+    ["key", "Chosen key"],
+    ["key_len", "Key length"],
+    ["ref", "Ref"],
+    ["rows", "Rows"],
+    ["filtered", "Filtered %"],
+    ["Extra", "Extra"],
+  ].freeze
 
   class ReportWorkflow < Durababble::Workflow
     workflow_name DEFAULT_WORKFLOW_NAME
@@ -202,39 +292,20 @@ module DurababbleMysqlHotPathReport
     def explain_query(query)
       return { skipped: "query failed before execution" } if query[:error]
 
-      row = @recorder.disabled do
-        @store.send(:execute_store_query_sql, "EXPLAIN FORMAT=JSON #{query.fetch(:sql)}", query.fetch(:params)).first
+      rows = @recorder.disabled do
+        @store.send(:execute_store_query_sql, "EXPLAIN #{query.fetch(:sql)}", query.fetch(:params))
       end
-      json = row&.fetch("EXPLAIN")
-      return { skipped: "EXPLAIN returned no JSON" } unless json
+      rows = normalize_rows(rows)
+      return { skipped: "EXPLAIN returned no rows" } if rows.empty?
 
-      plan = JSON.parse(json)
-      {
-        summary: access_paths(plan),
-        json: plan,
-      }
+      { rows: rows }
     rescue StandardError => error
       { error: "#{error.class}: #{error.message}" }
     end
 
-    def access_paths(node)
-      case node
-      when Hash
-        current = []
-        if node.key?("access_type")
-          current << {
-            "table" => node["table_name"],
-            "access_type" => node["access_type"],
-            "key" => node["key"],
-            "used_key_parts" => node["used_key_parts"],
-            "rows_examined_per_scan" => node["rows_examined_per_scan"],
-          }.compact
-        end
-        current + node.values.flat_map { |value| access_paths(value) }
-      when Array
-        node.flat_map { |value| access_paths(value) }
-      else
-        []
+    def normalize_rows(rows)
+      rows.map do |row|
+        row.to_h.transform_keys(&:to_s)
       end
     end
   end
@@ -340,9 +411,19 @@ module DurababbleMysqlHotPathReport
         fixture_size: @options.fetch(:fixture_size),
         result: DurababbleMysqlHotPathReport.format_value(result),
         total_query_runtime_ms: recorder.queries.sum { |query| query.fetch(:duration_ms, 0.0) }.round(3),
+        table_ddls: collect_table_ddls(store, recorder.queries),
         queries: recorder.queries,
         events: recorder.events,
       }
+    end
+
+    def collect_table_ddls(store, queries)
+      available_tables = store.send(:execute, "SHOW TABLES").map { |row| row.values.first }.select { |table_name| table_name.start_with?("#{store.send(:table_prefix)}_") }
+      table_names = DurababbleMysqlHotPathReport.table_names_from_queries(queries, table_prefix: store.send(:table_prefix)) & available_tables
+      table_names.to_h do |table_name|
+        row = store.send(:execute, "SHOW CREATE TABLE #{DurababbleMysqlHotPathReport.quote_identifier(table_name)}").first
+        [table_name, row.fetch("Create Table")]
+      end
     end
 
     def write_report(report)
@@ -386,6 +467,10 @@ module DurababbleMysqlHotPathReport
       DurababbleMysqlHotPathReport.runtime_label(value)
     end
 
+    def explain_value(value)
+      DurababbleMysqlHotPathReport.explain_value(value)
+    end
+
     def escape_table(value)
       DurababbleMysqlHotPathReport.escape_table(value)
     end
@@ -423,6 +508,7 @@ module DurababbleMysqlHotPathReport
       queries.each do |query|
         append_query(lines, query)
       end
+      append_schema_appendix(lines)
       lines.join("\n")
     end
 
@@ -460,22 +546,36 @@ module DurababbleMysqlHotPathReport
         return
       end
 
-      summary = explain.fetch(:summary)
-      if summary.empty?
-        lines << "**EXPLAIN access paths:** none reported"
-      else
-        lines << "**EXPLAIN access paths:**"
-        lines << ""
-        lines << "| Table | Access | Key | Key parts | Rows/scan |"
-        lines << "| --- | --- | --- | --- | --- |"
-        summary.each do |path|
-          lines << "| #{path.fetch("table", "")} | #{path.fetch("access_type", "")} | #{path.fetch("key", "")} | #{Array(path["used_key_parts"]).join(", ")} | #{path.fetch("rows_examined_per_scan", "")} |"
-        end
+      rows = explain.fetch(:rows)
+      if rows.empty?
+        lines << "**EXPLAIN plan:** none reported"
+        return
+      end
+
+      lines << "**EXPLAIN plan:**"
+      lines << ""
+      lines << "| #{EXPLAIN_COLUMNS.map(&:last).join(" | ")} |"
+      lines << "| #{EXPLAIN_COLUMNS.map { "---" }.join(" | ")} |"
+      rows.each do |row|
+        lines << "| #{EXPLAIN_COLUMNS.map { |key, _label| escape_table(explain_value(row[key])) }.join(" | ")} |"
       end
       lines << ""
-      lines << "```json"
-      lines << JSON.pretty_generate(explain.fetch(:json))
-      lines << "```"
+    end
+
+    def append_schema_appendix(lines)
+      table_ddls = @report.fetch(:table_ddls, {})
+      return if table_ddls.empty?
+
+      lines << "## Schema Appendix"
+      lines << ""
+      table_ddls.each do |table_name, ddl|
+        lines << "### `#{table_name}`"
+        lines << ""
+        lines << "```sql"
+        lines << ddl
+        lines << "```"
+        lines << ""
+      end
     end
   end
 
@@ -498,6 +598,18 @@ module DurababbleMysqlHotPathReport
             h1, h2 { line-height: 1.2; }
             code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
             pre { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px; overflow: auto; padding: 12px; }
+            pre.sql { line-height: 1.5; overflow: visible; white-space: pre-wrap; }
+            .sql-keyword { color: #cf222e; font-weight: 600; }
+            .sql-identifier { color: #0550ae; }
+            .sql-string { color: #0a3069; }
+            .sql-number { color: #953800; }
+            .sql-placeholder { color: #116329; font-weight: 600; }
+            .sql-comment { color: #6e7781; font-style: italic; }
+            .sql-table { border-bottom: 1px dotted #0550ae; cursor: help; position: relative; }
+            .schema-popover { background: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; box-shadow: 0 8px 24px rgb(140 149 159 / 35%); color: #1f2328; display: none; left: 0; max-height: 380px; min-width: min(560px, calc(100vw - 96px)); max-width: min(920px, calc(100vw - 96px)); overflow: auto; padding: 10px; position: absolute; top: 1.6em; white-space: normal; z-index: 10; }
+            .sql-table:hover .schema-popover, .sql-table:focus .schema-popover { display: block; }
+            .schema-popover-title { display: block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; margin-bottom: 8px; }
+            .schema-popover .schema-ddl { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px; display: block; font-size: 12px; line-height: 1.5; overflow: auto; padding: 8px; white-space: pre; }
             table { border-collapse: collapse; width: 100%; }
             th, td { border: 1px solid #d8dee4; padding: 6px 8px; text-align: left; vertical-align: top; }
             th { background: #f6f8fa; }
@@ -512,6 +624,23 @@ module DurababbleMysqlHotPathReport
             .timeline col.rows { width: 8%; }
             .timeline col.purpose-col { width: 24%; }
             .timeline code { white-space: normal; }
+            .explain-list { display: grid; gap: 12px; margin-top: 8px; }
+            .explain-card { background: #ffffff; border: 1px solid #d8dee4; border-radius: 6px; padding: 14px; }
+            .explain-card-header { align-items: start; display: grid; gap: 8px 12px; grid-template-columns: minmax(0, 1fr) auto; margin-bottom: 12px; }
+            .explain-title { font-weight: 700; overflow-wrap: anywhere; }
+            .explain-badges { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+            .explain-badge { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 999px; font-size: 12px; padding: 2px 8px; white-space: nowrap; }
+            .explain-access { background: #ddf4ff; border-color: #54aeef; }
+            .explain-metrics { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); margin: 0 0 12px; }
+            .explain-metric { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 6px; min-width: 0; padding: 7px 8px; }
+            .explain-metric dt, .explain-section-label { color: #57606a; font-size: 12px; margin: 0 0 2px; }
+            .explain-metric dd { font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+            .explain-section { margin-top: 10px; }
+            .explain-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+            .explain-pill { background: #f6f8fa; border: 1px solid #d8dee4; border-radius: 999px; max-width: 100%; overflow-wrap: anywhere; padding: 1px 7px; white-space: normal; }
+            .explain-pill-selected { background: #ddf4ff; border-color: #54aeef; }
+            .explain-extra .explain-pill { background: #fff8c5; border-color: #d4a72c; }
+            .muted { color: #6e7781; }
             .query { border-top: 1px solid #d8dee4; margin-top: 24px; padding-top: 16px; }
             .purpose { color: #57606a; }
             summary { cursor: pointer; font-weight: 600; }
@@ -574,7 +703,7 @@ module DurababbleMysqlHotPathReport
             <dt>Params</dt><dd><code>#{h(format_params(query.fetch(:params)))}</code></dd>
             <dt>Rows</dt><dd>#{h(rows_label(query))}</dd>
           </dl>
-          <details open><summary>SQL</summary><pre><code>#{h(query.fetch(:sql))}</code></pre></details>
+          <details open><summary>SQL</summary><pre class="sql"><code>#{highlight_sql(query.fetch(:sql))}</code></pre></details>
           #{explain_section(query.fetch(:explain))}
         </section>
       HTML
@@ -584,20 +713,72 @@ module DurababbleMysqlHotPathReport
       return "<p><strong>EXPLAIN error:</strong> <code>#{h(explain.fetch(:error))}</code></p>" if explain[:error]
       return "<p><strong>EXPLAIN skipped:</strong> #{h(explain.fetch(:skipped))}</p>" if explain[:skipped]
 
-      summary = explain.fetch(:summary)
-      table = if summary.empty?
-        "<p><strong>EXPLAIN access paths:</strong> none reported</p>"
-      else
-        rows = summary.map do |path|
-          "<tr><td>#{h(path.fetch("table", ""))}</td><td>#{h(path.fetch("access_type", ""))}</td><td>#{h(path.fetch("key", ""))}</td><td>#{h(Array(path["used_key_parts"]).join(", "))}</td><td>#{h(path.fetch("rows_examined_per_scan", "").to_s)}</td></tr>"
-        end.join("\n")
-        "<table><thead><tr><th>Table</th><th>Access</th><th>Key</th><th>Key parts</th><th>Rows/scan</th></tr></thead><tbody>#{rows}</tbody></table>"
-      end
-      "#{table}<details><summary>EXPLAIN JSON</summary><pre><code>#{h(JSON.pretty_generate(explain.fetch(:json)))}</code></pre></details>"
+      rows = explain.fetch(:rows)
+      return "<p><strong>EXPLAIN plan:</strong> none reported</p>" if rows.empty?
+
+      <<~HTML
+        <details open>
+          <summary>EXPLAIN plan</summary>
+          <div class="explain-list">#{rows.map { |row| explain_card(row) }.join("\n")}</div>
+        </details>
+      HTML
+    end
+
+    def explain_card(row)
+      possible_keys = explain_terms(row["possible_keys"], separator: ",")
+      extras = explain_terms(row["Extra"], separator: ";")
+
+      <<~HTML
+        <article class="explain-card">
+          <div class="explain-card-header">
+            <span class="explain-title"><code>#{h(explain_value(row["table"]))}</code></span>
+            <div class="explain-badges">
+              <span class="explain-badge">#{h(explain_value(row["select_type"]))} ##{h(explain_value(row["id"]))}</span>
+              <span class="explain-badge explain-access">access: #{h(explain_value(row["type"]))}</span>
+            </div>
+          </div>
+          <dl class="explain-metrics">
+            <div class="explain-metric"><dt>Rows</dt><dd>#{h(explain_value(row["rows"]))}</dd></div>
+            <div class="explain-metric"><dt>Filtered</dt><dd>#{h(filtered_value(row["filtered"]))}</dd></div>
+            <div class="explain-metric"><dt>Key length</dt><dd>#{h(explain_value(row["key_len"]))}</dd></div>
+            <div class="explain-metric"><dt>Ref</dt><dd>#{h(explain_value(row["ref"]))}</dd></div>
+            <div class="explain-metric"><dt>Partitions</dt><dd>#{h(explain_value(row["partitions"]))}</dd></div>
+          </dl>
+          <div class="explain-section"><span class="explain-section-label">Chosen key</span><div class="explain-pills">#{pill_list(explain_terms(row["key"], separator: ","), selected: true)}</div></div>
+          <div class="explain-section"><span class="explain-section-label">Possible keys</span><div class="explain-pills">#{pill_list(possible_keys, selected_value: row["key"])}</div></div>
+          <div class="explain-section explain-extra"><span class="explain-section-label">Extra</span><div class="explain-pills">#{pill_list(extras)}</div></div>
+        </article>
+      HTML
+    end
+
+    def explain_terms(value, separator:)
+      return [] if value.nil?
+
+      value.to_s.split(separator).map(&:strip).reject(&:empty?)
+    end
+
+    def filtered_value(value)
+      return explain_value(value) if value.nil?
+
+      "#{explain_value(value)}%"
+    end
+
+    def pill_list(values, selected: false, selected_value: nil)
+      return %(<span class="muted">NULL</span>) if values.empty?
+
+      values.map do |value|
+        classes = ["explain-pill"]
+        classes << "explain-pill-selected" if selected || (!selected_value.nil? && value == selected_value.to_s)
+        %(<code class="#{classes.join(" ")}">#{h(value)}</code>)
+      end.join
     end
 
     def h(value)
       CGI.escapeHTML(value.to_s)
+    end
+
+    def highlight_sql(value)
+      DurababbleMysqlHotPathReport.highlight_sql(value, table_ddls: @report.fetch(:table_ddls, {}))
     end
   end
 
@@ -705,8 +886,81 @@ module DurababbleMysqlHotPathReport
       "#{format("%.3f", value)}ms"
     end
 
+    def explain_value(value)
+      return "NULL" if value.nil?
+
+      value.to_s
+    end
+
+    def highlight_sql(value, table_ddls: {}, popovers: true)
+      sql = value.to_s
+      result = +""
+      offset = 0
+      sql.to_enum(:scan, SQL_TOKEN_PATTERN).each do
+        match = Regexp.last_match
+        result << CGI.escapeHTML(sql[offset...match.begin(0)].to_s)
+        result << highlight_sql_token(match[0], table_ddls:, popovers:)
+        offset = match.end(0)
+      end
+      result << CGI.escapeHTML(sql[offset..].to_s)
+      result
+    end
+
+    def highlight_sql_token(token, table_ddls:, popovers:)
+      escaped_token = CGI.escapeHTML(token)
+      table_name = sql_identifier_name(token)
+      if popovers && table_name && table_ddls.key?(table_name)
+        ddl = table_ddls.fetch(table_name)
+        highlighted_ddl = highlight_sql(ddl, popovers: false)
+        return %(<span class="sql-identifier sql-table" tabindex="0">#{escaped_token}<span class="schema-popover" role="tooltip"><span class="schema-popover-title">#{CGI.escapeHTML(table_name)}</span><code class="schema-ddl">#{highlighted_ddl}</code></span></span>)
+      end
+
+      %(<span class="#{sql_token_class(token)}">#{escaped_token}</span>)
+    end
+
+    def sql_identifier_name(token)
+      return unless token.start_with?("`")
+
+      token[1...-1].gsub("``", "`")
+    end
+
+    def sql_token_class(token)
+      case token
+      when %r{\A(?:--|/\*)}
+        "sql-comment"
+      when /\A`/
+        "sql-identifier"
+      when /\A['"]/
+        "sql-string"
+      when /\A(?:\$\d+|\?)\z/
+        "sql-placeholder"
+      when /\A\d/
+        "sql-number"
+      else
+        "sql-keyword"
+      end
+    end
+
     def escape_table(value)
       value.to_s.gsub("|", "\\|")
+    end
+
+    def table_names_from_queries(queries, table_prefix:)
+      table_names = queries.flat_map do |query|
+        table_names_from_sql(query.fetch(:sql), table_prefix:)
+      end
+      table_names.uniq.sort
+    end
+
+    def table_names_from_sql(sql, table_prefix:)
+      prefixed_table = /#{Regexp.escape(table_prefix)}_[A-Za-z0-9_]+/
+      quoted_tables = sql.scan(/\b(?:FROM|JOIN|UPDATE|INTO)\s+`((?:``|[^`])+)`/i).flatten.map { |name| name.gsub("``", "`") }
+      unquoted_tables = sql.scan(/\b(?:FROM|JOIN|UPDATE|INTO)\s+(#{prefixed_table})\b/i).flatten
+      (quoted_tables + unquoted_tables).select { |name| name.start_with?("#{table_prefix}_") }
+    end
+
+    def quote_identifier(identifier)
+      "`#{identifier.to_s.gsub("`", "``")}`"
     end
   end
 end
