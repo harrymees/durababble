@@ -69,7 +69,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "current object activation lease probe" => {
           sql: query_sql(:current_object_activation_lease),
-          params: ["default", "counter", "object-1"],
+          params: ["counter", "object-1"],
           expected_key_fragment: "PRIMARY",
         },
         "current object inbox lease probe" => {
