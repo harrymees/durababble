@@ -24,7 +24,6 @@ module Durababble
           locked_by text,
           locked_until timestamptz,
           next_run_at timestamptz,
-          runnable_immediately boolean NOT NULL DEFAULT true,
           cancel_reason text,
           cancel_requested_at timestamptz,
           cancel_delivered_at timestamptz,
@@ -233,12 +232,8 @@ module Durababble
     # require a separate statement), so the secondary indexes are created here in their final shape.
     #: () -> untyped
     def create_performance_indexes!
-      create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, created_at ASC)")
-      create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, next_run_at ASC, created_at ASC)")
+      create_postgres_index("workflows_claim_idx", "ON #{table("workflows")} (worker_pool ASC, (#{StoreQueries::POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, locked_until ASC)")
-      create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, runnable_immediately ASC, created_at ASC)")
-      create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (worker_pool ASC, next_run_at ASC, created_at ASC) WHERE status = 'failed'")
-      create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (worker_pool ASC, created_at ASC) WHERE status = 'canceling'")
       create_postgres_index("workflow_history_command_idx", "ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
       create_postgres_index("waits_event_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, event_key ASC, created_at ASC)")
       create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")

@@ -6,6 +6,14 @@ module Durababble
     Query = Struct.new(:id, :backend, :description, :builder, keyword_init: true)
 
     QUERIES = {}
+    POSTGRES_WORKFLOW_CLAIM_EXPRESSION = [
+      "CASE",
+      "WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)",
+      "WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at",
+      "WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until",
+      "ELSE NULL",
+      "END",
+    ].join(" ").freeze
 
     class << self
       #: (untyped, backend: untyped, ?description: String?) { (untyped) -> untyped } -> void
@@ -68,8 +76,8 @@ module Durababble
 
     HOT_QUERY_COVERAGE = {
       "workflow queue claim" => {
-        methods: ["Store.claim_runnable_workflow", "MysqlStore.claim_runnable_workflow"],
-        indexes: ["workflows_claim_idx", "workflows_queue_idx", "workflows_runnable_due_idx", "workflows_expired_lease_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
+        methods: ["Store.claim_runnable_workflow", "PostgresStore.claim_runnable_workflow", "MysqlStore.claim_runnable_workflow"],
+        indexes: ["workflows_claim_idx"],
         assertions: ["no sequential/full table scan", "allowed queue indexes", "LIMIT 1 probes", "FOR UPDATE SKIP LOCKED"],
         benchmarks: ["claim_runnable_workflows", "large_table_claim_scan"],
       },
@@ -105,71 +113,19 @@ module Durababble
       },
     }.freeze
 
-    define(:pg_claim_runnable_workflow, backend: :postgres) do |store, name_filter:|
+    define(:pg_claim_runnable_workflow, backend: :postgres, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_filter:|
       workflows = table(store, "workflows")
       <<~SQL.chomp
         WITH candidate AS (
-          SELECT id FROM (
-            SELECT id, created_at FROM (
-              SELECT id, created_at FROM #{workflows}
-              WHERE worker_pool = $1
-                AND status = 'pending'
-                AND runnable_immediately
-                #{name_filter}
-              ORDER BY status, runnable_immediately, created_at
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            ) pending_candidate
-            UNION ALL
-            SELECT id, created_at FROM (
-              SELECT id, created_at FROM #{workflows}
-              WHERE worker_pool = $1
-                AND status = 'pending'
-                AND next_run_at <= now()
-                #{name_filter}
-              ORDER BY next_run_at, created_at
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            ) due_pending_candidate
-            UNION ALL
-            SELECT id, created_at FROM (
-              SELECT id, created_at FROM #{workflows}
-              WHERE worker_pool = $1
-                AND status = 'failed'
-                AND next_run_at IS NOT NULL
-                AND next_run_at <= now()
-                #{name_filter}
-              ORDER BY created_at
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            ) failed_candidate
-            UNION ALL
-            SELECT id, created_at FROM (
-              SELECT id, created_at FROM #{workflows}
-              WHERE worker_pool = $1
-                AND status = 'canceling'
-                AND (next_run_at IS NULL OR next_run_at <= now())
-                #{name_filter}
-              ORDER BY created_at
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            ) canceling_candidate
-            UNION ALL
-            SELECT id, created_at FROM (
-              SELECT id, created_at FROM #{workflows}
-              WHERE worker_pool = $1
-                AND status = 'running' AND locked_until < now()
-                #{name_filter}
-              ORDER BY created_at
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            ) expired_candidate
-          ) candidates
-          ORDER BY created_at
+          SELECT id FROM #{workflows}
+          WHERE worker_pool = $1
+            AND (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) <= now()
+            #{name_filter}
           LIMIT 1
+          FOR UPDATE SKIP LOCKED
         )
         UPDATE #{workflows} AS workflows
-        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         FROM candidate
         WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
         RETURNING workflows.*
@@ -187,7 +143,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $3,
-            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -222,7 +178,7 @@ module Durababble
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
-          locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+          locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_by = $1
       SQL
     end
@@ -297,7 +253,7 @@ module Durababble
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
-          locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+          locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE status = 'running' AND locked_until < $1::timestamptz
       SQL
     end
@@ -486,7 +442,7 @@ module Durababble
     end
 
     define(:pg_mark_waits_workflows_pending, backend: :postgres) do |store, placeholders:|
-      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now() WHERE id IN (#{placeholders}) AND status = 'waiting'"
+      "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id IN (#{placeholders}) AND status = 'waiting'"
     end
 
     define(:pg_complete_step, backend: :postgres) do |store|
@@ -756,7 +712,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $3,
-            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -776,7 +732,7 @@ module Durababble
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
           END,
-          locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, runnable_immediately = false, updated_at = now()
+          locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, updated_at = now()
         WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
       SQL
     end
@@ -789,14 +745,14 @@ module Durababble
             WHEN EXISTS (SELECT 1 FROM #{table(store, "waits")} WHERE workflow_id = $1 AND status = 'pending') THEN 'waiting'
             ELSE 'pending'
           END,
-          locked_by = NULL, locked_until = NULL, runnable_immediately = true, updated_at = now()
+          locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE id = $1 AND status = 'running'
           AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
       SQL
     end
 
     define(:pg_make_workflow_due, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET next_run_at = NULL, runnable_immediately = true, updated_at = $2::timestamptz WHERE id = $1"
+      "UPDATE #{table(store, "workflows")} SET next_run_at = NULL, updated_at = $2::timestamptz WHERE id = $1"
     end
 
     define(:pg_request_workflow_cancellation, backend: :postgres) do |store|
@@ -810,7 +766,7 @@ module Durababble
     define(:pg_mark_workflow_canceling_for_request, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND status NOT IN ('completed', 'canceled')
       SQL
     end
@@ -916,7 +872,7 @@ module Durababble
       # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        SET status = 'running', error = NULL, next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND worker_pool = $2 AND status = 'pending' AND locked_by IS NULL
       SQL
     end
@@ -926,7 +882,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $1,
-            locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+            locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         WHERE id = $3 AND worker_pool = $4
           AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
@@ -939,20 +895,20 @@ module Durababble
     define(:pg_terminate_workflow, backend: :postgres) do |store|
       "UPDATE #{table(store, "workflows")}\n" \
         "SET status = 'terminated', result = $2::bytea, error = $3,\n  " \
-        "locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()\n" \
+        "locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now()\n" \
         "WHERE id = $1"
     end
 
     define(:pg_complete_workflow_with_worker, backend: :postgres) do |store|
       # [DURABABBLE-WF-1] Workflow completion requires the running lease; live durable work
       # is cleaned up after the UPDATE by the surrounding helper.
-      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() " \
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() " \
         "WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
     end
 
     define(:pg_complete_workflow, backend: :postgres) do |store|
       # [DURABABBLE-WF-1] Unfenced completion still rejects terminal rows and live durable work.
-      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() " \
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() " \
         "WHERE id = $1 " \
         "AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL)) " \
         "AND NOT EXISTS (SELECT 1 FROM #{table(store, "steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) " \
@@ -961,21 +917,21 @@ module Durababble
     end
 
     define(:pg_cancel_workflow_with_worker, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()"
+      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()"
     end
 
     define(:pg_cancel_workflow, backend: :postgres) do |store|
       # [DURABABBLE-WF-1] Unfenced cancel never stomps a terminal row.
-      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
+      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
     end
 
     define(:pg_fail_workflow_with_worker, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
+      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
     end
 
     define(:pg_fail_workflow, backend: :postgres) do |store|
       # [DURABABBLE-WF-1] Unfenced fail never stomps a terminal row.
-      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
+      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
     end
 
     define(:pg_terminate_workflow_waits, backend: :postgres) do |store|
