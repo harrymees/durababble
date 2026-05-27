@@ -413,10 +413,31 @@ module Durababble
       rescue GRPC::BadStatus
         raise
       rescue StandardError => e
+        observe_transient_error(request, e)
         remote_error_response(e)
       end
 
       private
+
+      # The remote caller learns about the failure through remote_error_response,
+      # but the serving node would otherwise have no local trace of an unexpected
+      # error it absorbed. Count it and log it so node-side operators can see it.
+      #: (Object, StandardError) -> void
+      def observe_transient_error(request, error)
+        request = request #: as untyped
+        method = request["method"]
+        Observability.count(
+          "durababble.rpc.server.errors",
+          "durababble.worker.id" => @node_id,
+          "durababble.rpc.method" => method,
+          "durababble.workflow.id" => request.workflow_id,
+          "error.type" => error.class.name,
+        )
+        Durababble.logger&.warn(
+          "Durababble RPC server #{@node_id} returning remote error for #{method}: " \
+            "#{error.class}: #{error.message}",
+        )
+      end
 
       #: (Object) -> void
       def authorize!(call)

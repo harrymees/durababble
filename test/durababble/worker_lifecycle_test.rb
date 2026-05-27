@@ -169,13 +169,11 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
     runtime.start
-    worker_store = runtime.instance_variable_get(:@worker_store)
-    rpc_store = runtime.instance_variable_get(:@rpc_store)
+    rpc_server = runtime.instance_variable_get(:@rpc_server)
+    rpc_server_store = rpc_server&.instance_variable_get(:@store)
 
-    refute_nil(worker_store)
-    refute_nil(rpc_store)
-    assert_same(runtime.store, worker_store)
-    assert_same(runtime.store, rpc_store)
+    refute_nil(rpc_server_store)
+    assert_same(runtime.store, rpc_server_store)
     owner = runtime.store.instance_variable_get(:@owner)
     runtime.close
     refute(owner.connection_pool.active_connection?)

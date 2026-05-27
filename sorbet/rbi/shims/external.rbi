@@ -7,6 +7,8 @@ module Concurrent
 end
 
 module Async
+  class TimeoutError < StandardError; end
+
   class Condition
     def initialize; end
     def wait; end
@@ -17,6 +19,7 @@ module Async
     def self.current; end
     def async(&blk); end
     def wait; end
+    def with_timeout(duration, &blk); end
   end
 end
 

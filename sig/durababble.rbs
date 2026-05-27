@@ -265,7 +265,7 @@ module Durababble
     def save_object_state: (object_type: String, object_id: String, state: serialized_payload, ?worker_pool: String) -> serialized_payload
     def enqueue_object_command: (?worker_pool: String, object_type: String, object_id: String, method_name: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?) -> String
     def claim_object_command: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> workflow_row?
-    def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?worker_id: String?) -> Object?
+    def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?, ?terminal: bool) -> Object?
     def retry_object_command: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
     def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String) -> Object?
@@ -305,6 +305,15 @@ module Durababble
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end
 
+  class ObjectWakeupChange
+    attr_reader action: Symbol
+    attr_reader name: String?
+    attr_reader wake_at: Time?
+    attr_reader payload: serialized_payload
+
+    def initialize: (Symbol action, String? name, Time? wake_at, serialized_payload payload) -> void
+  end
+
   class DurableObject[Id, State, Dispatch = Object]
     def self.object_type: (?String value) -> String
     def self.at: (Id durable_id, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?) -> durable_object_handle[Id, State, Dispatch]
@@ -320,7 +329,11 @@ module Durababble
     def initialize_state: () -> State
     def current_state: () -> State
     def update_state: (State state) -> State
+    def schedule_wake: (name: String, at: Time, ?payload: serialized_payload) -> Time
+    def cancel_wake: (name: String) -> bool
+    def cancel_all_wakes: () -> bool
     def state_dirty?: () -> bool
+    def wakeup_changes: () -> Array[ObjectWakeupChange]
   end
 
   class DurableObjectRef[Id, State]

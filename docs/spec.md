@@ -113,9 +113,9 @@ Transient object methods may run concurrently with other admitted transient meth
 
 Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`. Enqueuing a ready object command wakes the active owner through `DeliverMessage` or leaves a durable target activation for pool-local recovery. Object authors do not poll for commands; the owner drains the mailbox when woken or claimed.
 
-Lifecycle callbacks are `on_create`, `on_load`, `on_wake(payload: nil)`, and `on_destroy`. They are lifecycle hooks, not remotely callable public methods.
+Lifecycle callbacks are `on_create`, `on_load`, `on_wake(name:, payload: nil)`, and `on_destroy`. They are lifecycle hooks, not remotely callable public methods.
 
-Durable objects support one pending `sleep_until(at:, payload: nil)` wakeup per object id. `sleep_until` atomically replaces the pending sleep row in the same transaction as the command state write. `cancel_sleep` removes it. Matured sleeps convert atomically into durable mailbox wake messages.
+Durable objects support multiple named wakes per object id. `schedule_wake(name:, at:, payload: nil)` upserts a wake row by `(worker_pool, object_type, object_id, name)` in the same transaction as the command state write, replacing the time and payload when the same `name` is re-scheduled. `cancel_wake(name:)` removes one named wake and `cancel_all_wakes` removes all of them. Matured wakes convert atomically into durable mailbox `wake` messages that carry the wake name to `on_wake`.
 
 Durable object management APIs in the current contract are limited to `list`, `find`, `cancel`, `destroy!`, `evict`, and explicit `relocate_worker_pool`. Durable-object `pause` and `resume` control APIs are not part of this contract.
 
@@ -384,7 +384,7 @@ Durababble persists the following logical entities. Physical table names may be 
 | `fences` | Workflow-local side-effect idempotency fences | `(workflow_id, key)` |
 | `outbox` | Durable outgoing messages with processing leases | Id, unique message key, lease expiry |
 | `durable_objects` | Latest object state by object type/id | `(worker_pool, object_type, object_id)` |
-| `object_sleeps` | Pending durable object wakeups | Object identity and sleep id |
+| `object_wakeups` | Pending named durable object wakes, each with Paquito payload and wake time | `(worker_pool, object_type, object_id, name)` |
 
 Query-shape and transaction requirements:
 
@@ -400,7 +400,7 @@ Query-shape and transaction requirements:
 - Enqueueing a ready inbox message must atomically upsert a target activation row, or an equivalent scheduler row, keyed by worker pool and durable target identity. Workers globally poll target activations, not the inbox table; one activation can cover many pending inbox rows for the same target.
 - Target activation completion is conditional on the target mailbox/head state: after draining, the executor clears the activation only if no ready inbox row remains, otherwise it keeps or re-arms the activation with the next due time.
 - If a worker claims a target activation but finds the target is still owned by another fresh lease, it must not hot-loop the activation; it relies on advisory `DeliverMessage` for the live owner and re-arms the durable fallback no earlier than the observed lease deadline.
-- Object sleep rows are keyed by object identity plus worker pool when sleep dispatch is pool-scoped, with `sleep_id`, `wake_at`, and Paquito payload.
+- Object wake rows are keyed by object identity and worker pool plus the wake `name`, so several named wakes can be pending for one object id, each with its own `wake_at` and Paquito payload.
 - Append-only workflow history rows are ordered per workflow. Required record families include `step_scheduled`, `step_started`, `step_completed`, `step_failed`, `step_waiting`, timer/wait records, workflow command delivery records, child-workflow records, and patch marker records.
 - Store deterministic command ids and replay-relevant command shape on schedule records. Store concrete attempt ids on start/completion/failure/wait records. The command id is the replay identity; the attempt id is the execution/retry identity.
 - Mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution records; execution recovery uses distinct attempt start/completion records.
@@ -632,7 +632,7 @@ Observability requirements:
 | MySQL/MariaDB honors common store semantics | MySQL/MariaDB and PostgreSQL/YSQL satisfy the same store behavior contract. | Backend conformance spec |
 | Durable object API uses durable mailboxing | `at`, `tell`, `expose`, and `expose_command` execute through per-object mailbox ordering and lease ownership. | Durable object specs |
 | Object commands are per-id FIFO and worker-driven | Inbox/mailbox execution enforces one writer, blocked-head behavior, and worker-driven retries. | Object mailbox specs |
-| Object sleeps convert to durable wake messages | Sleep rows atomically convert to wake inbox rows without losing wakes. | Object sleep specs |
+| Named object wakes convert to durable wake messages | Each named wake row atomically converts to a wake inbox row carrying its name, without losing wakes. | Object wake specs |
 | Workflow patch markers guard code evolution | `patched` / `deprecate_patch` append and check ordered workflow history markers before branch side effects. | Patch-marker unit, backend-conformance, and crash tests |
 | Transient exposed methods route to owner | `CallTransient` invokes live object/workflow owner without durable mutation. | Transient RPC specs |
 | Worker pool scopes persisted targets and relevant keys | Persisted targets and query-critical keys include `worker_pool` where routing/claiming requires it. | Worker-pool backend specs |
@@ -663,7 +663,7 @@ Observability requirements:
 | Crash after object command checkpoint completion before state/message completion | Checkpoint output is cached; command replays and persists state/result once. |
 | Crash after object state persists before ask result completion | State persist and message completion must be atomic so this split state is impossible. |
 | Crash while head message is in backoff/dead-letter | Later messages remain blocked until operator action. |
-| Crash during object sleep-to-inbox conversion | Either sleep row remains or wake inbox row exists; no wake is lost. |
+| Crash during object wake-to-inbox conversion | Either the named wake row remains or its wake inbox row exists; no wake is lost. |
 | Crash after patch marker commit before first new-branch step | Replay sees marker, `patched` returns true, and the new branch continues. |
 | Code removes `patched` while normal marker history still exists | Checker raises nondeterminism before any later durable write. |
 | Owner pod loses lease while activity continues | External effect may finish; checkpoint/status write fails; retry uses idempotency. |

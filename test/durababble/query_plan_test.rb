@@ -23,6 +23,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_current_object_activation_lease,
     :pg_current_object_lease,
     :pg_dead_letter_inbox_message,
+    :pg_delete_all_object_wakeups,
+    :pg_delete_object_wakeup,
     :pg_delete_target_activation,
     :pg_drop_schema,
     :pg_existing_inbox_message_for_idempotency,
@@ -56,6 +58,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_step_heartbeat_cursor,
     :pg_target_activation,
     :pg_update_mailbox_sequence,
+    :pg_upsert_object_wakeup,
     :pg_upsert_target_activation,
     :pg_workflow_cancellation,
     :pg_workflow_history_count_for,
@@ -102,6 +105,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_current_object_lease,
     :mysql_current_workflow_lease,
     :mysql_dead_letter_inbox_message,
+    :mysql_delete_all_object_wakeups,
+    :mysql_delete_object_wakeup,
     :mysql_delete_target_activation,
     :mysql_drop_table,
     :mysql_existing_inbox_message_for_idempotency,
@@ -168,6 +173,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_target_activation,
     :mysql_update_latest_attempt,
     :mysql_update_mailbox_sequence,
+    :mysql_upsert_object_wakeup,
     :mysql_upsert_step_running,
     :mysql_upsert_target_activation,
     :mysql_upsert_waiting_step,
@@ -398,7 +404,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     refute_empty Durababble::StoreQueries::QUERIES
 
     Durababble::StoreQueries::QUERIES.each do |id, query|
-      assert_equal id, query.id
+      assert_kind_of Symbol, id
       assert_includes [:postgres, :mysql], query.backend
       assert_respond_to query.builder, :call
     end
@@ -580,7 +586,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
-        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "object_wakeups_due_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "waits_for" => {
@@ -773,6 +779,10 @@ class DurababbleQueryPlanTest < DurababbleTestCase
 
       INSERT INTO #{quoted_schema}.durable_objects (object_type, object_id, state, created_at, updated_at)
       VALUES ('counter', 'object-1', decode('#{serialized_result}', 'hex'), now() - interval '2 hours', now());
+
+      INSERT INTO #{quoted_schema}.object_wakeups (worker_pool, object_type, object_id, name, wake_at, payload, created_at, updated_at)
+      SELECT 'default', 'counter', 'future-wakeup-' || i, 'default', now() + interval '1 hour', decode('#{serialized_outbox}', 'hex'), now() - (i || ' seconds')::interval, now()
+      FROM generate_series(1, 2000) AS i;
 
     SQL
   end

@@ -148,7 +148,9 @@ class Batcher < Durababble::DurableObject
     update_state(current_state.merge("messages" => current_state.fetch("messages") + [message]))
   end
 
-  def on_wake(payload:)
+  # `name` is the wake that fired (an object can hold several named wakes). A
+  # batcher flushes on any wake, so it ignores the name and drains the buffer.
+  def on_wake(name:, payload:)
     update_state(
       "messages" => [],
       "flushes" => current_state.fetch("flushes") + [
@@ -175,6 +177,7 @@ store.enqueue_inbox_message(
   target_type: Batcher.object_type,
   target_id: "email-digest",
   message_kind: "wake",
+  method_name: "flush",
   payload: { "reason" => "alarm" },
 )
 worker.run_until_idle
@@ -213,7 +216,7 @@ class CacheEntry < Durababble::DurableObject
     update_state("value" => value, "expires_at" => expires_at, "expired" => false)
   end
 
-  def on_wake(payload:)
+  def on_wake(name:, payload:)
     expires_at = current_state.fetch("expires_at")
     return current_state unless expires_at && payload.fetch("now") >= expires_at
 
@@ -237,6 +240,7 @@ store.enqueue_inbox_message(
   target_type: CacheEntry.object_type,
   target_id: "feature-flags",
   message_kind: "wake",
+  method_name: "expire",
   payload: { "now" => 101 },
 )
 worker.run_until_idle

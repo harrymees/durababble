@@ -368,6 +368,7 @@ class DurababbleStepRetryTest < DurababbleTestCase
     assert_equal false, Durababble::RetryPolicy.from(nil).retryable?(RuntimeError.new("boom"), attempt_number: 1)
     assert_equal true, existing.retryable?(RuntimeError.new("boom"), attempt_number: 10_000)
     assert_equal 4.0, existing.delay_for_attempt(2)
+    assert_equal false, Durababble::RetryPolicy.new(maximum_attempts: 2, non_retryable_errors: ["RuntimeError"]).retryable?(RuntimeError.new("boom"), attempt_number: 1)
     assert_raises(ArgumentError) { Durababble::RetryPolicy.new(initial_interval: Object.new) }
   end
 

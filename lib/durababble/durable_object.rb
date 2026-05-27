@@ -8,11 +8,17 @@ require_relative "error_formatting"
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
   class ObjectReadBlocked < Error; end
+  ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
     extend DurableMethodDSL
 
     UNINITIALIZED = Object.new.freeze
+
+    # Wake names are stored in the indexed `name` column on `object_wakeups`
+    # (VARCHAR(191) / text). Bound the byte length so a name never silently
+    # truncates against the index width.
+    WAKE_NAME_MAX_BYTES = 191
 
     class << self
       #: (Class) -> void
@@ -111,6 +117,8 @@ module Durababble
     attr_reader :command_context
     #: String
     attr_reader :worker_pool
+    #: Array[ObjectWakeupChange]
+    attr_reader :wakeup_changes
 
     #: (?durable_id: String?, ?state: Object?, ?store: Store?, ?command_context: CommandContext?, ?worker_pool: String) -> void
     def initialize(durable_id: nil, state: UNINITIALIZED, store: nil, command_context: nil, worker_pool: "default")
@@ -120,6 +128,7 @@ module Durababble
       @command_context = command_context
       @worker_pool = worker_pool
       @state_dirty = false
+      @wakeup_changes = []
       @__durababble_query_context = false
     end
 
@@ -145,8 +154,52 @@ module Durababble
       new_state
     end
 
+    # Schedule a named wake for this object. Re-scheduling the same name before
+    # it fires replaces that name's wake time and payload; other names are left
+    # untouched. Wakes are committed atomically with the command, so a failed or
+    # retried command never leaves behind an orphaned process-local timer.
+    #: (name: String, at: Time, ?payload: Object?) -> Time
+    def schedule_wake(name:, at:, payload: nil)
+      raise Error, "cannot schedule durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be scheduled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:schedule, coerce_wake_name(name), at, payload)
+      at
+    end
+
+    # Cancel a single named wake. Wakes that are not scheduled are a no-op.
+    #: (name: String) -> bool
+    def cancel_wake(name:)
+      raise Error, "cannot cancel durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be canceled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:cancel, coerce_wake_name(name), nil, nil)
+      true
+    end
+
+    # Cancel every pending wake for this object.
+    #: () -> bool
+    def cancel_all_wakes
+      raise Error, "cannot cancel durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be canceled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:cancel_all, nil, nil, nil)
+      true
+    end
+
     #: () -> bool
     def state_dirty? = @state_dirty
+
+    private
+
+    #: (Object?) -> String
+    def coerce_wake_name(name)
+      name = String(name)
+      raise Error, "durable object wake name cannot be empty" if name.empty?
+      raise Error, "durable object wake name cannot exceed #{WAKE_NAME_MAX_BYTES} bytes" if name.bytesize > WAKE_NAME_MAX_BYTES
+
+      name
+    end
   end
 
   class DurableObjectRef
@@ -500,7 +553,7 @@ module Durababble
     def dispatch_wake(object_class, object_id:, message:)
       object = build_object(object_class, object_id:, message:)
       result = if object.respond_to?(:on_wake)
-        object.public_send(:on_wake, payload: message.fetch("payload"))
+        object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
       end
       complete_message(object, message, result:)
     rescue LeaseConflict
@@ -537,13 +590,14 @@ module Durababble
 
     #: (untyped, untyped, result: untyped, ?attributes: untyped) -> untyped
     def complete_message(object, message, result:, attributes: {})
-      completed = if object.state_dirty?
+      completed = if object.state_dirty? || object.wakeup_changes.any?
         @store.complete_object_command(
           command_id: message.fetch("id"),
           result:,
           object_type: object.class.object_type,
           object_id: object.durable_id,
-          state: object.current_state,
+          state: object.state_dirty? ? object.current_state : Store::NO_OBJECT_STATE,
+          wakeup_changes: object.wakeup_changes,
           worker_id: @worker_id,
         )
       else

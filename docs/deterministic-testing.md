@@ -39,6 +39,8 @@ Current scenarios:
 - `incomplete_step_retry_after_crash` — a step that crashed after start is retried and stale attempts are closed.
 - `attempt_history_append_only` — repeated failures append attempts instead of overwriting history.
 - `concurrent_timer_wake_once` — many callers race to wake one due timer exactly once.
+- `multiple_named_object_wakes` — one durable object arms several independently named wakes in a single command; each matures into its own `wake` inbox message and `on_wake(name:, payload:)` runs once per name.
+- `object_wake_survives_worker_crash` — a worker claims a matured object wake and crashes before committing; after the lease expires a second worker reclaims and the idempotent `on_wake` handler applies the effect exactly once.
 - `fenced_side_effect_once` — many callers share one fenced side-effect result.
 - `waits_fences_and_outbox` — timer waits, idempotency fences, and outbox processing.
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
