@@ -1947,7 +1947,7 @@ module Durababble
       <<~SQL.chomp
         INSERT INTO #{table(store, "durable_objects")} (worker_pool, object_type, object_id, state)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(worker_pool, object_type, object_id) DO UPDATE SET state = excluded.state, updated_at = dura_now()
+        ON CONFLICT(object_type, object_id) DO UPDATE SET state = excluded.state, updated_at = dura_now()
       SQL
     end
 
@@ -1963,7 +1963,7 @@ module Durababble
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
-        ON CONFLICT(worker_pool, target_kind, target_type, target_id) DO UPDATE SET status = CASE WHEN status = 'running' THEN status ELSE 'pending' END, ready_at = MIN(ready_at, excluded.ready_at), updated_at = dura_now()
+        ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = CASE WHEN status = 'running' THEN status ELSE 'pending' END, ready_at = MIN(ready_at, excluded.ready_at), updated_at = dura_now()
       SQL
     end
 
@@ -1971,7 +1971,7 @@ module Durababble
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
-        ON CONFLICT(worker_pool, target_kind, target_type, target_id) DO UPDATE SET status = 'pending', ready_at = excluded.ready_at, locked_by = NULL, locked_until = NULL, updated_at = dura_now()
+        ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = 'pending', ready_at = excluded.ready_at, locked_by = NULL, locked_until = NULL, updated_at = dura_now()
       SQL
     end
 

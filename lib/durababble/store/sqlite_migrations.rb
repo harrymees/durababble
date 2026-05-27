@@ -147,7 +147,7 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (worker_pool, object_type, object_id)
+          PRIMARY KEY (object_type, object_id)
         )
       SQL
       execute(<<~SQL)
@@ -201,7 +201,7 @@ module Durababble
           target_id TEXT NOT NULL,
           last_sequence INTEGER NOT NULL DEFAULT 0,
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
+          PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
@@ -231,13 +231,13 @@ module Durababble
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           completed_at INTEGER,
           dead_lettered_at INTEGER,
-          UNIQUE (worker_pool, target_kind, target_type, target_id, sequence),
+          UNIQUE (target_kind, target_type, target_id, sequence),
           UNIQUE (idempotency_hash)
         )
       SQL
       execute(<<~SQL)
         CREATE INDEX IF NOT EXISTS #{index_name("inbox", "target_status_sequence")}
-        ON #{table("inbox")} (worker_pool, target_kind, target_type, target_id, status, sequence)
+        ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("target_activations")} (
@@ -251,7 +251,7 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
-          PRIMARY KEY (worker_pool, target_kind, target_type, target_id)
+          PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
