@@ -187,21 +187,39 @@ module Durababble
       object_type = activation.fetch("target_type")
       object_id = activation.fetch("target_id")
       worker_pool = activation_worker_pool(activation)
-      executor = DurableObjectExecutor.new(store: @store, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
-      drained = executor.drain_object_inbox(object_type, object_id:)
       target = activation_target(activation, worker_pool:)
+
+      # Establish ownership before any inbox work, mirroring
+      # `claim_workflow_for_activation` in `process_workflow_activation`.
+      # Without this, an activation that fires on an empty inbox never
+      # claims the unified per-object lease (the lazy claim inside
+      # `claim_inbox_messages` is gated on finding rows), so consumers
+      # polling `current_object_lease` have nothing to find. Claiming
+      # eagerly here makes the activation itself the ownership signal.
+      holder = @store.claim_object_lease(worker_pool:, object_type:, object_id:, worker_id: @worker_id, lease_seconds: @lease_seconds)
+
+      drained = 0
+      if holder
+        executor = DurableObjectExecutor.new(store: @store, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
+        drained = executor.drain_object_inbox(object_type, object_id:)
+        # `drain_object_inbox` releases the lease in its ensure block; the
+        # in-claim re-claim inside `claim_inbox_messages` is idempotent for
+        # the same worker_id and stays as a safety net for direct callers.
+      end
+
+      claimed_and_drained = holder && drained.positive?
       if advisory
-        if drained.positive?
+        if claimed_and_drained
           reconcile_activation_target(target)
         else
           forward_target_activation(activation)
-          rearm_activation_target(target, ready_at: Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
+          rearm_activation_target(target, ready_at: object_activation_retry_time(object_type, object_id))
         end
         return
       end
 
-      forward_target_activation(activation) if drained.zero?
-      complete_activation_target(target, worker_id: @worker_id, now: drained.positive? ? Time.now : Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
+      forward_target_activation(activation) unless claimed_and_drained
+      complete_activation_target(target, worker_id: @worker_id, now: claimed_and_drained ? Time.now : object_activation_retry_time(object_type, object_id))
     end
 
     #: (untyped) -> untyped
@@ -222,6 +240,28 @@ module Durababble
       Time.now
     rescue KeyError
       Time.now
+    end
+
+    # Object equivalent of `activation_retry_time`: when another worker holds
+    # the per-object lease, bound the rearm/complete `ready_at` by their
+    # `locked_until` so we don't busy-poll while they're still draining.
+    # Shape differs from the workflow helper (takes `(object_type, object_id)`)
+    # because lease identity is `durable_objects.(object_type, object_id)`.
+    #: (String, String) -> Time
+    def object_activation_retry_time(object_type, object_id)
+      retry_at = Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS)
+      row = @store.current_object_lease(object_type, object_id)
+      return Time.now if row.nil?
+
+      locked_until = row["locked_until"]
+      if locked_until
+        lease_deadline = Time.parse(locked_until.to_s)
+        return [lease_deadline, retry_at].min
+      end
+
+      Time.now
+    rescue ArgumentError, TypeError
+      Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS)
     end
 
     #: (untyped) -> untyped
