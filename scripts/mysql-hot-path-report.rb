@@ -22,13 +22,15 @@ module DurababbleMysqlHotPathReport
   DEFAULT_WORKER_ID = "hot-path-worker"
   DEFAULT_WORKER_POOL = "default"
   DEFAULT_OUTPUT_DIR = "tmp/sql-hot-path-reports"
+  DEFAULT_OPERATION = "claim_runnable_workflow"
 
-  OPERATIONS = {
+  BUILTIN_OPERATION_DESCRIPTIONS = {
     "enqueue_workflow" => "Trace the single durable write that enqueues a pending workflow.",
     "claim_runnable_workflow" => "Trace the MySQL queue probes and lease update used when a worker claims runnable workflow work.",
     "worker_poll_idle" => "Trace one Worker#tick poll when no workflow work is available.",
     "worker_tick_claim" => "Trace one Worker#tick that polls, claims a workflow, and runs it to completion.",
   }.freeze
+  OPERATIONS = BUILTIN_OPERATION_DESCRIPTIONS
   SQL_KEYWORDS = [
     "ALL",
     "AND",
@@ -125,6 +127,79 @@ module DurababbleMysqlHotPathReport
 
     def execute(input)
       input.merge("executed" => true)
+    end
+  end
+
+  class Scenario
+    attr_reader :name, :description
+
+    def initialize(name:, description:, setup:, run:)
+      @name = name
+      @description = description
+      @setup = setup
+      @run = run
+    end
+
+    def setup(context)
+      @setup&.call(context)
+    end
+
+    def run(context)
+      @run.call(context)
+    end
+  end
+
+  class ScenarioContext
+    attr_reader :store, :options
+
+    def initialize(store:, options:)
+      @store = store
+      @options = options
+    end
+
+    def fixture_size
+      @options.fetch(:fixture_size)
+    end
+
+    def worker(
+      workflows: { DEFAULT_WORKFLOW_NAME => ReportWorkflow },
+      worker_id: DEFAULT_WORKER_ID,
+      worker_pool: DEFAULT_WORKER_POOL,
+      lease_seconds: 60
+    )
+      Durababble::Worker.new(
+        store:,
+        workflows:,
+        worker_id:,
+        worker_pool:,
+        lease_seconds:,
+        migrate: false,
+      )
+    end
+
+    def enqueue_report_workflow(
+      id: "hot-path-claimable",
+      input: { "kind" => "claim" },
+      name: DEFAULT_WORKFLOW_NAME,
+      worker_pool: DEFAULT_WORKER_POOL
+    )
+      store.enqueue_workflow(name:, input:, id:, worker_pool:)
+    end
+
+    def seed_pending_workflows(
+      count = fixture_size,
+      name: "other-workflow",
+      worker_pool: DEFAULT_WORKER_POOL,
+      id_prefix: "hot-path-background"
+    )
+      count.times do |index|
+        store.enqueue_workflow(
+          name:,
+          input: { "n" => index },
+          id: "#{id_prefix}-#{index}",
+          worker_pool:,
+        )
+      end
     end
   end
 
@@ -242,27 +317,29 @@ module DurababbleMysqlHotPathReport
 
   module StoreSqlInstrumentation
     def execute_store_query(id, params = [], **locals)
-      recorder = instance_variable_get(:@durababble_hot_path_recorder)
+      store = self #: as untyped
+      recorder = store.instance_variable_get(:@durababble_hot_path_recorder)
       return super unless recorder&.active?
 
-      query_id = qualified_store_query_id(id)
-      sql = store_query_sql(id, **locals)
+      query_id = store.send(:qualified_store_query_id, id)
+      sql = store.send(:store_query_sql, id, **locals)
       query = recorder.record_query(
         query_id:,
         sql:,
         params:,
-        callsite: recorder.callsite(caller_locations(1)),
+        callsite: recorder.callsite(Kernel.caller_locations(1)),
       )
-      result = with_connection { execute_store_query_sql(sql, params) }
+      result = store.send(:with_connection) { store.send(:execute_store_query_sql, sql, params) }
       recorder.finish_query(query, result)
       result
     rescue StandardError => error
       recorder&.fail_query(query, error) if query
-      raise
+      Kernel.raise
     end
 
     def transaction(**options, &block)
-      recorder = instance_variable_get(:@durababble_hot_path_recorder)
+      store = self #: as untyped
+      recorder = store.instance_variable_get(:@durababble_hot_path_recorder)
       return super unless recorder&.active?
 
       transaction = recorder.begin_transaction(options)
@@ -271,7 +348,7 @@ module DurababbleMysqlHotPathReport
       result
     rescue StandardError
       recorder.end_transaction(transaction, "rollback") if transaction
-      raise
+      Kernel.raise
     end
   end
 
@@ -317,7 +394,7 @@ module DurababbleMysqlHotPathReport
     end
 
     def run
-      validate_operation!
+      scenario = validate_operation!
       store = connect_store
       recorder = SqlRecorder.new(root: @root)
       store.singleton_class.prepend(StoreSqlInstrumentation) unless store.singleton_class.ancestors.include?(StoreSqlInstrumentation)
@@ -326,10 +403,11 @@ module DurababbleMysqlHotPathReport
       begin
         recorder.disabled { reset_schema(store) }
         recorder.disabled { store.migrate! }
-        recorder.disabled { seed_fixture(store) }
-        result = run_operation(store)
+        context = ScenarioContext.new(store:, options: @options)
+        recorder.disabled { scenario.setup(context) }
+        result = scenario.run(context)
         MysqlExplainer.new(store:, recorder:).explain!(recorder.queries)
-        report = build_report(store:, recorder:, result:)
+        report = build_report(store:, recorder:, scenario:, result:)
         write_report(report)
       ensure
         store.instance_variable_set(:@durababble_hot_path_recorder, nil)
@@ -364,47 +442,10 @@ module DurababbleMysqlHotPathReport
       warn("failed to drop report schema #{@options.fetch(:schema)}: #{error.class}: #{error.message}")
     end
 
-    def seed_fixture(store)
-      case @options.fetch(:operation)
-      when "claim_runnable_workflow", "worker_tick_claim"
-        store.enqueue_workflow(name: DEFAULT_WORKFLOW_NAME, input: { "kind" => "claim" }, id: "hot-path-claimable", worker_pool: DEFAULT_WORKER_POOL)
-      end
-
-      @options.fetch(:fixture_size).times do |index|
-        store.enqueue_workflow(name: "other-workflow", input: { "n" => index }, id: "hot-path-background-#{index}", worker_pool: DEFAULT_WORKER_POOL)
-      end
-    end
-
-    def run_operation(store)
-      case @options.fetch(:operation)
-      when "enqueue_workflow"
-        store.enqueue_workflow(name: DEFAULT_WORKFLOW_NAME, input: { "kind" => "enqueue" }, id: "hot-path-enqueue", worker_pool: DEFAULT_WORKER_POOL)
-      when "claim_runnable_workflow"
-        store.claim_runnable_workflow(worker_id: DEFAULT_WORKER_ID, lease_seconds: 60, workflow_names: [DEFAULT_WORKFLOW_NAME], worker_pool: DEFAULT_WORKER_POOL)
-      when "worker_poll_idle"
-        worker(store).tick
-      when "worker_tick_claim"
-        worker(store).tick
-      else
-        raise ArgumentError, "unknown operation: #{@options.fetch(:operation)}"
-      end
-    end
-
-    def worker(store)
-      Durababble::Worker.new(
-        store:,
-        workflows: { DEFAULT_WORKFLOW_NAME => ReportWorkflow },
-        worker_id: DEFAULT_WORKER_ID,
-        worker_pool: DEFAULT_WORKER_POOL,
-        lease_seconds: 60,
-        migrate: false,
-      )
-    end
-
-    def build_report(store:, recorder:, result:)
+    def build_report(store:, recorder:, scenario:, result:)
       {
-        operation: @options.fetch(:operation),
-        operation_description: OPERATIONS.fetch(@options.fetch(:operation)),
+        operation: scenario.name,
+        operation_description: scenario.description,
         database_url: redacted_database_url(@options.fetch(:database_url)),
         schema: store.schema,
         table_prefix: store.send(:table_prefix),
@@ -436,9 +477,11 @@ module DurababbleMysqlHotPathReport
     end
 
     def validate_operation!
-      return if OPERATIONS.key?(@options.fetch(:operation))
+      DurababbleMysqlHotPathReport.scenario_for(@options.fetch(:operation))
+    rescue KeyError
+      scenario_names = DurababbleMysqlHotPathReport.scenarios.keys.sort.join(", ")
 
-      raise ArgumentError, "unknown --operation #{@options.fetch(:operation).inspect}; choose one of #{OPERATIONS.keys.join(", ")}"
+      raise ArgumentError, "unknown --operation #{@options.fetch(:operation).inspect}; choose one of #{scenario_names}"
     end
 
     def redacted_database_url(value)
@@ -783,20 +826,58 @@ module DurababbleMysqlHotPathReport
   end
 
   class << self
+    def scenarios
+      @scenarios ||= {}
+    end
+
+    def register_scenario(name, description:, setup: nil, &block)
+      raise ArgumentError, "scenario #{name.inspect} needs a run block" unless block
+
+      scenarios[name.to_s] = Scenario.new(
+        name: name.to_s,
+        description:,
+        setup:,
+        run: block,
+      )
+    end
+    alias_method :scenario, :register_scenario
+
+    def scenario_for(name)
+      scenarios.fetch(name.to_s)
+    end
+
+    def load_scenario_file(path)
+      load(File.expand_path(path))
+    end
+
+    def print_scenarios(io = $stdout)
+      scenarios.sort.each do |name, scenario|
+        io.puts "#{name}\t#{scenario.description}"
+      end
+    end
+
     def parse_options(argv)
       options = {
-        operation: "claim_runnable_workflow",
+        operation: nil,
         database_url: default_database_url,
         schema: nil,
         output_dir: DEFAULT_OUTPUT_DIR,
         format: "html",
         fixture_size: 0,
         keep_schema: false,
-      }
+        list_operations: false,
+        scenario_files: [],
+      } #: Hash[Symbol, untyped]
 
       parser = OptionParser.new do |opts|
         opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
-        opts.on("--operation NAME", "Operation: #{OPERATIONS.keys.join(", ")}") { |value| options[:operation] = value }
+        opts.on("--operation NAME", "Scenario to run; use --list-scenarios to inspect choices") do |value|
+          options[:operation] = value
+        end
+        opts.on("--scenario NAME", "Alias for --operation") do |value|
+          options[:operation] = value
+        end
+        opts.on("--scenario-file PATH", "Load a Ruby file that registers additional scenarios") { |value| options[:scenario_files] << value }
         opts.on("--database-url URL", "MySQL URL; defaults to DURABABBLE_DATABASE_URL or local MySQL test URL") { |value| options[:database_url] = value }
         opts.on("--schema NAME", "Durababble schema/table prefix namespace") { |value| options[:schema] = value }
         opts.on("--format FORMAT", "html or markdown") { |value| options[:format] = value == "markdown" ? "markdown" : value }
@@ -804,19 +885,36 @@ module DurababbleMysqlHotPathReport
         opts.on("--output-dir DIR", "Directory for default report path") { |value| options[:output_dir] = value }
         opts.on("--fixture-size N", Integer, "Seed N unrelated workflows before tracing") { |value| options[:fixture_size] = value }
         opts.on("--keep-schema", "Leave the report schema/tables in MySQL after the run") { options[:keep_schema] = true }
-        opts.on("--list-operations", "Print operation names and exit") do
-          OPERATIONS.each { |name, description| puts "#{name}\t#{description}" }
-          exit
-        end
+        opts.on("--list-operations", "Print scenario names and exit") { options[:list_operations] = true }
+        opts.on("--list-scenarios", "Print scenario names and exit") { options[:list_operations] = true }
       end
       parser.parse!(argv)
       raise ArgumentError, "--format must be html or markdown" unless ["html", "markdown"].include?(options.fetch(:format))
       raise ArgumentError, "--fixture-size must be non-negative" if options.fetch(:fixture_size).negative?
 
+      existing_names = scenarios.keys
+      options.fetch(:scenario_files).each { |path| load_scenario_file(path) }
+      loaded_names = scenarios.keys - existing_names
+      if options.fetch(:list_operations)
+        print_scenarios
+        exit
+      end
+      if options[:operation].nil?
+        if loaded_names.length == 1
+          options[:operation] = loaded_names.first
+        elsif loaded_names.length > 1
+          raise ArgumentError, "--scenario-file registered multiple scenarios; choose one with --operation"
+        else
+          options[:operation] = DEFAULT_OPERATION
+        end
+      end
+
       options[:schema] ||= Durababble.workspace_schema(
         File.join(Dir.pwd, "sql-hot-path-report", options.fetch(:operation)),
         prefix: "durababble_hot_path",
       )
+      options.delete(:list_operations)
+      options.delete(:scenario_files)
       options
     end
 
@@ -897,7 +995,7 @@ module DurababbleMysqlHotPathReport
       result = +""
       offset = 0
       sql.to_enum(:scan, SQL_TOKEN_PATTERN).each do
-        match = Regexp.last_match
+        match = Regexp.last_match #: as MatchData
         result << CGI.escapeHTML(sql[offset...match.begin(0)].to_s)
         result << highlight_sql_token(match[0], table_ddls:, popovers:)
         offset = match.end(0)
@@ -962,6 +1060,54 @@ module DurababbleMysqlHotPathReport
     def quote_identifier(identifier)
       "`#{identifier.to_s.gsub("`", "``")}`"
     end
+  end
+
+  register_scenario(
+    "enqueue_workflow",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("enqueue_workflow"),
+    setup: proc(&:seed_pending_workflows),
+  ) do |context|
+    context.store.enqueue_workflow(
+      name: DEFAULT_WORKFLOW_NAME,
+      input: { "kind" => "enqueue" },
+      id: "hot-path-enqueue",
+      worker_pool: DEFAULT_WORKER_POOL,
+    )
+  end
+
+  register_scenario(
+    "claim_runnable_workflow",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("claim_runnable_workflow"),
+    setup: lambda do |context|
+      context.enqueue_report_workflow
+      context.seed_pending_workflows
+    end,
+  ) do |context|
+    context.store.claim_runnable_workflow(
+      worker_id: DEFAULT_WORKER_ID,
+      lease_seconds: 60,
+      workflow_names: [DEFAULT_WORKFLOW_NAME],
+      worker_pool: DEFAULT_WORKER_POOL,
+    )
+  end
+
+  register_scenario(
+    "worker_poll_idle",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("worker_poll_idle"),
+    setup: proc(&:seed_pending_workflows),
+  ) do |context|
+    context.worker.tick
+  end
+
+  register_scenario(
+    "worker_tick_claim",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("worker_tick_claim"),
+    setup: lambda do |context|
+      context.enqueue_report_workflow
+      context.seed_pending_workflows
+    end,
+  ) do |context|
+    context.worker.tick
   end
 end
 

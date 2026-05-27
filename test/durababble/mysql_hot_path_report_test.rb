@@ -1,6 +1,8 @@
 # typed: false
 # frozen_string_literal: true
 
+require "tempfile"
+
 require_relative "../test_helper"
 require_relative "../../scripts/mysql-hot-path-report"
 
@@ -76,6 +78,30 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     sql = "SELECT id FROM `dura_test_workflows` FORCE INDEX (`dura_test_workflows_queue_idx`) WHERE status = ?"
 
     assert_equal ["dura_test_workflows"], DurababbleMysqlHotPathReport.table_names_from_sql(sql, table_prefix: "dura_test")
+  end
+
+  test "scenario files register reusable custom hot paths" do
+    original_scenarios = DurababbleMysqlHotPathReport.scenarios.dup
+
+    Tempfile.create(["durababble-hot-path-scenario", ".rb"]) do |file|
+      file.write(<<~RUBY)
+        DurababbleMysqlHotPathReport.register_scenario(
+          "custom_store_read",
+          description: "Trace a custom store read.",
+          setup: ->(context) { context.seed_pending_workflows(2, name: "ignored") },
+        ) do |context|
+          context.store.workflow("workflow-1")
+        end
+      RUBY
+      file.flush
+
+      options = DurababbleMysqlHotPathReport.parse_options(["--scenario-file", file.path, "--format", "markdown"])
+
+      assert_equal("custom_store_read", options.fetch(:operation))
+      assert_equal("Trace a custom store read.", DurababbleMysqlHotPathReport.scenario_for("custom_store_read").description)
+    end
+  ensure
+    DurababbleMysqlHotPathReport.instance_variable_set(:@scenarios, original_scenarios) if original_scenarios
   end
 
   private

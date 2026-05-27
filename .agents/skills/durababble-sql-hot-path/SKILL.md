@@ -1,7 +1,7 @@
 ---
 name: durababble-sql-hot-path
 description: |
-  Generate human-facing MySQL hot-path SQL reports for Durababble enqueueing and worker polling. Use when investigating store query order, SQL text, callsites, transaction context, or EXPLAIN plans for enqueue_workflow, claim_runnable_workflow, worker_poll_idle, or worker_tick_claim.
+  Generate human-facing MySQL hot-path SQL reports for Durababble enqueueing, worker polling, and custom scenario files. Use when investigating store query order, SQL text, callsites, transaction context, or EXPLAIN plans for enqueue_workflow, claim_runnable_workflow, worker_poll_idle, worker_tick_claim, or a bespoke hot path.
 ---
 
 # Durababble SQL Hot Path Reports
@@ -18,12 +18,12 @@ mise exec -- bundle exec ruby scripts/mysql-hot-path-report.rb --operation claim
 
 The script prints the generated report path, defaulting to `tmp/sql-hot-path-reports/<operation>.html`. Use `--format markdown` for Markdown output.
 
-## Operations
+## Scenarios
 
-List supported operations:
+List supported built-in and loaded scenarios:
 
 ```sh
-mise exec -- bundle exec ruby scripts/mysql-hot-path-report.rb --list-operations
+mise exec -- bundle exec ruby scripts/mysql-hot-path-report.rb --list-scenarios
 ```
 
 Useful defaults:
@@ -33,11 +33,36 @@ Useful defaults:
 - `worker_poll_idle`: one `Worker#tick` with no runnable workflow work, useful for idle polling probes.
 - `worker_tick_claim`: one `Worker#tick` that polls, claims, and executes the tiny report workflow to completion.
 
+To trace a new hot path, load a Ruby scenario file:
+
+```sh
+mise exec -- bundle exec ruby scripts/mysql-hot-path-report.rb \
+  --scenario-file test/support/hot_path_scenarios/my_scenario.rb \
+  --scenario my_scenario \
+  --format html
+```
+
+Scenario files register one or more blocks. The `setup:` block runs before tracing so fixture writes do not pollute the report; the main block is traced and becomes the report body.
+
+```ruby
+DurababbleMysqlHotPathReport.register_scenario(
+  "my_scenario",
+  description: "Trace the store operation I am optimizing.",
+  setup: ->(context) { context.seed_pending_workflows(100) },
+) do |context|
+  context.store.claim_runnable_workflow(
+    worker_id: "worker-a",
+    lease_seconds: 60,
+    workflow_names: ["my-workflow"],
+  )
+end
+```
+
 ## Database
 
 By default the script uses `DURABABBLE_DATABASE_URL`, or the local MySQL test URL built from `DURABABBLE_MYSQL_*`/`MYSQL_*` env vars, ending at `mysql://root@127.0.0.1:3306/sidekick_server_test`. Override with `--database-url URL`.
 
-The default schema is workspace-derived and operation-specific through `Durababble.workspace_schema(..., prefix: "durababble_hot_path")`. Override with `--schema NAME` only when you need a stable report namespace for comparison.
+The default schema is workspace-derived and scenario-specific through `Durababble.workspace_schema(..., prefix: "durababble_hot_path")`. Override with `--schema NAME` only when you need a stable report namespace for comparison.
 
 ## Options
 
@@ -48,7 +73,7 @@ mise exec -- bundle exec ruby scripts/mysql-hot-path-report.rb \
   --output tmp/sql-hot-path-reports/worker-poll-idle.md
 ```
 
-Use `--fixture-size N` to seed N unrelated pending workflows before tracing, and `--keep-schema` when you want to inspect the generated MySQL tables after the report. The script resets its report schema before each run and drops it afterward unless `--keep-schema` is set.
+Use `--scenario NAME` as an alias for `--operation NAME`, `--scenario-file PATH` to load custom scenarios, `--fixture-size N` for built-ins or scenario helpers that read `context.fixture_size`, and `--keep-schema` when you want to inspect the generated MySQL tables after the report. The script resets its report schema before each run and drops it afterward unless `--keep-schema` is set.
 
 ## Reading The Report
 
