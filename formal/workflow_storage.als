@@ -560,6 +560,55 @@ pred releaseOrStealLease[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   preserveLeasesExcept[wf, t, tnext]
 }
 
+pred claimWorkflowForActivation[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
+  -- [DURABABBLE-LEASE-1] The inbox-driven activation claim path (drain_workflow_inbox)
+  -- may additionally wake a suspended (waiting) workflow to deliver a command, while
+  -- pending/failed backoff rows remain protected by their due time exactly as in
+  -- claimWorkflow. This mirrors Store#claim_workflow_for_activation.
+  (
+    workflowStatus[wf, t] = Pending and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
+  )
+  or (
+    workflowStatus[wf, t] = Waiting
+  )
+  or (
+    workflowStatus[wf, t] = Canceling and (no workflowNextRun[wf, t] or some due: workflowNextRun[wf, t] | not gt[due, t])
+  )
+  or (
+    workflowStatus[wf, t] = Failed and some due: workflowNextRun[wf, t] | not gt[due, t]
+  )
+  or (
+    workflowStatus[wf, t] = Running and no owner: Worker | liveWorkflowLease[wf, owner, t]
+  )
+  no live: LeaseRow | live.lr_workflow = wf and live.lr_time = t and gt[live.lr_expiresAt, t]
+  workflowStatus[wf, tnext] = Running
+  no workflowNextRun[wf, tnext]
+  some exp: Time | gt[exp, tnext] and one l: LeaseRow |
+    l.lr_workflow = wf and l.lr_worker = worker and l.lr_time = tnext and l.lr_expiresAt = exp
+  all l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext implies l.lr_worker = worker
+  workflowCancelSame[wf, t, tnext]
+  unchangedExcept[wf, none, none, none, none, none, none, none, t, tnext]
+  preserveLeasesExcept[wf, t, tnext]
+}
+
+pred suspendWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
+  -- [DURABABBLE-WAIT-1] The owning worker re-suspends a running workflow back to
+  -- waiting (its pending waits remain) or pending, releasing the lease. This models
+  -- Store#suspend_workflow on the activation drain path.
+  liveWorkflowLease[wf, worker, t]
+  workflowStatus[wf, t] = Running
+  some workflowCancelRequestedAt[wf, t] implies workflowStatus[wf, tnext] = Canceling
+  no workflowCancelRequestedAt[wf, t] and (some wt: Wait | wt.wait_step.step_workflow = wf and waitStatus[wt, t] = WaitPending)
+    implies workflowStatus[wf, tnext] = Waiting
+  no workflowCancelRequestedAt[wf, t] and (no wt: Wait | wt.wait_step.step_workflow = wf and waitStatus[wt, t] = WaitPending)
+    implies workflowStatus[wf, tnext] = Pending
+  no workflowNextRun[wf, tnext]
+  no l: LeaseRow | l.lr_workflow = wf and l.lr_time = tnext
+  workflowCancelSame[wf, t, tnext]
+  unchangedExcept[wf, none, none, none, none, none, none, none, t, tnext]
+  preserveLeasesExcept[wf, t, tnext]
+}
+
 pred scheduleWorkflowCommand[wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-CONCURRENCY-1] Concurrent workflow fibers append ordered step command history before side-effect execution.
   cmd.wc_workflow = wf
@@ -1063,6 +1112,8 @@ pred step[t: Time, tnext: Time] {
   stutter[t, tnext]
   or some wf: Workflow | enqueueWorkflow[wf, t, tnext]
   or some wf: Workflow, worker: Worker | claimWorkflow[wf, worker, t, tnext]
+  or some wf: Workflow, worker: Worker | claimWorkflowForActivation[wf, worker, t, tnext]
+  or some wf: Workflow, worker: Worker | suspendWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | heartbeatWorkflow[wf, worker, t, tnext]
   or some wf: Workflow, worker: Worker | releaseOrStealLease[wf, worker, t, tnext]
   or some wf: Workflow, cmd: WorkflowCommand, shape: CommandShape, worker: Worker | scheduleWorkflowCommand[wf, cmd, shape, worker, t, tnext]
@@ -1704,6 +1755,87 @@ pred exampleWorkflowInboxCommandCompletes {
   }
 }
 
+pred exampleWorkflowInboxActivatesWaitingWorkflow {
+  -- [DURABABBLE-LEASE-1] The activation drain path wakes a *waiting* workflow to
+  -- deliver an inbox command (claim_workflow_for_activation), commits the command
+  -- under the workflow lease, and re-suspends the workflow (suspend_workflow).
+  some wf: Workflow, st: Step, wait: Wait, target: InboxTarget, ic: InboxCommand, worker: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    target.target_kind = WorkflowInbox
+    target.target_workflow = wf
+    ic.command_target = target
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    recordWait[wf, st, none, wait, worker, first.next.next.next, first.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next] = Waiting
+    enqueueInboxCommand[ic, first.next.next.next.next, first.next.next.next.next.next]
+    claimTargetActivation[target, worker, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    claimWorkflowForActivation[wf, worker, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next] = Running
+    stepStatus[st, first.next.next.next.next.next.next.next] = StepWaiting
+    waitStatus[wait, first.next.next.next.next.next.next.next] = WaitPending
+    claimInboxCommand[ic, worker, first.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next]
+    completeInboxCommand[ic, worker, first.next.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next.next]
+    suspendWorkflow[wf, worker, first.next.next.next.next.next.next.next.next.next, first.next.next.next.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next.next.next.next] = Waiting
+  }
+}
+
+pred exampleLiveLeaseBlocksCompetingClaim {
+  -- [DURABABBLE-LEASE-1] Near-miss witness: while one worker holds a live workflow
+  -- lease, no other worker can claim the same workflow.
+  some wf: Workflow, owner, other: Worker | {
+    owner != other
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, owner, first.next, first.next.next]
+    liveWorkflowLease[wf, owner, first.next.next]
+    no w: Worker, tn: Time | w != owner and claimWorkflow[wf, w, first.next.next, tn]
+  }
+}
+
+pred exampleStaleOwnerCannotCommitStep {
+  -- [DURABABBLE-LEASE-4] Near-miss witness: after a lease expires and is reclaimed by
+  -- another worker, the original (now stale) owner cannot commit the step it started.
+  some wf: Workflow, st: Step, att: Attempt, owner, thief: Worker, cmd: WorkflowCommand, shape: CommandShape | {
+    owner != thief
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, owner, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, owner, first.next.next, first.next.next.next]
+    startStep[wf, st, att, owner, first.next.next.next, first.next.next.next.next]
+    no l: LeaseRow | l.lr_workflow = wf and l.lr_time = first.next.next.next.next and gt[l.lr_expiresAt, first.next.next.next.next]
+    releaseOrStealLease[wf, thief, first.next.next.next.next, first.next.next.next.next.next]
+    claimWorkflow[wf, thief, first.next.next.next.next.next, first.next.next.next.next.next.next]
+    stepStatus[st, first.next.next.next.next.next.next] = StepRunning
+    not completeStep[wf, st, att, owner, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+  }
+}
+
+pred exampleBackedOffWorkflowEventuallyRuns {
+  -- [DURABABBLE-STEP-2] Liveness/progress witness: a workflow parked with a retry
+  -- backoff deadline cannot be claimed early, but once its due time arrives it is
+  -- claimable again and reaches Running.
+  some wf: Workflow, st: Step, att: Attempt, worker: Worker, due: Time, cmd: WorkflowCommand, shape: CommandShape | {
+    cmd.wc_workflow = wf
+    cmd.wc_step = st
+    enqueueWorkflow[wf, first, first.next]
+    claimWorkflow[wf, worker, first.next, first.next.next]
+    scheduleWorkflowCommand[wf, cmd, shape, worker, first.next.next, first.next.next.next]
+    startStep[wf, st, att, worker, first.next.next.next, first.next.next.next.next]
+    retryStep[wf, st, att, worker, due, first.next.next.next.next, first.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next] = Pending
+    workflowNextRun[wf, first.next.next.next.next.next] = due
+    due = first.next.next.next.next.next.next
+    no w: Worker, tn: Time | claimWorkflow[wf, w, first.next.next.next.next.next, tn]
+    stutter[first.next.next.next.next.next, first.next.next.next.next.next.next]
+    claimWorkflow[wf, worker, first.next.next.next.next.next.next, first.next.next.next.next.next.next.next]
+    workflowStatus[wf, first.next.next.next.next.next.next.next] = Running
+  }
+}
+
 pred exampleInboxCommandEnqueues {
   some target: InboxTarget, cmd: InboxCommand | {
     cmd.command_target = target
@@ -1849,21 +1981,25 @@ run exampleInboxCommandFifoHeadBlocksLaterCommand for 12 but exactly 1 InboxTarg
 run exampleInboxCommandFailureRearmsActivation for 7 but exactly 1 InboxTarget, 1 InboxCommand, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 6 Time expect 1
 run exampleTargetActivationExpiresAndReclaims for 7 but exactly 1 InboxTarget, 1 InboxCommand, 2 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 6 Time expect 1
 run exampleInboxCommandDeadLettersAndStopsActivation for 10 but exactly 1 InboxTarget, 2 InboxCommand, 13 CommandRow, 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 WorkflowCommand, 1 CommandShape, 0 DurableCommit, 8 Time expect 1
+run exampleWorkflowInboxActivatesWaitingWorkflow for 16 but exactly 1 InboxTarget, exactly 1 InboxCommand, exactly 1 Worker, exactly 1 Workflow, exactly 1 Step, 1 Attempt, 0 AttemptRow, exactly 1 Wait, exactly 1 WorkflowCommand, exactly 1 CommandShape, 1 WaitTrigger, 0 WakeEvent, 1 DurableCommit, 16 CommandHistoryRow, 11 Time expect 1
+run exampleLiveLeaseBlocksCompetingClaim for 4 but exactly 1 Workflow, exactly 2 Worker, 4 Time expect 1
+run exampleStaleOwnerCannotCommitStep for 8 but exactly 1 Workflow, exactly 2 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 12 CommandHistoryRow, 8 Time expect 1
+run exampleBackedOffWorkflowEventuallyRuns for 9 but exactly 1 Workflow, exactly 1 Worker, exactly 1 Step, exactly 1 Attempt, exactly 1 WorkflowCommand, exactly 1 CommandShape, 16 CommandHistoryRow, 9 Time expect 1
 
-check atMostOneLiveOwner for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check scheduledCommandHistoryIsReplayStable for 4 but 2 Workflow, 2 Worker, 3 Step, 3 WorkflowCommand, 3 CommandShape, 5 Time expect 0
+check atMostOneLiveOwner for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check terminalStatesDoNotMutate for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check terminalWorkflowsHaveNoIncompleteWork for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check completedStepsAreNotReexecuted for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check scheduledCommandHistoryIsReplayStable for 4 but 2 Workflow, 2 Worker, 3 Step, 3 WorkflowCommand, 3 CommandShape, 6 Time expect 0
 check terminalCommandHistoryUsesLatestReplayEvent for 4 but 1 Workflow, 2 Worker, 2 Step, 2 Attempt, 2 Wait, 2 WaitTrigger, 2 WorkflowCommand, 2 CommandShape, 7 Time expect 0
 check commandHistoryFollowsRuntimeLifecycle for 4 but 1 Workflow, 2 Worker, 2 Step, 2 Attempt, 2 Wait, 2 WaitTrigger, 2 WorkflowCommand, 2 CommandShape, 7 Time expect 0
-check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check staleFenceTokensCannotFinish for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
+check incompleteStepsRetrySafely for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check retryBackoffPreventsEarlyClaim for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check waitsWakeOnce for 4 but 2 Workflow, 2 Worker, 2 Step, 3 Attempt, 3 Wait, 2 WaitTrigger, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check staleOwnersCannotCommit for 4 but 2 Workflow, 3 Worker, 3 Step, 4 Attempt, 1 WorkflowCommand, 1 CommandShape, 8 Time expect 0
+check idempotencyFencesPreventDuplicateSideEffects for 4 but 2 Workflow, 2 Worker, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check staleFenceTokensCannotFinish for 4 but 2 Workflow, 2 Worker, 2 FenceToken, 2 Fence, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
+check outboxAckLeaseBehaviorIsSafe for 4 but 2 Workflow, 2 Worker, 3 OutboxMessage, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
 check durableInboxCommandSerializationHolds for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
 check inboxClaimsRequireExistingRows for 4 but 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
-check workflowInboxCommandCommitsNeedWorkflowLease for 4 but 2 Workflow, 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 6 Time expect 0
+check workflowInboxCommandCommitsNeedWorkflowLease for 4 but 2 Workflow, 2 InboxTarget, 4 InboxCommand, 3 Worker, 1 WorkflowCommand, 1 CommandShape, 7 Time expect 0
