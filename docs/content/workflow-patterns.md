@@ -318,6 +318,135 @@ The `rescue` runs the compensating steps and then re-raises so the workflow ends
 
 The pattern generalises: catch the specific failure you want to compensate for (here, `TicketPrinterUnavailable`), run compensating steps in the reverse order of the forward steps they undo, and re-raise.
 
+## Cancellation Cleanup With Ensure
+
+When a workflow creates temporary external state that must be cleaned up no matter how the run exits, wrap the owned region in Ruby's `ensure`. Cancellation is delivered as `Durababble::CancellationError` at a durable boundary, so the `ensure` block runs while the workflow unwinds. Keep the cleanup itself in durable steps, because cleanup may crash or retry just like the forward work.
+
+<!-- DOCS:patterns-cancellation-ensure:start -->
+
+<!-- DOCS:patterns-cancellation-ensure:hidden
+```ruby
+store ||= Durababble::Store.connect(database_url: Durababble.default_database_url)
+store.migrate!
+Durababble.default_store = store
+```
+-->
+
+```ruby
+class ExportProject < Durababble::Workflow
+  def execute(export)
+    workspace = nil
+    begin
+      workspace = create_workspace(export)
+      copy_rows(workspace)
+      publish_export(workspace)
+    ensure
+      delete_workspace(workspace) if workspace
+    end
+  end
+
+  step def create_workspace(export)
+    ExportWorkspace.create(export.fetch("project_id"), idempotency_key: step_context.idempotency_key)
+  end
+
+  step def copy_rows(workspace)
+    ExportWorkspace.copy(workspace, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def publish_export(workspace)
+    ExportWorkspace.publish(workspace, idempotency_key: step_context.idempotency_key)
+  end
+
+  step def delete_workspace(workspace)
+    ExportWorkspace.delete(workspace.fetch("workspace_id"))
+  end
+end
+```
+
+<!-- DOCS:patterns-cancellation-ensure:hidden
+```ruby
+module ExportWorkspace
+  @deleted = []
+  @cancel_target = nil
+
+  class << self
+    attr_reader :deleted
+
+    def cancel_during_copy(workflow_class:, workflow_id:, store:, reason:)
+      @cancel_target = { workflow_class:, workflow_id:, store:, reason: }
+    end
+
+    def create(project_id, idempotency_key:)
+      { "project_id" => project_id, "workspace_id" => "tmp_#{project_id}", "create_key" => idempotency_key }
+    end
+
+    def copy(workspace, idempotency_key:)
+      if @cancel_target
+        target = @cancel_target
+        @cancel_target = nil
+        target.fetch(:workflow_class).handle(target.fetch(:workflow_id), store: target.fetch(:store)).cancel(reason: target.fetch(:reason))
+      end
+
+      workspace.merge("copy_key" => idempotency_key)
+    end
+
+    def publish(workspace, idempotency_key:)
+      workspace.merge("published" => true, "publish_key" => idempotency_key)
+    end
+
+    def delete(workspace_id)
+      @deleted << workspace_id
+      { "deleted" => workspace_id }
+    end
+  end
+end
+```
+-->
+
+```ruby
+export = ExportProject.start({ "project_id" => "proj_123" })
+```
+
+<!-- DOCS:patterns-cancellation-ensure:hidden
+```ruby
+ExportWorkspace.cancel_during_copy(
+  workflow_class: ExportProject,
+  workflow_id: export.workflow_id,
+  store:,
+  reason: "project archived",
+)
+
+worker = Durababble::Worker.new(
+  store:,
+  workflows: [ExportProject],
+  worker_id: "export-worker",
+  migrate: false,
+)
+worker.run_until_idle
+```
+-->
+
+```ruby
+export.status # => "canceled"
+```
+
+<!-- DOCS:patterns-cancellation-ensure:hidden
+```ruby
+{
+  "status" => export.status,
+  "result" => export.result,
+  "deleted" => ExportWorkspace.deleted,
+  "steps" => store.steps_for(export.workflow_id).select { |step|
+    ["create_workspace", "copy_rows", "delete_workspace"].include?(step.fetch("name"))
+  }.map { |step| [step.fetch("name"), step.fetch("status")] },
+}
+```
+-->
+
+<!-- DOCS:patterns-cancellation-ensure:end -->
+
+Here `copy_rows` represents work that was allowed to finish before the cancellation request was observed. Durababble raises cancellation before the workflow can schedule `publish_export`, then Ruby runs `ensure` and `delete_workspace` is recorded as a completed durable cleanup step. If the worker crashes after deleting the workspace but before the workflow reaches terminal `canceled`, replay skips the completed delete step instead of deleting the workspace twice.
+
 ## Other Patterns
 
 A few common shapes do not need their own executable example because they compose the patterns above with the other workflow primitives. The relevant references in the workflow docs:
@@ -326,4 +455,4 @@ A few common shapes do not need their own executable example because they compos
 - **Polling external state** — use `wait_condition { ... }` to suspend until a block returns true, with an optional timeout. The block runs in workflow context on each wake, so call a durable `step` inside it if the check itself has side effects worth recording.
 - **External signal / human-in-the-loop approval** — expose a command with `expose_command` and have the workflow wait on a durable object or `wait_condition` watching the durable side-effect of that command. See [RPC]({{< ref "workflows#rpc" >}}).
 - **Long-lived per-identity state** — do not stretch a workflow to live forever. Use a [durable object]({{< ref "durable-objects" >}}) keyed by the identity (shop id, cart id, channel id) and enqueue bounded workflows from it when there is a finite job to run.
-- **Cancellation-aware cleanup** — combine the saga shape above with the `Durababble::CancellationError` rescue from [Cancellation]({{< ref "workflows#cancellation" >}}) so a cancelled workflow gets the same compensation treatment as a failed one.
+- **Cancellation-aware cleanup** — use `ensure` for resources that must be released on success, failure, or cancellation. Use an explicit `rescue Durababble::CancellationError` instead when cleanup needs the cancellation reason or should return a cleanup result.

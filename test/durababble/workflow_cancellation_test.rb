@@ -63,6 +63,61 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
       end
     end
 
+    test "runs ensure cleanup when cancellation unwinds after a step boundary with #{backend.name}" do
+      with_durababble_store(backend, "workflow_cancellation_test") do |store|
+        cleanup_runs = 0
+        finalize_runs = 0
+        workflow = nil
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "cancel-ensure-cleanup"
+
+          define_method(:execute) do |input|
+            workspace = nil
+            begin
+              workspace = create_workspace(input)
+              copy_rows(workspace)
+              finalize_export(workspace)
+            ensure
+              delete_workspace(workspace) if workspace
+            end
+          end
+
+          define_method(:create_workspace) do |input|
+            { "workflow_id" => input.fetch("workflow_id"), "workspace_id" => "tmp-#{input.fetch("id")}" }
+          end
+          step :create_workspace
+
+          define_method(:copy_rows) do |workspace|
+            workflow.handle(workspace.fetch("workflow_id"), store:).cancel(reason: "customer canceled")
+            workspace.merge("copied" => true)
+          end
+          step :copy_rows
+
+          define_method(:finalize_export) do |workspace|
+            finalize_runs += 1
+            workspace.merge("finalized" => true)
+          end
+          step :finalize_export
+
+          define_method(:delete_workspace) do |workspace|
+            cleanup_runs += 1
+            { "deleted" => workspace.fetch("workspace_id") }
+          end
+          step :delete_workspace
+        end
+        workflow_id = workflow.enqueue({ "id" => "ensure" }, store:)
+        update_workflow_input(store, workflow_id, { "id" => "ensure", "workflow_id" => workflow_id }, backend)
+
+        run = Durababble::Engine.new(store:).resume(workflow, workflow_id:)
+        completed_steps = store.steps_for(workflow_id).select { |step| step.fetch("status") == "completed" }.map { |step| step.fetch("name") }
+
+        assert_equal "canceled", run.status
+        assert_equal 1, cleanup_runs
+        assert_equal 0, finalize_runs
+        assert_equal ["create_workspace", "copy_rows", "delete_workspace"], completed_steps
+      end
+    end
+
     test "cancels during retry backoff without waiting for the retry due time with #{backend.name}" do
       with_durababble_store(backend, "workflow_cancellation_test") do |store|
         work_runs = 0
