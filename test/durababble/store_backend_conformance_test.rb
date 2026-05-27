@@ -1252,6 +1252,33 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "skips excluded workflow ids when claiming runnable work with #{backend.name}" do
+      with_durababble_store(backend, "workflow_claim_exclusion") do |store|
+        first = store.enqueue_workflow(name: "exclude-workflow", input: { "id" => "first" })
+        second = store.enqueue_workflow(name: "exclude-workflow", input: { "id" => "second" })
+
+        claimed = store.claim_runnable_workflow(
+          worker_id: "worker-a",
+          lease_seconds: 30,
+          workflow_names: ["exclude-workflow"],
+          excluding_workflow_ids: [first],
+        )
+        assert_hash_includes claimed, "id" => second, "locked_by" => "worker-a"
+        assert_hash_includes store.workflow(first), "status" => "pending", "locked_by" => nil
+        assert_nil store.claim_runnable_workflow(
+          worker_id: "worker-b",
+          lease_seconds: 30,
+          workflow_names: ["exclude-workflow"],
+          excluding_workflow_ids: [first],
+        )
+        assert_hash_includes(
+          store.claim_runnable_workflow(worker_id: "worker-c", lease_seconds: 30, workflow_names: ["exclude-workflow"]),
+          "id" => first,
+          "locked_by" => "worker-c",
+        )
+      end
+    end
+
     test "supports lease, heartbeat, retry, failure, and release lifecycle operations with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "lifecycle", input: { "start" => true })

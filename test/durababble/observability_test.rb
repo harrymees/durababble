@@ -140,8 +140,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
       row
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
-      row = @workflows.values.find { |workflow| workflow.fetch("worker_pool", "default") == worker_pool && workflow.fetch("status") == "pending" && (!workflow_names || workflow_names.include?(workflow.fetch("name"))) }
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
+      row = @workflows.values.find do |workflow|
+        workflow.fetch("worker_pool", "default") == worker_pool &&
+          workflow.fetch("status") == "pending" &&
+          (!workflow_names || workflow_names.include?(workflow.fetch("name"))) &&
+          !Array(excluding_workflow_ids).include?(workflow.fetch("id"))
+      end
       return unless row
 
       claim_workflow(workflow_id: row.fetch("id"), worker_id:, lease_seconds:, worker_pool:)

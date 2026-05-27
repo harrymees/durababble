@@ -26,7 +26,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       @released << worker_id
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       result = @tick_results.shift
       raise result if result.is_a?(Exception)
 
@@ -41,6 +41,85 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class ForcedUnavailableDeliveryClient
     def deliver_message(**)
       raise Durababble::Rpc::Unavailable, "forced delivery failure"
+    end
+  end
+
+  class SaturatedDeliveryWorker
+    attr_reader :claim_attempts, :delivery_claims
+
+    def initialize(runtime:)
+      @runtime = runtime
+      @claim_attempts = 0
+      @delivery_claims = 0
+      @slow_completed = Queue.new
+      @delivery_completed = Queue.new
+    end
+
+    def claim_work(excluding_target_keys: nil)
+      @claim_attempts += 1
+      return if @claim_attempts > 1
+
+      Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "slow", "wf-1"], :slow)
+    end
+
+    def delivery_work(worker_pool:, target_kind:, target_type:, target_id:)
+      @delivery_claims += 1
+      Durababble::Worker::WorkItem.new(
+        :delivery,
+        [worker_pool, target_kind, target_type, target_id].map(&:to_s).freeze,
+        { worker_pool:, target_kind:, target_type:, target_id: },
+      )
+    end
+
+    def perform_work(work_item)
+      if work_item.payload == :slow
+        @runtime.send(
+          :enqueue_delivery,
+          worker_pool: "default",
+          target_kind: "workflow",
+          target_class: "slow",
+          target_id: "wf-2",
+        )
+        Kernel.sleep(0.05)
+        @slow_completed << true
+      else
+        @delivery_completed << true
+      end
+    end
+
+    def slow_completed?
+      !@slow_completed.empty?
+    end
+
+    def delivery_completed?
+      !@delivery_completed.empty?
+    end
+  end
+
+  class YieldingScheduledWorker
+    attr_reader :performed
+
+    def initialize
+      @claims = [
+        Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "yielding", "first"], :first),
+        Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "yielding", "second"], :second),
+      ]
+      @performed = Queue.new
+      @release_first = Queue.new
+    end
+
+    def claim_work(excluding_target_keys: nil)
+      @claims.shift
+    end
+
+    def perform_work(work_item)
+      @performed << work_item.payload
+      case work_item.payload
+      when :first
+        @release_first.pop
+      when :second
+        @release_first << true
+      end
     end
   end
 
@@ -75,6 +154,44 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_raises_matching(ArgumentError, /rpc_port/) do
       Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", rpc_port: nil)
     end
+  end
+
+  test "requires positive concurrency" do
+    store = RuntimeBranchStore.new
+
+    assert_raises_matching(ArgumentError, /concurrency/) do
+      Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: 0)
+    end
+    assert_raises_matching(ArgumentError, /concurrency/) do
+      Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: "many")
+    end
+
+    runtime = Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: 3)
+    assert_equal 3, runtime.concurrency
+  end
+
+  test "refuses to start an object-only concurrent runtime without fiber isolation" do
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_isolation_guard_object"
+
+      define_method(:ping) { true }
+      expose_command :ping
+    end
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 2,
+      migrate: false,
+    )
+
+    with_isolation_level(:thread) do
+      error = assert_raises(Durababble::ConfigurationError) { runtime.start }
+      assert_match(/isolation_level = :fiber/, error.message)
+    end
+
+    assert_equal false, runtime.running?
   end
 
   test "is idempotent when started more than once and stopped more than once" do
@@ -213,6 +330,340 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       "locked_until" => nil,
     )
     assert_equal ["completed"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+  end
+
+  test "runs multiple workflow tasks concurrently inside one runtime" do
+    active = 0
+    max_active = 0
+    release = false
+    started = Queue.new
+    workflow = durababble_test_workflow("runtime-concurrent-workflows") do
+      test_step("hold") do |ctx|
+        active += 1
+        max_active = [max_active, active].max
+        started << ctx.fetch("id")
+        sleep(0.01) until release
+        ctx.merge("done" => true)
+      ensure
+        active -= 1
+      end
+    end
+    workflow_ids = [
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "a" }),
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "b" }),
+    ]
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-concurrent",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+
+    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+    assert_operator(max_active, :>=, 2)
+    release = true
+    eventually(timeout: 3) do
+      assert_equal(["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") })
+    end
+    assert_equal(:stopped, runtime.shutdown(timeout: 1))
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "waits for active work instead of spinning when queued deliveries arrive while saturated" do
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      worker_pool: "default",
+      concurrency: 1,
+      poll_interval: 5,
+      migrate: false,
+    )
+    worker = SaturatedDeliveryWorker.new(runtime:)
+    thread = Thread.new do
+      runtime.instance_variable_set(:@thread, Thread.current)
+      Async { |task| runtime.send(:run_loop, task, worker) }
+    end
+
+    eventually(timeout: 1) { assert(worker.slow_completed?) }
+    eventually(timeout: 1) { assert(worker.delivery_completed?) }
+  ensure
+    runtime&.shutdown(timeout: 1)
+    thread&.join(1)
+  end
+
+  test "clears each active target after concurrently scheduled child work completes" do
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      worker_pool: "default",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    worker = YieldingScheduledWorker.new
+    active_targets = {}
+
+    Async do |task|
+      assert_equal(true, runtime.send(:schedule_available_work, task, worker, active_targets))
+    end
+
+    assert_equal([:first, :second], queue_values(worker.performed, 2))
+    assert_empty(active_targets, "completed child tasks should clear their own active target keys")
+  end
+
+  test "a single concurrent runtime can make workflow-to-object progress without another process" do
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_concurrent_object"
+
+      define_method(:record) do |value|
+        update_state({ "value" => value })
+        { "recorded" => value }
+      end
+      expose_command :record
+    end
+    caller_store = Durababble::Store.connect(database_url:, schema:)
+    def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.005, timeout: 2)
+      super(message_id, poll_interval:, timeout:)
+    end
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "runtime-concurrent-object-call"
+
+      define_method(:execute) do |input|
+        persist_to_object(input.fetch("object_id"))
+      end
+
+      define_method(:persist_to_object) do |object_id|
+        object.handle(object_id, store: caller_store).record("ok")
+      end
+      step :persist_to_object
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "object_id" => "object-1" })
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.workflow_name => workflow },
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+      rpc_host: "127.0.0.1",
+      rpc_port: 0,
+    )
+    runtime.start
+
+    eventually(timeout: 3) do
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "recorded" => "ok" })
+    end
+    assert_equal({ "value" => "ok" }, store.object_state(object_type: object.object_type, object_id: "object-1"))
+  ensure
+    runtime&.shutdown(timeout: 1)
+    caller_store&.close
+  end
+
+  test "does not re-enter an in-flight workflow when a duplicate activation is claimed by the same runtime" do
+    release = false
+    started = Queue.new
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "runtime-duplicate-activation"
+
+      define_method(:execute) do |input|
+        hold(input)
+      end
+
+      define_method(:hold) do |input|
+        started << input.fetch("id")
+        sleep(0.01) until release
+        { "done" => true }
+      end
+      step :hold
+
+      expose_command def approve
+        { "approved" => true }
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wf" })
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.workflow_name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-duplicate",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+    assert_equal("wf", started.pop)
+    message_id = store.enqueue_workflow_command(
+      workflow_id:,
+      workflow_name: workflow.workflow_name,
+      method_name: "approve",
+      payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+    )
+
+    sleep(0.25)
+    assert_equal(0, started.length)
+    assert_equal(1, store.step_attempts_for(workflow_id).length)
+
+    release = true
+    eventually(timeout: 3) do
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "done" => true })
+      assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "approved" => true })
+    end
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "does not renew an expired in-flight workflow lease by reclaiming its own active target" do
+    release = false
+    started = Queue.new
+    workflow = durababble_test_workflow("runtime-active-lease-not-renewed") do
+      test_step("hold") do |ctx|
+        started << true
+        sleep(0.01) until release
+        ctx.merge("done" => true)
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.name, input: {})
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-active-lease-not-renewed",
+      concurrency: 2,
+      poll_interval: 0.01,
+      lease_seconds: 1,
+      migrate: false,
+    )
+    runtime.start
+    assert_equal(true, started.pop)
+    original_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+
+    eventually(timeout: 3) { assert_operator(Time.now, :>, original_locked_until + 0.15) }
+    sleep(0.15)
+
+    current_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+    assert_operator(
+      current_locked_until,
+      :<=,
+      original_locked_until + 0.05,
+      "active workflow lease should not be renewed by duplicate in-process scheduling",
+    )
+  ensure
+    runtime&.shutdown(timeout: 0.05)
+    release = true
+    runtime&.wait(timeout: 1)
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "keeps commands for one object id serialized while other runtime slots are available" do
+    active = 0
+    max_active = 0
+    entered = Queue.new
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_serial_object"
+
+      define_method(:append) do |value|
+        active += 1
+        max_active = [max_active, active].max
+        entered << value
+        sleep(0.02)
+        values = current_state || []
+        update_state(values + [value])
+        values + [value]
+      ensure
+        active -= 1
+      end
+      expose_command :append
+    end
+    first_id = object.tell("shared", :append, 1, store:)
+    second_id = object.tell("shared", :append, 2, store:)
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: {},
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 4,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+
+    eventually(timeout: 3) do
+      assert_hash_includes(store.inbox_message(first_id), "status" => "completed")
+      assert_hash_includes(store.inbox_message(second_id), "status" => "completed")
+    end
+    assert_equal([1, 2], queue_values(entered, 2))
+    assert_equal(1, max_active)
+    assert_equal([1, 2], store.object_state(object_type: object.object_type, object_id: "shared"))
+  ensure
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "shutdown timeout releases every in-flight workflow lease from a concurrent runtime" do
+    release = false
+    started = Queue.new
+    attempts = Hash.new(0)
+    workflow = durababble_test_workflow("runtime-concurrent-timeout") do
+      test_step("hold") do |ctx|
+        attempts[ctx.fetch("id")] += 1
+        started << ctx.fetch("id")
+        sleep(0.01) until release
+        ctx.merge("attempt" => attempts.fetch(ctx.fetch("id")))
+      end
+    end
+    workflow_ids = [
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "a" }),
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "b" }),
+    ]
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-concurrent-timeout",
+      concurrency: 2,
+      poll_interval: 0.01,
+      lease_seconds: 60,
+      migrate: false,
+    )
+    runtime.start
+    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+
+    assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
+    workflow_ids.each do |workflow_id|
+      assert_hash_includes(store.workflow(workflow_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+      assert_equal(["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") })
+    end
+
+    release = true
+    runtime.wait(timeout: 1)
+    recovery = Durababble::Worker.new(
+      store:,
+      workflows: { workflow.name => workflow },
+      worker_id: "concurrent-recovery",
+      lease_seconds: 60,
+      migrate: false,
+    )
+    assert_equal(2, recovery.run_until_idle(max_ticks: 4))
+    workflow_ids.each do |workflow_id|
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "id" => store.workflow(workflow_id).fetch("input").fetch("id"), "attempt" => 2 })
+      assert_equal(["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+    end
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
   end
 
   test "stops claiming work on shutdown timeout, revokes owned leases, and lets another worker retry incomplete steps" do
@@ -549,5 +1000,23 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
       sleep(0.01)
     end
+  end
+
+  def queue_values(queue, count)
+    return [] if queue.length < count
+
+    count.times.map { queue.pop(true) }
+  end
+
+  def parse_time(value)
+    value.is_a?(Time) ? value : Time.parse(value.to_s)
+  end
+
+  def with_isolation_level(level)
+    previous = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = level
+    yield
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous
   end
 end

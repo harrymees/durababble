@@ -32,17 +32,20 @@ module Durababble
       end
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
       transaction do
         name_sql, name_params = workflow_name_filter(workflow_names)
+        exclusion_sql, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids)
+        workflow_sql = "#{name_sql} #{exclusion_sql}"
+        workflow_params = name_params + exclusion_params
         candidates = []
-        candidates.concat(execute_store_query(:claim_pending_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_failed_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_canceling_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_expired_workflow, [worker_pool] + name_params, name_sql:).to_a)
+        candidates.concat(execute_store_query(:claim_pending_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_failed_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_canceling_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_expired_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
         candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
         next unless candidate
 
@@ -801,6 +804,14 @@ module Durababble
       return ["", []] unless workflow_names
 
       ["AND name IN (#{mysql_placeholders(workflow_names.length)})", workflow_names]
+    end
+
+    #: (Array[String]?) -> [String, Array[String]]
+    def workflow_exclusion_filter(workflow_ids)
+      workflow_ids = Array(workflow_ids).uniq
+      return ["", []] if workflow_ids.empty?
+
+      ["AND id NOT IN (#{mysql_placeholders(workflow_ids.length)})", workflow_ids]
     end
 
     #: (Integer) -> Object?

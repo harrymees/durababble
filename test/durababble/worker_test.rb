@@ -21,7 +21,7 @@ class DurababbleWorkerTest < DurababbleTestCase
       @migrations += 1
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       claim = @claims.shift
       claim&.merge("claimed_by" => worker_id, "lease_seconds" => lease_seconds, "workflow_names" => workflow_names, "worker_pool" => worker_pool)
     end

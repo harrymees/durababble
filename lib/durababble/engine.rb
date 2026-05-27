@@ -193,12 +193,14 @@ module Durababble
     def persist_terminal_state(execution, workflow_id:, result:, attributes:)
       WorkflowExecutionContext.with_current(execution) do
         execution.validate_replay_complete!
-        if execution.cancellation_delivered?
-          @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
-          Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
-        else
-          @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
-          Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+        WorkflowDeterminism.allow_host_operations do
+          if execution.cancellation_delivered?
+            @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
+            Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+          else
+            @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
+            Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+          end
         end
         nil
       end
@@ -206,8 +208,11 @@ module Durababble
 
     #: (untyped) -> untyped
     def persist_workflow_suspension(workflow_id)
-      unless @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
-        row = @store.workflow(workflow_id)
+      suspended = WorkflowDeterminism.allow_host_operations do
+        @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+      end
+      unless suspended
+        row = WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id) }
         return run_from_row(row) if terminal_workflow_row?(row)
 
         raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow suspension"
@@ -218,7 +223,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def snapshot_if_terminal_or_reraise(workflow_id)
-      row = @store.workflow(workflow_id)
+      row = WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id) }
       return run_from_row(row) if terminal_workflow_row?(row)
 
       raise
@@ -226,8 +231,10 @@ module Durababble
 
     #: (untyped, CancellationError, untyped) -> untyped
     def persist_workflow_cancellation(workflow_id, error, attributes)
-      @store.cancel_workflow(workflow_id, reason: error.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
-      Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+      WorkflowDeterminism.allow_host_operations do
+        @store.cancel_workflow(workflow_id, reason: error.reason || cancellation_reason(workflow_id), result: nil, worker_id: @worker_id)
+        Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+      end
       snapshot(workflow_id)
     end
 
@@ -236,14 +243,16 @@ module Durababble
       raise if error.is_a?(InjectedCrash) || error.is_a?(LeaseConflict) || error.is_a?(ConfigurationError)
 
       message = ErrorFormatting.format_error(error)
-      @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
-      Observability.count("durababble.workflow.failures", attributes.merge("durababble.workflow.status" => "failed", "error.type" => error.class.name))
+      WorkflowDeterminism.allow_host_operations do
+        @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)
+        Observability.count("durababble.workflow.failures", attributes.merge("durababble.workflow.status" => "failed", "error.type" => error.class.name))
+      end
       snapshot(workflow_id)
     end
 
     #: (untyped) -> untyped
     def initial_context(workflow_id)
-      @store.workflow(workflow_id).fetch("input")
+      WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id).fetch("input") }
     end
 
     #: (untyped, untyped, untyped) { () -> untyped } -> untyped
@@ -255,12 +264,12 @@ module Durababble
 
     #: (untyped) -> untyped
     def cancellation_reason(workflow_id)
-      @store.workflow_cancellation(workflow_id)&.fetch("reason", nil)
+      WorkflowDeterminism.allow_host_operations { @store.workflow_cancellation(workflow_id)&.fetch("reason", nil) }
     end
 
     #: (untyped) -> untyped
     def snapshot(workflow_id)
-      run_from_row(@store.workflow(workflow_id))
+      WorkflowDeterminism.allow_host_operations { run_from_row(@store.workflow(workflow_id)) }
     end
 
     #: (untyped) -> untyped
