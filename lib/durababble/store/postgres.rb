@@ -295,30 +295,6 @@ module Durababble
       execute_store_query(:fail_live_step_attempts_for_workflow, [workflow_id, error])
     end
 
-    #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
-      payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
-      transaction do
-        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
-        execute_store_query(:insert_scheduled_step, [workflow_id, command_id, name])
-      end
-    end
-
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
-      command_id = normalize_command_id(command_id, position)
-      transaction do
-        assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        execute_store_query(:supersede_running_step_attempts, [workflow_id, command_id])
-        execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
-        attempt_id = SecureRandom.uuid
-        execute_store_query(:insert_step_attempt, [attempt_id, workflow_id, command_id, name])
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
-        attempt_id
-      end
-    end
-
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
     def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
@@ -761,22 +737,6 @@ module Durababble
     #: (workflow_id: String, command_id: Integer, status: String, serialized_result: Object?, error: String?) -> Object?
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
       execute_store_query(:update_latest_attempt, [workflow_id, command_id, status, serialized_result, error])
-    end
-
-    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: String?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
-    def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-      execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
-      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-      event_index
-    end
-
-    #: (Integer?, Integer?) -> Integer
-    def normalize_command_id(command_id, position)
-      id = command_id.nil? ? position : command_id
-      raise ArgumentError, "command_id is required" if id.nil?
-
-      id.to_i
     end
 
     #: (?max_attempts: Integer) { () -> Object? } -> Object?
