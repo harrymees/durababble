@@ -15,7 +15,7 @@ Durababble exposes two durable primitives:
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
-The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, target activations, and FIFO inbox command rows for object and workflow targets. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands and validates `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests.
+The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, target activations, and FIFO inbox command rows for object and workflow targets. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands. `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests are checked on every PR by `test/durababble/formal_sigil_drift_test.rb` in the fast `test` suite.
 
 Storage works through PostgreSQL/YSQL (`postgresql://` / `postgres://`) and MySQL/MariaDB (`mysql://` / `mysql2://`). Both adapters must provide the same public durable semantics, with backend-specific SQL hidden behind shared conformance tests and backend-specific locking/query-plan tests where query shape matters.
 
@@ -589,7 +589,7 @@ Observability requirements:
 | Transient exposed methods route to owner | `CallTransient` invokes live object/workflow owner without durable mutation. | Transient RPC specs |
 | Worker pool scopes persisted targets and relevant keys | Persisted targets and query-critical keys include `worker_pool` where routing/claiming requires it. | Worker-pool backend specs |
 | Unified inbox is the durable message model | Object commands, object wakes, and workflow commands share one inbox contract. | Inbox/mailbox specs |
-| Alloy model tracks storage/lease/concurrency invariants | `formal/workflow_storage.als` checks model obligations and Durababble sigil validation ties them to Ruby implementation/tests. | `rake formal` in CI |
+| Alloy model tracks storage/lease/concurrency invariants | `formal/workflow_storage.als` checks model obligations; `[DURABABBLE-*]` sigils tie each obligation to a Ruby implementation/test callsite. | `rake formal` (Alloy verifier) plus `FormalSigilDriftTest` in CI |
 
 ## Crash matrix
 

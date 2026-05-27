@@ -30,6 +30,6 @@ The Durababble Alloy model was designed after reviewing Silo's `specs/job_shard.
 
 Copied from Silo: time-indexed durable rows, explicit transition predicates with preconditions/postconditions/frame conditions, safety properties as `assert`/`check`, representative SAT `run` examples, and bidirectional model-to-implementation sigils.
 
-Adapted for Durababble: job/task/holder vocabulary became workflows, method-order steps, attempts, waits, leases, fences, outbox rows, and durable-object command rows; permanent shard ownership became expiring workflow/outbox leases with heartbeat, expiry, release, and stale-owner commit rejection; Silo's Rust validator became a Ruby validator over Alloy files and Ruby implementation/test files.
+Adapted for Durababble: job/task/holder vocabulary became workflows, method-order steps, attempts, waits, leases, fences, outbox rows, and durable-object command rows; permanent shard ownership became expiring workflow/outbox leases with heartbeat, expiry, release, and stale-owner commit rejection; Silo's Rust validator became `test/durababble/formal_sigil_drift_test.rb`, a Minitest case that rides the fast `test` job and cross-checks `[DURABABBLE-*]` sigils between the Alloy files and Ruby implementation/tests.
 
 Rejected from Silo: broker buffers, shard splitting, tenant ranges, concurrency ticket holders, and a separate cancellation flag model, because those are not current Durababble storage concepts.

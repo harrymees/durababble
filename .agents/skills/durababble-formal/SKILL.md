@@ -33,11 +33,10 @@ Run the Alloy verifier (slow, ~30 min on a clean checkout):
 mise exec -- bundle exec rake formal
 ```
 
-Or run the pieces directly:
+Or run the verifier script directly:
 
 ```sh
 mise exec -- scripts/verify-alloy.sh
-mise exec -- bundle exec ruby scripts/validate-durababble-sigils.rb --verbose
 ```
 
 `scripts/verify-alloy.sh` uses `alloy6` when installed; otherwise it downloads
@@ -53,16 +52,23 @@ mise exec -- env ALLOY_COMMAND=exampleWaitWake scripts/verify-alloy.sh
 mise exec -- env ALLOY_COMMAND='exampleInboxCommand*' scripts/verify-alloy.sh
 ```
 
+Check sigil drift between the Alloy model and the Ruby tree (fast — runs in
+the regular test suite, but useful to run alone before pushing a merge):
+
+```sh
+mise exec -- bundle exec ruby -Ilib -Itest test/durababble/formal_sigil_drift_test.rb
+```
+
 ## CI layout
 
-The Alloy verifier is wired into `.github/workflows/formal.yml` and only runs
-when `formal/**`, `scripts/verify-alloy.sh`, or that workflow file changes —
-it is too slow to ride every PR.
+The slow Alloy verifier is wired into `.github/workflows/formal.yml` and only
+runs when `formal/**`, `scripts/verify-alloy.sh`, or that workflow file
+changes — it is too slow to ride every PR.
 
 Sigil drift is caught on every PR by `test/durababble/formal_sigil_drift_test.rb`
-which rides the fast `test` job in `.github/workflows/ci.yml`. The Ruby script
-`scripts/validate-durababble-sigils.rb` is kept for local use from `rake formal`
-but is no longer the canonical CI check.
+which rides the fast `test` job in `.github/workflows/ci.yml`. It is a normal
+Minitest test, not a separate script or rake task. To validate sigils outside
+the full suite, run the file directly (see the command above).
 
 ## Drift trap when merging main
 
@@ -70,14 +76,15 @@ but is no longer the canonical CI check.
 comment will leave `main` green, but the next merge of `main` into a
 formal-model branch will fail `FormalSigilDriftTest` in the fast `test` job.
 
-Pre-merge check:
+Pre-merge check after `git merge origin/main`:
 
 ```sh
-mise exec -- bundle exec ruby scripts/validate-durababble-sigils.rb
+mise exec -- bundle exec ruby -Ilib -Itest test/durababble/formal_sigil_drift_test.rb
 ```
 
-If "Only in Alloy" or "Only in Ruby" is nonzero, re-anchor each missing tag on
-the closest equivalent method in the new layout before pushing.
+If the test fails, the failure message lists the unmatched tags and the files
+where they appear. Re-anchor each missing tag on the closest equivalent method
+in the new layout before pushing.
 
 ## Model-to-implementation matrix
 

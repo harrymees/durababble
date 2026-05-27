@@ -32,15 +32,14 @@ task :typecheck do
   sh("bundle exec srb tc")
 end
 
-task :sigils do
-  sh(RbConfig.ruby, "scripts/validate-durababble-sigils.rb")
-end
-
 task :alloy do
   sh("scripts/verify-alloy.sh")
 end
 
-task formal: [:alloy, :sigils]
+# Sigil drift is checked by `test/durababble/formal_sigil_drift_test.rb` which
+# runs on every PR with the rest of the fast `test` suite. The `formal` task
+# only triggers the slow Alloy verifier; no separate sigil step is needed.
+task formal: [:alloy]
 
 task lint: [:rubocop, :typecheck, "check:markdown"]
 

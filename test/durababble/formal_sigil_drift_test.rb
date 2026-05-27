@@ -6,11 +6,14 @@ require "find"
 require "pathname"
 require "set"
 
-# Mirror of scripts/validate-durababble-sigils.rb, run as a Minitest test so
-# every CI run catches `[DURABABBLE-*]` drift between the Alloy model and the
-# Ruby implementation/specs. The script remains usable from `rake formal` for
-# local Alloy workflows; this test is the canonical check in CI because it
-# rides the fast `test` job rather than the long Alloy verification job.
+# Catches `[DURABABBLE-*]` sigil drift between the Alloy model under `formal/`
+# and the Ruby implementation/tests under `lib/` and `test/`. Runs on every PR
+# with the fast `test` job — the slow Alloy verifier in `rake formal` is
+# gated on `formal/**` changes only, so this is the canonical drift check.
+#
+# To run just this test:
+#
+#   bundle exec ruby -Ilib -Itest test/durababble/formal_sigil_drift_test.rb
 class FormalSigilDriftTest < Minitest::Test
   TAG_REGEX = /\[DURABABBLE-[A-Z0-9-]+\]/
   MODEL_DIRS = ["formal"].freeze
