@@ -52,18 +52,26 @@ jobs:
           bundler-cache: true
 
       - name: Run coverage gate
+        if: matrix.backend == 'mysql'
         env:
-          DURABABBLE_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:postgres@127.0.0.1:5432/postgres' || 'mysql://root@127.0.0.1:3306/sidekick_server_test' }}
+          DURABABBLE_DATABASE_URL: mysql://root@127.0.0.1:3306/sidekick_server_test
           DURABABBLE_MYSQL_HOST: 127.0.0.1
-          DURABABBLE_POSTGRES_DATABASE_URL: ${{ matrix.backend == 'postgres' && 'postgresql://postgres:postgres@127.0.0.1:5432/postgres' || '' }}
-          DURABABBLE_TEST_BACKENDS: ${{ matrix.backend }}
+          DURABABBLE_TEST_BACKENDS: mysql
         run: bundle exec rake test:coverage
 
+      - name: Run PostgreSQL suite
+        if: matrix.backend == 'postgres'
+        env:
+          DURABABBLE_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          DURABABBLE_POSTGRES_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+          DURABABBLE_TEST_BACKENDS: postgres
+        run: bundle exec rake test
+
       - name: Upload coverage report
-        if: always()
+        if: always() && matrix.backend == 'mysql'
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report-${{ matrix.backend }}
+          name: coverage-report
           path: coverage/
           if-no-files-found: ignore
           include-hidden-files: true
