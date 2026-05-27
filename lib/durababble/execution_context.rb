@@ -5,6 +5,7 @@ require "async"
 
 Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?(:durababble_workflow_execution)
 Fiber.attr_accessor(:durababble_step_context) unless Fiber.method_defined?(:durababble_step_context)
+Fiber.attr_accessor(:durababble_stream_writer) unless Fiber.method_defined?(:durababble_stream_writer)
 
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
@@ -54,6 +55,31 @@ module Durababble
         block.call
       ensure
         fiber.durababble_step_context = previous
+      end
+    end
+  end
+
+  # Points at the active streaming-result writer (a `ResultStream::Writer` for a
+  # local snapshot producer, or an `Rpc::StreamWriter`/lease-checking wrapper for
+  # a server-side producer). The exposed_stream method body runs in the same
+  # fiber as the producer, so `Durababble.stream_cancelled?` can read it to learn
+  # whether the consumer has gone away.
+  module StreamExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_stream_writer
+      end
+
+      #: (untyped) { () -> void } -> void
+      def with_current(writer, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_stream_writer
+        fiber.durababble_stream_writer = writer
+        block.call
+      ensure
+        fiber.durababble_stream_writer = previous
       end
     end
   end

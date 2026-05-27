@@ -94,6 +94,8 @@ module Durababble
       @consecutive_errors = 0
       @rpc_server = nil
       @rpc_address = nil
+      @stream_dispatcher = nil
+      @object_stream_host = nil
       @workflow_query_registry = WorkflowQueryRegistry.new
       @workflow_rpc_handlers = workflow_rpc_handlers
     end
@@ -203,10 +205,62 @@ module Durababble
         verify_deliver_message_owner: false,
         identity_id: @worker_identity_id,
         deliver_message: method(:enqueue_delivery),
+        stream_handler: method(:handle_stream),
+        evict_lease: method(:handle_evict_lease),
       ).start
       @rpc_address = @rpc_server.address
-      @worker_id = @rpc_server.node_id
+      # The server assigns its `node_id` during `start`, so it is non-nil here.
+      node_id = @rpc_server.node_id #: as String
+      @worker_id = node_id
+      # The host's renewal task uses `Store#with_dedicated_connection` so its
+      # writes do not contend with the worker loop's reactor connection. Built
+      # before the dispatcher so the dispatcher receives it.
+      lease_seconds = @lease_seconds.to_i
+      @object_stream_host = ObjectStreamHost.new(
+        store: @store,
+        worker_id: @worker_id,
+        node_id:,
+        worker_pool: @worker_pool,
+        lease_seconds:,
+      )
+      # Build the dispatcher once, now that `@worker_id` is assigned. It normalizes
+      # the workflow/object registries up front, so reusing it avoids re-running
+      # `normalize_registry` per stream open.
+      @stream_dispatcher = StreamDispatcher.new(
+        store: @store,
+        workflows: @workflows,
+        objects: @objects,
+        node_id:,
+        object_stream_host: @object_stream_host,
+        lease_seconds:,
+      )
+      # Publish for `DurableObjectRef#open_object_stream` to self-route when no
+      # owner exists yet. Multiple runtimes in one process (test HA only) →
+      # last-writer-wins; production has one runtime per process so the caveat
+      # does not bite.
+      Durababble.local_stream_host = @object_stream_host
+      # Register this runtime as the local workflow-query owner so a `WorkflowRef`
+      # opened against the same store can dispatch queries in-process instead of
+      # opening an HTTP/2 client just to call itself.
       configure_local_workflow_rpc(@store)
+    end
+
+    # Handles `Rpc::Server` `evict_lease` calls. For `target_kind == "object"`
+    # this surfaces a `StaleLease` terminal frame to in-flight stream consumers
+    # and releases the row. Workflow eviction continues to flow through the
+    # workflow runtime; this is intentionally object-only here.
+    #: (worker_pool: String, target_kind: String, target_class: String, target_id: String) -> void
+    def handle_evict_lease(worker_pool:, target_kind:, target_class:, target_id:)
+      return unless target_kind == "object"
+
+      @object_stream_host&.evict!(worker_pool:, object_type: target_class, object_id: target_id)
+    end
+
+    # Routes a `call_transient_stream` RPC to the memoized `StreamDispatcher` built
+    # in `start_rpc_server`.
+    #: (request: untyped, args: untyped, writer: untyped) -> void
+    def handle_stream(request:, args:, writer:)
+      @stream_dispatcher&.call(request:, args:, writer:)
     end
 
     #: () -> untyped
@@ -214,9 +268,22 @@ module Durababble
       server = @rpc_server
       return unless server
 
+      # Evict in-flight object streams BEFORE the reactor interrupts; consumers
+      # then receive a terminal `StaleLease` frame instead of a dropped TCP
+      # connection. The host's renewal thread is stopped on the way out.
+      host = @object_stream_host
+      if host
+        host.evict_all!
+        host.stop!
+      end
+
+      Durababble.local_stream_host = nil if Durababble.local_stream_host.equal?(host)
+
+      clear_local_workflow_rpc(@store)
       @rpc_server = nil
       @rpc_address = nil
-      clear_local_workflow_rpc(@store)
+      @stream_dispatcher = nil
+      @object_stream_host = nil
       server.stop
     end
 

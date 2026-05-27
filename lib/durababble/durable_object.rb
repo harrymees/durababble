@@ -243,6 +243,11 @@ module Durababble
     #: () -> bool
     def state_dirty? = @state_dirty
 
+    # True when the consumer of an in-progress `expose_stream` has gone away.
+    # Indefinite stream producers should poll this and return when it flips.
+    #: () -> bool
+    def stream_cancelled? = Durababble.stream_cancelled?
+
     private
 
     #: (Object?) -> String
@@ -290,6 +295,8 @@ module Durababble
         end
 
         invoke_query(method_name, args:, kwargs:, block:)
+      elsif @object_class.exposed_streams.key?(method_name)
+        open_object_stream(method_name, args:, kwargs:)
       elsif (retry_policy = @object_class.exposed_commands[method_name])
         raise ArgumentError, "blocks cannot be passed to durable object command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
 
@@ -318,10 +325,118 @@ module Durababble
 
     #: (Symbol, ?bool) -> bool
     def respond_to_missing?(method_name, include_private = false)
-      @object_class.exposed_queries.key?(method_name) || @object_class.exposed_commands.key?(method_name) || super
+      @object_class.exposed_queries.key?(method_name) ||
+        @object_class.exposed_streams.key?(method_name) ||
+        @object_class.exposed_commands.key?(method_name) || super
     end
 
     private
+
+    # An object stream routes to the unified `durable_objects` lease holder when
+    # one exists, so producers (and the commands they observe) all run on the
+    # single exclusive owner node. When no live lease exists but this process is
+    # itself a worker, the consumer self-routes to its own RPC server via
+    # `Durababble.local_stream_host`; the server-side dispatcher then claims the
+    # lease as part of `with_lease`, so the first opener becomes the owner.
+    # Plain consumers without a local host fall back to a local state snapshot
+    # (same semantics as exposed queries).
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> ResultStream
+    def open_object_stream(method_name, args:, kwargs:)
+      lease = @store.current_object_lease(@object_class.object_type, @durable_id)
+      if lease
+        open_remote_object_stream(method_name, args:, kwargs:, lease:)
+      elsif (host = Durababble.local_stream_host)
+        synthetic = { "worker_id" => host.worker_id, "worker_pool" => host.worker_pool }
+        open_remote_object_stream(method_name, args:, kwargs:, lease: synthetic)
+      else
+        open_local_object_stream(method_name, args:, kwargs:)
+      end
+    end
+
+    # Opens the stream on the node that currently holds the object lease. The
+    # lease's `worker_id` is a worker *identity* (`id@host:port`); we resolve it
+    # to the bare RPC address before building the client, since the identity's
+    # `id` segment is for fencing, not addressing. The pool is taken from the
+    # lease, falling back to the ref's pool and then "default".
+    #
+    # A bounded re-resolve handles two narrow races: (1) the previous owner
+    # crashed but its row has not expired yet (consumer sees `NodeUnavailable`
+    # on connect), and (2) a fresh claim arrived between the consumer's lookup
+    # and the server-side `with_lease` (server raises `StaleLease` before any
+    # value has been emitted). One retry off `current_object_lease` lets a
+    # follow-on open land on the new owner; we only retry when nothing has been
+    # delivered yet so a mid-stream failure still surfaces.
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> ResultStream
+    def open_remote_object_stream(method_name, args:, kwargs:, lease:)
+      object_class = @object_class
+      durable_id = @durable_id
+      store = @store
+      ref_pool = @worker_pool
+      ResultStream.new do |writer|
+        attempts = 0
+        emitted = 0
+        current = lease
+        begin
+          attempts += 1
+          emitted = run_object_remote_request(method_name, args:, kwargs:, lease: current, store:, writer:, object_class:, durable_id:, ref_pool:)
+        rescue WorkflowRpc::StaleLease, WorkflowRpc::NodeUnavailable
+          # Once any frame has been forwarded to the consumer, a retry would
+          # double-emit, so propagate. Otherwise re-resolve the lease once and
+          # try a fresh owner.
+          raise if emitted.positive? || attempts >= 2
+
+          refreshed = store.current_object_lease(object_class.object_type, durable_id)
+          raise unless refreshed
+
+          current = refreshed
+          retry
+        end
+      end
+    end
+
+    # Inner RPC call — pulled out so `open_remote_object_stream` can re-resolve
+    # on a transient failure before any value has been forwarded. Returns the
+    # number of values forwarded so the caller can decide whether retrying is
+    # still safe.
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?], store: untyped, writer: untyped, object_class: untyped, durable_id: String, ref_pool: String) -> Integer
+    def run_object_remote_request(method_name, args:, kwargs:, lease:, store:, writer:, object_class:, durable_id:, ref_pool:)
+      worker_id = lease.fetch("worker_id") #: as String
+      worker_pool = lease["worker_pool"] || ref_pool #: as String
+      client = store.rpc_client_factory.call(WorkerIdentity.address_for(worker_id)) #: as untyped
+      remote = client.call_transient_stream(
+        worker_pool:,
+        class_name: object_class.object_type,
+        durable_object_id: durable_id,
+        method: method_name.to_s,
+        args: { "args" => args, "kwargs" => kwargs },
+      )
+      count = 0
+      remote.each do |value|
+        writer.emit(value)
+        count += 1
+      end
+      count
+    end
+
+    # No live lease and no local host: run the `expose_stream` method against a
+    # local snapshot instance as the `ResultStream`'s producer task. Publishes
+    # the writer so `Durababble.stream_cancelled?` works inside the method body.
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> ResultStream
+    def open_local_object_stream(method_name, args:, kwargs:)
+      object_class = @object_class
+      store = @store
+      durable_id = @durable_id
+      worker_pool = @worker_pool
+      ResultStream.new do |writer|
+        StreamExecutionContext.with_current(writer) do
+          state = DurableObject.state_from_store(store, object_type: object_class.object_type, object_id: durable_id)
+          object = object_class.new(durable_id:, state:, store:, worker_pool:) #: as untyped
+          object.instance_variable_set(:@__durababble_query_context, true)
+          emit = ->(value) { writer.emit(value) }
+          object.public_send(method_name, *args, **kwargs, &emit)
+        end
+      end
+    end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
     def invoke_query(method_name, args:, kwargs:, block:)
@@ -422,11 +537,14 @@ module Durababble
     ensure
       # The gated claim inside `claim_inbox_messages` acquires the unified object
       # lease as part of taking command rows; releasing it when drain returns hands
-      # ownership back so another worker can claim. Skipping this release would
-      # strand the lease for `lease_seconds` after the worker idles, blocking any
-      # other node from picking up the next command. Every Store implementation
-      # is expected to provide `release_object_lease`; the base no-op falls
-      # through cleanly when no lease was actually taken.
+      # ownership back so another worker (or this one's stream lane on a future
+      # opener) can claim. If a streaming `ObjectStreamHost` is currently using the
+      # same lease, its renewal task will lose this row and the stream ends with
+      # `StaleLease`, which is the documented graceful-eviction behavior. Skipping
+      # this release would strand the lease for `lease_seconds` after the worker
+      # idles, blocking any other node from picking up the next command. Every
+      # Store implementation provides `release_object_lease`; the base no-op
+      # falls through cleanly when no lease was actually taken.
       @store.release_object_lease(object_type:, object_id:, worker_id: @worker_id)
     end
 

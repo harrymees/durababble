@@ -6,6 +6,8 @@ require "async"
 require "async/http"
 require "async/http/endpoint"
 require "protocol/http/response"
+require "protocol/http/body/writable"
+require_relative "worker_identity"
 require_relative "rpc_messages"
 
 module Durababble
@@ -13,15 +15,27 @@ module Durababble
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     DEFAULT_TIMEOUT = 5.0
 
-    # One HTTP path per unary method. The wire payload on both legs is
+    # Bounded buffer between a stream producer and the wire (server side) and
+    # between the wire and the consumer (client side). Provides back-pressure on
+    # top of HTTP/2 flow control: a producer that outpaces the reader parks.
+    STREAM_BUFFER = 16
+    # How long a streaming consumer parks in a single `read` before waking to
+    # re-check whether it has been cancelled. Keeps cancellation responsive for
+    # idle/indefinite streams without busy-looping.
+    STREAM_POLL_TIMEOUT = 0.25
+
+    # One HTTP path per RPC method. The wire payload on both legs is
     # `Rpc.dump`/`Rpc.load` (Paquito/Marshal), Ruby-to-Ruby — durababble never
     # used protobuf for cross-language interop, so HTTP/2 + Paquito carries the
-    # same opaque bytes the gRPC transport did.
+    # same opaque bytes the gRPC transport did. `call_transient_stream` differs
+    # only in its response: a stream of length-prefixed `StreamFrame`s rather
+    # than a single response body.
     PATHS = {
       awaken_batch: "/durababble/v1/awaken_batch",
       evict_lease: "/durababble/v1/evict_lease",
       deliver_message: "/durababble/v1/deliver_message",
       call_transient: "/durababble/v1/call_transient",
+      call_transient_stream: "/durababble/v1/call_transient_stream",
     }.freeze #: Hash[Symbol, String]
 
     ROUTES = PATHS.invert.freeze #: Hash[String, Symbol]
@@ -52,6 +66,11 @@ module Durababble
 
       #: (String?) -> Object?
       def load(bytes) = bytes.nil? || bytes.empty? ? nil : SERIALIZER.load(bytes)
+
+      #: () -> Hash[String, String]
+      def octet_headers
+        OCTET_HEADERS
+      end
 
       # Thread-local cache of `Async::HTTP::Client` keyed by remote address so
       # repeated RPC calls to the same peer reuse the same HTTP/2 connection
@@ -102,6 +121,16 @@ module Durababble
         cache.clear
       end
 
+      # Maps a remote error's class name + message back to a typed local error.
+      # Shared by the unary `decode_transient_response` path and the streaming
+      # consumer's terminal error frame. Returns the error object (the caller
+      # decides whether to raise now or carry it).
+      #: (String, String) -> Exception
+      def build_remote_error(klass, message)
+        WorkflowRpc.remote_error_from_fields(klass, message) ||
+          Durababble::Rpc::RemoteError.new("#{klass}: #{message}")
+      end
+
       private
 
       #: () -> Hash[String, untyped]
@@ -112,6 +141,29 @@ module Durababble
         cache = {}
         Thread.current.thread_variable_set(HTTP_CLIENT_CACHE_KEY, cache)
         cache
+      end
+    end
+
+    # Server-side producer handle passed to a `call_transient_stream` handler.
+    # Wraps the `Protocol::HTTP::Body::Writable` the response streams: `emit`
+    # encodes one value `StreamFrame` and writes it as a length-prefixed frame;
+    # `cancelled?` reports whether the consumer has reset the stream (the body's
+    # queue is closed). A handler is expected to check `cancelled?` between
+    # quacks; a write after cancellation raises, which unwinds the handler.
+    class StreamWriter
+      #: (Protocol::HTTP::Body::Writable) -> void
+      def initialize(body)
+        @body = body
+      end
+
+      #: (Object?) -> void
+      def emit(value)
+        @body.write(FrameCodec.frame(Rpc.dump(Messages::StreamFrame.new(kind: :value, value:))))
+      end
+
+      #: () -> bool
+      def cancelled?
+        @body.closed?
       end
     end
 
@@ -129,7 +181,7 @@ module Durababble
 
       #: (String) -> String?
       def rpc_address_for(node_id)
-        @entries[node_id]
+        @entries[node_id] || WorkerIdentity.address_for(node_id)
       end
     end
 
@@ -166,10 +218,7 @@ module Durababble
         #: (Object) -> bot
         def raise_remote_error(error)
           error = error #: as untyped
-          typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
-          raise typed if typed
-
-          raise Durababble::Rpc::RemoteError, "#{error.klass}: #{error.message}"
+          raise Rpc.build_remote_error(error.klass.to_s, error.message.to_s)
         end
       end
 
@@ -245,7 +294,149 @@ module Durababble
         raise WorkflowRpc::NodeUnavailable, e.message
       end
 
+      # Opens a streaming-result RPC and returns a `ResultStream`. The HTTP
+      # request is not sent until the stream is iterated (`each`/`read`): the
+      # `ResultStream` runs the block below as a child task on the consumer's
+      # reactor, where `Sync` reuses that task, POSTs the request, and pumps
+      # decoded frames into the stream. Closing the `ResultStream` (or its reactor
+      # scope ending) stops the producer task: `cancelled?` flips, the poll loop
+      # breaks, and the response is closed (resetting the HTTP/2 stream so the
+      # server-side producer observes the cancellation and unwinds).
+      #
+      # Fencing note: unlike unary `call_transient`, this intentionally does not
+      # send `expected_worker_id`. Workflow streams are instead fenced server-side
+      # by lease ownership — `StreamDispatcher` verifies the lease up front and the
+      # `LeaseCheckingWriter` re-checks it as frames are produced, ending the stream
+      # with a terminal `StaleLease` if this node no longer owns the workflow. The
+      # consumer therefore observes a hand-off via a raised `StaleLease`, not via a
+      # rejected request. (Object streams run against a snapshot, so there is no
+      # owner to fence against.)
+      #: (**Object?) -> ResultStream
+      def call_transient_stream(**kwargs)
+        worker_pool = kwargs.fetch(:worker_pool) #: as String
+        method = kwargs.fetch(:method) #: as String
+        args = kwargs.fetch(:args)
+        class_name = kwargs.fetch(:class_name, "") #: as String
+        durable_object_id = kwargs.fetch(:durable_object_id, "") #: as String
+        workflow_id = kwargs.fetch(:workflow_id, "") #: as String
+        deadline_ms = kwargs.fetch(:deadline_ms, 0) #: as Integer
+        request = Messages::TransientRequest.new(
+          worker_pool:,
+          class_name:,
+          durable_object_id:,
+          workflow_id:,
+          method:,
+          args: Rpc.dump(args, surface: :rpc_argument, context: "CallTransientStream #{method} args"),
+          deadline_ms:,
+        )
+        ResultStream.new { |writer| open_stream(request, writer) }
+      end
+
       private
+
+      # Runs on the `ResultStream`'s producer task (the consumer's reactor). Sends
+      # the request, then decodes frames until the stream ends, errors, or the
+      # consumer cancels. Transport-level failures map to `NodeUnavailable` so the
+      # consumer sees a typed error; application errors arrive as terminal error
+      # frames.
+      #: (Messages::TransientRequest, ResultStream::Writer) -> void
+      def open_stream(request, writer)
+        Sync do |task|
+          # HTTP/2 multiplexes streams over a single connection — the cached
+          # client serves both `unary` and `open_stream`. We never close it
+          # here: ownership belongs to the cache (or the test injecting it).
+          client = @injected_client || Rpc.http_client_for(@address) #: as untyped
+          response = nil
+          begin
+            response = task.with_timeout(@timeout) do
+              client.post(PATHS.fetch(:call_transient_stream), OCTET_HEADERS, [Rpc.dump(request)])
+            end
+            consume_stream(response, writer, task)
+          rescue Async::TimeoutError, Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::EPIPE, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError, IOError => e
+            raise WorkflowRpc::NodeUnavailable, e.message
+          rescue Protocol::HTTP2::Error => e
+            raise WorkflowRpc::NodeUnavailable, e.message
+          ensure
+            cancel_stream(response)
+          end
+        end
+      end
+
+      # Forcefully resets the HTTP/2 stream when it is still open, then closes
+      # the response. On a graceful end the server already sent END_STREAM, so
+      # the stream is closed and the reset is skipped; on consumer cancellation
+      # the stream is still open and the RST_STREAM tells the server to stop
+      # producing (its body closes and `StreamWriter#cancelled?` flips true).
+      # Without this, `client.close` would block draining an unfinished stream.
+      #: (untyped) -> void
+      def cancel_stream(response)
+        return unless response
+
+        stream = response.respond_to?(:stream) ? response.stream : nil
+        if stream.respond_to?(:send_reset_stream) && !stream.closed?
+          stream.send_reset_stream(Protocol::HTTP2::Error::CANCEL)
+        end
+      rescue StandardError
+        nil
+      ensure
+        response&.close
+      end
+
+      #: (untyped, ResultStream::Writer, untyped) -> void
+      def consume_stream(response, writer, task)
+        ensure_stream_ok!(response)
+        buffer = FrameCodec::Buffer.new
+        loop do
+          break if writer.cancelled?
+
+          chunk = read_stream_chunk(response, task)
+          next if chunk == :timeout
+          break if chunk.nil?
+
+          bytes = chunk #: as String
+          buffer << bytes
+          while (payload = buffer.shift)
+            deliver_frame(Rpc.load(payload), writer)
+          end
+        end
+      end
+
+      # Reads the next body chunk, waking after `STREAM_POLL_TIMEOUT` so the loop
+      # can re-check cancellation even when the server is idle. A timeout is not
+      # an error: it returns the `:timeout` sentinel and the read is retried.
+      #: (untyped, untyped) -> (String | Symbol)?
+      def read_stream_chunk(response, task)
+        task.with_timeout(STREAM_POLL_TIMEOUT) { response.body&.read }
+      rescue Async::TimeoutError
+        :timeout
+      end
+
+      #: (Object?, ResultStream::Writer) -> void
+      def deliver_frame(frame, writer)
+        frame = frame #: as Messages::StreamFrame
+        if frame.error?
+          error = frame.error #: as untyped
+          raise Rpc.build_remote_error(error.klass.to_s, error.message.to_s)
+        end
+
+        writer.emit(frame.value)
+      end
+
+      # A streaming response is HTTP 200 with a frame body; any other status is a
+      # transport-level failure carried in the (small, fully-read) body.
+      #: (untyped) -> void
+      def ensure_stream_ok!(response)
+        status = response.status
+        return if status == 200
+
+        body = response.read
+        case status
+        when 401
+          raise Unauthenticated, error_message(body, "durababble RPC peer is not authorized")
+        else
+          raise Unavailable, error_message(body, "durababble RPC node is unavailable")
+        end
+      end
 
       # Performs one unary request: encode the value object, POST it over HTTP/2,
       # then decode the response value object. Runs inside `Sync` so it is
@@ -298,6 +489,11 @@ module Durababble
         body.nil? || body.empty? ? default : body
       end
 
+      #: () -> Async::HTTP::Endpoint
+      def endpoint
+        @endpoint ||= Async::HTTP::Endpoint.parse(@address.include?("://") ? @address : "http://#{@address}")
+      end
+
       #: () { () -> Object? } -> Object?
       def with_rpc_errors(&block)
         block.call
@@ -334,6 +530,10 @@ module Durababble
     end
 
     class Server
+      # Cap how long #stop blocks waiting for the serving task to drain. A hung
+      # request must not wedge shutdown forever; we log and move on past this.
+      STOP_DRAIN_TIMEOUT = 5.0
+
       #: String?
       attr_reader :node_id
       #: String
@@ -344,15 +544,14 @@ module Durababble
       # `credentials:`/`pool_size:` are accepted for call-site compatibility with
       # the former gRPC server but unused: the transport is cleartext H2C and the
       # reactor multiplexes connections on one fiber scheduler (no thread pool).
-      # `identity_id:` seeds the generated `node_id` (`<id>@<address>`) so a worker
-      # keeps a stable identity across address reuse (see #68/#69).
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
       def initialize(
         node_id:,
         store:,
         worker_pool: "default",
         workflow_handlers: {},
         transient_handler: nil,
+        stream_handler: nil,
         node_directory: NodeDirectory.new,
         host: "127.0.0.1",
         port: 50_051,
@@ -363,13 +562,15 @@ module Durababble
         evict_lease: nil,
         deliver_message: nil,
         verify_deliver_message_owner: true,
-        identity_id: nil
+        identity_id: nil,
+        stop_drain_timeout: STOP_DRAIN_TIMEOUT
       )
         @node_id = node_id
         @store = store
         @worker_pool = worker_pool
         @workflow_handlers = workflow_handlers
         @transient_handler = transient_handler
+        @stream_handler = stream_handler
         @node_directory = node_directory
         @host = host
         @requested_port = port
@@ -379,6 +580,7 @@ module Durababble
         @deliver_message = deliver_message
         @verify_deliver_message_owner = verify_deliver_message_owner
         @identity_id = identity_id
+        @stop_drain_timeout = stop_drain_timeout
       end
 
       #: () -> Server
@@ -388,6 +590,9 @@ module Durababble
         http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
         @bound = http_endpoint.bound
         @port = @bound.sockets.first.local_address.ip_port
+        # Fence the node identity to the bound address so a recycled host:port
+        # (a new worker reusing a dead one's address) presents a distinct
+        # `node_id`; `expected_worker_id` checks then reject stale callers.
         @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
         service = build_service
         app = ->(request) { route(service, request) }
@@ -396,36 +601,29 @@ module Durababble
         # The socket is already bound/listening (above, on this thread); the
         # reactor thread only runs the accept loop. Hand the scheduler back
         # through a Queue so `stop` can interrupt it thread-safely.
-        #
-        # The rescue only covers the *startup handshake* — failures that escape
-        # the `Async { }` block synchronously, before `ready << Fiber.scheduler`
-        # is reached (e.g. `Async {}` itself failing to install a reactor —
-        # vanishingly rare but otherwise silent). Without it `ready.pop` would
-        # block forever and `start` would never return. Once the scheduler is
-        # published, `Async { }` returns and any later `server.run` failure is
-        # captured by Async's task supervisor (logged as a warning) rather than
-        # bubbling here — at that point `start` has already handed control back
-        # to the caller, so it's the reactor's problem, not ours.
         ready = Thread::Queue.new
         @thread = Thread.new do
           Async do
             ready << Fiber.scheduler
             server.run
           end
-        rescue StandardError => e
-          ready << e
         end
-        result = ready.pop
-        raise result if result.is_a?(StandardError)
-
-        @scheduler = result
+        @scheduler = ready.pop
         self
       end
 
+      # Interrupt the reactor and join its thread, bounding the wait by
+      # `@stop_drain_timeout` so a wedged in-flight request/stream cannot block
+      # shutdown forever; if the drain times out we log and abandon the thread.
       #: () -> void
       def stop
         @scheduler&.interrupt
-        @thread&.join
+        if @thread && !@thread.join(@stop_drain_timeout)
+          Durababble.logger&.warn(
+            "Durababble::Rpc::Server#stop timed out after #{@stop_drain_timeout}s " \
+              "waiting for the reactor thread to drain; abandoning it",
+          )
+        end
       ensure
         @bound&.close
         @thread = nil
@@ -450,6 +648,7 @@ module Durababble
           worker_pool: @worker_pool,
           workflow_handlers: @workflow_handlers,
           transient_handler: @transient_handler,
+          stream_handler: @stream_handler,
           node_directory: @node_directory,
           authorize: @authorize,
           awaken_batch: @awaken_batch,
@@ -463,11 +662,6 @@ module Durababble
       # already encoded as discriminated response bodies by `Service`
       # (`call_transient` returns `not_running`/`moved`/`err` frames with a 200);
       # only authorization failures and unexpected raises become status codes.
-      # Unexpected raises return 500 (`Rpc::Error`, NOT retried) so an unforeseen
-      # bug on one node cannot get amplified by client-side retries into a stampede
-      # against an already-struggling cluster. 503 is reserved for transport-level
-      # unavailability (timeouts, connection failures — produced by `with_rpc_errors`,
-      # not by `route`) which IS retried via `WorkflowRpc::NodeUnavailable`.
       #
       # The case/when below is the one place where decoded wire bytes (`Object`
       # from `Rpc.load`) cross into the typed `Service` API — each branch's
@@ -475,37 +669,50 @@ module Durababble
       # the path we routed" and the concrete `Messages::*` shape. Service
       # methods are typed in terms of those `Messages::*` classes downstream and
       # need no per-method casts.
+      #
+      # The catch-all `StandardError` -> 503 below means an *unexpected* bug in a
+      # handler is reported to the caller as `Unavailable` (which it may retry).
+      # For `call_transient` that path is effectively unreachable — `Service`
+      # already converts application errors into 200 `err` frames — but the
+      # best-effort control-plane methods (`awaken_batch`/`evict_lease`/
+      # `deliver_message`) have no inner rescue, so a deterministic bug there would
+      # be masked as transient. That is an accepted trade-off for control-plane
+      # RPCs (the caller retries a few times and gives up); revisit if a handler
+      # ever needs to surface a non-retryable error to the caller.
       #: (Service, Object) -> Object
       def route(service, request)
         request = request #: as untyped
         method = ROUTES[request.path]
-        return Protocol::HTTP::Response[404, OCTET_HEADERS, []] unless method
+        return Protocol::HTTP::Response[404, Rpc.octet_headers, []] unless method
 
+        # The wire boundary: bytes become a typed `Messages::*` value here, and the
+        # path dictates which one. The unary methods go through `public_send`
+        # (untyped dispatch), but the stream call is direct, so cast the decoded
+        # value to the `TransientRequest` its handler expects.
         request_value = Rpc.load(request.read)
-        response_value = case method
-        when :awaken_batch
-          awaken = request_value #: as Messages::AwakenBatchRequest
-          service.awaken_batch(awaken, request)
-        when :evict_lease
-          evict = request_value #: as Messages::EvictLeaseRequest
-          service.evict_lease(evict, request)
-        when :deliver_message
-          deliver = request_value #: as Messages::DeliverMessageRequest
-          service.deliver_message(deliver, request)
-        when :call_transient
-          transient = request_value #: as Messages::TransientRequest
-          service.call_transient(transient, request)
+        if method == :call_transient_stream
+          stream_request = request_value #: as Messages::TransientRequest
+          body = service.open_stream(stream_request, request)
+          return Protocol::HTTP::Response[200, Rpc.octet_headers, body]
         end
-        Protocol::HTTP::Response[200, OCTET_HEADERS, [Rpc.dump(response_value)]]
+
+        response_value = service.public_send(method, request_value, request)
+        Protocol::HTTP::Response[200, Rpc.octet_headers, [Rpc.dump(response_value)]]
       rescue Unauthenticated => e
         Protocol::HTTP::Response[401, OCTET_HEADERS, [e.message.to_s]]
       rescue StandardError => e
+        # Unexpected raises return 500 (`Rpc::Error`, NOT retried) so an
+        # unforeseen bug on one node cannot get amplified by client-side retries
+        # into a stampede against an already-struggling cluster. 503 is reserved
+        # for transport-level unavailability (timeouts, connection failures —
+        # produced by `with_rpc_errors`, not by `route`) which IS retried via
+        # `WorkflowRpc::NodeUnavailable`.
         Protocol::HTTP::Response[500, OCTET_HEADERS, [e.message.to_s]]
       end
     end
 
     class Service
-      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
+      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -517,6 +724,7 @@ module Durababble
         awaken_batch:,
         evict_lease:,
         deliver_message:,
+        stream_handler: nil,
         verify_deliver_message_owner: true
       )
         @node_id = node_id
@@ -524,6 +732,7 @@ module Durababble
         @worker_pool = worker_pool
         @workflow_handlers = workflow_handlers
         @transient_handler = transient_handler
+        @stream_handler = stream_handler
         @node_directory = node_directory
         @authorize = authorize
         @awaken_batch = awaken_batch
@@ -589,36 +798,57 @@ module Durababble
       rescue WorkflowRpc::StaleLease => e
         moved_response(request) || remote_error_response(e)
       rescue Unauthenticated
-        # Let the wire-level 401 stand. Without this re-raise the catch-all
-        # `rescue StandardError` below would convert authorization failures
-        # into a 200 with an `err` frame, defeating the status-code contract
-        # that `Server#route` translates `Unauthenticated` into HTTP 401.
         raise
       rescue StandardError => e
-        observe_transient_error(request, e)
         remote_error_response(e)
+      end
+
+      # Returns a streaming response body for a `call_transient_stream` request.
+      # The body is filled by a child reactor task running the stream handler;
+      # `route` wraps it in a 200 response and the server pumps frames to the
+      # consumer as they are written. Authorization is checked synchronously so a
+      # failure becomes a 401 (rather than a half-open stream). Application
+      # errors raised by the handler are encoded as a terminal error frame.
+      #: (Messages::TransientRequest, Object) -> Protocol::HTTP::Body::Writable
+      def open_stream(request, call)
+        authorize!(call)
+        body = Protocol::HTTP::Body::Writable.new(nil, queue: Thread::SizedQueue.new(STREAM_BUFFER))
+        Async { write_stream(request, body) }
+        body
       end
 
       private
 
-      # The remote caller learns about the failure through remote_error_response,
-      # but the serving node would otherwise have no local trace of an unexpected
-      # error it absorbed. Count it and log it so node-side operators can see it.
-      #: (Messages::TransientRequest, StandardError) -> void
-      def observe_transient_error(request, error)
-        request = request #: as untyped
-        method = request["method"]
-        Observability.count(
-          "durababble.rpc.server.errors",
-          "durababble.worker.id" => @node_id,
-          "durababble.rpc.method" => method,
-          "durababble.workflow.id" => request.workflow_id,
-          "error.type" => error.class.name,
+      #: (Messages::TransientRequest, Protocol::HTTP::Body::Writable) -> void
+      def write_stream(request, body)
+        raise WorkflowRpc::UnknownCommand, "no streaming RPC handler registered" unless @stream_handler
+
+        args = load_request_args(request, context: "CallTransientStream #{request["method"]} args")
+        @stream_handler.call(request:, args:, writer: StreamWriter.new(body))
+        body.close_write
+      rescue StandardError => e
+        finish_stream_with_error(body, e)
+      end
+
+      # Encodes a terminal error frame and ends the stream. If the body is
+      # already closed the consumer cancelled (reset the stream), so there is
+      # nothing to deliver and any write would raise — bail out quietly.
+      #: (Protocol::HTTP::Body::Writable, Exception) -> void
+      def finish_stream_with_error(body, error)
+        return if body.closed?
+
+        frame = Messages::StreamFrame.new(
+          kind: :error,
+          error: Messages::RemoteError.new(
+            klass: error.class.name.to_s,
+            message: error.message.to_s,
+            backtrace: error.backtrace || [],
+          ),
         )
-        Durababble.logger&.warn(
-          "Durababble RPC server #{@node_id} returning remote error for #{method}: " \
-            "#{error.class}: #{error.message}",
-        )
+        body.write(FrameCodec.frame(Rpc.dump(frame)))
+        body.close_write
+      rescue Protocol::HTTP::Body::Writable::Closed, IOError
+        nil
       end
 
       #: (Object) -> void
@@ -636,7 +866,7 @@ module Durababble
           "workflow_id" => request.workflow_id,
           "expected_worker_id" => expected_worker_id,
           "command" => request["method"],
-          "payload" => load_request_args(request, context: "CallTransient #{request["method"]} args") || {},
+          "payload" => Rpc.load(request.args) || {},
         }
         with_store do |store|
           WorkflowRpc::Handler.new(
@@ -647,6 +877,10 @@ module Durababble
         end
       end
 
+      # Routes a transient query through a dedicated AR connection when the store
+      # exposes one (PR #77). Reactor-shared connections corrupt under concurrent
+      # fan-out (Trilogy yields mid-query); the dedicated lane keeps query bodies
+      # isolated from the surrounding RPC reactor.
       #: () { (Store) -> Object? } -> Object?
       def with_store(&block)
         if @store.respond_to?(:with_dedicated_connection)
@@ -677,7 +911,7 @@ module Durababble
         Rpc.load(request.args)
       end
 
-      #: (Messages::DeliverMessageRequest) -> bool
+      #: (Messages::TargetRequest) -> bool
       def stale_workflow_message?(request)
         return false unless request.target_kind == "workflow"
 
@@ -685,12 +919,6 @@ module Durababble
         !lease || lease.fetch("worker_id") != @node_id
       end
 
-      # Fences recycled worker addresses (see #68/#69): when the caller named the
-      # worker it expected to reach and this node is not that worker, the message
-      # was routed to a reused address and must be ignored. Both
-      # `Messages::EvictLeaseRequest` and `Messages::DeliverMessageRequest` are
-      # `Messages::TargetRequest` subclasses and share the `expected_worker_id`
-      # field, so the helper takes the common base.
       #: (Messages::TargetRequest) -> bool
       def expected_worker_mismatch?(request)
         expected_worker_id = request.expected_worker_id.to_s
@@ -702,7 +930,7 @@ module Durababble
         lease = @store.current_workflow_lease(request.workflow_id, worker_pool: request.worker_pool)
         return unless lease
 
-        new_node_id = lease.fetch("worker_id") #: as String
+        new_node_id = lease.fetch("worker_id").to_s
         return if new_node_id == @node_id
 
         Messages::TransientResponse.new(
