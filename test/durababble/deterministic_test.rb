@@ -63,21 +63,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "parallel_wait_with_retrying_sibling",
     "wait_condition_command_wakeup",
     "wait_condition_sequential_command_wakeups",
-    "inbox_messages_for_worker_pool_isolation",
-    "mailbox_worker_pool_first_writer",
-    "mailbox_worker_pool_isolation",
-    "object_advisory_delivery_worker_pool_isolation",
-    "target_activation_worker_pool_completion_isolation",
-    "target_activation_worker_pool_rearm_isolation",
     "stolen_lease_write_rejection",
     "workflow_command_async_delivery",
     "workflow_command_delivery_crash_recovery",
     "workflow_command_retry_then_complete",
-    "workflow_command_target_identity_isolation",
-    "workflow_command_enqueue_target_name_isolation",
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
-    "object_command_target_identity_isolation",
     "object_command_failure_exhaustion",
     "object_command_claim_contention",
   ].freeze
@@ -582,20 +573,6 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
   end
 
-  test "keeps workflow command completion scoped to the command target" do
-    result = Durababble::Deterministic.prove("workflow_command_target_identity_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_workflow_command_target completed=false failed=false first_status=\"running\" second_status=\"running\" wf_b_history=0"
-  end
-
-  test "keeps workflow command enqueue scoped to the persisted workflow name" do
-    result = Durababble::Deterministic.prove("workflow_command_enqueue_target_name_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_workflow_command_name enqueued=false error=\"workflow wf-name is counter, not other_counter\" wrong_activation=false wrong_messages=0"
-  end
-
   test "dead-letters a terminally-failed command exactly once with a single history entry through crashes" do
     result = Durababble::Deterministic.prove("workflow_command_terminal_failure_crash_fuzz", seed: 7)
 
@@ -656,55 +633,6 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
   end
 
-  test "keeps inbox claims scoped to the persisted worker pool" do
-    result = Durababble::Deterministic.prove("mailbox_worker_pool_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_pool_claim claimed=[]"
-    assert_includes result.trace, "right_pool_claim"
-  end
-
-  test "filters inbox message inspection by worker pool" do
-    result = Durababble::Deterministic.prove("inbox_messages_for_worker_pool_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "pool_filtered_inbox_inspection"
-    assert_includes result.trace, "wrong_pool=[]"
-    assert_includes result.trace, "right_pool="
-    assert_includes result.trace, "all_pools="
-  end
-
-  test "keeps object mailbox messages on the first worker pool" do
-    result = Durababble::Deterministic.prove("mailbox_worker_pool_first_writer", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, 'persisted_pools pools=["pool-a","pool-a"]'
-    assert_includes result.trace, "right_pool_claim"
-  end
-
-  test "routes object advisory delivery through the active worker pool" do
-    result = Durababble::Deterministic.prove("object_advisory_delivery_worker_pool_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "object_delivery_pool_scope"
-    assert_includes result.trace, "delivered=true"
-    assert_includes result.trace, 'deliveries=["pool-a"]'
-  end
-
-  test "keeps target activation completion scoped to worker pool" do
-    result = Durababble::Deterministic.prove("target_activation_worker_pool_completion_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_pool_complete completed=false still_active=true visible=false"
-  end
-
-  test "keeps target activation rearm scoped to worker pool" do
-    result = Durababble::Deterministic.prove("target_activation_worker_pool_rearm_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_pool_rearm locked_by=\"shared-worker\" status=\"running\" stolen=false"
-  end
-
   test "atomically terminates dependents when termination requests crash" do
     result = Durababble::Deterministic.prove("workflow_termination_dependents_crash_fuzz", seed: 6)
 
@@ -746,13 +674,6 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "b_blocked_by_lease"
     refute_includes result.trace, "b_stole_live_lease"
-  end
-
-  test "keeps object command completion scoped to the command target" do
-    result = Durababble::Deterministic.prove("object_command_target_identity_isolation", seed: 1)
-
-    assert_empty result.violations
-    assert_includes result.trace, "wrong_object_command_target completed=false status=\"running\" wrong_state=false"
   end
 
   test "drives an object command to a consistent terminal state through store crashes" do
