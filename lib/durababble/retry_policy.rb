@@ -30,11 +30,11 @@ module Durababble
 
     #: (?initial_interval: Numeric, ?backoff_coefficient: Numeric, ?maximum_interval: Numeric?, ?maximum_attempts: Integer?, ?schedule: Array[Numeric]?, ?non_retryable_errors: Array[Class | String | Symbol]) -> void
     def initialize(initial_interval: DEFAULT_INITIAL_INTERVAL, backoff_coefficient: DEFAULT_BACKOFF_COEFFICIENT, maximum_interval: nil, maximum_attempts: 1, schedule: nil, non_retryable_errors: [])
-      @initial_interval = interval_seconds(initial_interval)
-      @backoff_coefficient = Float(backoff_coefficient)
-      @maximum_interval = maximum_interval && interval_seconds(maximum_interval)
-      @maximum_attempts = maximum_attempts.nil? ? Float::INFINITY : Integer(maximum_attempts)
-      @schedule = Array(schedule).map { |interval| interval_seconds(interval) }
+      @initial_interval = validate_interval!("initial_interval", interval_seconds(initial_interval))
+      @backoff_coefficient = validate_backoff_coefficient!(Float(backoff_coefficient))
+      @maximum_interval = maximum_interval && validate_interval!("maximum_interval", interval_seconds(maximum_interval))
+      @maximum_attempts = validate_maximum_attempts!(maximum_attempts)
+      @schedule = Array(schedule).map.with_index { |interval, index| validate_interval!("schedule[#{index}]", interval_seconds(interval)) }
       @non_retryable_errors = Array(non_retryable_errors)
     end
 
@@ -74,6 +74,30 @@ module Durababble
       return value.to_f if value.respond_to?(:to_f)
 
       raise ArgumentError, "retry intervals must be numeric seconds"
+    end
+
+    #: (String, Float) -> Float
+    def validate_interval!(name, seconds)
+      return seconds if seconds.finite? && seconds >= 0
+
+      raise ArgumentError, "#{name} must be a finite non-negative interval"
+    end
+
+    #: (Float) -> Float
+    def validate_backoff_coefficient!(coefficient)
+      return coefficient if coefficient.finite? && coefficient.positive?
+
+      raise ArgumentError, "backoff_coefficient must be a finite positive number"
+    end
+
+    #: (Integer?) -> (Integer | Float)
+    def validate_maximum_attempts!(attempts)
+      return Float::INFINITY if attempts.nil?
+
+      attempts = Integer(attempts)
+      return attempts if attempts.positive?
+
+      raise ArgumentError, "maximum_attempts must be positive"
     end
   end
 end

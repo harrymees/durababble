@@ -168,23 +168,6 @@ module Durababble
         ON #{table("object_wakeups")} (wake_at, created_at)
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id TEXT PRIMARY KEY,
-          object_type TEXT NOT NULL,
-          object_id TEXT NOT NULL,
-          method_name TEXT NOT NULL,
-          args BLOB NOT NULL,
-          kwargs BLOB NOT NULL,
-          status TEXT NOT NULL,
-          result BLOB,
-          error TEXT,
-          locked_by TEXT,
-          locked_until INTEGER,
-          created_at INTEGER NOT NULL DEFAULT (dura_now()),
-          completed_at INTEGER
-        )
-      SQL
       @migrated = true
       self
     end

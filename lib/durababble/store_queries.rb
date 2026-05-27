@@ -97,10 +97,10 @@ module Durababble
         assertions: ["unique key lookup", "queue/expired indexes", "worker release index"],
         benchmarks: ["outbox_claim_ack", "outbox_expired_reclaim"],
       },
-      "durable object commands" => {
-        methods: ["Store.object_state", "Store.save_object_state", "Store.enqueue_object_command", "Store.claim_object_command", "Store.complete_object_command"],
-        indexes: ["durable_objects_pkey", "durable_object_commands_pkey", "durable_object_commands_object_status_idx"],
-        assertions: ["object primary key lookup", "command primary-key claim", "object-status index exists for future per-object scans"],
+      "durable object mailbox" => {
+        methods: ["Store.object_state", "Store.save_object_state", "Store.enqueue_inbox_message", "Store.claim_object_command", "Store.complete_object_command"],
+        indexes: ["durable_objects_pkey", "inbox_pkey", "inbox_target_status_sequence_idx", "inbox_idempotency_hash_idx", "target_activations_pkey", "target_activations_queue_idx"],
+        assertions: ["object primary-key lookup", "mailbox primary-key claim", "target-sequence and activation queue indexes"],
         benchmarks: ["durable_object_command_claim"],
       },
     }.freeze

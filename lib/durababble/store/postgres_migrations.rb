@@ -145,23 +145,6 @@ module Durababble
         )
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id text PRIMARY KEY,
-          object_type text NOT NULL,
-          object_id text NOT NULL,
-          method_name text NOT NULL,
-          args bytea NOT NULL,
-          kwargs bytea NOT NULL,
-          status text NOT NULL,
-          result bytea,
-          error text,
-          locked_by text,
-          locked_until timestamptz,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          completed_at timestamptz
-        )
-      SQL
       create_performance_indexes!
       @migrated = true
       self

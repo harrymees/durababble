@@ -372,6 +372,19 @@ class DurababbleStepRetryTest < DurababbleTestCase
     assert_raises(ArgumentError) { Durababble::RetryPolicy.new(initial_interval: Object.new) }
   end
 
+  test "rejects retry policies with invalid retry bounds" do
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(initial_interval: -1) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(maximum_interval: -1) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(schedule: [-1]) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(backoff_coefficient: 0) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(backoff_coefficient: -1) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(maximum_attempts: 0) }
+    assert_raises(ArgumentError) { Durababble::RetryPolicy.new(maximum_attempts: -1) }
+
+    assert_equal 0, Durababble::RetryPolicy.new(schedule: [0]).delay_for_attempt(1)
+    assert_equal true, Durababble::RetryPolicy.new(maximum_attempts: nil).retryable?(RuntimeError.new("boom"), attempt_number: 10_000)
+  end
+
   private
 
   def step_failure_error_from_replay(event)

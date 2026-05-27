@@ -361,7 +361,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     # without `locked_by`/`locked_until` populated, the planner short-circuits to
     # "Impossible WHERE" and the EXPLAIN tree has no access-path nodes to inspect.
     execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, locked_by, locked_until, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, 'owner', #{mysql_literal(now + 300)}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
-    execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")
   rescue StandardError
     begin
