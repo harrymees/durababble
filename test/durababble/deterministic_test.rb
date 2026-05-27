@@ -1,6 +1,8 @@
 # typed: false
 # frozen_string_literal: true
 
+require "digest"
+
 require_relative "../test_helper"
 
 require_relative "../support/deterministic"
@@ -10,75 +12,82 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_durable_before_claim",
     "multi_worker_counter",
     "lease_conflict",
-    "heartbeat_extension",
-    "zombie_workflow_heartbeat_after_expiry",
-    "step_heartbeat_cursor_recovery",
-    "step_retry_policy_recovery",
     "lease_expiry",
-    "completed_step_skip_after_crash",
-    "incomplete_step_retry_after_crash",
-    "attempt_history_append_only",
     "concurrent_timer_wake_once",
-    "multiple_named_object_wakes",
     "object_wake_survives_worker_crash",
     "timer_and_partition",
-    "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
     "fenced_side_effect_once",
-    "fence_holder_crash_and_reclaim",
     "step_failure_crash_matrix",
-    "outbox_lease_expiry",
-    "store_fault_after_step_completed",
-    "store_fault_after_wait_recorded",
-    "store_fault_after_outbox_enqueue",
     "duplicate_delivery_timer_and_outbox",
-    "workflow_rpc_owner_state_matrix",
-    "cooperative_cancellation_cleanup",
     "cancellation_cleanup_crash_fuzz",
     "cancellation_during_suspend_race",
-    "parallel_branch_failure_orphans_step",
-    "parallel_wait_with_retrying_sibling",
-    "wait_condition_command_wakeup",
-    "wait_condition_sequential_command_wakeups",
     "wait_condition_timer_command_race",
     "record_step_canceled_crash_fuzz",
     "workflow_termination_dependents_crash_fuzz",
-    "stolen_lease_write_rejection",
     "timer_wakeup_batch_crash_fuzz",
-    "workflow_command_async_delivery",
-    "workflow_command_delivery_crash_recovery",
     "workflow_command_delivery_crash_matrix",
     "workflow_command_claim_window_crash_matrix",
-    "workflow_command_retry_then_complete",
-    "workflow_command_terminal_failure",
     "workflow_command_terminal_failure_crash_fuzz",
-    "workflow_command_delivery_to_terminal_workflow",
-    "object_command_failure_exhaustion",
-    "object_command_claim_contention",
     "object_command_crash_fuzz",
     "object_command_state_crash_fuzz",
     "object_command_retry_then_apply_crash_fuzz",
     "object_command_activation_driven_drain",
     "object_command_idempotent_enqueue",
     "object_command_multi_target_isolation",
-    "rpc_workflow_rpc_response_matrix",
     "rpc_workflow_rpc_transport_fault_matrix",
-    "rpc_workflow_rpc_transport_fault_reroute",
     "random_operation_sequence",
     "chaos",
+  ].freeze
+
+  REGRESSION_SCENARIOS = [
+    "heartbeat_extension",
+    "zombie_workflow_heartbeat_after_expiry",
+    "step_heartbeat_cursor_recovery",
+    "step_retry_policy_recovery",
+    "completed_step_skip_after_crash",
+    "incomplete_step_retry_after_crash",
+    "attempt_history_append_only",
+    "multiple_named_object_wakes",
+    "stale_wait_timer_terminal_workflow",
+    "fence_holder_crash_and_reclaim",
+    "outbox_lease_expiry",
+    "store_fault_after_step_completed",
+    "store_fault_after_wait_recorded",
+    "store_fault_after_outbox_enqueue",
+    "cooperative_cancellation_cleanup",
+    "parallel_branch_failure_orphans_step",
+    "parallel_wait_with_retrying_sibling",
+    "wait_condition_command_wakeup",
+    "wait_condition_sequential_command_wakeups",
+    "stolen_lease_write_rejection",
+    "workflow_command_async_delivery",
+    "workflow_command_delivery_crash_recovery",
+    "workflow_command_retry_then_complete",
+    "workflow_command_terminal_failure",
+    "workflow_command_delivery_to_terminal_workflow",
+    "object_command_failure_exhaustion",
+    "object_command_claim_contention",
   ].freeze
 
   CONTRACT_SCENARIOS = [
     "rpc_fault_injection",
     "rpc_service_contract",
     "rpc_wakeup_fault_matrix",
+    "workflow_rpc_owner_state_matrix",
+    "rpc_workflow_rpc_response_matrix",
+    "rpc_workflow_rpc_transport_fault_reroute",
   ].freeze
 
+  CLEAN_SCENARIOS = (FUZZ_SCENARIOS + REGRESSION_SCENARIOS + CONTRACT_SCENARIOS).freeze
+  EXPLORATION_PROBE_SEEDS = [1, 2, 3].freeze
+
   # The full fuzz sweep (every FUZZ_SCENARIOS target × these seeds) dominates the
-  # DST suite's wall time. Locally it runs in full; CI sharding sets DST_FUZZ_SEEDS
-  # (e.g. "1..50") so parallel jobs each cover a slice of the seed space without
-  # dropping any scenario. The default keeps the complete 1..100 sweep for anyone
-  # running `rake dst` directly.
+  # DST suite's wall time, so FUZZ_SCENARIOS is reserved for scenarios where the
+  # seed changes the ordering, timing, workload shape, or injected faults. Static
+  # regression and contract matrices still run, but only once. Locally the fuzz
+  # sweep runs in full; CI sharding sets DST_FUZZ_SEEDS so parallel jobs each cover
+  # a slice of the seed space without dropping any exploratory scenario.
   DEFAULT_FUZZ_SEEDS = (1..100)
 
   def fuzz_seeds
@@ -109,9 +118,51 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty(first.violations, "scenario #{scenario.inspect} had invariant violations: #{first.violations.inspect}")
   end
 
+  def exploration_signature(result)
+    result.trace.lines.map do |line|
+      line
+        .gsub(/ scenario="[^"]+"/, " scenario=<scenario>")
+        .gsub(/ seed=\d+/, " seed=<seed>")
+        .gsub(/"(?:alarm|await|await2|obj|parallel-fail|retry-parked|suspend-race)-\d+"/, '"<seeded-id>"')
+        .gsub(/\bstop \d+\b/, "stop <seed>")
+        .gsub(/\boffset:\d+\b/, "offset:<seed>")
+        .gsub(/\bresumed_from:\d+\b/, "resumed_from:<seed>")
+        .gsub(/\bcount:\d+\b/, "count:<n>")
+        .gsub(/\bseed:\d+\b/, "seed:<seed>")
+    end.join("\n")
+  end
+
+  test "classifies every clean deterministic scenario by execution cost" do
+    scenario_files = Dir[File.expand_path("../support/deterministic/scenarios/*.rb", __dir__)]
+      .map { |path| File.basename(path, ".rb") }
+      .reject { |name| name.start_with?("bug_") }
+      .sort
+
+    assert_equal scenario_files, CLEAN_SCENARIOS.sort
+    assert_empty CLEAN_SCENARIOS.tally.select { |_scenario, count| count > 1 }
+  end
+
   test "proves exact trace determinism for every clean scenario target" do
-    (FUZZ_SCENARIOS + CONTRACT_SCENARIOS).uniq.each do |scenario|
+    CLEAN_SCENARIOS.each do |scenario|
       assert_scenario_deterministic(scenario, seed: 12_345)
+    end
+  end
+
+  test "fuzz scenarios use seeds to explore different execution shapes" do
+    FUZZ_SCENARIOS.each do |scenario|
+      signatures = EXPLORATION_PROBE_SEEDS.map do |seed|
+        result = Durababble::Deterministic.prove(scenario, seed:)
+        assert_empty(result.violations, "scenario #{scenario.inspect} failed under seed #{seed}: #{result.violations.inspect}")
+
+        Digest::SHA256.hexdigest(exploration_signature(result))
+      end
+
+      assert_operator(
+        signatures.uniq.length,
+        :>,
+        1,
+        "scenario #{scenario.inspect} is in FUZZ_SCENARIOS but seeds #{EXPLORATION_PROBE_SEEDS.inspect} all produced the same normalized trace",
+      )
     end
   end
 
@@ -712,6 +763,10 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
   test "runs deterministic contract scenarios once" do
     assert_scenarios_hold(CONTRACT_SCENARIOS, seeds: [1])
+  end
+
+  test "runs deterministic regression scenarios once" do
+    assert_scenarios_hold(REGRESSION_SCENARIOS, seeds: [1])
   end
 
   test "exposes deterministic utility edge cases directly" do
