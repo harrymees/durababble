@@ -258,7 +258,7 @@ A step wait is a terminal command-resolution record, but releasing the workflow 
 
 Workflow commands are durable workflow inbox messages delivered to the workflow lease owner. A committed command must make the target runnable immediately. If a live owner holds the workflow lease, the runtime sends `DeliverMessage` after commit; if there is no live owner or advisory delivery fails, the durable target activation remains claimable by the worker pool. The command executes inside the active `WorkflowExecution` and same workflow object instance that is running or replaying `#execute` after a step completes/fails/waits, when a running step heartbeats or otherwise yields to the workflow engine, or when a condition wait is interrupted by message work. A non-heartbeating user step body is not preempted mid-Ruby-frame; the command runs when the active owner reaches a safe point or lease expiry/recovery gives the target to another worker.
 
-Workflow command delivery appends a `workflow_command_completed` or `workflow_command_failed` history record with the inbox message id, method, args, kwargs, sequence, shape hash, and result or error. Replay delivers those command records in `workflow_history` order only after preceding scheduled/resolved workflow command history has been consumed, invokes the command handler against workflow-local state, and raises nondeterminism if the exposed method is missing or the replayed result/error diverges from the recorded command record.
+Workflow command delivery appends a `workflow_command_completed` or `workflow_command_failed` history record with the inbox message id, method, args, kwargs, sequence, shape hash, and result or error. Replay delivers those command records in `workflow_history` order only after preceding scheduled/resolved workflow command history has been consumed, invokes the command handler against workflow-local state, and raises replay divergence if the exposed method is missing or the replayed result/error diverges from the recorded command record.
 
 Synchronous workflow command APIs are durable asks. The caller waits for the inbox row to store a serialized result or typed error, then returns/re-raises it. If the caller times out or loses its connection after the row commits, the durable command is not canceled; retrying with the same idempotency key reattaches to the same inbox row. Command responses do not require the general outbox table because the response is a one-to-one property of the ask row; workflow/object code may still write ordinary outbox messages when a command handler needs durable delivery to an external system.
 
@@ -312,7 +312,7 @@ Rules:
 - When live execution reaches a history point with no persisted marker, `patched(patch_id)` appends a normal patch marker and returns `true`. The marker commit must happen before the new branch produces steps, waits, commands, or other durable workflow records.
 - When replaying history that already contains a normal marker for `patch_id`, `patched(patch_id)` consumes that marker and returns `true`.
 - When replaying history that reached the change point without a marker, `patched(patch_id)` returns `false` and appends nothing, so workflow code follows the branch matching existing history.
-- If persisted history contains a normal patch marker that workflow code does not consume with `patched` or `deprecate_patch`, the checker raises nondeterminism before any further durable writes. Patch-id mismatches and out-of-order marker consumption also raise nondeterminism.
+- If persisted history contains a normal patch marker that workflow code does not consume with `patched` or `deprecate_patch`, the checker raises replay divergence before any further durable writes. Patch-id mismatches and out-of-order marker consumption also raise replay divergence.
 - Patch markers are workflow-history markers, not inbox messages, state schema versions, or node-capability routing indicators.
 
 Patch lifecycle:
@@ -567,7 +567,7 @@ Observability requirements:
 | Completed steps are not re-executed on resume | Completed command results are returned from durable state. | Complete spec guarantee plus subprocess crash harness |
 | Incomplete steps are retried | Incomplete/running/failed/waiting command state is retried or continued according to durable state. | Crash matrix |
 | Workflow command history is replay truth | Schedule, start, and completion/failure/wait records are distinct append-only history facts. | Async workflow replay specs plus backend conformance |
-| Parallel schedule shape is validated | Replay validates method, args/kwargs digest, retry/executor attributes, and semantic key for every scheduled command, including incomplete commands. | Fanout replay/nondeterminism specs |
+| Parallel schedule shape is validated | Replay validates method, args/kwargs digest, retry/executor attributes, and semantic key for every scheduled command, including incomplete commands. | Fanout replay divergence specs |
 | Workflow future resolution is deterministic | Step completions, failures, timer fires, workflow command deliveries, and child completions resume workflow fibers in history order. | Continuation fanout replay specs |
 | Step attempts are append-only | Every started attempt and terminal attempt state remains inspectable. | Guarantee matrix |
 | Timer wait attempts complete once | Wait completion updates attempts from `waiting` to `completed` without losing payload. | Wait-attempt spec |
@@ -618,7 +618,7 @@ Observability requirements:
 | Crash while head message is in backoff/dead-letter | Later messages remain blocked until operator action. |
 | Crash during object wake-to-inbox conversion | Either the named wake row remains or its wake inbox row exists; no wake is lost. |
 | Crash after patch marker commit before first new-branch step | Replay sees marker, `patched` returns true, and the new branch continues. |
-| Code removes `patched` while normal marker history still exists | Checker raises nondeterminism before any later durable write. |
+| Code removes `patched` while normal marker history still exists | Checker raises replay divergence before any later durable write. |
 | Owner pod loses lease while activity continues | External effect may finish; checkpoint/status write fails; retry uses idempotency. |
 | Caller times out waiting for durable ask result | Row may keep running; same idempotency key reattaches later. |
 | Database circuit breaker opens before commit | No durable change exists unless transaction committed; caller receives typed breaker error. |
@@ -636,7 +636,7 @@ Correctness claims must be backed by tests:
 - RPC tests cover stale lease, lease moved, no-active-owner, shutdown/non-running workflow, retry/reroute, Paquito serialization, unavailable-node, timeout, deadline, RST, EOF, lost-response, duplicate-response, auth-failure, wakeup drops/duplicates, and all four service methods.
 - Object mailbox tests cover strict FIFO, blocked head behavior, ask/tell ordering, wake ordering, idempotency conflicts, owner crash, lease takeover, dead-letter, and operator repair paths.
 - Workflow command tests cover history acceptance, deterministic replay order, timeout behavior, terminal-workflow rejection, and idempotency dedup.
-- Workflow patch-marker tests cover first-run marker recording, no-marker `false` branches, marker-history `true` branches, missing-marker nondeterminism failures, `deprecate_patch` cleanup, duplicate-id handling, backend conformance, and crash after marker commit.
+- Workflow patch-marker tests cover first-run marker recording, no-marker `false` branches, marker-history `true` branches, missing-marker replay divergence failures, `deprecate_patch` cleanup, duplicate-id handling, backend conformance, and crash after marker commit.
 - Exposed transient method tests verify no durable state mutation and deadline/crash semantics.
 - Observability tests verify required span/metric labels without depending on a particular vendor backend.
 

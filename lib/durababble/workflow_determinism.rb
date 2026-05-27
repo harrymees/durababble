@@ -94,8 +94,8 @@ module Durababble
 
       #: (untyped, untyped, ?locations: Array[Thread::Backtrace::Location]?) -> void
       def check_event!(workflow_id, event, locations: nil)
-        return unless WorkflowExecutionContext.current
         return if allowed_host_operation?
+        return unless WorkflowExecutionContext.current
 
         violation, callsite_filtered = violation_candidate_for(event)
         return unless violation

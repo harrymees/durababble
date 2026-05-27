@@ -189,6 +189,11 @@ module Durababble
 
     #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
     def current_object_lease(object_type, object_id, worker_pool: nil)
+      # `worker_pool` is part of the lease KEY for stream routing but the
+      # `durable_objects` row's primary key is `(object_type, object_id)` — pool
+      # ownership is determined by the holder's `worker_id`, not the row. Accept
+      # the keyword to match `current_target_lease`'s dispatcher shape and
+      # discard it explicitly.
       _ = worker_pool
       row = execute_store_query(:current_object_lease, [object_type, object_id]).first
       row&.transform_values(&:itself)

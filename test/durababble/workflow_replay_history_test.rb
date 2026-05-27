@@ -4,6 +4,10 @@
 require_relative "../test_helper"
 
 class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
+  test "keeps the old replay divergence constant as a compatibility alias" do
+    assert_same Durababble::ReplayDivergenceError, Durababble::NonDeterminismError
+  end
+
   def scheduled_event(command_id, name: "step", payload: { "name" => name }, event_index: command_id)
     { "kind" => "step_scheduled", "command_id" => command_id, "event_index" => event_index, "name" => name, "payload" => payload }
   end
@@ -88,7 +92,7 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     history = Durababble::WorkflowReplayHistory.new([scheduled_event(0, payload: { "name" => "step" }, event_index: 0)])
 
     assert history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "step" })
-    assert_raises(Durababble::NonDeterminismError) do
+    assert_raises(Durababble::ReplayDivergenceError) do
       history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "different" })
     end
   end
@@ -97,7 +101,7 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     history = Durababble::WorkflowReplayHistory.new([scheduled_event(5, name: "leftover", event_index: 0)])
 
     assert_nil history.validate_complete!(workflow_id: "wf", next_command_id: 6)
-    assert_raises(Durababble::NonDeterminismError) do
+    assert_raises(Durababble::ReplayDivergenceError) do
       history.validate_complete!(workflow_id: "wf", next_command_id: 0)
     end
   end

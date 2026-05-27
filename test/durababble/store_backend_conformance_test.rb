@@ -1741,6 +1741,116 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal 1, claimed.size
       end
     end
+
+    test "awards the object lease to exactly one of many concurrent claimers with #{backend.name}" do
+      # The atomic-claim primitive's contract is "exactly one wins" — Ruby-level
+      # serialization through a single connection only proves the WHERE clause
+      # rejects the second claim in sequence. To pin down the SQL-engine-level
+      # race we fan out N independent stores (separate connections) and have
+      # them all attempt to claim the same fresh row at once. The DB has to
+      # serialize the writes; this test asserts the loser branch returns nil
+      # rather than blowing up on a unique-key violation, deadlock, or partial
+      # update. SQLite skips: the conformance harness uses a single in-memory
+      # database with serialized access, which doesn't model the contention.
+      skip("in-memory SQLite serializes connections; this test needs real concurrency") if backend.sqlite?
+
+      with_durababble_store(backend, "object_lease_race") do |store|
+        store.migrate!
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "race" }
+        queue = Queue.new
+        thread_count = 8
+        mutex = Mutex.new
+        condition = ConditionVariable.new
+        ready = 0
+        release = false
+
+        threads = thread_count.times.map do |index|
+          Thread.new do
+            thread_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              mutex.synchronize do
+                ready += 1
+                condition.broadcast
+                condition.wait(mutex) until release
+              end
+              holder = thread_store.claim_object_lease(**claim_key, worker_id: "owner-#{index}", lease_seconds: 30)
+              queue << (holder ? [:won, "owner-#{index}", holder] : [:lost, "owner-#{index}"])
+            rescue StandardError => e
+              queue << [:error, "owner-#{index}", e]
+            ensure
+              thread_store.close
+            end
+          end
+        end
+
+        mutex.synchronize do
+          condition.wait(mutex) until ready == thread_count
+          release = true
+          condition.broadcast
+        end
+
+        results = thread_count.times.map { queue.pop }
+        threads.each(&:join)
+
+        errors = results.select { |status, *_| status == :error }
+        raise errors.first.last unless errors.empty?
+
+        winners = results.select { |status, *_| status == :won }
+        losers = results.select { |status, *_| status == :lost }
+        assert_equal 1, winners.size, "expected exactly one winner, got #{winners.map { |_, id, _| id }.inspect}"
+        assert_equal thread_count - 1, losers.size
+
+        # The lease the database actually holds matches the unique winner.
+        winning_worker = winners.first[1]
+        live = store.current_object_lease("counter", "race")
+        assert_hash_includes live, "worker_id" => winning_worker
+
+        # And the winner's claim row reports the same worker — i.e., the row
+        # the DB awarded matches what the caller was told it won.
+        winning_row = winners.first[2]
+        assert_equal winning_worker, winning_row.fetch("worker_id")
+      end
+    end
+
+    test "release after steal is a safe no-op for the original holder with #{backend.name}" do
+      # The hot-path scenario: worker A claims, A's process stalls past the
+      # lease deadline, worker B steals the row and starts processing, and
+      # then A's `ensure`-block release finally fires. A's release must NOT
+      # clear B's hold — the conditional `WHERE locked_by = worker_id` in the
+      # release SQL is what makes this safe, and a regression here would
+      # silently strand a real owner. (`drain_object_inbox` relies on this in
+      # its ensure clause, as does any stream lease releaser layered on top.)
+      with_durababble_store(backend, "object_lease_release_after_steal") do |store|
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "stale" }
+        key = { object_type: "counter", object_id: "stale" }
+
+        # A holds the lease, then the row is backdated to simulate A's process
+        # stalling. We don't actually wait `lease_seconds` — `expire_object_lease!`
+        # rewrites locked_until directly, mirroring how `steal_expired_leases!`
+        # would observe a crashed owner.
+        store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "stale")
+
+        # B takes over by claiming the now-expired row. After the takeover, B
+        # is the only legitimate holder; current_object_lease reflects that.
+        assert_equal "owner-b", store.claim_object_lease(**claim_key, worker_id: "owner-b", lease_seconds: 30).fetch("worker_id")
+        assert_hash_includes(store.current_object_lease("counter", "stale"), "worker_id" => "owner-b")
+
+        # A's release fires late. The `WHERE locked_by = worker_id` guard
+        # means it returns false (nothing to release for A) and does not
+        # touch B's hold.
+        assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
+        assert_hash_includes(store.current_object_lease("counter", "stale"), "worker_id" => "owner-b")
+
+        # B can still renew and release normally — the row is intact.
+        assert_equal true, store.renew_object_lease(**key, worker_id: "owner-b", lease_seconds: 30)
+        assert_equal true, store.release_object_lease(**key, worker_id: "owner-b")
+        assert_nil store.current_object_lease("counter", "stale")
+
+        # And A's release remains idempotent on the now-empty row.
+        assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
+      end
+    end
   end
 
   def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)

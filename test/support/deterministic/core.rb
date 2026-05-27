@@ -99,10 +99,10 @@ module Durababble
       #: (actor: untyped, delay: untyped, name: untyped) { (?) -> untyped } -> untyped
       def schedule(actor:, delay:, name:, &block)
         @seq += 1
-        event = [@time + delay, @seq, actor, name, block]
-        @events << event
-        @events.sort_by! { |time, seq, _actor, _name, _block| [time, seq] }
-        trace.event(@time, actor, "schedule", at: @time + delay, name:)
+        event_time = @time + delay
+        event = [event_time, @seq, actor, name, block]
+        insert_event(event)
+        trace.event(@time, actor, "schedule", at: event_time, name:)
       end
 
       #: (untyped) -> untyped
@@ -124,6 +124,25 @@ module Durababble
           after_event&.call(actor:, name:, time: @time)
           count += 1
         end
+      end
+
+      private
+
+      #: (Array[untyped]) -> void
+      def insert_event(event)
+        index = @events.bsearch_index { |queued| event_after?(queued, event) }
+        if index
+          @events.insert(index, event)
+        else
+          @events << event
+        end
+      end
+
+      #: (Array[untyped], Array[untyped]) -> bool
+      def event_after?(left, right)
+        left_time, left_seq = left
+        right_time, right_seq = right
+        left_time > right_time || (left_time == right_time && left_seq > right_seq)
       end
     end
 

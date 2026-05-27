@@ -46,7 +46,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         ).resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/new_step/, run.error)
         assert_match(/different durable command shape/, run.error)
         assert_hash_includes store.steps_for(workflow_id).first, "name" => "old_step", "status" => "completed"
@@ -91,7 +91,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         run = Durababble::Engine.new(store:, worker_id: "second-version").resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/without consuming durable command history/, run.error)
         assert_match(/1:wait_for_release/, run.error)
         assert_equal(
@@ -141,7 +141,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         ).resume(second_version, workflow_id:)
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/without consuming durable command history/, run.error)
         assert_match(/0:old_step/, run.error)
         assert_hash_includes store.steps_for(workflow_id).first, "name" => "old_step", "status" => "failed"
@@ -198,7 +198,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         ).resume(reordered_version, workflow_id:)
 
         assert_equal "failed", run.status
-        assert_match(/NonDeterminismError/, run.error)
+        assert_match(/ReplayDivergenceError/, run.error)
         assert_match(/second/, run.error)
         assert_match(/different durable command shape/, run.error)
       end

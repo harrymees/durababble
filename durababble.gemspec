@@ -54,4 +54,5 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency("simplecov", "~> 0.22")
   spec.add_development_dependency("sorbet", "~> 0.5")
   spec.add_development_dependency("sqlite3", "~> 2.1")
+  spec.add_development_dependency("stackprof", "~> 0.2")
 end

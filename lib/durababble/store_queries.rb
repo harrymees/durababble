@@ -3,19 +3,20 @@
 
 module Durababble
   module StoreQueries
-    Query = Struct.new(:id, :backend, :builder, keyword_init: true)
+    Query = Struct.new(:id, :backend, :description, :builder, keyword_init: true)
 
     QUERIES = {}
 
     class << self
-      #: (untyped, backend: untyped) { (untyped) -> untyped } -> void
-      def define(id, backend:, &builder)
+      #: (untyped, backend: untyped, ?description: String?) { (untyped) -> untyped } -> void
+      def define(id, backend:, description: nil, &builder)
         query_id = id.to_sym
         raise ArgumentError, "duplicate store query id: #{query_id}" if QUERIES.key?(query_id)
 
         QUERIES[query_id] = Query.new(
           id: query_id,
           backend: backend.to_sym,
+          description: description || inferred_description(query_id),
           builder:,
         )
       end
@@ -36,6 +37,11 @@ module Durababble
         QUERIES.key?(id.to_sym)
       end
 
+      #: (untyped) -> String
+      def description_for(id)
+        QUERIES.fetch(id.to_sym).description
+      end
+
       #: () -> untyped
       def hot_query_coverage
         HOT_QUERY_COVERAGE
@@ -51,6 +57,12 @@ module Durababble
       #: (untyped, untyped, untyped) -> untyped
       def index_name(store, table_name, suffix)
         store.send(:index_name, table_name, suffix)
+      end
+
+      #: (Symbol) -> String
+      def inferred_description(id)
+        suffix = id.to_s.sub(/\A(?:pg|mysql|sqlite)_/, "")
+        "Run the #{suffix.tr("_", " ")} store query."
       end
     end
 
@@ -494,7 +506,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_pending_workflow, backend: :mysql) do |store, name_sql:|
+    define(:mysql_claim_pending_workflow, backend: :mysql, description: "Probe the pending workflow queue for the oldest runnable candidate in this worker pool.") do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
         WHERE worker_pool = ?
@@ -507,7 +519,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_failed_workflow, backend: :mysql) do |store, name_sql:|
+    define(:mysql_claim_failed_workflow, backend: :mysql, description: "Probe failed workflows whose retry backoff is due.") do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
         WHERE worker_pool = ?
@@ -521,7 +533,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_canceling_workflow, backend: :mysql) do |store, name_sql:|
+    define(:mysql_claim_canceling_workflow, backend: :mysql, description: "Probe canceling workflows that are ready for cleanup work.") do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")}
         WHERE worker_pool = ?
@@ -534,7 +546,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_expired_workflow, backend: :mysql) do |store, name_sql:|
+    define(:mysql_claim_expired_workflow, backend: :mysql, description: "Probe running workflows whose worker lease has expired.") do |store, name_sql:|
       <<~SQL.chomp
         SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")})
         WHERE worker_pool = ?
@@ -546,7 +558,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_selected_workflow, backend: :mysql) do |store|
+    define(:mysql_claim_selected_workflow, backend: :mysql, description: "Attach this worker lease to the selected workflow candidate.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
@@ -560,14 +572,14 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_workflow_already_owned, backend: :mysql) do |store|
+    define(:mysql_claim_workflow_already_owned, backend: :mysql, description: "Check whether this worker already holds a live workflow lease.") do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
       SQL
     end
 
-    define(:mysql_claim_workflow_lock, backend: :mysql) do |store|
+    define(:mysql_claim_workflow_lock, backend: :mysql, description: "Lock a target workflow row before a MySQL lease update.") do |store|
       <<~SQL.chomp
         SELECT id FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
@@ -581,7 +593,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_workflow_update, backend: :mysql) do |store|
+    define(:mysql_claim_workflow_update, backend: :mysql, description: "Move a target workflow to running and attach this worker lease.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
@@ -736,11 +748,11 @@ module Durababble
       "SELECT * FROM #{table(store, "outbox")} WHERE id = ?"
     end
 
-    define(:mysql_workflow, backend: :mysql) do |store|
+    define(:mysql_workflow, backend: :mysql, description: "Read one workflow row by id after a claim or for runtime state.") do |store|
       "SELECT * FROM #{table(store, "workflows")} WHERE id = ?"
     end
 
-    define(:mysql_steps_for, backend: :mysql) do |store|
+    define(:mysql_steps_for, backend: :mysql, description: "Read step rows for a workflow in command order.") do |store|
       "SELECT * FROM #{table(store, "steps")} WHERE workflow_id = ? ORDER BY position"
     end
 
@@ -755,11 +767,11 @@ module Durababble
       SQL
     end
 
-    define(:mysql_step_attempts_for, backend: :mysql) do |store|
+    define(:mysql_step_attempts_for, backend: :mysql, description: "Read step attempts for a workflow in replay order.") do |store|
       "SELECT * FROM #{table(store, "step_attempts")} WHERE workflow_id = ? ORDER BY started_at, position"
     end
 
-    define(:mysql_step_attempt_count_for, backend: :mysql) do |store|
+    define(:mysql_step_attempt_count_for, backend: :mysql, description: "Count attempts for one workflow command.") do |store|
       "SELECT COUNT(*) AS count FROM #{table(store, "step_attempts")} WHERE workflow_id = ? AND position = ?"
     end
 
@@ -1389,15 +1401,15 @@ module Durababble
       "DROP TABLE IF EXISTS #{table(store, table_name)}"
     end
 
-    define(:mysql_insert_workflow, backend: :mysql) do |store|
+    define(:mysql_insert_workflow, backend: :mysql, description: "Insert a pending workflow row with serialized input.") do |store|
       "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input) VALUES (?, ?, ?, ?, ?)"
     end
 
-    define(:mysql_insert_workflow_with_worker, backend: :mysql) do |store|
+    define(:mysql_insert_workflow_with_worker, backend: :mysql, description: "Insert a running workflow row with an initial worker lease.") do |store|
       "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))"
     end
 
-    define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|
+    define(:mysql_mark_workflow_running_with_worker, backend: :mysql, description: "Move a workflow to running and attach a worker lease.") do |store|
       # [DURABABBLE-WF-1] Terminal rows must stay terminal even when a worker holds a lease.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
@@ -1407,12 +1419,12 @@ module Durababble
       SQL
     end
 
-    define(:mysql_mark_workflow_running, backend: :mysql) do |store|
+    define(:mysql_mark_workflow_running, backend: :mysql, description: "Move a workflow to running without attaching a lease.") do |store|
       # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
       "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL"
     end
 
-    define(:mysql_claim_workflow_for_activation_lock, backend: :mysql) do |store|
+    define(:mysql_claim_workflow_for_activation_lock, backend: :mysql, description: "Lock a workflow activation target before claiming it.") do |store|
       <<~SQL.chomp
         SELECT id FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
@@ -1427,7 +1439,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_workflow_for_activation_update, backend: :mysql) do |store|
+    define(:mysql_claim_workflow_for_activation_update, backend: :mysql, description: "Claim a workflow through its activation path.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
@@ -1648,7 +1660,7 @@ module Durababble
         "WHERE id = ?"
     end
 
-    define(:mysql_complete_workflow_with_worker, backend: :mysql) do |store|
+    define(:mysql_complete_workflow_with_worker, backend: :mysql, description: "Mark a workflow completed while verifying the worker lease.") do |store|
       # [DURABABBLE-WF-1] Workflow completion requires the running lease; live durable work
       # is cleaned up after the UPDATE by the surrounding helper.
       <<~SQL.chomp
@@ -1658,7 +1670,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_complete_workflow, backend: :mysql) do |store|
+    define(:mysql_complete_workflow, backend: :mysql, description: "Mark a workflow completed when no worker lease check is required.") do |store|
       # [DURABABBLE-WF-1] Unfenced completion still rejects terminal rows and live durable work.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
@@ -1826,7 +1838,7 @@ module Durababble
       "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = ? AND object_type = ? AND object_id = ?"
     end
 
-    define(:mysql_claim_pending_target_activation, backend: :mysql) do |store, filter_sql:|
+    define(:mysql_claim_pending_target_activation, backend: :mysql, description: "Probe ready target activations for this worker pool and target filter.") do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
         WHERE worker_pool = ? AND status = 'pending' AND ready_at <= ?
@@ -1837,7 +1849,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_expired_target_activation, backend: :mysql) do |store, filter_sql:|
+    define(:mysql_claim_expired_target_activation, backend: :mysql, description: "Probe target activations abandoned by an expired lease.") do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "expired")})
         WHERE worker_pool = ? AND status = 'running' AND locked_until < ?
@@ -1848,7 +1860,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_selected_target_activation, backend: :mysql) do |store|
+    define(:mysql_claim_selected_target_activation, backend: :mysql, description: "Attach this worker lease to the selected target activation.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
@@ -1856,7 +1868,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_lock_target_activation_for_completion, backend: :mysql) do |store|
+    define(:mysql_lock_target_activation_for_completion, backend: :mysql, description: "Lock an owned target activation before reconciliation.") do |store|
       <<~SQL.chomp
         SELECT 1 FROM #{table(store, "target_activations")}
         WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
@@ -1949,7 +1961,7 @@ module Durababble
 
     # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
     # writer's value so the routing pool for a target activation is fixed at creation time.
-    define(:mysql_upsert_target_activation, backend: :mysql) do |store|
+    define(:mysql_upsert_target_activation, backend: :mysql, description: "Create or refresh a target activation wakeup.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
@@ -1957,13 +1969,13 @@ module Durababble
       SQL
     end
 
-    define(:mysql_delete_target_activation, backend: :mysql) do |store|
+    define(:mysql_delete_target_activation, backend: :mysql, description: "Delete a target activation with no claimable mailbox head.") do |store|
       "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
     # Explicit rearm/reconcile writes are scoped to the activation's routing
     # pool; a caller from another pool must not clear an active lease.
-    define(:mysql_set_target_activation_pending, backend: :mysql) do |store|
+    define(:mysql_set_target_activation_pending, backend: :mysql, description: "Return a target activation to pending at the chosen ready time.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
@@ -1978,14 +1990,14 @@ module Durababble
 
     # worker_pool is routing metadata, not identity — INSERT IGNORE on conflict keeps the first
     # writer's value so the routing pool for a mailbox is fixed at creation time.
-    define(:mysql_insert_mailbox_sequence, backend: :mysql) do |store|
+    define(:mysql_insert_mailbox_sequence, backend: :mysql, description: "Create the mailbox sequence row if it does not exist.") do |store|
       <<~SQL.chomp
         INSERT IGNORE INTO #{table(store, "mailbox_sequences")} (worker_pool, target_kind, target_type, target_id, last_sequence)
         VALUES (?, ?, ?, ?, 0)
       SQL
     end
 
-    define(:mysql_mailbox_sequence_for_update, backend: :mysql) do |store|
+    define(:mysql_mailbox_sequence_for_update, backend: :mysql, description: "Lock the mailbox sequence row before assigning the next message number.") do |store|
       <<~SQL.chomp
         SELECT worker_pool, last_sequence
         FROM #{table(store, "mailbox_sequences")}
@@ -1994,7 +2006,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_update_mailbox_sequence, backend: :mysql) do |store|
+    define(:mysql_update_mailbox_sequence, backend: :mysql, description: "Persist the next mailbox sequence number.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "mailbox_sequences")}
         SET last_sequence = ?, updated_at = NOW(6)
@@ -2002,7 +2014,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_existing_inbox_message_for_idempotency, backend: :mysql) do |store|
+    define(:mysql_existing_inbox_message_for_idempotency, backend: :mysql, description: "Find an existing inbox message for an idempotent command.") do |store|
       <<~SQL.chomp
         SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
         FROM #{table(store, "inbox")}
@@ -2011,11 +2023,11 @@ module Durababble
       SQL
     end
 
-    define(:mysql_lock_workflow_for_update, backend: :mysql) do |store|
+    define(:mysql_lock_workflow_for_update, backend: :mysql, description: "Lock a workflow row before a dependent durable mutation.") do |store|
       "SELECT * FROM #{table(store, "workflows")} WHERE id = ? FOR UPDATE"
     end
 
-    define(:mysql_insert_inbox_message, backend: :mysql) do |store|
+    define(:mysql_insert_inbox_message, backend: :mysql, description: "Insert a durable inbox message with serialized payload.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "inbox")} (
         id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name,
@@ -2025,7 +2037,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_inbox_claim_rows_for_update, backend: :mysql) do |store, limit:|
+    define(:mysql_inbox_claim_rows_for_update, backend: :mysql, description: "Lock claimable inbox messages for a single target mailbox.") do |store, limit:|
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
@@ -2037,7 +2049,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_inbox_head_for_update, backend: :mysql) do |store|
+    define(:mysql_inbox_head_for_update, backend: :mysql, description: "Lock the current mailbox head for activation reconciliation.") do |store|
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "inbox")}
@@ -2049,7 +2061,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_mark_inbox_row_running, backend: :mysql) do |store|
+    define(:mysql_mark_inbox_row_running, backend: :mysql, description: "Attach this worker lease to an inbox message.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "inbox")}
         SET status = 'running', attempts = attempts + 1, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
@@ -2057,23 +2069,23 @@ module Durababble
       SQL
     end
 
-    define(:mysql_complete_inbox_message, backend: :mysql) do |store|
+    define(:mysql_complete_inbox_message, backend: :mysql, description: "Mark an inbox message completed with serialized result.") do |store|
       "UPDATE #{table(store, "inbox")} SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = NOW(6), updated_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_fail_inbox_message, backend: :mysql) do |store|
+    define(:mysql_fail_inbox_message, backend: :mysql, description: "Mark an inbox message failed.") do |store|
       "UPDATE #{table(store, "inbox")} SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_retry_inbox_message, backend: :mysql) do |store|
+    define(:mysql_retry_inbox_message, backend: :mysql, description: "Schedule a failed inbox message for retry.") do |store|
       "UPDATE #{table(store, "inbox")} SET status = 'pending', error = ?, ready_at = ?, locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_dead_letter_inbox_message, backend: :mysql) do |store|
+    define(:mysql_dead_letter_inbox_message, backend: :mysql, description: "Permanently dead-letter an inbox message.") do |store|
       "UPDATE #{table(store, "inbox")} SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_update_latest_attempt, backend: :mysql) do |store|
+    define(:mysql_update_latest_attempt, backend: :mysql, description: "Mirror the latest command outcome onto its latest step attempt.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "step_attempts")}
         SET status = ?, result = ?, error = ?, completed_at = NOW(6)
@@ -2083,7 +2095,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_complete_timer_waits, backend: :mysql) do |store, limit:|
+    define(:mysql_complete_timer_waits, backend: :mysql, description: "Lock due timer waits in a bounded batch.") do |store, limit:|
       <<~SQL.chomp
         SELECT w.* FROM #{table(store, "waits")} AS w
         JOIN #{table(store, "workflows")} AS wf ON wf.id = w.workflow_id
@@ -2097,7 +2109,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_due_object_wakeups, backend: :mysql) do |store, limit:|
+    define(:mysql_due_object_wakeups, backend: :mysql, description: "Lock due durable object wakeups in a bounded batch.") do |store, limit:|
       <<~SQL.chomp
         SELECT *
         FROM #{table(store, "object_wakeups")}
@@ -2108,46 +2120,46 @@ module Durababble
       SQL
     end
 
-    define(:mysql_complete_wait, backend: :mysql) do |store|
+    define(:mysql_complete_wait, backend: :mysql, description: "Mark a wait completed with serialized wake payload.") do |store|
       "UPDATE #{table(store, "waits")} SET status = 'completed', payload = ?, completed_at = NOW(6) WHERE id = ?"
     end
 
-    define(:mysql_mark_waits_workflows_pending, backend: :mysql) do |store, placeholders:|
+    define(:mysql_mark_waits_workflows_pending, backend: :mysql, description: "Move workflows with completed waits back to pending.") do |store, placeholders:|
       "UPDATE #{table(store, "workflows")} SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6) WHERE id IN (#{placeholders}) AND status = 'waiting'"
     end
 
-    define(:mysql_lock_workflow_history_workflow, backend: :mysql) do |store|
+    define(:mysql_lock_workflow_history_workflow, backend: :mysql, description: "Lock the workflow row before appending history.") do |store|
       "SELECT id FROM #{table(store, "workflows")} WHERE id = ? FOR UPDATE"
     end
 
-    define(:mysql_next_workflow_history_event_index, backend: :mysql) do |store|
+    define(:mysql_next_workflow_history_event_index, backend: :mysql, description: "Compute the next workflow history event index.") do |store|
       "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
-    define(:mysql_insert_workflow_history, backend: :mysql) do |store|
+    define(:mysql_insert_workflow_history, backend: :mysql, description: "Append a workflow replay history event.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       SQL
     end
 
-    define(:mysql_workflow_history_for, backend: :mysql) do |store|
+    define(:mysql_workflow_history_for, backend: :mysql, description: "Read workflow history events in replay order.") do |store|
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = ? ORDER BY event_index"
     end
 
-    define(:mysql_workflow_history_count_for, backend: :mysql) do |store|
+    define(:mysql_workflow_history_count_for, backend: :mysql, description: "Count workflow history events for the replay guard.") do |store|
       "SELECT COUNT(*) AS count FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
-    define(:mysql_waits_for_workflow, backend: :mysql) do |store|
+    define(:mysql_waits_for_workflow, backend: :mysql, description: "Read wait rows for one workflow.") do |store|
       "SELECT * FROM #{table(store, "waits")} WHERE workflow_id = ? ORDER BY created_at"
     end
 
-    define(:mysql_inbox_message, backend: :mysql) do |store|
+    define(:mysql_inbox_message, backend: :mysql, description: "Read one inbox message by id.") do |store|
       "SELECT * FROM #{table(store, "inbox")} WHERE id = ?"
     end
 
-    define(:mysql_inbox_messages_for, backend: :mysql) do |store|
+    define(:mysql_inbox_messages_for, backend: :mysql, description: "Read inbox messages for one target mailbox.") do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
         WHERE target_kind = ? AND target_type = ? AND target_id = ?
@@ -2155,7 +2167,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_inbox_messages_for_worker_pool, backend: :mysql) do |store|
+    define(:mysql_inbox_messages_for_worker_pool, backend: :mysql, description: "Read inbox messages for one worker-pool target mailbox.") do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
         WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
@@ -2163,7 +2175,7 @@ module Durababble
       SQL
     end
 
-    define(:mysql_target_activation, backend: :mysql) do |store|
+    define(:mysql_target_activation, backend: :mysql, description: "Read a target activation by worker pool and target key.") do |store|
       "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
