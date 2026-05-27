@@ -236,10 +236,10 @@ module Durababble
     #: () -> String
     def status
       if (execution = WorkflowExecutionContext.current)
-        return execution.call_child_workflow_observe(self).fetch("status")
+        return execution.call_child_workflow_observe(self).fetch("status").to_s
       end
 
-      @store.observe_child_workflow(@workflow_id).fetch("status")
+      @store.observe_child_workflow(@workflow_id).fetch("status").to_s
     end
 
     #: () -> Object?
@@ -254,10 +254,12 @@ module Durababble
     #: () -> String?
     def error
       if (execution = WorkflowExecutionContext.current)
-        return execution.call_child_workflow_observe(self)["error"]
+        error = execution.call_child_workflow_observe(self)["error"]
+        return error&.to_s
       end
 
-      @store.observe_child_workflow(@workflow_id)["error"]
+      error = @store.observe_child_workflow(@workflow_id)["error"]
+      error&.to_s
     end
 
     #: (?poll_interval: Numeric, ?timeout: Numeric?) -> Object?

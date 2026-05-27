@@ -254,7 +254,8 @@ module Durababble
       resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{child_workflow_name}"
       resolved_id = id || generated_child_workflow_id(child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key: resolved_key)
       policy = normalize_child_cancellation_policy(cancellation)
-      link = @store.start_child_workflow(
+      store = @store #: as Store
+      link = store.start_child_workflow(
         origin_kind: "object",
         parent_object_type: self.class.object_type,
         parent_object_id: durable_id,
@@ -268,10 +269,10 @@ module Durababble
       )
       ChildWorkflowHandle.new(
         workflow_class,
-        link.fetch("child_workflow_id"),
-        store: @store,
-        worker_pool: link.fetch("worker_pool"),
-        cancellation_policy: link.fetch("cancellation_policy"),
+        link.fetch("child_workflow_id").to_s,
+        store:,
+        worker_pool: link.fetch("worker_pool").to_s,
+        cancellation_policy: link.fetch("cancellation_policy").to_s,
       )
     end
 
