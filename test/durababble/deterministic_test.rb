@@ -72,6 +72,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_delivery_crash_recovery",
     "workflow_command_retry_then_complete",
     "workflow_command_target_identity_isolation",
+    "workflow_command_enqueue_target_name_isolation",
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
     "object_command_target_identity_isolation",
@@ -584,6 +585,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "wrong_workflow_command_target completed=false failed=false first_status=\"running\" second_status=\"running\" wf_b_history=0"
+  end
+
+  test "keeps workflow command enqueue scoped to the persisted workflow name" do
+    result = Durababble::Deterministic.prove("workflow_command_enqueue_target_name_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wrong_workflow_command_name enqueued=false error=\"workflow wf-name is counter, not other_counter\" wrong_activation=false wrong_messages=0"
   end
 
   test "dead-letters a terminally-failed command exactly once with a single history entry through crashes" do

@@ -539,6 +539,26 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not enqueue workflow commands for a different workflow name with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_target_name") do |store|
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+
+        error = assert_raises(Durababble::Error) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "other-approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+            idempotency_key: "wrong-name",
+          )
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} is approval, not other-approval/, error.message)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "other-approval", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "other-approval", target_id: workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id)
+      end
+    end
+
     test "scopes workflow claims and command activations by persisted worker pool with #{backend.name}" do
       with_durababble_store(backend, "workflow_pool_routing") do |store|
         pool_a_workflow = store.enqueue_workflow(name: "shared-workflow", input: { "pool" => "a" }, worker_pool: "pool-a")

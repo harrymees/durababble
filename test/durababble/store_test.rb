@@ -564,7 +564,7 @@ class DurababbleStoreTest < DurababbleTestCase
       payload:,
     )
     new_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result,
       sql_result([{ "worker_pool" => "default", "last_sequence" => "0" }]),
@@ -584,7 +584,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
@@ -596,7 +596,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-command", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "id" => "pending-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_workflow_command(
@@ -610,7 +610,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+        sql_result([{ "id" => "wf-1", "name" => "approval", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
         sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_workflow_command(
         workflow_id: "wf-1",
@@ -627,7 +627,7 @@ class DurababbleStoreTest < DurababbleTestCase
     end
     assert_raises_matching(Durababble::Error, /terminal/) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "wf-1", "status" => "completed", "next_run_at" => nil }]),
+        sql_result([{ "id" => "wf-1", "name" => "approval", "status" => "completed", "next_run_at" => nil }]),
       ])).enqueue_workflow_command(workflow_id: "wf-1", workflow_name: "approval", method_name: "approve", payload:)
     end
   end

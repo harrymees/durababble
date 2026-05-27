@@ -174,6 +174,9 @@ module Durababble
         raise KeyError, "workflow not found: #{workflow_id}" unless workflow
 
         decoded_workflow = decode_row(workflow)
+        persisted_workflow_name = decoded_workflow.fetch("name")
+        raise Error, "workflow #{workflow_id} is #{persisted_workflow_name}, not #{workflow_name}" unless persisted_workflow_name == workflow_name
+
         worker_pool = row_worker_pool(decoded_workflow)
         target_kind = "workflow"
         message_kind = "workflow_command"
