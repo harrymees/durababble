@@ -5,6 +5,9 @@ require_relative "../test_helper"
 require "json"
 
 class DurababbleMysqlQueryPlanTest < DurababbleTestCase
+  MYSQL_ALLOWED_ACCESS_TYPES = ["const", "eq_ref", "ref", "range"].freeze
+  MYSQL_DEFAULT_MAX_ROWS_EXAMINED_PER_SCAN = 600
+
   test "uses indexes for hot MySQL queue wait activation and inbox predicates" do
     backend = durababble_store_backends.find(&:mysql?)
     skip("MySQL-backed Durababble tests require a MySQL database URL") unless backend
@@ -33,6 +36,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:claim_expired_workflow, name_sql: ""),
           params: ["default"],
           expected_key_fragment: "workflows_expired_lease",
+          expected_access_types: ["range"],
+          allow_filesort: true,
         },
         "pending outbox claim probe" => {
           sql: query_sql(:claim_pending_outbox),
@@ -41,21 +46,28 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         "expired outbox claim probe" => {
           sql: query_sql(:claim_expired_outbox),
           expected_key_fragment: "outbox_expired_lease",
+          expected_access_types: ["range"],
+          allow_filesort: true,
         },
         "timer wait wake probe" => {
           sql: query_sql(:complete_timer_waits, limit: 100),
           params: [now],
           expected_key_fragment: "waits_timer_pending",
+          expected_access_types: ["range", "eq_ref"],
+          max_rows_examined_per_scan: 5,
         },
         "pending target activation claim probe" => {
           sql: query_sql(:claim_pending_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
           params: ["default", now, "object", "counter"],
           expected_key_fragment: "target_activations_queue",
+          expected_access_types: ["range"],
         },
         "expired target activation claim probe" => {
           sql: query_sql(:claim_expired_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
           params: ["default", now, "object", "counter"],
           expected_key_fragment: "target_activations_expired",
+          expected_access_types: ["range"],
+          allow_filesort: true,
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
@@ -71,11 +83,16 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:current_object_lease),
           params: ["counter", "object-1", "counter", "object-1"],
           expected_key_fragment: ["PRIMARY", "inbox_target"],
+          expected_access_types: ["const", "ref"],
+          allow_filesort: true,
+          allow_temporary_table: true,
         },
         "inbox idempotency probe" => {
           sql: query_sql(:existing_inbox_message_for_idempotency),
           params: [inbox_idempotency_hash("idempotency-1", target_kind: "object", target_type: "counter", target_id: "object-1")],
           expected_key_fragment: "inbox_idempotency_hash",
+          expected_access_types: ["const"],
+          max_rows_examined_per_scan: 1,
         },
         "workflow lease count probe" => {
           sql: query_sql(:count_workflow_leases, index: mysql_index_name("workflows", "worker_lease")),
@@ -86,6 +103,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:release_workflow_leases, index: mysql_index_name("workflows", "worker_lease")),
           params: ["other"],
           expected_key_fragment: "workflows_worker_lease",
+          expected_access_types: ["range"],
         },
         "outbox lease count probe" => {
           sql: query_sql(:count_outbox_leases, index: mysql_index_name("outbox", "worker_lease")),
@@ -96,6 +114,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:release_outbox_leases, index: mysql_index_name("outbox", "worker_lease")),
           params: ["owner"],
           expected_key_fragment: "outbox_worker_lease",
+          expected_access_types: ["range"],
         },
         "inbox lease count probe" => {
           sql: query_sql(:count_inbox_leases, index: mysql_index_name("inbox", "worker_lease")),
@@ -106,6 +125,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:release_inbox_leases, index: mysql_index_name("inbox", "worker_lease")),
           params: ["owner"],
           expected_key_fragment: "inbox_worker_lease",
+          expected_access_types: ["range"],
         },
         "target activation lease count probe" => {
           sql: query_sql(:count_target_activation_leases, index: mysql_index_name("target_activations", "worker_lease")),
@@ -116,6 +136,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           sql: query_sql(:release_target_activation_leases, index: mysql_index_name("target_activations", "worker_lease")),
           params: ["owner"],
           expected_key_fragment: "target_activations_worker_lease",
+          expected_access_types: ["range"],
         },
       }
 
@@ -125,6 +146,10 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expectation.fetch(:sql),
           params: expectation.fetch(:params, []),
           expected_key_fragment: expectation.fetch(:expected_key_fragment),
+          expected_access_types: expectation.fetch(:expected_access_types, ["ref"]),
+          max_rows_examined_per_scan: expectation.fetch(:max_rows_examined_per_scan, MYSQL_DEFAULT_MAX_ROWS_EXAMINED_PER_SCAN),
+          allow_filesort: expectation.fetch(:allow_filesort, false),
+          allow_temporary_table: expectation.fetch(:allow_temporary_table, false),
         )
       end
     end
@@ -157,30 +182,125 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     JSON.parse(row.fetch("EXPLAIN"))
   end
 
-  def assert_mysql_plan_uses_index(name, sql, params:, expected_key_fragment:)
+  def assert_mysql_plan_uses_index(name, sql, params:, expected_key_fragment:, expected_access_types:, max_rows_examined_per_scan:, allow_filesort:, allow_temporary_table:)
     plan = explain_json(sql, params)
     access_paths = mysql_access_paths(plan)
     refute_empty(access_paths, "expected #{name} to have table access nodes: #{JSON.pretty_generate(plan)}")
+    assert_equal(
+      expected_access_types,
+      access_paths.map { |path| path.fetch("access_type") },
+      "expected #{name} access type shape to stay bounded, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
+    )
     assert(
-      access_paths.all? { |path| path.fetch("access_type") != "ALL" },
-      "expected #{name} to avoid full table scans: #{JSON.pretty_generate(plan)}",
+      access_paths.all? { |path| MYSQL_ALLOWED_ACCESS_TYPES.include?(path.fetch("access_type")) },
+      "expected #{name} to avoid full scans and full index scans, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
     )
     Array(expected_key_fragment).each do |fragment|
       assert(
         access_paths.any? { |path| path.fetch("key", "").include?(fragment) },
         "expected #{name} to use index containing #{fragment.inspect}, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
       )
+      assert_mysql_key_parts!(name, access_paths, fragment, plan)
     end
+    assert_mysql_rows_examined!(name, access_paths, max_rows_examined_per_scan, plan)
+    assert_mysql_filesort_shape!(name, plan, allow_filesort:)
+    assert_no_unexpected_mysql_temporary_table!(name, plan, allow_temporary_table:)
   end
 
   def mysql_access_paths(node)
     case node
     when Hash
       current = []
-      current << node.slice("table_name", "access_type", "key", "rows") if node.key?("access_type") && !node.key?("materialized_from_subquery")
+      current << node.slice(
+        "table_name",
+        "access_type",
+        "key",
+        "used_key_parts",
+        "rows_examined_per_scan",
+        "rows_produced_per_join",
+        "using_temporary_table",
+      ) if node.key?("access_type") && !node.key?("materialized_from_subquery")
       current + node.values.flat_map { |value| mysql_access_paths(value) }
     when Array
       node.flat_map { |value| mysql_access_paths(value) }
+    else
+      []
+    end
+  end
+
+  def assert_mysql_key_parts!(name, access_paths, expected_key_fragment, plan)
+    expected_parts = mysql_expected_key_parts(expected_key_fragment)
+    return if expected_parts.empty?
+
+    matching_path = access_paths.find { |path| path.fetch("key", "").include?(expected_key_fragment) }
+    used_parts = Array(matching_path&.fetch("used_key_parts", []))
+    missing_parts = expected_parts - used_parts
+    assert_empty(
+      missing_parts,
+      "expected #{name} to use key parts #{expected_parts.inspect}, got #{used_parts.inspect}: #{JSON.pretty_generate(plan)}",
+    )
+  end
+
+  def mysql_expected_key_parts(expected_key_fragment)
+    case expected_key_fragment
+    when "workflows_queue"
+      ["worker_pool", "status"]
+    when "workflows_expired_lease"
+      ["worker_pool", "status", "locked_until"]
+    when "outbox_queue"
+      ["status"]
+    when "outbox_expired_lease"
+      ["status", "locked_until"]
+    when "waits_timer_pending"
+      ["status", "kind", "wake_at"]
+    when "target_activations_queue"
+      ["worker_pool", "status", "ready_at"]
+    when "target_activations_expired"
+      ["worker_pool", "status", "locked_until"]
+    when "inbox_target"
+      ["target_kind", "target_type", "target_id"]
+    when "inbox_idempotency_hash"
+      ["idempotency_hash"]
+    when /worker_lease/
+      ["status", "locked_by"]
+    else
+      []
+    end
+  end
+
+  def assert_mysql_rows_examined!(name, access_paths, max_rows_examined_per_scan, plan)
+    over_budget = access_paths.select do |path|
+      rows = path["rows_examined_per_scan"]
+      rows && rows.to_i > max_rows_examined_per_scan
+    end
+    assert_empty(
+      over_budget,
+      "expected #{name} to examine at most #{max_rows_examined_per_scan} rows per scan, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
+    )
+  end
+
+  def assert_mysql_filesort_shape!(name, plan, allow_filesort:)
+    filesorts = mysql_plan_values(plan, "using_filesort")
+    return if allow_filesort
+
+    assert_empty(filesorts.select { |value| value == true }, "expected #{name} not to require filesort: #{JSON.pretty_generate(plan)}")
+  end
+
+  def assert_no_unexpected_mysql_temporary_table!(name, plan, allow_temporary_table:)
+    return if allow_temporary_table
+
+    temporary_tables = mysql_plan_values(plan, "using_temporary_table")
+    unexpected = temporary_tables.reject { |value| [false, "for update"].include?(value) }
+    assert_empty(unexpected, "expected #{name} not to require a temporary table: #{JSON.pretty_generate(plan)}")
+  end
+
+  def mysql_plan_values(node, key)
+    case node
+    when Hash
+      current = node.key?(key) ? [node.fetch(key)] : []
+      current + node.values.flat_map { |value| mysql_plan_values(value, key) }
+    when Array
+      node.flat_map { |value| mysql_plan_values(value, key) }
     else
       []
     end
