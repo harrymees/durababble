@@ -50,9 +50,10 @@ module Durababble
   class LeaseConflict < Error; end
 
   # DeterminismError rejects unsafe host APIs during the current workflow run;
-  # NonDeterminismError rejects replay divergence from already persisted history.
+  # ReplayDivergenceError rejects replay divergence from already persisted history.
   class DeterminismError < Error; end
-  class NonDeterminismError < DeterminismError; end
+  class ReplayDivergenceError < DeterminismError; end
+  NonDeterminismError = ReplayDivergenceError
 
   class WorkflowHistoryLimitExceeded < Error
     #: String

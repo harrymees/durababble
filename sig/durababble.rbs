@@ -105,8 +105,9 @@ module Durababble
   class DeterminismError < Error
   end
 
-  class NonDeterminismError < DeterminismError
+  class ReplayDivergenceError < DeterminismError
   end
+  NonDeterminismError: singleton(ReplayDivergenceError)
 
   class WorkflowHistoryLimitExceeded < Error
     attr_reader workflow_id: String
