@@ -102,8 +102,8 @@ module Durababble
 
       activation = work_item.payload
       worker_pool = activation_worker_pool(activation)
-      @store.complete_target_activation(
-        **activation_target(activation, worker_pool:),
+      complete_activation_target(
+        activation_target(activation, worker_pool:),
         worker_id: @worker_id,
         now: ready_at,
       )

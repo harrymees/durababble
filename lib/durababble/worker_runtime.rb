@@ -55,12 +55,14 @@ module Durababble
       @rpc_host = rpc_host || raise(ArgumentError, "rpc_host is required")
       @rpc_port = rpc_port.nil? ? raise(ArgumentError, "rpc_port is required") : rpc_port
 
-      concurrency = begin
-        Integer(concurrency)
+      raw_concurrency = concurrency #: as untyped
+      parsed_concurrency = begin
+        Integer(raw_concurrency)
       rescue ArgumentError, TypeError
         raise ArgumentError, "concurrency must be a positive integer"
       end
-      raise ArgumentError, "concurrency must be a positive integer" unless concurrency.positive?
+      parsed_concurrency = parsed_concurrency #: as Integer
+      raise ArgumentError, "concurrency must be a positive integer" unless parsed_concurrency.positive?
 
       database_url = database_url #: as untyped
       schema = schema #: as untyped
@@ -73,7 +75,7 @@ module Durababble
       @worker_id = @worker_identity_id
       @lease_seconds = lease_seconds
       @poll_interval = poll_interval
-      @concurrency = concurrency
+      @concurrency = parsed_concurrency
       @migrate = migrate
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
