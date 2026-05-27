@@ -295,6 +295,7 @@ module Durababble
       transaction do
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
+        next nil unless object_command_completion_target_matches?(command, object_type:, object_id:, state:, wakeup_changes:)
 
         worker_pool = row_worker_pool(command)
         save_object_state(worker_pool:, object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
@@ -726,6 +727,15 @@ module Durababble
     #: (Hash[String, Object?], String) -> bool
     def workflow_command_targets_workflow?(command, workflow_id)
       command.fetch("target_kind", nil) == "workflow" && command.fetch("target_id", nil) == workflow_id
+    end
+
+    #: (Hash[String, Object?], object_type: String?, object_id: String?, state: Object?, wakeup_changes: Array[ObjectWakeupChange]) -> bool
+    def object_command_completion_target_matches?(command, object_type:, object_id:, state:, wakeup_changes:)
+      target_required = !object_type.nil? || !object_id.nil? || !state.equal?(Store::NO_OBJECT_STATE) || !wakeup_changes.empty?
+      return true unless target_required
+      return true unless command.key?("target_kind")
+
+      command.fetch("target_kind") == "object" && command.fetch("target_type") == object_type && command.fetch("target_id") == object_id
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Object?

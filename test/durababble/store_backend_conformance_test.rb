@@ -375,6 +375,33 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not complete object commands for a different object with #{backend.name}" do
+      with_durababble_store(backend, "object_command_target_identity") do |store|
+        command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "object-a",
+          method_name: "write",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30),
+          "locked_by" => "object-worker",
+        )
+
+        assert_nil store.complete_object_command(
+          command_id:,
+          result: { "ok" => true },
+          object_type: "counter",
+          object_id: "object-b",
+          state: { "value" => "wrong-object" },
+          worker_id: "object-worker",
+        )
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "object-worker"
+        assert_nil store.object_state(object_type: "counter", object_id: "object-b")
+      end
+    end
+
     test "does not claim an earlier object command when asked for a later one with #{backend.name}" do
       with_durababble_store(backend, "object_command_fifo_claim") do |store|
         first = store.enqueue_object_command(

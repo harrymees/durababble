@@ -74,6 +74,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "workflow_command_target_identity_isolation",
     "workflow_command_terminal_failure",
     "workflow_command_delivery_to_terminal_workflow",
+    "object_command_target_identity_isolation",
     "object_command_failure_exhaustion",
     "object_command_claim_contention",
   ].freeze
@@ -716,6 +717,13 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "b_blocked_by_lease"
     refute_includes result.trace, "b_stole_live_lease"
+  end
+
+  test "keeps object command completion scoped to the command target" do
+    result = Durababble::Deterministic.prove("object_command_target_identity_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "wrong_object_command_target completed=false status=\"running\" wrong_state=false"
   end
 
   test "drives an object command to a consistent terminal state through store crashes" do
