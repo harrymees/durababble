@@ -248,6 +248,31 @@ module Durababble
         workflow
       end
 
+      #: (untyped) ?{ (?) -> untyped } -> untyped
+      def durable_object_class(type, &definition)
+        object_class = Class.new(Durababble::DurableObject)
+        object_class.object_type(type)
+        object_class.class_eval(&definition) if definition
+        object_class
+      end
+
+      #: () -> untyped
+      def alarm_object_class
+        durable_object_class("alarm") do
+          define_method(:initialize_state) { { "wakes" => [], "armed" => [] } }
+          define_method(:arm) do |specs|
+            specs.each { |spec| schedule_wake(name: spec.fetch("name"), at: spec.fetch("at"), payload: spec.fetch("payload")) }
+            update_state(current_state.merge("armed" => current_state.fetch("armed") + specs.map { |spec| spec.fetch("name") }))
+          end
+          expose_command(:arm)
+          define_method(:on_wake) do |name:, payload:| # rubocop:disable Lint/UnusedBlockArgument
+            update_state(current_state.merge("wakes" => current_state.fetch("wakes") | [name]))
+          end
+          define_method(:snapshot) { current_state }
+          expose(:snapshot)
+        end
+      end
+
       #: (untyped, untyped) { (untyped) -> untyped } -> untyped
       def run(seed, scenario, &block)
         trace = Trace.new

@@ -229,11 +229,25 @@ UPDATE "durababble_pg_snapshot"."inbox"
 SET status = 'dead_lettered', error = $2, locked_by = NULL, locked_until = NULL, dead_lettered_at = now(), updated_at = now()
 WHERE id = $1
 
+-- pg_delete_all_object_wakeups
+DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3
+
+-- pg_delete_object_wakeup
+DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3 AND name = $4
+
 -- pg_delete_target_activation
 DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 
 -- pg_drop_schema
 DROP SCHEMA IF EXISTS "durababble_pg_snapshot" CASCADE
+
+-- pg_due_object_wakeups
+SELECT *
+FROM "durababble_pg_snapshot"."object_wakeups"
+WHERE wake_at <= $1::timestamptz
+ORDER BY wake_at, created_at
+LIMIT $2
+FOR UPDATE SKIP LOCKED
 
 -- pg_existing_inbox_message_for_idempotency
 SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
@@ -569,6 +583,14 @@ WHERE id = (
 UPDATE "durababble_pg_snapshot"."mailbox_sequences"
 SET last_sequence = $5, updated_at = now()
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+
+-- pg_upsert_object_wakeup
+INSERT INTO "durababble_pg_snapshot"."object_wakeups" (worker_pool, object_type, object_id, name, wake_at, payload)
+VALUES ($1, $2, $3, $4, $5::timestamptz, $6::bytea)
+ON CONFLICT (worker_pool, object_type, object_id, name) DO UPDATE
+  SET wake_at = EXCLUDED.wake_at,
+      payload = EXCLUDED.payload,
+      updated_at = now()
 
 -- pg_upsert_step_running
 INSERT INTO "durababble_pg_snapshot"."steps" (workflow_id, position, name, status, started_at, updated_at)

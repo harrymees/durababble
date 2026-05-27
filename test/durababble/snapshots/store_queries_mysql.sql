@@ -242,11 +242,25 @@ WHERE id = ? <worker_pool_sql> AND status = 'running' AND locked_by IS NOT NULL 
 -- mysql_dead_letter_inbox_message
 UPDATE `durababble_mysql_snapshot_inbox` SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?
 
+-- mysql_delete_all_object_wakeups
+DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND object_type = ? AND object_id = ?
+
+-- mysql_delete_object_wakeup
+DELETE FROM `durababble_mysql_snapshot_object_wakeups` WHERE worker_pool = ? AND object_type = ? AND object_id = ? AND name = ?
+
 -- mysql_delete_target_activation
 DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 
 -- mysql_drop_table
 DROP TABLE IF EXISTS `durababble_mysql_snapshot_workflows`
+
+-- mysql_due_object_wakeups
+SELECT *
+FROM `durababble_mysql_snapshot_object_wakeups`
+WHERE wake_at <= ?
+ORDER BY wake_at, created_at
+LIMIT 100
+FOR UPDATE SKIP LOCKED
 
 -- mysql_existing_inbox_message_for_idempotency
 SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
@@ -575,6 +589,14 @@ LIMIT 1
 UPDATE `durababble_mysql_snapshot_mailbox_sequences`
 SET last_sequence = ?, updated_at = NOW(6)
 WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
+
+-- mysql_upsert_object_wakeup
+INSERT INTO `durababble_mysql_snapshot_object_wakeups` (worker_pool, object_type, object_id, name, wake_at, payload)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  wake_at = VALUES(wake_at),
+  payload = VALUES(payload),
+  updated_at = NOW(6)
 
 -- mysql_upsert_step_running
 INSERT INTO `durababble_mysql_snapshot_steps` (workflow_id, position, name, status, started_at, updated_at)

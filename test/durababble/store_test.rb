@@ -115,6 +115,20 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil shared_store.send(:observe_claim_latency, nil, "workflow")
   end
 
+  test "observe_claim_latency accepts serialized timestamps" do
+    assert_nil shared_store.send(:observe_claim_latency, { "created_at" => "2024-01-01T00:00:00Z" }, "workflow")
+  end
+
+  test "record_wait_latency accepts serialized timestamps" do
+    wait = {
+      "kind" => "timer",
+      "created_at" => "2024-01-01T00:00:00Z",
+      "completed_at" => "2024-01-01T00:00:01Z",
+    }
+
+    assert_nil shared_store.send(:record_wait_latency, wait)
+  end
+
   test "inbox_row_claimable? rejects blocked inbox statuses" do
     store = shared_store
     now = Time.utc(2024, 1, 1)

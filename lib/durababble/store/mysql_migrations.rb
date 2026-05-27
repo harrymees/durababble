@@ -146,6 +146,20 @@ module Durababble
           PRIMARY KEY (worker_pool, object_type, object_id)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("object_wakeups")} (
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
+          object_type VARCHAR(191) NOT NULL,
+          object_id VARCHAR(191) NOT NULL,
+          name VARCHAR(191) NOT NULL,
+          wake_at DATETIME(6) NOT NULL,
+          payload LONGBLOB NOT NULL,
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          PRIMARY KEY (worker_pool, object_type, object_id, name),
+          INDEX #{quote_column_name(index_name("object_wakeups", "due"))} (wake_at, created_at)
+        )
+      SQL
       create_inbox_tables!
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (

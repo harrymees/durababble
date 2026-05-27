@@ -105,6 +105,11 @@ module Durababble
         total += completed
         break if completed < batch_size
       end
+      loop do
+        completed = complete_object_wakeups(timestamp, batch_size)
+        total += completed
+        break if completed < batch_size
+      end
       total
     end
 
@@ -285,15 +290,17 @@ module Durababble
       object_command_row(claimed)
     end
 
-    #: (command_id: String, result: Object?, ?object_type: String?, ?object_id: String?, ?state: Object?, ?worker_id: String?) -> Object?
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Store::NO_OBJECT_STATE, worker_id: nil)
+    #: (command_id: String, result: Object?, ?object_type: String?, ?object_id: String?, ?state: Object?, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> Object?
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
       transaction do
         command = lock_object_command_for_completion(command_id:, worker_id:)
         next nil unless command
 
-        save_object_state(worker_pool: row_worker_pool(command), object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
+        worker_pool = row_worker_pool(command)
+        save_object_state(worker_pool:, object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
+        apply_object_wakeup_changes_without_transaction(worker_pool:, object_type:, object_id:, wakeup_changes:) unless wakeup_changes.empty?
         updated = complete_inbox_message_without_transaction(message_id: command_id, result:)
-        reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
+        reconcile_target_activation_without_transaction(worker_pool:, target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id")) if command.key?("target_kind")
         updated
       end
     end
@@ -439,6 +446,33 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
+    # Apply an object command's ordered wake mutations within the completion
+    # transaction so every change commits atomically with state and command
+    # completion. A single command may schedule, replace, and cancel several
+    # named wakes; we replay them in order.
+    #: (worker_pool: String, object_type: String?, object_id: String?, wakeup_changes: Array[ObjectWakeupChange]) -> void
+    def apply_object_wakeup_changes_without_transaction(worker_pool:, object_type:, object_id:, wakeup_changes:)
+      wakeup_changes.each do |wakeup_change|
+        case wakeup_change.action
+        when :schedule
+          upsert_object_wakeup_without_transaction(
+            worker_pool:,
+            object_type:,
+            object_id:,
+            name: wakeup_change.name,
+            wake_at: wakeup_change.wake_at,
+            payload: wakeup_change.payload,
+          )
+        when :cancel
+          delete_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name: wakeup_change.name)
+        when :cancel_all
+          delete_all_object_wakeups_without_transaction(worker_pool:, object_type:, object_id:)
+        else
+          raise ArgumentError, "unknown durable object wakeup change #{wakeup_change.action.inspect}"
+        end
+      end
+    end
+
     #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
     def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
       raise NotImplementedError
@@ -496,6 +530,71 @@ module Durababble
 
     #: (Object?, Integer) -> Integer
     def complete_timer_waits(now, batch_size)
+      raise NotImplementedError
+    end
+
+    #: (Object?, Integer) -> Integer
+    def complete_object_wakeups(now, batch_size)
+      raise NotImplementedError
+    end
+
+    # Convert a batch of due object wakeups into ordinary `wake` inbox messages. Must run inside a
+    # transaction so the inbox write, wakeup removal, and target activation commit atomically with the
+    # row-locking claim that selected the batch. Returns the number of wakeups delivered.
+    #: (Array[Hash[String, Object?]]) -> Integer
+    def deliver_due_object_wakeups(wakeups)
+      wakeups.each do |wakeup|
+        worker_pool = row_worker_pool(wakeup)
+        target_kind = "object"
+        target_type = wakeup.fetch("object_type") #: as String
+        target_id = wakeup.fetch("object_id") #: as String
+        name = wakeup.fetch("name") #: as String
+        message_kind = "wake"
+        payload = wakeup.fetch("payload")
+        message_id = SecureRandom.uuid
+        sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+        sequence = sequence #: as Integer
+        insert_inbox_message_without_transaction(
+          id: message_id,
+          worker_pool:,
+          target_kind:,
+          target_type:,
+          target_id:,
+          sequence:,
+          message_kind:,
+          method_name: name,
+          operation_id: message_id,
+          idempotency_key: nil,
+          shape_hash: inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name: name, payload:),
+          payload:,
+        )
+        delete_object_wakeup_without_transaction(worker_pool:, object_type: target_type, object_id: target_id, name:)
+        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
+      end
+      wakeups.length
+    end
+
+    # Emit the wakeup-completion metric after the batch transaction commits, skipping empty batches so
+    # the terminal drain iteration does not report a zero-valued sample.
+    #: (Integer) -> void
+    def report_object_wakeups_completed(count)
+      return unless count.positive?
+
+      Observability.count("durababble.waits.completed", { "durababble.wait.kind" => "object_wakeup" }, by: count)
+    end
+
+    #: (worker_pool: String, object_type: String?, object_id: String?, name: String, wake_at: Object?, payload: Object?) -> Object?
+    def upsert_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:, wake_at:, payload:)
+      raise NotImplementedError
+    end
+
+    #: (worker_pool: String, object_type: String?, object_id: String?, name: String) -> Object?
+    def delete_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:)
+      raise NotImplementedError
+    end
+
+    #: (worker_pool: String, object_type: String?, object_id: String?) -> Object?
+    def delete_all_object_wakeups_without_transaction(worker_pool:, object_type:, object_id:)
       raise NotImplementedError
     end
 

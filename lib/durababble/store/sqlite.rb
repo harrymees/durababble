@@ -17,7 +17,7 @@ module Durababble
   # dialect:
   #
   #   * Queries are resolved by falling back to the :mysql_* sibling and
-  #     translating the rendered SQL to SQLite (see #translate_to_sqlite). Five
+  #     translating the rendered SQL to SQLite (see #translate_to_sqlite). Six
   #     upserts that cannot be regex-translated have explicit :sqlite_* variants.
   #   * Timestamps are an integer clock. dura_now() — a per-connection UDF —
   #     returns #current_time, so DEFAULTs and translated NOW(6) references all

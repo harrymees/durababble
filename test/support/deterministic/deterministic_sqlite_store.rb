@@ -63,6 +63,7 @@ module Durababble
         @scheduler = scheduler
         @fault_plan = fault_plan || FaultPlan.new(scheduler:)
         @side_effects = 0
+        @object_wakes_delivered = 0
         @uuid_seq = 0
         @injected_workflows = {} #: Hash[String, Hash[String, Object?]]
         @injected_steps = {} #: Hash[String, Hash[Integer, Hash[String, Object?]]]
@@ -338,6 +339,44 @@ module Durababble
         out
       end
 
+      #: (worker_pool: String, object_type: String?, object_id: String?, name: String, wake_at: Object?, payload: Object?) -> Object?
+      def upsert_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:, wake_at:, payload:)
+        out = super
+        trace_event("object_wake_scheduled", object_id:, name:, wake_at:) if affected?(out)
+        out
+      end
+
+      #: (worker_pool: String, object_type: String?, object_id: String?, name: String) -> Object?
+      def delete_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:)
+        out = super
+        trace_event("object_wake_canceled", object_id:, name:) if affected?(out) && !@delivering_object_wakeups
+        out
+      end
+
+      #: (worker_pool: String, object_type: String?, object_id: String?) -> Object?
+      def delete_all_object_wakeups_without_transaction(worker_pool:, object_type:, object_id:)
+        removed = pending_object_wakeups.count do |wakeup|
+          wakeup.fetch("worker_pool") == worker_pool && wakeup.fetch("object_type") == object_type && wakeup.fetch("object_id") == object_id
+        end
+        out = super
+        trace_event("object_wake_canceled_all", object_id:, removed:) if removed.positive? && affected?(out)
+        out
+      end
+
+      #: (Array[Hash[String, Object?]]) -> Integer
+      def deliver_due_object_wakeups(wakeups)
+        previous = @delivering_object_wakeups
+        @delivering_object_wakeups = true
+        count = super
+        wakeups.each do |wakeup|
+          trace_event("object_wake_delivered", object_id: wakeup.fetch("object_id"), name: wakeup.fetch("name"))
+        end
+        @object_wakes_delivered += count
+        count
+      ensure
+        @delivering_object_wakeups = previous
+      end
+
       #: (workflow_id: String, worker_id: String, run_at: Object?) -> Object?
       def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         result = super
@@ -576,6 +615,11 @@ module Durababble
         select_all("target_activations", order: "worker_pool, target_kind, target_type, target_id") + @injected_target_activations
       end
 
+      #: () -> Array[Hash[String, Object?]]
+      def pending_object_wakeups
+        select_all("object_wakeups", order: "worker_pool, object_type, object_id, name")
+      end
+
       #: () -> Hash[Symbol, Object?]
       def summary
         workflows = select_all("workflows")
@@ -585,6 +629,7 @@ module Durababble
           side_effects: @side_effects,
           processed_outbox: select_all("outbox").count { |row| row.fetch("status") == "processed" },
           workflows: workflows.length,
+          object_wakes_delivered: @object_wakes_delivered,
         }
       end
 
