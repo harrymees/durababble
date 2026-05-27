@@ -1307,11 +1307,12 @@ module Durababble
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|
-      # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
+      # [DURABABBLE-WF-1] Terminal rows must stay terminal even when a worker holds a lease.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-        WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL
+        WHERE id = ? AND worker_pool = ?
+          AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
     end
 

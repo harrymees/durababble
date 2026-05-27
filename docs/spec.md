@@ -78,6 +78,8 @@ Idempotent start scopes caller keys to worker pool, workflow class, operation ki
 
 `expose_command` declares durable workflow command methods. A command call commits a durable inbox ask/tell row before returning to the caller, wakes the active workflow owner through `DeliverMessage` or leaves a durable target activation, and executes against the workflow at the next safe deterministic yield point. If the workflow row exists but is not actively owned, the target activation lets a worker warm it up before delivering the command; if the workflow does not exist or is terminal, the command fails instead of being buffered for a future target. Workflow authors do not park on a matching broadcast or poll an inbox manually. Synchronous command APIs wait for the ask row to store a serialized result or typed error; retrying with the same idempotency key reattaches to the same row.
 
+Workflow orchestration code may obtain workflow handles with `Workflow.handle(id)` / `Workflow.at(id)` and call the same handle methods available to external callers. Calls made from orchestration code outside an explicit step are not transient Ruby shortcuts: Durababble schedules a normal workflow command-history entry for the handle call before reading workflow status/result/error, requesting cancellation, invoking exposed queries, or enqueuing exposed workflow commands. Replay validates the recorded handle target, method, args, kwargs, and idempotency key and reuses the recorded result or error instead of sending the outbound RPC again.
+
 Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `sleep_until(time, context)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, `Durababble.sleep_until(time, context)`, and `Durababble.wait_until(time, context)`.
 
 Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
@@ -111,6 +113,8 @@ end
 
 Synchronous asks and asynchronous tells share the same mailbox, so asks cannot overtake earlier tells. `tell` validates that the target method is an `expose_command`. Enqueuing a ready object command wakes the active owner through `DeliverMessage` or leaves a durable target activation for pool-local recovery. Object authors do not poll for commands; the owner drains the mailbox when woken or claimed.
 
+Workflow orchestration code may obtain durable-object handles with `DurableObject.at(id)` / `DurableObject.handle(id)` and call exposed queries or commands directly, and may call `DurableObject.tell(id, method, ...)` for asynchronous commands. When these APIs are called from orchestration code outside an explicit step, Durababble records the handle RPC as a workflow command-history entry before the object query, ask, or tell is dispatched. Completed history is replayed as the original return value, including the object command result or tell message id, so crash recovery does not enqueue duplicate object inbox rows.
+
 Lifecycle callbacks are `on_create`, `on_load`, `on_wake(name:, payload: nil)`, and `on_destroy`. They are lifecycle hooks, not remotely callable public methods.
 
 Durable objects support multiple named wakes per object id. `schedule_wake(name:, at:, payload: nil)` upserts a wake row by `(worker_pool, object_type, object_id, name)` in the same transaction as the command state write, replacing the time and payload when the same `name` is re-scheduled. `cancel_wake(name:)` removes one named wake and `cancel_all_wakes` removes all of them. Matured wakes convert atomically into durable mailbox `wake` messages that carry the wake name to `on_wake`.
@@ -136,6 +140,8 @@ Workflow orchestration code must not perform direct blocking or nondeterministic
 The workflow runtime must provide workflow-local deterministic behavior for time, sleep, randomness, UUID generation, and workflow futures/fibers, or reject unsafe host APIs with `Durababble::DeterminismError` until a durable deterministic API exists. The implementation must not rely on process-wide monkeypatching to create determinism.
 
 Durable commands called from any workflow fiber are assigned command ids when the workflow fiber reaches the call, before the side-effecting implementation runs. The runtime and replay system must not assume that a workflow will stay single-fiber across code changes.
+
+In-workflow handle RPCs are durable commands for replay purposes. The command shape records the target kind, target type, target id, RPC kind, method, args, kwargs, and caller-provided idempotency key if present; the schedule is persisted before the handle implementation dispatches a workflow inbox command, object inbox command, object tell, object query, or workflow status/result/cancel operation. If the process crashes after dispatch and completion are recorded, recovery delivers the recorded command resolution and skips the outbound dispatch block. If dispatch fails before a terminal resolution, the command follows the same step failure, retry scheduling, cancellation, and lease fencing rules as other workflow commands.
 
 ### Workflow command history
 

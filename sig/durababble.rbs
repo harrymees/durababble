@@ -412,9 +412,11 @@ module Durababble
   end
 
   class WorkflowExecution
+    attr_reader store: Store
     attr_reader step_context: StepContext?
     def call_step: (Workflow[serialized_payload, serialized_payload] instance, method_name: Symbol, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) { () -> serialized_payload } -> serialized_payload
     def call_wait: (WaitRequest wait_request, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
+    def call_handle_rpc: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload } -> serialized_payload
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def timer_after: (Numeric duration) -> Time
     def validate_replay_complete!: () -> void

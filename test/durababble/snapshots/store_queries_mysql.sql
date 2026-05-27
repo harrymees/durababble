@@ -462,7 +462,8 @@ UPDATE `durababble_mysql_snapshot_workflows` SET status = 'running', error = NUL
 -- mysql_mark_workflow_running_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
-WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL
+WHERE id = ? AND worker_pool = ?
+  AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_next_workflow_history_event_index
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ?
