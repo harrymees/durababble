@@ -19,6 +19,8 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "incomplete_step_retry_after_crash",
     "attempt_history_append_only",
     "concurrent_timer_wake_once",
+    "multiple_named_object_wakes",
+    "object_wake_survives_worker_crash",
     "timer_and_partition",
     "stale_wait_timer_terminal_workflow",
     "waits_fences_and_outbox",
@@ -188,6 +190,24 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "step_retry_not_due"
     assert_equal 3, result.trace.scan("step_retry_attempt").length
     assert_equal 1, result.summary.fetch(:completed_workflows)
+  end
+
+  test "models multiple named durable-object wakes delivered once each" do
+    result = Durababble::Deterministic.prove("multiple_named_object_wakes", seed: 71)
+
+    assert_empty result.violations
+    assert_equal 3, result.trace.scan("object_wake_delivered").length
+    assert_includes result.trace, "object_wake_scheduled"
+    assert_equal 3, result.summary.fetch(:object_wakes_delivered)
+    assert_equal result.digest, Durababble::Deterministic.prove("multiple_named_object_wakes", seed: 71).digest
+  end
+
+  test "delivers durable-object wakes at-least-once across a worker crash" do
+    result = Durababble::Deterministic.prove("object_wake_survives_worker_crash", seed: 73)
+
+    assert_empty result.violations
+    assert_includes result.trace, "object_wake_delivered"
+    assert_equal result.digest, Durababble::Deterministic.prove("object_wake_survives_worker_crash", seed: 73).digest
   end
 
   test "models cooperative cancellation cleanup" do

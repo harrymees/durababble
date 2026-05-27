@@ -64,8 +64,8 @@ module Durababble
         benchmarks: ["lease_heartbeat", "lease_conflict_check", "expired_workflow_lease_recovery"],
       },
       "wait wake scans" => {
-        methods: ["Store.record_wait", "Store.complete_waits", "MysqlStore.complete_waits_mysql"],
-        indexes: ["waits_timer_pending_idx", "waits_workflow_status_idx"],
+        methods: ["Store.record_wait", "Store.complete_waits", "Store.complete_object_wakeups", "MysqlStore.complete_waits_mysql"],
+        indexes: ["waits_timer_pending_idx", "waits_workflow_status_idx", "object_wakeups_due_idx"],
         assertions: ["timer pending index", "workflow join remains indexed", "bounded wake batches"],
         benchmarks: ["large_table_due_timer_scan", "bulk_due_timer_wake_parallel"],
       },
@@ -440,6 +440,25 @@ module Durababble
         ON CONFLICT (worker_pool, object_type, object_id) DO UPDATE
           SET state = $4::bytea, updated_at = now()
       SQL
+    end
+
+    define(:pg_upsert_object_wakeup, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "object_wakeups")} (worker_pool, object_type, object_id, name, wake_at, payload)
+        VALUES ($1, $2, $3, $4, $5::timestamptz, $6::bytea)
+        ON CONFLICT (worker_pool, object_type, object_id, name) DO UPDATE
+          SET wake_at = EXCLUDED.wake_at,
+              payload = EXCLUDED.payload,
+              updated_at = now()
+      SQL
+    end
+
+    define(:pg_delete_object_wakeup, backend: :postgres) do |store|
+      "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3 AND name = $4"
+    end
+
+    define(:pg_delete_all_object_wakeups, backend: :postgres) do |store|
+      "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3"
     end
 
     define(:pg_mark_waits_workflows_pending, backend: :postgres) do |store, placeholders:|
@@ -1158,6 +1177,17 @@ module Durababble
       SQL
     end
 
+    define(:pg_due_object_wakeups, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT *
+        FROM #{table(store, "object_wakeups")}
+        WHERE wake_at <= $1::timestamptz
+        ORDER BY wake_at, created_at
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+      SQL
+    end
+
     define(:pg_lock_workflow_history_workflow, backend: :postgres) do |store|
       "SELECT id FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
     end
@@ -1533,6 +1563,25 @@ module Durababble
       SQL
     end
 
+    define(:mysql_upsert_object_wakeup, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "object_wakeups")} (worker_pool, object_type, object_id, name, wake_at, payload)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          wake_at = VALUES(wake_at),
+          payload = VALUES(payload),
+          updated_at = NOW(6)
+      SQL
+    end
+
+    define(:mysql_delete_object_wakeup, backend: :mysql) do |store|
+      "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = ? AND object_type = ? AND object_id = ? AND name = ?"
+    end
+
+    define(:mysql_delete_all_object_wakeups, backend: :mysql) do |store|
+      "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = ? AND object_type = ? AND object_id = ?"
+    end
+
     define(:mysql_claim_pending_target_activation, backend: :mysql) do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
@@ -1753,6 +1802,17 @@ module Durababble
         ORDER BY w.wake_at, w.created_at
         LIMIT #{Integer(limit)}
         FOR UPDATE OF w SKIP LOCKED
+      SQL
+    end
+
+    define(:mysql_due_object_wakeups, backend: :mysql) do |store, limit:|
+      <<~SQL.chomp
+        SELECT *
+        FROM #{table(store, "object_wakeups")}
+        WHERE wake_at <= ?
+        ORDER BY wake_at, created_at
+        LIMIT #{Integer(limit)}
+        FOR UPDATE SKIP LOCKED
       SQL
     end
 

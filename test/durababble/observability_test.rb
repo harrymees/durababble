@@ -294,7 +294,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       { "id" => command_id }
     end
 
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
       command = @commands.fetch(command_id)
       @state[[command.fetch("worker_pool", "default"), object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
       command.merge!("status" => "completed", "result" => result, "locked_by" => nil, "worker_id" => worker_id)

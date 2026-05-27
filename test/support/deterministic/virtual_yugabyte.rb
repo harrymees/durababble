@@ -8,6 +8,11 @@ module Durababble
     class VirtualYugabyte
       include Durababble::TestSupport::FakeStoreCommandClaiming
 
+      # Mirrors the affected-row count the SQL stores hand back from a completion
+      # write; `DurableObjectExecutor#complete_message` treats a non-positive
+      # count as a lost lease.
+      AffectedRows = Data.define(:affected_rows)
+
       #: untyped
       attr_reader :scheduler, :fault_plan
 
@@ -26,6 +31,11 @@ module Durababble
         @outbox = {}
         @outbox_by_key = {}
         @side_effects = 0
+        @object_inbox = {}
+        @object_state = {}
+        @object_wakeups = {}
+        @mailbox_sequences = {}
+        @object_wakes_delivered = 0
         trace("init")
       end
 
@@ -304,7 +314,8 @@ module Durababble
       #: (?now: untyped) -> untyped
       def wake_due_timers(now: nil)
         now ||= scheduler.time
-        complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "timer" && wait.fetch("wake_at") <= now }, {})
+        completed = complete_waits(@waits.values.select { |wait| wait.fetch("status") == "pending" && wait.fetch("kind") == "timer" && wait.fetch("wake_at") <= now }, {})
+        completed + deliver_due_object_wakeups(now)
       end
 
       #: (untyped) -> untyped
@@ -387,11 +398,6 @@ module Durababble
         nil
       end
 
-      #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, lease_seconds: untyped, limit: untyped) -> untyped
-      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default")
-        []
-      end
-
       #: (workflow_id: untyped, worker_id: untyped) -> untyped
       def workflow_owned?(workflow_id:, worker_id:)
         row = @workflows.fetch(workflow_id)
@@ -469,10 +475,246 @@ module Durababble
           side_effects: @side_effects,
           processed_outbox: @outbox.values.count { |row| row.fetch("status") == "processed" },
           workflows: @workflows.length,
+          object_wakes_delivered: @object_wakes_delivered,
         }
       end
 
+      # --- durable object store contract -------------------------------------
+      # The object-command path is exercised directly through
+      # DurableObjectExecutor#drain_object_inbox, so the mock implements the same
+      # store methods that path touches: command enqueue, inbox claim (with
+      # mailbox-sequence ordering and lease-expiry reclaim), completion that
+      # applies state + ordered wake mutations atomically, retry/dead-letter, and
+      # object-state reads. wake_due_timers converts matured wakes into ordinary
+      # `wake` inbox messages carrying the wake name via method_name.
+
+      #: (object_type: untyped, object_id: untyped, method_name: untyped, args: untyped, kwargs: untyped, ?message_kind: untyped, ?idempotency_key: untyped, ?max_attempts: untyped, ?worker_pool: untyped) -> untyped
+      def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil, worker_pool: "default")
+        id = next_id("inbox")
+        @object_inbox[id] = object_inbox_row(
+          id:,
+          worker_pool:,
+          object_type:,
+          object_id:,
+          message_kind:,
+          method_name: method_name.to_s,
+          payload: deep({ "method_name" => method_name.to_s, "args" => args, "kwargs" => kwargs }),
+          max_attempts:,
+        )
+        trace("object_command_enqueued", id:, object_type:, object_id:, method: method_name.to_s)
+        id
+      end
+
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped, worker_id: untyped, ?lease_seconds: untyped, ?limit: untyped, ?now: untyped, ?worker_pool: untyped) -> untyped
+      def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: nil, worker_pool: "default")
+        now ||= scheduler.time
+        rows = @object_inbox.values.select do |row|
+          row.fetch("worker_pool") == worker_pool && row.fetch("target_kind") == target_kind &&
+            row.fetch("target_type") == target_type && row.fetch("target_id") == target_id &&
+            ["pending", "failed", "running", "dead_lettered"].include?(row.fetch("status"))
+        end.sort_by { |row| row.fetch("sequence") }
+        claimable = []
+        rows.first(limit).each do |row|
+          break unless object_inbox_claimable?(row, now)
+
+          claimable << row
+        end
+        claimable.map do |row|
+          row["status"] = "running"
+          row["attempts"] = row.fetch("attempts").to_i + 1
+          row["locked_by"] = worker_id
+          row["locked_until"] = now + lease_seconds
+          trace("object_inbox_claimed", id: row.fetch("id"), worker: worker_id)
+          deep(row)
+        end
+      end
+
+      #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: untyped) -> untyped
+      def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: "default")
+        @object_inbox.values.select do |row|
+          row.fetch("worker_pool") == worker_pool && row.fetch("target_kind") == target_kind &&
+            row.fetch("target_type") == target_type && row.fetch("target_id") == target_id
+        end.sort_by { |row| row.fetch("sequence") }.map { |row| deep(row) }
+      end
+
+      #: (object_type: untyped, object_id: untyped, ?worker_pool: untyped) -> untyped
+      def object_state_entry(object_type:, object_id:, worker_pool: "default")
+        key = [worker_pool, object_type, object_id]
+        @object_state.key?(key) ? deep(@object_state.fetch(key)) : Store::NO_OBJECT_STATE
+      end
+
+      #: (object_type: untyped, object_id: untyped, ?worker_pool: untyped) -> untyped
+      def object_state(object_type:, object_id:, worker_pool: "default")
+        entry = object_state_entry(worker_pool:, object_type:, object_id:)
+        entry.equal?(Store::NO_OBJECT_STATE) ? nil : entry
+      end
+
+      #: (object_type: untyped, object_id: untyped, state: untyped, ?worker_pool: untyped) -> untyped
+      def save_object_state(object_type:, object_id:, state:, worker_pool: "default")
+        @object_state[[worker_pool, object_type, object_id]] = deep(state)
+        trace("object_state_saved", object_type:, object_id:)
+        AffectedRows.new(1)
+      end
+
+      #: (command_id: untyped, result: untyped, ?object_type: untyped, ?object_id: untyped, ?state: untyped, ?wakeup_changes: untyped, ?worker_id: untyped) -> untyped
+      def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
+        row = @object_inbox[command_id]
+        return unless row
+        return if worker_id && !object_command_owned?(row, worker_id)
+
+        worker_pool = row.fetch("worker_pool")
+        save_object_state(worker_pool:, object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
+        apply_object_wakeup_changes(worker_pool:, object_type:, object_id:, wakeup_changes:) unless wakeup_changes.empty?
+        row["status"] = "completed"
+        row["result"] = deep(result)
+        row["error"] = nil
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        trace("object_command_completed", id: command_id)
+        AffectedRows.new(1)
+      end
+
+      #: (command_id: untyped, error: untyped, worker_id: untyped, ready_at: untyped) -> untyped
+      def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+        row = @object_inbox[command_id]
+        return unless row
+        return if worker_id && !object_command_owned?(row, worker_id)
+
+        row["status"] = "pending"
+        row["error"] = error
+        row["ready_at"] = ready_at
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        trace("object_command_retry", id: command_id, ready_at:)
+        AffectedRows.new(1)
+      end
+
+      #: (command_id: untyped, error: untyped, ?worker_id: untyped, ?terminal: untyped) -> untyped
+      def fail_object_command(command_id:, error:, worker_id: nil, terminal: false)
+        row = @object_inbox[command_id]
+        return unless row
+        return if worker_id && !object_command_owned?(row, worker_id)
+
+        max_attempts = row.fetch("max_attempts")
+        row["status"] = if terminal || (max_attempts && row.fetch("attempts").to_i >= max_attempts)
+          "dead_lettered"
+        else
+          "failed"
+        end
+        row["error"] = error
+        row["locked_by"] = nil
+        row["locked_until"] = nil
+        trace("object_command_failed", id: command_id, terminal:, status: row.fetch("status"))
+        AffectedRows.new(1)
+      end
+
       private
+
+      #: (id: untyped, worker_pool: untyped, object_type: untyped, object_id: untyped, message_kind: untyped, method_name: untyped, payload: untyped, ?max_attempts: untyped) -> untyped
+      def object_inbox_row(id:, worker_pool:, object_type:, object_id:, message_kind:, method_name:, payload:, max_attempts: nil)
+        {
+          "id" => id,
+          "worker_pool" => worker_pool,
+          "target_kind" => "object",
+          "target_type" => object_type,
+          "target_id" => object_id,
+          "sequence" => allocate_object_sequence(worker_pool, "object", object_type, object_id),
+          "message_kind" => message_kind,
+          "method_name" => method_name,
+          "payload" => payload,
+          "status" => "pending",
+          "attempts" => 0,
+          "locked_by" => nil,
+          "locked_until" => nil,
+          "ready_at" => nil,
+          "max_attempts" => max_attempts,
+          "result" => nil,
+          "error" => nil,
+        }
+      end
+
+      #: (untyped, untyped) -> untyped
+      def object_inbox_claimable?(row, now)
+        status = row.fetch("status")
+        return false if status == "dead_lettered"
+
+        if status == "running"
+          locked_until = row.fetch("locked_until")
+          return false unless locked_until
+
+          return locked_until < now
+        end
+        ready_at = row.fetch("ready_at")
+        ready_at.nil? || ready_at <= now
+      end
+
+      #: (untyped, untyped) -> untyped
+      def object_command_owned?(row, worker_id)
+        row.fetch("status") == "running" &&
+          row.fetch("locked_by") == worker_id &&
+          row.fetch("locked_until") &&
+          row.fetch("locked_until") >= scheduler.time
+      end
+
+      #: (worker_pool: untyped, object_type: untyped, object_id: untyped, wakeup_changes: untyped) -> untyped
+      def apply_object_wakeup_changes(worker_pool:, object_type:, object_id:, wakeup_changes:)
+        wakeup_changes.each do |change|
+          case change.action
+          when :schedule
+            @object_wakeups[[worker_pool, object_type, object_id, change.name]] = {
+              "worker_pool" => worker_pool,
+              "object_type" => object_type,
+              "object_id" => object_id,
+              "name" => change.name,
+              "wake_at" => change.wake_at,
+              "payload" => deep(change.payload),
+            }
+            trace("object_wake_scheduled", object_id:, name: change.name, wake_at: change.wake_at)
+          when :cancel
+            removed = @object_wakeups.delete([worker_pool, object_type, object_id, change.name])
+            trace("object_wake_canceled", object_id:, name: change.name) if removed
+          when :cancel_all
+            keys = @object_wakeups.keys.select { |key| key[0] == worker_pool && key[1] == object_type && key[2] == object_id }
+            keys.each { |key| @object_wakeups.delete(key) }
+            trace("object_wake_canceled_all", object_id:, removed: keys.length)
+          else
+            raise ArgumentError, "unknown durable object wakeup change #{change.action.inspect}"
+          end
+        end
+      end
+
+      #: (untyped) -> untyped
+      def deliver_due_object_wakeups(now)
+        due = @object_wakeups.values
+          .select { |wakeup| wakeup.fetch("wake_at") <= now }
+          .sort_by { |wakeup| [wakeup.fetch("worker_pool"), wakeup.fetch("object_type"), wakeup.fetch("object_id"), wakeup.fetch("name")] }
+        due.each do |wakeup|
+          worker_pool = wakeup.fetch("worker_pool")
+          object_type = wakeup.fetch("object_type")
+          object_id = wakeup.fetch("object_id")
+          name = wakeup.fetch("name")
+          id = next_id("inbox")
+          @object_inbox[id] = object_inbox_row(
+            id:,
+            worker_pool:,
+            object_type:,
+            object_id:,
+            message_kind: "wake",
+            method_name: name,
+            payload: deep(wakeup.fetch("payload")),
+          )
+          @object_wakeups.delete([worker_pool, object_type, object_id, name])
+          @object_wakes_delivered += 1
+          trace("object_wake_delivered", object_id:, name:)
+        end
+        due.length
+      end
+
+      #: (untyped, untyped, untyped, untyped) -> untyped
+      def allocate_object_sequence(worker_pool, target_kind, target_type, target_id)
+        key = [worker_pool, target_kind, target_type, target_id]
+        @mailbox_sequences[key] = @mailbox_sequences.fetch(key, 0) + 1
+      end
 
       #: (untyped) -> untyped
       def runnable?(row)

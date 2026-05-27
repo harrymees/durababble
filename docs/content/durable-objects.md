@@ -129,6 +129,44 @@ channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```
 
+## Alarms
+
+Object commands can schedule persisted, named wakeups for the object with `schedule_wake(name:, at:, payload: nil)`. Each `name` addresses an independent wake, so one object can hold several outstanding wakes at once — a TTL sweep, a retry, and a daily flush can all be pending against the same id. Calling `schedule_wake` again with the same `name` before it fires replaces that wake's time and payload while leaving the other names untouched. `cancel_wake(name:)` removes a single named wake, and `cancel_all_wakes` removes every pending wake for the object. Scheduling and cancellation are committed with the command, so a failed or retried command does not leave behind an unrelated process-local timer.
+
+Wake names are required, non-empty strings of at most 191 bytes.
+
+When a wake time matures, `store.wake_due_timers(now:)` converts each due wake into the object's durable mailbox as a `wake` message in the same worker pool, carrying the wake's name. The ordinary object worker path later claims that message and invokes `on_wake(name:, payload:)`, where `name` is the wake that fired so the handler can dispatch on it.
+
+Because the wake is delivered as an ordinary inbox message, `on_wake` inherits at-least-once delivery: a worker that crashes after running `on_wake` but before committing the message can run it again. Keep `on_wake` handlers idempotent (key the side effect off the name/payload, or guard against duplicates in state) rather than assuming exactly-once delivery.
+
+```ruby
+class Reminder < Durababble::DurableObject
+  object_type "reminder"
+
+  def initialize_state
+    { "delivered" => [] }
+  end
+
+  # Several reminders can be outstanding at once, each addressed by name.
+  expose_command def remind_at(name, time, label)
+    schedule_wake(name:, at: time, payload: { "label" => label })
+  end
+
+  expose_command def clear_reminder(name)
+    cancel_wake(name:)
+  end
+
+  expose_command def clear_all_reminders
+    cancel_all_wakes
+  end
+
+  def on_wake(name:, payload:)
+    # idempotent: redelivery of the same wake must not double-record the label
+    update_state("delivered" => current_state.fetch("delivered") | [payload.fetch("label")])
+  end
+end
+```
+
 ## Choosing Objects Or Workflows
 
 Durable workflows and durable objects share the same durable store, but they fit different shapes of work. Use a workflow when the work is a finite process with a start, a result, ordered durable steps, waits, retries, or cancellation: indexing pipelines, tool sequences, resumable imports, or fulfillment flows. Use a durable object when the work centers on an id that should keep mutable state over time, potentially indefinitely, and accept repeated queries or commands: sessions, carts, conversations, agent contexts, project state, or per-shop workers.
