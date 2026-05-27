@@ -77,10 +77,12 @@ module Durababble
         end
       end
 
-      #: (Object, object_type: String, object_id: String, ?worker_pool: String) -> Object?
-      def state_from_store(store, object_type:, object_id:, worker_pool: "default")
+      # Object state is keyed by (object_type, object_id) alone; worker_pool is
+      # routing metadata, not identity, so reads never need a worker pool.
+      #: (Object, object_type: String, object_id: String) -> Object?
+      def state_from_store(store, object_type:, object_id:)
         store = store #: as untyped
-        state = store.object_state_entry(worker_pool:, object_type:, object_id:)
+        state = store.object_state_entry(object_type:, object_id:)
         state.equal?(Store::NO_OBJECT_STATE) ? UNINITIALIZED : state
       end
 
@@ -268,7 +270,7 @@ module Durababble
         attempts = 0
         begin
           if (lease = current_object_lease)
-            return invoke_owned_query(method_name, args:, kwargs:, block:) if current_runtime_owns?(lease)
+            return invoke_owned_query(method_name, args:, kwargs:, block:, lease:) if current_runtime_owns?(lease)
 
             return invoke_remote_query(method_name, args:, kwargs:, lease:)
           end
@@ -288,7 +290,7 @@ module Durababble
     def current_object_lease
       return unless @store.respond_to?(:current_object_lease)
 
-      @store.current_object_lease(@object_class.object_type, @durable_id, worker_pool: @worker_pool)
+      @store.current_object_lease(@object_class.object_type, @durable_id)
     end
 
     #: (Hash[String, Object?]) -> bool
@@ -298,26 +300,28 @@ module Durababble
       !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
     end
 
-    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
-    def invoke_owned_query(method_name, args:, kwargs:, block:)
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, lease: Hash[String, Object?]) -> Object?
+    def invoke_owned_query(method_name, args:, kwargs:, block:, lease:)
+      worker_pool = lease_worker_pool(lease)
       handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
       if handler
         return handler.call(
-          request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool: @worker_pool),
+          request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool:),
           args: { "args" => args, "kwargs" => kwargs },
         )
       end
 
-      DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
+      DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
       invoke_local_query(method_name, args:, kwargs:, block:)
     end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
     def invoke_remote_query(method_name, args:, kwargs:, lease:)
       worker_id = lease.fetch("worker_id")
+      worker_pool = lease_worker_pool(lease)
       client = @store.rpc_client_factory.call(WorkerIdentity.address_for(worker_id.to_s))
       client.call_transient(
-        worker_pool: @worker_pool,
+        worker_pool:,
         class_name: @object_class.object_type,
         durable_object_id: @durable_id,
         method: method_name.to_s,
@@ -329,10 +333,15 @@ module Durababble
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
     def invoke_local_query(method_name, args:, kwargs:, block:)
-      state = DurableObject.state_from_store(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
+      state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
       object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
       object.instance_variable_set(:@__durababble_query_context, true)
       kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+    end
+
+    #: (Hash[String, Object?]) -> String
+    def lease_worker_pool(lease)
+      lease.fetch("worker_pool", @worker_pool).to_s
     end
 
     #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
@@ -435,7 +444,7 @@ module Durababble
 
     #: (worker_pool: untyped, object_type: untyped, object_id: untyped) -> void
     def assert_current_lease!(worker_pool:, object_type:, object_id:)
-      lease = @store.current_object_lease(object_type, object_id, worker_pool:)
+      lease = @store.current_object_lease(object_type, object_id)
       raise WorkflowRpc::NoActiveLease, "durable object #{object_type}/#{object_id} has no active owner" unless lease
 
       expected = node_id
@@ -466,7 +475,7 @@ module Durababble
       payload ||= {}
       args = payload.fetch("args", [])
       kwargs = payload.fetch("kwargs", {})
-      state = DurableObject.state_from_store(@store, worker_pool:, object_type: object_class.object_type, object_id:)
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
       object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:)
       object.instance_variable_set(:@__durababble_query_context, true)
       kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
@@ -572,7 +581,7 @@ module Durababble
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def build_object(object_class, object_id:, message:)
       worker_pool = message.fetch("worker_pool", @worker_pool)
-      state = DurableObject.state_from_store(@store, worker_pool:, object_type: object_class.object_type, object_id:)
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
       context = CommandContext.new(
         object_type: object_class.object_type,
         durable_id: object_id,

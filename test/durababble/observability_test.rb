@@ -226,10 +226,10 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def migrate! = self
-    def object_state(object_type:, object_id:, worker_pool: "default") = @state[[worker_pool, object_type, object_id]]
+    def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
 
-    def object_state_entry(object_type:, object_id:, worker_pool: "default")
-      state = @state[[worker_pool, object_type, object_id]]
+    def object_state_entry(object_type:, object_id:)
+      state = @state[[object_type, object_id]]
       state.nil? ? Durababble::Store::NO_OBJECT_STATE : state
     end
 
@@ -296,7 +296,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
       command = @commands.fetch(command_id)
-      @state[[command.fetch("worker_pool", "default"), object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
+      @state[[object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
       command.merge!("status" => "completed", "result" => result, "locked_by" => nil, "worker_id" => worker_id)
       Result.new(1)
     end

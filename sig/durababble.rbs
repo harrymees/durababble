@@ -240,7 +240,7 @@ module Durababble
     def heartbeat_step: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: serialized_payload, ?command_id: Integer?, ?position: Integer?) -> Object?
     def step_heartbeat_cursor: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> serialized_payload
     def current_workflow_lease: (String workflow_id, ?worker_pool: String?) -> workflow_row?
-    def current_object_lease: (String object_type, String object_id, ?worker_pool: String) -> workflow_row?
+    def current_object_lease: (String object_type, String object_id) -> workflow_row?
     def deliver_target_message: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: _RpcClientFactory?) -> bool
     def steal_expired_leases!: (?now: Time) -> Integer
     def mark_workflow_running: (String workflow_id, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> Object?

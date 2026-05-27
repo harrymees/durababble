@@ -145,8 +145,8 @@ RETURNING *
 
 -- pg_claim_selected_target_activation
 UPDATE "durababble_pg_snapshot"."target_activations"
-SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+SET status = 'running', locked_by = $4, locked_until = now() + ($5::int * interval '1 second'), updated_at = now()
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 RETURNING *
 
 -- pg_claim_workflow_already_owned
@@ -216,12 +216,12 @@ SELECT worker_pool, object_id, worker_id, locked_until
 FROM (
   SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 0 AS source_priority, NULL::bigint AS inbox_sequence
   FROM "durababble_pg_snapshot"."target_activations"
-  WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+  WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
     AND locked_by IS NOT NULL AND locked_until >= now()
   UNION ALL
   SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 1 AS source_priority, sequence AS inbox_sequence
   FROM "durababble_pg_snapshot"."inbox"
-  WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+  WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
     AND locked_by IS NOT NULL AND locked_until >= now()
 ) AS leases
 ORDER BY source_priority, inbox_sequence
@@ -244,7 +244,7 @@ DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND
 DELETE FROM "durababble_pg_snapshot"."object_wakeups" WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3 AND name = $4
 
 -- pg_delete_target_activation
-DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 
 -- pg_drop_schema
 DROP SCHEMA IF EXISTS "durababble_pg_snapshot" CASCADE
@@ -315,16 +315,16 @@ WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now(
 -- pg_inbox_claim_rows_for_update
 SELECT *
 FROM "durababble_pg_snapshot"."inbox"
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
-LIMIT $5
+LIMIT $4
 FOR UPDATE
 
 -- pg_inbox_head_for_update
 SELECT *
 FROM "durababble_pg_snapshot"."inbox"
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
 ORDER BY sequence
 LIMIT 1
@@ -335,7 +335,7 @@ SELECT * FROM "durababble_pg_snapshot"."inbox" WHERE id = $1
 
 -- pg_inbox_messages_for
 SELECT * FROM "durababble_pg_snapshot"."inbox"
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 ORDER BY sequence
 
 -- pg_insert_fence
@@ -353,7 +353,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::bytea, 'pending'
 -- pg_insert_mailbox_sequence
 INSERT INTO "durababble_pg_snapshot"."mailbox_sequences" (worker_pool, target_kind, target_type, target_id, last_sequence)
 VALUES ($1, $2, $3, $4, 0)
-ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO NOTHING
+ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
 
 -- pg_insert_outbox
 INSERT INTO "durababble_pg_snapshot"."outbox" (id, workflow_id, topic, payload, key, status)
@@ -399,8 +399,8 @@ FOR UPDATE
 
 -- pg_lock_target_activation_for_completion
 SELECT 1 FROM "durababble_pg_snapshot"."target_activations"
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
-  AND status = 'running' AND locked_by = $5
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+  AND status = 'running' AND locked_by = $4
 FOR UPDATE
 
 -- pg_lock_workflow_for_termination
@@ -415,7 +415,7 @@ SELECT id FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
 -- pg_mailbox_sequence_for_update
 SELECT last_sequence
 FROM "durababble_pg_snapshot"."mailbox_sequences"
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 FOR UPDATE
 
 -- pg_make_workflow_due
@@ -448,7 +448,7 @@ WHERE id = $1 AND worker_pool = $2
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
 
 -- pg_object_state
-SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE worker_pool = $1 AND object_type = $2 AND object_id = $3
+SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2
 
 -- pg_outbox_by_key
 SELECT id FROM "durababble_pg_snapshot"."outbox" WHERE key = $1
@@ -496,7 +496,7 @@ WHERE id = $1
 -- pg_save_object_state
 INSERT INTO "durababble_pg_snapshot"."durable_objects" (worker_pool, object_type, object_id, state)
 VALUES ($1, $2, $3, $4::bytea)
-ON CONFLICT (worker_pool, object_type, object_id) DO UPDATE
+ON CONFLICT (object_type, object_id) DO UPDATE
   SET state = $4::bytea, updated_at = now()
 
 -- pg_schedule_workflow_retry
@@ -511,7 +511,7 @@ WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now(
 -- pg_set_target_activation_pending
 INSERT INTO "durababble_pg_snapshot"."target_activations" (worker_pool, target_kind, target_type, target_id, status, ready_at)
 VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
-ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO UPDATE
+ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
   SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
 
 -- pg_steal_expired_leases
@@ -552,7 +552,7 @@ WHERE id = $1 AND status = 'running'
   AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
 
 -- pg_target_activation
-SELECT * FROM "durababble_pg_snapshot"."target_activations" WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+SELECT * FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 
 -- pg_terminate_workflow
 UPDATE "durababble_pg_snapshot"."workflows"
@@ -589,8 +589,8 @@ WHERE id = (
 
 -- pg_update_mailbox_sequence
 UPDATE "durababble_pg_snapshot"."mailbox_sequences"
-SET last_sequence = $5, updated_at = now()
-WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+SET last_sequence = $1, updated_at = now()
+WHERE target_kind = $2 AND target_type = $3 AND target_id = $4
 
 -- pg_upsert_object_wakeup
 INSERT INTO "durababble_pg_snapshot"."object_wakeups" (worker_pool, object_type, object_id, name, wake_at, payload)
@@ -609,7 +609,7 @@ ON CONFLICT (workflow_id, position) DO UPDATE
 -- pg_upsert_target_activation
 INSERT INTO "durababble_pg_snapshot"."target_activations" (worker_pool, target_kind, target_type, target_id, status, ready_at)
 VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
-ON CONFLICT (worker_pool, target_kind, target_type, target_id) DO UPDATE
+ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
   SET status = CASE WHEN "durababble_pg_snapshot"."target_activations".status = 'running' THEN "durababble_pg_snapshot"."target_activations".status ELSE 'pending' END,
   ready_at = LEAST("durababble_pg_snapshot"."target_activations".ready_at, EXCLUDED.ready_at), updated_at = now()
 

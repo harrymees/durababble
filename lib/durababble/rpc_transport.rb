@@ -697,7 +697,7 @@ module Durababble
       #: (Messages::TransientRequest) -> Messages::TransientResponse?
       def moved_response(request)
         lease = if workflow_id(request).empty?
-          @store.send(:current_object_lease, request.class_name, durable_object_id(request), worker_pool: request.worker_pool)
+          @store.send(:current_object_lease, request.class_name, durable_object_id(request))
         else
           @store.current_workflow_lease(workflow_id(request), worker_pool: request.worker_pool)
         end
