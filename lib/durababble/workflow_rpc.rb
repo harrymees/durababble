@@ -11,13 +11,14 @@ module Durababble
     class UnknownCommand < Error; end
 
     class << self
-      #: (untyped) -> untyped
+      #: (String) -> Error?
       def remote_error_from_message(message)
         klass_name, parsed_message = message.split(": ", 2)
+        klass_name ||= message
         remote_error_from_fields(klass_name, parsed_message || message)
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (String, String) -> Error?
       def remote_error_from_fields(klass_name, message)
         case klass_name
         when "Durababble::WorkflowRpc::StaleLease", "WorkflowRpc::StaleLease", "StaleLease"
@@ -35,8 +36,9 @@ module Durababble
 
       # The error to raise when a workflow has no current lease: terminal/not-running
       # workflows report WorkflowNotRunning, otherwise the lease is simply absent.
-      #: (untyped, untyped) -> untyped
+      #: (Store, String) -> Error
       def inactive_workflow_error(store, workflow_id)
+        store = store #: as untyped
         row = store.workflow(workflow_id)
         return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
 
@@ -50,16 +52,16 @@ module Durababble
       # visible, not for slow work to finish.
       DEFAULT_AWAIT_RETRY_STEP_SECONDS = 0.05
 
-      #: (store: untyped, worker_ids: untyped, ?lease_seconds: untyped, ?await_attempts: untyped, ?await_sleep: untyped) -> void
+      #: (store: Store, worker_ids: Array[String], ?lease_seconds: Numeric, ?await_attempts: Integer, ?await_sleep: Object?) -> void
       def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: nil)
-        @store = store
+        @store = store #: as untyped
         @worker_ids = worker_ids
         @lease_seconds = lease_seconds
         @await_attempts = await_attempts
         @await_sleep = await_sleep || default_await_sleep
       end
 
-      #: (workflow_id: untyped) -> untyped
+      #: (workflow_id: String) -> Hash[String, Object?]
       def call(workflow_id:)
         workflow = @store.workflow(workflow_id)
         worker_pool = workflow.fetch("worker_pool", "default").to_s
@@ -74,7 +76,7 @@ module Durababble
 
       private
 
-      #: (untyped, worker_pool: String) -> untyped
+      #: (String, worker_pool: String) -> Hash[String, Object?]
       def await_started!(workflow_id, worker_pool:)
         last_attempt = @await_attempts - 1
         @await_attempts.times do |attempt|
@@ -91,16 +93,16 @@ module Durababble
       # Backoff so a fleet awaiting the same workflow does not poll in lockstep.
       # Runs on the worker host, outside workflow replay, so the randomness is
       # determinism-safe.
-      #: () -> untyped
+      #: () -> Proc
       def default_await_sleep
         ->(attempt) { Kernel.sleep(Backoff.linear(attempt + 1, step: DEFAULT_AWAIT_RETRY_STEP_SECONDS)) }
       end
     end
 
     class Router
-      #: (store: untyped, ?rpc_clients: untyped, ?rpc_client_factory: untyped, ?retry_on_stale: untyped, ?start_workflow: untyped, ?start_on_no_active_lease: untyped) -> void
+      #: (store: Store, ?rpc_clients: Hash[String, Object], ?rpc_client_factory: Object?, ?retry_on_stale: bool, ?start_workflow: Object?, ?start_on_no_active_lease: bool) -> void
       def initialize(store:, rpc_clients: {}, rpc_client_factory: nil, retry_on_stale: false, start_workflow: nil, start_on_no_active_lease: true)
-        @store = store
+        @store = store #: as untyped
         @rpc_clients = rpc_clients
         @rpc_client_factory = rpc_client_factory
         @retry_on_stale = retry_on_stale
@@ -108,7 +110,7 @@ module Durababble
         @start_on_no_active_lease = start_on_no_active_lease
       end
 
-      #: (workflow_id: untyped, command: untyped, ?payload: untyped) -> untyped
+      #: (workflow_id: String, command: String, ?payload: Hash[String, Object?]) -> Object?
       def request(workflow_id:, command:, payload: {})
         attributes = {
           "durababble.workflow.id" => workflow_id,
@@ -135,7 +137,7 @@ module Durababble
 
       private
 
-      #: (workflow_id: untyped, command: untyped, payload: untyped) -> untyped
+      #: (workflow_id: String, command: String, payload: Hash[String, Object?]) -> Object?
       def route_once(workflow_id:, command:, payload:)
         lease = @store.current_workflow_lease(workflow_id)
         raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
@@ -143,6 +145,7 @@ module Durababble
         worker_id = lease.fetch("worker_id")
         worker_pool = lease.fetch("worker_pool", "default").to_s
         client = rpc_client_for(worker_id, workflow_id:, worker_pool:)
+        client = client #: as untyped
         client.request("workflow_rpc", {
           "workflow_id" => workflow_id,
           "expected_worker_id" => worker_id,
@@ -153,13 +156,14 @@ module Durababble
         raise translate_remote_error(e)
       end
 
-      #: (untyped) -> untyped
+      #: (String) -> Hash[String, Object?]
       def start_workflow!(workflow_id)
         starter = @start_workflow || LeaseStarter.new(store: @store, worker_ids: @rpc_clients.keys)
+        starter = starter #: as untyped
         starter.call(workflow_id:)
       end
 
-      #: (untyped, workflow_id: untyped, worker_pool: String) -> untyped
+      #: (String, workflow_id: String, worker_pool: String) -> Object
       def rpc_client_for(worker_id, workflow_id:, worker_pool:)
         if @rpc_clients.respond_to?(:fetch)
           sentinel = Object.new
@@ -168,26 +172,27 @@ module Durababble
         end
 
         factory = @rpc_client_factory
+        factory = factory #: as untyped
         return factory.call(worker_id, worker_pool:) if factory
 
         raise NodeUnavailable, "workflow #{workflow_id} is leased by unavailable node #{worker_id}"
       end
 
-      #: (untyped) -> untyped
+      #: (Durababble::Rpc::RemoteError) -> StandardError
       def translate_remote_error(error)
         WorkflowRpc.remote_error_from_message(error.message) || error
       end
     end
 
     class LocalClient
-      #: (store: untyped, node_id: untyped, handlers: untyped) -> void
+      #: (store: Store, node_id: String, handlers: Hash[String, Object]) -> void
       def initialize(store:, node_id:, handlers:)
-        @store = store
+        @store = store #: as untyped
         @node_id = node_id
         @handlers = handlers
       end
 
-      #: (untyped, untyped) -> untyped
+      #: (String, Hash[String, Object?]) -> Object?
       def request(command, payload)
         raise UnknownCommand, command unless command == "workflow_rpc"
 
@@ -198,7 +203,7 @@ module Durababble
 
       private
 
-      #: () { (untyped) -> untyped } -> untyped
+      #: () { (Store) -> Object? } -> Object?
       def with_store(&block)
         if @store.respond_to?(:with_dedicated_connection)
           @store.with_dedicated_connection(&block)
@@ -209,20 +214,21 @@ module Durababble
     end
 
     class Handler
-      #: (store: untyped, node_id: untyped, handlers: untyped) -> void
+      #: (store: Store, node_id: String, handlers: Hash[String, Object]) -> void
       def initialize(store:, node_id:, handlers:)
-        @store = store
+        @store = store #: as untyped
         @node_id = node_id
         @handlers = handlers
       end
 
-      #: (untyped) -> untyped
+      #: (Hash[String, Object?]) -> Object?
       def call(payload)
-        workflow_id = payload.fetch("workflow_id")
+        workflow_id = payload.fetch("workflow_id").to_s
         expected_worker_id = payload.fetch("expected_worker_id")
+        command = payload.fetch("command").to_s
         attributes = {
           "durababble.workflow.id" => workflow_id,
-          "durababble.rpc.command" => payload.fetch("command"),
+          "durababble.rpc.command" => command,
           "durababble.worker.id" => @node_id,
           "durababble.lease.owner" => expected_worker_id,
         }
@@ -230,9 +236,10 @@ module Durababble
           raise StaleLease, "RPC expected #{expected_worker_id}, but reached #{@node_id}" unless expected_worker_id == @node_id
 
           assert_current_lease!(workflow_id)
-          handler = @handlers.fetch(payload.fetch("command")) do
-            raise UnknownCommand, "unknown workflow RPC command #{payload.fetch("command")}"
+          handler = @handlers.fetch(command) do
+            raise UnknownCommand, "unknown workflow RPC command #{command}"
           end
+          handler = handler #: as untyped
           result = handler.call(payload.fetch("payload", {}))
           assert_current_lease!(workflow_id)
           result
@@ -241,7 +248,7 @@ module Durababble
 
       private
 
-      #: (untyped) -> untyped
+      #: (String) -> void
       def assert_current_lease!(workflow_id)
         lease = @store.current_workflow_lease(workflow_id)
         raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease

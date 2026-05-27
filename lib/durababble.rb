@@ -123,11 +123,11 @@ module Durababble
     attr_reader :default_store
     #: Engine?
     attr_reader :default_engine
-    #: untyped
+    #: Object?
     attr_writer :logger
-    #: untyped
+    #: Integer | String
     attr_writer :max_workflow_history_events
-    #: untyped
+    #: Integer | String
     attr_writer :workflow_history_warning_events
 
     #: (Store?) -> Store?
@@ -201,7 +201,7 @@ module Durababble
       @payload_limits = normalize_payload_limits(limits)
     end
 
-    #: () -> untyped
+    #: () -> Object?
     def logger
       return @logger if instance_variable_defined?(:@logger)
 

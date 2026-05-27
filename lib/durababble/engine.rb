@@ -11,29 +11,31 @@ module Durababble
   class Engine
     DEFAULT_LEASE_SECONDS = 60
 
-    #: untyped
+    #: Store
     attr_reader :store
     #: String
     attr_reader :worker_pool
 
-    #: (store: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?crash_after: untyped, ?migrate: untyped, ?worker_pool: String, ?workflow_query_registry: untyped) -> void
+    #: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?crash_after: Symbol?, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true, worker_pool: "default", workflow_query_registry: nil)
-      @store = store
+      @store = store #: as untyped
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after
       @worker_pool = worker_pool
-      @workflow_query_registry = workflow_query_registry
+      @workflow_query_registry = workflow_query_registry #: as untyped
     end
 
-    #: (untyped, input: untyped, ?id: untyped) -> untyped
+    #: (Class, input: Object?, ?id: String?) -> String
     def enqueue(workflow_class, input:, id: nil)
+      workflow_class = workflow_class #: as untyped
       workflow_id = id || SecureRandom.uuid
       @store.enqueue_workflow(name: workflow_class.workflow_name, input:, id: workflow_id, worker_pool: @worker_pool)
     end
 
-    #: (untyped, input: untyped) -> untyped
+    #: (Class, input: Object?) -> Run
     def run(workflow_class, input:)
+      workflow_class = workflow_class #: as untyped
       attributes = {
         "durababble.workflow.name" => workflow_class.workflow_name,
         "durababble.worker.id" => @worker_id,
@@ -45,8 +47,9 @@ module Durababble
       end
     end
 
-    #: (untyped, workflow_id: untyped, ?claimed: untyped) -> untyped
+    #: (Class, workflow_id: String, ?claimed: Hash[String, Object?]?) -> Run
     def resume(workflow_class, workflow_id:, claimed: nil)
+      workflow_class = workflow_class #: as untyped
       attributes = execute_attributes(workflow_class, workflow_id)
       Observability.trace("durababble.workflow.resume", attributes) do
         current = claimed || @store.workflow(workflow_id)
@@ -197,6 +200,7 @@ module Durababble
           @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
           Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
         end
+        nil
       end
     end
 

@@ -10,7 +10,7 @@ module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
 
   Heartbeat = Data.define(:cursor, :recorder) do
-    #: (?untyped) -> untyped
+    #: (?Object?) -> Object?
     def record(cursor = self.cursor)
       recorder.call(cursor)
     end
@@ -20,13 +20,13 @@ module Durababble
 
   module WorkflowExecutionContext
     class << self
-      #: () -> untyped
+      #: () -> WorkflowExecution?
       def current
         fiber = Fiber.current #: as untyped
-        fiber.durababble_workflow_execution
+        fiber.durababble_workflow_execution #: as WorkflowExecution?
       end
 
-      #: (untyped) { (?) -> untyped } -> untyped
+      #: (Object?) { () -> Object? } -> Object?
       def with_current(execution, &block)
         fiber = Fiber.current #: as untyped
         previous = fiber.durababble_workflow_execution
@@ -40,13 +40,13 @@ module Durababble
 
   module StepExecutionContext
     class << self
-      #: () -> untyped
+      #: () -> StepContext?
       def current
         fiber = Fiber.current #: as untyped
-        fiber.durababble_step_context
+        fiber.durababble_step_context #: as StepContext?
       end
 
-      #: (untyped) { (?) -> untyped } -> untyped
+      #: (StepContext?) { () -> Object? } -> Object?
       def with_current(context, &block)
         fiber = Fiber.current #: as untyped
         previous = fiber.durababble_step_context
@@ -59,7 +59,7 @@ module Durababble
   end
 
   module AsyncTaskWorkflowContextPatch
-    #: () { (?) -> untyped } -> untyped
+    #: () { () -> Object? } -> Object?
     def schedule(&block)
       task = self #: as untyped
       step_context = StepExecutionContext.current
@@ -77,17 +77,18 @@ module Durababble
       execution = WorkflowExecutionContext.current
       return super(&block) unless execution || step_context
 
-      execution&.register_workflow_task(self)
+      workflow_task = self #: as untyped
+      execution&.register_workflow_task(workflow_task)
       super do
         WorkflowExecutionContext.with_current(execution) do
           StepExecutionContext.with_current(step_context) { block.call }
         end
       ensure
-        execution&.unregister_workflow_task(self)
+        execution&.unregister_workflow_task(workflow_task)
       end
     end
 
-    #: () -> untyped
+    #: () -> Object?
     def wait
       execution = WorkflowExecutionContext.current
       return super() unless execution

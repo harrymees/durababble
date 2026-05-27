@@ -10,9 +10,9 @@ module Durababble
     # racing on the same activation does not retry in lockstep.
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
 
-    #: (store: untyped, workflows: untyped, worker_id: untyped, ?objects: untyped, ?lease_seconds: untyped, ?migrate: untyped, ?worker_pool: String, ?workflow_query_registry: untyped) -> void
+    #: (store: Store, workflows: Object, worker_id: String, ?objects: Object, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default", workflow_query_registry: nil)
-      @store = store
+      @store = store #: as untyped
       @workflows = normalize_workflows(workflows)
       @objects = normalize_objects(objects)
       @worker_id = worker_id
@@ -23,7 +23,7 @@ module Durababble
       @store.migrate! if migrate
     end
 
-    #: () -> untyped
+    #: () -> Symbol
     def tick
       attributes = { "durababble.worker.id" => @worker_id }
       Observability.measure("durababble.worker.tick", attributes) do
@@ -47,7 +47,7 @@ module Durababble
       end
     end
 
-    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: String) -> untyped
+    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Symbol
     def deliver_target(target_kind:, target_type:, target_id:, worker_pool: @worker_pool)
       return :idle unless worker_pool == @worker_pool
       return :idle unless registered_target?(target_kind:, target_type:)
@@ -64,7 +64,7 @@ module Durababble
       :worked
     end
 
-    #: (?max_ticks: untyped) -> untyped
+    #: (?max_ticks: Integer) -> Integer
     def run_until_idle(max_ticks: 100)
       worked = 0
       max_ticks.times do
