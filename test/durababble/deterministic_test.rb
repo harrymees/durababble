@@ -647,6 +647,14 @@ class DurababbleDeterministicTest < DurababbleTestCase
     refute_includes result.trace, "stale_accepted"
   end
 
+  test "random invalid operation fuzz always exercises stale-owner write rejection" do
+    result = Durababble::Deterministic.prove("random_invalid_operation_sequence", seed: 252)
+
+    assert_empty result.violations
+    assert_includes result.trace, "stale_write_rejected"
+    refute_includes result.trace, "stale_accepted"
+  end
+
   test "atomically wakes a batch of due timers through crashes without stranding waiters" do
     result = Durababble::Deterministic.prove("timer_wakeup_batch_crash_fuzz", seed: 1)
 

@@ -165,6 +165,13 @@ module Durababble
           h.scheduler.schedule(actor: "new-owner", delay: 12, name: "claim_stale_workflow") do
             h.store.claim_workflow(workflow_id: stale_id, worker_id: "new-owner", lease_seconds: 60)
           end
+          stale_writes.each_with_index do |(name, block), index|
+            h.scheduler.schedule(actor: "invalid-guaranteed-stale-#{index}", delay: 13 + index, name: "stale_write") do
+              safe.call("invalid-guaranteed-stale-#{index}", "stale_write") do
+                reject_stale_write.call("invalid-guaranteed-stale-#{index}", name, block)
+              end
+            end
+          end
 
           36.times do |i|
             operation = [
