@@ -6,14 +6,14 @@ module Durababble
     Query = Struct.new(:id, :backend, :description, :builder, keyword_init: true)
 
     QUERIES = {}
-    POSTGRES_WORKFLOW_CLAIM_EXPRESSION = [
-      "CASE",
-      "WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)",
-      "WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at",
-      "WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until",
-      "ELSE NULL",
-      "END",
-    ].join(" ").freeze
+    POSTGRES_WORKFLOW_CLAIM_EXPRESSION = <<~SQL.chomp.freeze
+      CASE
+        WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+        WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+        WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+        ELSE NULL
+      END
+    SQL
 
     class << self
       #: (untyped, backend: untyped, ?description: String?) { (untyped) -> untyped } -> void

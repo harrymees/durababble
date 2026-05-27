@@ -87,7 +87,12 @@ FOR UPDATE SKIP LOCKED
 WITH candidate AS (
   SELECT id FROM "durababble_pg_snapshot"."workflows"
   WHERE worker_pool = $1
-    AND (CASE WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at) WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until ELSE NULL END) <= now()
+    AND (CASE
+  WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+  WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+  WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END) <= now()
     <name_filter>
   LIMIT 1
   FOR UPDATE SKIP LOCKED
