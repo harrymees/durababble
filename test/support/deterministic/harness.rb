@@ -22,6 +22,17 @@ module Durababble
         @expect_settled = false
         @expected_side_effects = nil
         @expected_processed_outbox = nil
+        @monitor_transitions = false
+        @previous_transition_snapshot = nil
+        @transition_violation_keys = {}
+      end
+
+      # Opt into online transition checks. Final-state invariants are still run,
+      # but this catches illegal intermediate transitions that later cleanup
+      # could otherwise hide.
+      #: () -> void
+      def monitor_transitions!
+        @monitor_transitions = true
       end
 
       # Declare that, once the scheduler drains, every workflow must be either
@@ -56,6 +67,21 @@ module Durababble
       #: (untyped) { (?) -> untyped } -> untyped
       def check(description, &block)
         @checks << [description, block]
+      end
+
+      #: () -> void
+      def prepare_for_run!
+        @previous_transition_snapshot = transition_snapshot if @monitor_transitions
+      end
+
+      #: (actor: untyped, name: untyped, time: untyped) -> void
+      def observe_transition!(actor:, name:, time:)
+        return unless @monitor_transitions
+
+        previous = @previous_transition_snapshot || transition_snapshot
+        current = transition_snapshot
+        verify_transition!(previous, current, actor:, event_name: name, time:)
+        @previous_transition_snapshot = current
       end
 
       #: () -> untyped
@@ -93,6 +119,262 @@ module Durababble
         verify_activation_inbox_consistency!(inbox_state, activations_state)
         verify_liveness!(workflows_state, waits_state) if @expect_settled
         verify_effect_expectations!
+      end
+
+      #: () -> Hash[Symbol, untyped]
+      def transition_snapshot
+        workflows = store.all_workflows
+        {
+          time: scheduler.time,
+          workflows: workflows,
+          outbox: store.all_outbox,
+          inbox: store.all_inbox,
+          activations: store.all_target_activations.to_h { |activation| [target_key(activation), activation] },
+          histories: workflows.keys.to_h do |workflow_id|
+            [workflow_id, store.workflow_history_for(workflow_id)]
+          rescue KeyError
+            [workflow_id, []]
+          end,
+        }
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_transition!(previous, current, actor:, event_name:, time:)
+        verify_terminal_workflow_transitions!(previous, current, actor:, event_name:, time:)
+        verify_backoff_claim_transitions!(previous, current, actor:, event_name:, time:)
+        verify_outbox_transitions!(previous, current, actor:, event_name:, time:)
+        verify_inbox_transitions!(previous, current, actor:, event_name:, time:)
+        verify_activation_transitions!(previous, current, actor:, event_name:, time:)
+        verify_workflow_command_history_transitions!(previous, current, actor:, event_name:, time:)
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_terminal_workflow_transitions!(previous, current, actor:, event_name:, time:)
+        previous.fetch(:workflows).each do |workflow_id, before|
+          next unless terminal_workflow_row?(before)
+
+          after = current.fetch(:workflows)[workflow_id]
+          if after.nil?
+            transition_violation!("terminal workflow #{workflow_id} disappeared", actor:, event_name:, time:)
+            next
+          end
+
+          next if terminal_workflow_fingerprint(before) == terminal_workflow_fingerprint(after)
+
+          transition_violation!(
+            "terminal workflow #{workflow_id} mutated from #{before.fetch("status").inspect} to #{after.fetch("status").inspect}",
+            actor:,
+            event_name:,
+            time:,
+          )
+        end
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_backoff_claim_transitions!(previous, current, actor:, event_name:, time:)
+        previous.fetch(:workflows).each do |workflow_id, before|
+          after = current.fetch(:workflows)[workflow_id]
+          next unless after
+          next unless after.fetch("status") == WorkflowStatus::RUNNING
+          next unless backoff_protected?(previous, workflow_id, before, time)
+
+          transition_violation!(
+            "workflow #{workflow_id} became running before retry/backoff due time",
+            actor:,
+            event_name:,
+            time:,
+          )
+        end
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_outbox_transitions!(previous, current, actor:, event_name:, time:)
+        previous.fetch(:outbox).each do |outbox_id, before|
+          after = current.fetch(:outbox)[outbox_id]
+          next unless after
+          next unless before.fetch("status") != OutboxStatus::PROCESSED && after.fetch("status") == OutboxStatus::PROCESSED
+          next if before.fetch("status") == OutboxStatus::PROCESSING && live_row_lease?(before, time)
+
+          transition_violation!(
+            "outbox #{outbox_id} was processed without a live processing lease",
+            actor:,
+            event_name:,
+            time:,
+          )
+        end
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_inbox_transitions!(previous, current, actor:, event_name:, time:)
+        terminal_statuses = [InboxStatus::COMPLETED, InboxStatus::FAILED, InboxStatus::DEAD_LETTERED]
+        previous.fetch(:inbox).each do |message_id, before|
+          after = current.fetch(:inbox)[message_id]
+          next unless after
+          next unless before.fetch("status") == InboxStatus::RUNNING
+          next unless terminal_statuses.include?(after.fetch("status"))
+          next if live_row_lease?(before, time)
+          next if before["locked_by"] != actor
+
+          transition_violation!(
+            "inbox #{message_id} moved to #{after.fetch("status")} without a live command lease",
+            actor:,
+            event_name:,
+            time:,
+          )
+        end
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_activation_transitions!(previous, current, actor:, event_name:, time:)
+        previous.fetch(:activations).each do |key, before|
+          next unless before.fetch("status") == "running"
+          next if live_row_lease?(before, time)
+          next if before["locked_by"] != actor
+
+          after = current.fetch(:activations)[key]
+          next if after && after.fetch("status") == "running"
+
+          transition_violation!(
+            "expired target activation #{key.join("/")} was completed or removed instead of reclaimed",
+            actor:,
+            event_name:,
+            time:,
+          )
+        end
+      end
+
+      #: (Hash[Symbol, untyped], Hash[Symbol, untyped], actor: untyped, event_name: untyped, time: untyped) -> void
+      def verify_workflow_command_history_transitions!(previous, current, actor:, event_name:, time:)
+        current.fetch(:histories).each do |workflow_id, after_history|
+          before_history = previous.fetch(:histories).fetch(workflow_id, [])
+          before_count = before_history.length
+          next if after_history.length <= before_count
+
+          after_history.drop(before_count).each do |event|
+            next unless ["workflow_command_completed", "workflow_command_failed"].include?(event.fetch("kind"))
+
+            before_workflow = previous.fetch(:workflows)[workflow_id]
+            if before_workflow && terminal_workflow_row?(before_workflow)
+              transition_violation!(
+                "terminal workflow #{workflow_id} appended #{event.fetch("kind")} history",
+                actor:,
+                event_name:,
+                time:,
+              )
+              next
+            end
+
+            message_id = event["attempt_id"]
+            before_message = previous.fetch(:inbox)[message_id]
+            inbox_owner = before_message&.fetch("locked_by", nil)
+            visible_owner = visible_live_workflow_owner(previous.fetch(:workflows)[workflow_id], time) ||
+              visible_live_workflow_owner(current.fetch(:workflows)[workflow_id], time)
+            next if inbox_owner.nil?
+            next if inbox_owner != actor
+
+            if visible_owner.nil?
+              transition_violation!(
+                "workflow #{workflow_id} appended #{event.fetch("kind")} for inbox owner #{inbox_owner.inspect} without a live workflow lease",
+                actor:,
+                event_name:,
+                time:,
+              )
+              next
+            end
+            next if visible_owner == inbox_owner
+
+            transition_violation!(
+              "workflow #{workflow_id} appended #{event.fetch("kind")} for inbox owner #{inbox_owner.inspect} while workflow lease was held by #{visible_owner.inspect}",
+              actor:,
+              event_name:,
+              time:,
+            )
+          end
+        end
+      end
+
+      #: (String, actor: untyped, event_name: untyped, time: untyped) -> void
+      def transition_violation!(message, actor:, event_name:, time:)
+        key = [message, actor, event_name, time]
+        return if @transition_violation_keys[key]
+
+        @transition_violation_keys[key] = true
+        violations << "transition violation after #{actor}/#{event_name} at t=#{time}: #{message}"
+      end
+
+      #: (Hash[String, Object?]?) -> bool
+      def terminal_workflow_row?(row)
+        return false unless row
+
+        status = row.fetch("status")
+        status == WorkflowStatus::COMPLETED ||
+          status == WorkflowStatus::CANCELED ||
+          status == WorkflowStatus::TERMINATED ||
+          (status == WorkflowStatus::FAILED && row["next_run_at"].nil?)
+      end
+
+      #: (Hash[String, Object?]) -> Array[Object?]
+      def terminal_workflow_fingerprint(row)
+        row.values_at("status", "result", "error", "cancel_reason", "locked_by", "locked_until", "next_run_at")
+      end
+
+      #: (Hash[Symbol, untyped], String, Hash[String, Object?], untyped) -> bool
+      def backoff_protected?(snapshot, workflow_id, row, time)
+        status = row.fetch("status")
+        due_at = row["next_run_at"]
+        return true if status == WorkflowStatus::FAILED && due_at.nil?
+        return false unless [WorkflowStatus::PENDING, WorkflowStatus::CANCELING, WorkflowStatus::FAILED].include?(status)
+        return false if due_at.nil?
+        return false if status != WorkflowStatus::FAILED && workflow_command_pending?(snapshot, workflow_id)
+
+        timestamp_gt?(due_at, time)
+      end
+
+      #: (Hash[Symbol, untyped], String) -> bool
+      def workflow_command_pending?(snapshot, workflow_id)
+        terminal_statuses = [InboxStatus::COMPLETED, InboxStatus::FAILED, InboxStatus::DEAD_LETTERED]
+        snapshot.fetch(:inbox).values.any? do |message|
+          message.fetch("target_kind") == "workflow" &&
+            message.fetch("target_id") == workflow_id &&
+            !terminal_statuses.include?(message.fetch("status"))
+        end
+      end
+
+      #: (Hash[String, Object?]?, untyped) -> bool
+      def live_row_lease?(row, time)
+        return false unless row
+        return false if row["locked_by"].nil? || row["locked_until"].nil?
+
+        !timestamp_lt?(row.fetch("locked_until"), time)
+      end
+
+      #: (Hash[String, Object?]?, untyped) -> Object?
+      def visible_live_workflow_owner(row, time)
+        return unless row
+        return unless row.fetch("status") == WorkflowStatus::RUNNING
+        return unless live_row_lease?(row, time)
+
+        row["locked_by"]
+      end
+
+      #: (untyped, untyped) -> bool
+      def timestamp_gt?(left, right)
+        timestamp_value(left) > timestamp_value(right)
+      end
+
+      #: (untyped, untyped) -> bool
+      def timestamp_lt?(left, right)
+        timestamp_value(left) < timestamp_value(right)
+      end
+
+      #: (untyped) -> Numeric
+      def timestamp_value(value)
+        case value
+        when Time
+          value.to_r
+        else
+          value.to_i
+        end
       end
 
       # An inbox message claimed (`running`) by a worker that then crashed leaves

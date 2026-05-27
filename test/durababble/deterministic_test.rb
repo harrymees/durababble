@@ -40,6 +40,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "object_command_multi_target_isolation",
     "rpc_workflow_rpc_transport_fault_matrix",
     "random_operation_sequence",
+    "generated_workflow_rpc_interleaving_fuzz",
     "chaos",
   ].freeze
 
@@ -538,6 +539,18 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_equal 1, failures.length
     assert_includes failures.first.last.join("\n"), "orphaned wakeup"
+  end
+
+  test "reports broad semantic transition violations for lease and terminal bug families" do
+    failures = Durababble::Deterministic.search("bug_semantic_operation_fuzz", seeds: 1..1)
+
+    assert_equal 1, failures.length
+    messages = failures.first.last.join("\n")
+    assert_includes messages, "terminal workflow monitor-terminal mutated"
+    assert_includes messages, "workflow monitor-backoff became running before retry/backoff due time"
+    assert_includes messages, "outbox monitor-outbox was processed without a live processing lease"
+    assert_includes messages, "expired target activation default/object/monitor-object/activation was completed or removed instead of reclaimed"
+    assert_includes messages, "workflow monitor-command appended workflow_command_completed"
   end
 
   test "delivers async workflow commands exactly once and retires the wakeup row" do
