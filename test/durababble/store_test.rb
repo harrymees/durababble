@@ -88,6 +88,45 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "10", mysql_config.fetch(:read_timeout)
   end
 
+  test "test backend selection can require standard postgres without yugabyte" do
+    with_env(
+      "DURABABBLE_TEST_BACKENDS" => "postgres",
+      "DURABABBLE_POSTGRES_DATABASE_URL" => "postgresql://postgres@127.0.0.1:5432/postgres",
+      "DURABABBLE_YUGABYTE_DATABASE_URL" => nil,
+    ) do
+      backends = durababble_store_backends
+
+      assert_equal ["postgres"], backends.map(&:name)
+      assert_equal "postgresql://postgres@127.0.0.1:5432/postgres", backends.first.database_url
+      assert_equal "durababble_pg", backends.first.default_schema_prefix
+    end
+  end
+
+  test "test backend selection keeps postgres explicit and yugabyte optional" do
+    with_env(
+      "DURABABBLE_TEST_BACKENDS" => "mysql",
+      "DURABABBLE_POSTGRES_DATABASE_URL" => "postgresql://postgres@127.0.0.1:5432/postgres",
+      "DURABABBLE_YUGABYTE_DATABASE_URL" => "postgresql://yugabyte@127.0.0.1:15433/yugabyte",
+    ) do
+      assert_equal ["mysql"], durababble_store_backends.map(&:name)
+    end
+
+    with_env(
+      "DURABABBLE_TEST_BACKENDS" => nil,
+      "DURABABBLE_POSTGRES_DATABASE_URL" => "postgresql://postgres@127.0.0.1:5432/postgres",
+      "DURABABBLE_YUGABYTE_DATABASE_URL" => "postgresql://yugabyte@127.0.0.1:15433/yugabyte",
+    ) do
+      assert_equal ["mysql", "yugabyte"], durababble_store_backends.map(&:name)
+    end
+  end
+
+  test "test backend selection rejects unknown names" do
+    with_env("DURABABBLE_TEST_BACKENDS" => "mysql,sqlite") do
+      error = assert_raises(ArgumentError) { durababble_store_backends }
+      assert_match(/unknown DURABABBLE_TEST_BACKENDS value/, error.message)
+    end
+  end
+
   test "close removes generated active record connection constants" do
     owner = nil
     const_name = nil
@@ -1115,6 +1154,20 @@ class DurababbleStoreTest < DurababbleTestCase
 
   def mysql_store(connection = ScriptedMysqlConnection.new, schema: "branch_schema")
     Durababble::MysqlStore.new(scripted_pool(connection), schema:)
+  end
+
+  def with_env(values)
+    previous = {}
+    values.each do |key, value|
+      previous[key] = ENV.key?(key) ? ENV.fetch(key) : nil
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
+
+    yield
+  ensure
+    previous.each do |key, value|
+      value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
   end
 
   def with_yugabyte_store(migrate: true, &block)

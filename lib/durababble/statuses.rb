@@ -16,7 +16,7 @@ module Durababble
     COMPLETED_STATUSES = [COMPLETED, CANCELED].freeze
     TERMINAL_STATUSES = [COMPLETED, CANCELED, TERMINATED].freeze
     SUSPENDED_OR_RUNNABLE = [PENDING, WAITING, CANCELING].freeze
-    RPC_NOT_RUNNING = [COMPLETED, TERMINATED, WAITING].freeze
+    RPC_NOT_RUNNING = [WAITING].freeze
 
     class << self
       #: (String | Hash[String, Object?]) -> bool
@@ -41,7 +41,8 @@ module Durababble
 
       #: (String | Hash[String, Object?]) -> bool
       def rpc_not_running?(row_or_status)
-        RPC_NOT_RUNNING.include?(status_of(row_or_status))
+        status = status_of(row_or_status)
+        RPC_NOT_RUNNING.include?(status) || TERMINAL_STATUSES.include?(status) || (row_or_status.is_a?(Hash) && final_failed?(row_or_status))
       end
 
       #: (String | Hash[String, Object?]) -> bool

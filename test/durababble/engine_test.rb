@@ -572,6 +572,7 @@ class DurababbleEngineTest < DurababbleTestCase
           store:,
           workflows: { workflow.name => workflow },
           worker_id: "large-history-worker",
+          lease_seconds: 300,
           migrate: false,
         )
         workflow_id = store.enqueue_workflow(

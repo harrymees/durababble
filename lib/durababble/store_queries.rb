@@ -879,6 +879,15 @@ module Durababble
       SQL
     end
 
+    define(:pg_mark_workflow_running_with_worker, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "workflows")}
+        SET status = 'running', error = NULL, locked_by = $1,
+            locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
+        WHERE id = $3 AND worker_pool = $4
+      SQL
+    end
+
     define(:pg_lock_workflow_for_termination, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
     end
