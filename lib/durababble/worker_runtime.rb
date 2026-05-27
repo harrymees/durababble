@@ -101,6 +101,7 @@ module Durababble
       @mutex.synchronize do
         return self if running?
 
+        Durababble.assert_fiber_isolation!
         @stopping = false
         @last_error = nil
         @consecutive_errors = 0

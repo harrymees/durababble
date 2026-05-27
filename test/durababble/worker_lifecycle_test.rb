@@ -143,6 +143,30 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     assert_equal 3, runtime.concurrency
   end
 
+  test "refuses to start an object-only concurrent runtime without fiber isolation" do
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_isolation_guard_object"
+
+      define_method(:ping) { true }
+      expose_command :ping
+    end
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 2,
+      migrate: false,
+    )
+
+    with_isolation_level(:thread) do
+      error = assert_raises(Durababble::ConfigurationError) { runtime.start }
+      assert_match(/isolation_level = :fiber/, error.message)
+    end
+
+    assert_equal false, runtime.running?
+  end
+
   test "is idempotent when started more than once and stopped more than once" do
     store = RuntimeBranchStore.new
     runtime = Durababble::WorkerRuntime.new(
@@ -938,5 +962,13 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
   def parse_time(value)
     value.is_a?(Time) ? value : Time.parse(value.to_s)
+  end
+
+  def with_isolation_level(level)
+    previous = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = level
+    yield
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous
   end
 end
