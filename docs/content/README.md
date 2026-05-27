@@ -36,4 +36,4 @@ Durababble exists for the middle ground where background jobs are too coarse but
 
 Workflow orchestration can also call workflow and durable-object handles directly; those in-workflow handle calls are persisted as workflow history commands so replay and crash recovery do not send the outbound RPC twice.
 
-New here? Jump to the [Quickstart](quickstart.md) for a tour of the features. Detailed guarantees live in [the spec](../spec.md) and [the architecture overview](architecture.md).
+New here? Jump to the [Quickstart](quickstart.md) for a tour of the features. Detailed guarantees live in [the spec](../spec.md) and [the architecture overview](internals/architecture.md).

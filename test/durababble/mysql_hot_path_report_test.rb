@@ -2,9 +2,11 @@
 # frozen_string_literal: true
 
 require "tempfile"
+require "tmpdir"
 
 require_relative "../test_helper"
 require_relative "../../scripts/mysql-hot-path-report"
+require_relative "../../scripts/generate-doc-query-reports"
 
 class DurababbleMysqlHotPathReportTest < DurababbleTestCase
   test "records colocated query descriptions and deterministic transaction context" do
@@ -102,6 +104,33 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     end
   ensure
     DurababbleMysqlHotPathReport.instance_variable_set(:@scenarios, original_scenarios) if original_scenarios
+  end
+
+  test "docs query report generator runs every registered scenario into static docs paths" do
+    scenario_names = DurababbleMysqlHotPathReport.scenarios.keys.sort
+    recorded_options = []
+
+    Dir.mktmpdir("durababble-doc-query-reports") do |dir|
+      stale_report = File.join(dir, "stale.html")
+      File.write(stale_report, "stale")
+
+      DurababbleDocsQueryReports::Generator.new(
+        output_dir: dir,
+        database_url: "mysql://root@127.0.0.1:3306/sidekick_server_test",
+        fixture_size: 7,
+        runner: ->(options) { recorded_options << options },
+      ).run
+
+      refute File.exist?(stale_report)
+    end
+
+    assert_equal scenario_names, recorded_options.map { |options| options.fetch(:operation) }
+    assert_equal ["html"], recorded_options.map { |options| options.fetch(:format) }.uniq
+    assert_equal [7], recorded_options.map { |options| options.fetch(:fixture_size) }.uniq
+    assert_equal(
+      scenario_names.map { |scenario_name| "#{scenario_name}.html" },
+      recorded_options.map { |options| File.basename(options.fetch(:output)) },
+    )
   end
 
   private
