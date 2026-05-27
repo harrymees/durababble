@@ -26,7 +26,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       @released << worker_id
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       result = @tick_results.shift
       raise result if result.is_a?(Exception)
 
@@ -41,6 +41,58 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class ForcedUnavailableDeliveryClient
     def deliver_message(**)
       raise Durababble::Rpc::Unavailable, "forced delivery failure"
+    end
+  end
+
+  class SaturatedDeliveryWorker
+    attr_reader :claim_attempts, :delivery_claims
+
+    def initialize(runtime:)
+      @runtime = runtime
+      @claim_attempts = 0
+      @delivery_claims = 0
+      @slow_completed = Queue.new
+      @delivery_completed = Queue.new
+    end
+
+    def claim_work(excluding_target_keys: nil)
+      @claim_attempts += 1
+      return if @claim_attempts > 1
+
+      Durababble::Worker::WorkItem.new(:workflow, ["default", "workflow", "slow", "wf-1"], :slow)
+    end
+
+    def delivery_work(worker_pool:, target_kind:, target_type:, target_id:)
+      @delivery_claims += 1
+      Durababble::Worker::WorkItem.new(
+        :delivery,
+        [worker_pool, target_kind, target_type, target_id].map(&:to_s).freeze,
+        { worker_pool:, target_kind:, target_type:, target_id: },
+      )
+    end
+
+    def perform_work(work_item)
+      if work_item.payload == :slow
+        @runtime.send(
+          :enqueue_delivery,
+          worker_pool: "default",
+          target_kind: "workflow",
+          target_class: "slow",
+          target_id: "wf-2",
+        )
+        Kernel.sleep(0.05)
+        @slow_completed << true
+      else
+        @delivery_completed << true
+      end
+    end
+
+    def slow_completed?
+      !@slow_completed.empty?
+    end
+
+    def delivery_completed?
+      !@delivery_completed.empty?
     end
   end
 
@@ -272,6 +324,28 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     runtime&.shutdown(timeout: 1)
   end
 
+  test "waits for active work instead of spinning when queued deliveries arrive while saturated" do
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      worker_pool: "default",
+      concurrency: 1,
+      poll_interval: 5,
+      migrate: false,
+    )
+    worker = SaturatedDeliveryWorker.new(runtime:)
+    thread = Thread.new do
+      runtime.instance_variable_set(:@thread, Thread.current)
+      Async { |task| runtime.send(:run_loop, task, worker) }
+    end
+
+    eventually(timeout: 1) { assert(worker.slow_completed?) }
+    eventually(timeout: 1) { assert(worker.delivery_completed?) }
+  ensure
+    runtime&.shutdown(timeout: 1)
+    thread&.join(1)
+  end
+
   test "a single concurrent runtime can make workflow-to-object progress without another process" do
     object = Class.new(Durababble::DurableObject) do
       object_type "runtime_concurrent_object"
@@ -374,6 +448,49 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   ensure
     release = true
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "does not renew an expired in-flight workflow lease by reclaiming its own active target" do
+    release = false
+    started = Queue.new
+    workflow = durababble_test_workflow("runtime-active-lease-not-renewed") do
+      test_step("hold") do |ctx|
+        started << true
+        sleep(0.01) until release
+        ctx.merge("done" => true)
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.name, input: {})
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-active-lease-not-renewed",
+      concurrency: 2,
+      poll_interval: 0.01,
+      lease_seconds: 1,
+      migrate: false,
+    )
+    runtime.start
+    assert_equal(true, started.pop)
+    original_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+
+    eventually(timeout: 3) { assert_operator(Time.now, :>, original_locked_until + 0.15) }
+    sleep(0.15)
+
+    current_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+    assert_operator(
+      current_locked_until,
+      :<=,
+      original_locked_until + 0.05,
+      "active workflow lease should not be renewed by duplicate in-process scheduling",
+    )
+  ensure
+    runtime&.shutdown(timeout: 0.05)
+    release = true
+    runtime&.wait(timeout: 1)
     runtime&.shutdown(timeout: 1)
   end
 
@@ -817,5 +934,9 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     return [] if queue.length < count
 
     count.times.map { queue.pop(true) }
+  end
+
+  def parse_time(value)
+    value.is_a?(Time) ? value : Time.parse(value.to_s)
   end
 end

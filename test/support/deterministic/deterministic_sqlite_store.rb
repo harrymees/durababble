@@ -149,8 +149,8 @@ module Durababble
         id
       end
 
-      #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
-      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+      #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+      def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
         claimed = super
         trace_event("workflow_claimed", id: claimed.fetch("id"), worker: worker_id) if claimed
         claimed

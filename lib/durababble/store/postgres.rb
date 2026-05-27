@@ -20,15 +20,17 @@ module Durababble
       @migrated = false
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
       # [DURABABBLE-LEASE-1] Queue selection and lease assignment commit as one locked update
       # so two pollers can never both hold a live workflow lease.
       name_filter, name_params = workflow_name_filter(workflow_names, offset: 4)
+      exclusion_filter, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids, offset: 4 + name_params.length)
+      workflow_filter = "#{name_filter} #{exclusion_filter}"
       row = retry_serialization_failures do
-        execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params, name_filter:).first
+        execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params + exclusion_params, name_filter: workflow_filter).first
       end
       typed_row = row #: as untyped
       observe_claim_latency(typed_row, "workflow") if typed_row
@@ -796,6 +798,14 @@ module Durababble
       return ["", []] unless workflow_names
 
       ["AND name IN (#{postgres_placeholders(offset, workflow_names.length)})", workflow_names]
+    end
+
+    #: (Array[String]?, ?offset: Integer) -> [String, Array[String]]
+    def workflow_exclusion_filter(workflow_ids, offset: 1)
+      workflow_ids = Array(workflow_ids).uniq
+      return ["", []] if workflow_ids.empty?
+
+      ["AND id NOT IN (#{postgres_placeholders(offset, workflow_ids.length)})", workflow_ids]
     end
 
     #: (Integer, Integer) -> Object?

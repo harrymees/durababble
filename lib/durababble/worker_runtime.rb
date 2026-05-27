@@ -291,7 +291,13 @@ module Durababble
 
         begin
           scheduled = schedule_available_work(task, worker, active_targets)
-          await_work(task) unless scheduled
+          next if scheduled
+
+          if active_targets.length >= @concurrency
+            await_active_work(task)
+          else
+            await_work(task)
+          end
         rescue LeaseConflict => e
           record_worker_error(e)
         rescue StandardError => e
@@ -307,7 +313,7 @@ module Durababble
     def schedule_available_work(task, worker, active_targets)
       scheduled_count = 0
       while active_targets.length < @concurrency && !stopping?
-        work_item = next_delivery_work(worker) || worker.claim_work
+        work_item = next_delivery_work(worker) || worker.claim_work(excluding_target_keys: active_targets.keys)
         break unless work_item
 
         if active_targets.key?(work_item.target_key)

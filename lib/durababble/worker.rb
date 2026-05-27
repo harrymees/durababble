@@ -40,12 +40,18 @@ module Durababble
       end
     end
 
-    #: () -> untyped
-    def claim_work
+    #: (?excluding_target_keys: untyped) -> untyped
+    def claim_work(excluding_target_keys: nil)
       activation = claim_next_target_activation
       return target_activation_work_item(activation) if activation
 
-      claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys, worker_pool: @worker_pool)
+      claimed = @store.claim_runnable_workflow(
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        workflow_names: @workflows.keys,
+        worker_pool: @worker_pool,
+        excluding_workflow_ids: excluded_workflow_ids(excluding_target_keys),
+      )
       return unless claimed
 
       workflow_name = claimed.fetch("name")
@@ -260,6 +266,18 @@ module Durababble
         target_types: @objects.keys,
         worker_pool: @worker_pool,
       )
+    end
+
+    #: (untyped) -> Array[String]
+    def excluded_workflow_ids(target_keys)
+      Array(target_keys).filter_map do |target_key|
+        key = Array(target_key)
+        next unless key[0] == @worker_pool
+        next unless key[1] == "workflow"
+        next unless @workflows.key?(key[2])
+
+        key[3].to_s
+      end
     end
 
     #: (untyped) -> WorkItem

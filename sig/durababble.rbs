@@ -218,7 +218,7 @@ module Durababble
     def current_time: () -> Time
     def enqueue_workflow: (name: String, input: serialized_payload, ?id: String?, ?worker_pool: String) -> String
     def create_workflow: (name: String, input: serialized_payload, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
-    def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String], ?worker_pool: String) -> workflow_row?
+    def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String], ?worker_pool: String, ?excluding_workflow_ids: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
     def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
     def heartbeat: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Object
@@ -386,7 +386,7 @@ module Durababble
 
     def initialize: (store: Store, workflows: workflow_registry, worker_id: String, ?objects: object_registry, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def tick: () -> Symbol
-    def claim_work: () -> WorkItem?
+    def claim_work: (?excluding_target_keys: Array[Array[String]]) -> WorkItem?
     def delivery_work: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> WorkItem?
     def perform_work: (WorkItem work_item) -> Object?
     def defer_claimed_work: (WorkItem work_item, ready_at: Time) -> Object?
