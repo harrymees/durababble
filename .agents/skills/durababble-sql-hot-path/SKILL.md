@@ -52,4 +52,4 @@ Use `--fixture-size N` to seed N unrelated pending workflows before tracing, and
 
 ## Reading The Report
 
-Start with the Query Timeline table. Each query has the colocated `StoreQueries` description, the concrete registry id, callsite, deterministic transaction label such as `tx1 depth=1`, SQL with placeholders, formatted bind params, and a MySQL `EXPLAIN FORMAT=JSON` summary plus raw JSON.
+Start with the Query Timeline table. Each query has the colocated `StoreQueries` description, the concrete registry id, Ruby-side query runtime, callsite, deterministic transaction label such as `tx1 depth=1`, SQL with placeholders, formatted bind params, and a MySQL `EXPLAIN FORMAT=JSON` summary plus raw JSON. The report metadata also includes total captured query runtime for the operation.

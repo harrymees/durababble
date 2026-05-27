@@ -21,6 +21,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     assert_equal 1, query.fetch(:transaction).fetch(:id)
     assert_equal 1, query.fetch(:transaction).fetch(:depth)
     assert_equal({ isolation: "read_committed" }, query.fetch(:transaction).fetch(:options))
+    assert_operator query.fetch(:duration_ms), :>=, 0.0
     assert_equal ["transaction.begin", "query", "transaction.commit"], recorder.events.map { |event| event.fetch(:type) }
   end
 
@@ -33,6 +34,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
       table_prefix: "durababble_hot_path_test",
       fixture_size: 0,
       result: "{\"id\"=>\"hot-path-claimable\"}",
+      total_query_runtime_ms: 0.123,
       events: [],
       queries: [
         {
@@ -43,6 +45,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
           params: ["default"],
           callsite: "lib/durababble/store/mysql.rb:34:in block in claim_runnable_workflow",
           transaction: { id: 1, depth: 1, parent_id: nil, options: {} },
+          duration_ms: 0.123,
           row_count: 1,
           affected_rows: 0,
           explain: {
@@ -71,6 +74,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     markdown = DurababbleMysqlHotPathReport::MarkdownRenderer.new(report).render
 
     assert_includes markdown, "Probe the pending workflow queue"
+    assert_includes markdown, "0.123ms"
     assert_includes markdown, "tx1 depth=1"
     assert_includes markdown, "lib/durababble/store/mysql.rb"
     assert_includes markdown, "SELECT id FROM"

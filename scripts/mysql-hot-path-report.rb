@@ -91,6 +91,7 @@ module DurababbleMysqlHotPathReport
         params: params,
         callsite: callsite,
         transaction: @transaction_stack.last&.dup,
+        started_at_monotonic: Process.clock_gettime(Process::CLOCK_MONOTONIC),
       }
       @queries << query
       @events << { type: "query", query: query }
@@ -98,11 +99,13 @@ module DurababbleMysqlHotPathReport
     end
 
     def finish_query(query, result)
+      record_duration(query)
       query[:row_count] = result_row_count(result)
       query[:affected_rows] = result_affected_rows(result)
     end
 
     def fail_query(query, error)
+      record_duration(query)
       query[:error] = "#{error.class}: #{error.message}"
     end
 
@@ -119,6 +122,14 @@ module DurababbleMysqlHotPathReport
 
     def normalize_options(options)
       options.transform_values { |value| value.is_a?(Symbol) ? value.to_s : value }
+    end
+
+    def record_duration(query)
+      started_at = query.delete(:started_at_monotonic)
+      return unless started_at
+
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+      query[:duration_ms] = (elapsed * 1000).round(3)
     end
 
     def result_row_count(result)
@@ -328,6 +339,7 @@ module DurababbleMysqlHotPathReport
         table_prefix: store.send(:table_prefix),
         fixture_size: @options.fetch(:fixture_size),
         result: DurababbleMysqlHotPathReport.format_value(result),
+        total_query_runtime_ms: recorder.queries.sum { |query| query.fetch(:duration_ms, 0.0) }.round(3),
         queries: recorder.queries,
         events: recorder.events,
       }
@@ -370,6 +382,10 @@ module DurababbleMysqlHotPathReport
       DurababbleMysqlHotPathReport.rows_label(query)
     end
 
+    def runtime_label(value)
+      DurababbleMysqlHotPathReport.runtime_label(value)
+    end
+
     def escape_table(value)
       DurababbleMysqlHotPathReport.escape_table(value)
     end
@@ -394,13 +410,14 @@ module DurababbleMysqlHotPathReport
       lines << "- Fixture size: `#{@report.fetch(:fixture_size)}`"
       lines << "- Result: `#{@report.fetch(:result)}`"
       lines << "- SQL statements: `#{queries.length}`"
+      lines << "- Total query runtime: `#{runtime_label(@report.fetch(:total_query_runtime_ms))}`"
       lines << ""
       lines << "## Query Timeline"
       lines << ""
-      lines << "| # | Query | Transaction | Callsite | Rows | Purpose |"
-      lines << "| --- | --- | --- | --- | --- | --- |"
+      lines << "| # | Query | Runtime | Transaction | Callsite | Rows | Purpose |"
+      lines << "| --- | --- | --- | --- | --- | --- | --- |"
       queries.each do |query|
-        lines << "| #{query.fetch(:sequence)} | `#{query.fetch(:query_id)}` | #{transaction_label(query)} | `#{query.fetch(:callsite)}` | #{rows_label(query)} | #{escape_table(query.fetch(:description))} |"
+        lines << "| #{query.fetch(:sequence)} | `#{query.fetch(:query_id)}` | #{runtime_label(query.fetch(:duration_ms, nil))} | #{transaction_label(query)} | `#{query.fetch(:callsite)}` | #{rows_label(query)} | #{escape_table(query.fetch(:description))} |"
       end
       lines << ""
       queries.each do |query|
@@ -419,6 +436,7 @@ module DurababbleMysqlHotPathReport
       lines << query.fetch(:description)
       lines << ""
       lines << "- Transaction: #{transaction_label(query)}"
+      lines << "- Runtime: `#{runtime_label(query.fetch(:duration_ms, nil))}`"
       lines << "- Callsite: `#{query.fetch(:callsite)}`"
       lines << "- Params: `#{format_params(query.fetch(:params))}`"
       lines << "- Rows: #{rows_label(query)}"
@@ -483,7 +501,17 @@ module DurababbleMysqlHotPathReport
             table { border-collapse: collapse; width: 100%; }
             th, td { border: 1px solid #d8dee4; padding: 6px 8px; text-align: left; vertical-align: top; }
             th { background: #f6f8fa; }
+            td, th { overflow-wrap: anywhere; }
             .meta { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
+            .timeline { table-layout: fixed; }
+            .timeline col.sequence { width: 4%; }
+            .timeline col.query-id { width: 17%; }
+            .timeline col.runtime { width: 8%; }
+            .timeline col.transaction { width: 12%; }
+            .timeline col.callsite { width: 27%; }
+            .timeline col.rows { width: 8%; }
+            .timeline col.purpose-col { width: 24%; }
+            .timeline code { white-space: normal; }
             .query { border-top: 1px solid #d8dee4; margin-top: 24px; padding-top: 16px; }
             .purpose { color: #57606a; }
             summary { cursor: pointer; font-weight: 600; }
@@ -499,6 +527,7 @@ module DurababbleMysqlHotPathReport
             <dt>Fixture size</dt><dd><code>#{h(@report.fetch(:fixture_size).to_s)}</code></dd>
             <dt>Result</dt><dd><code>#{h(@report.fetch(:result))}</code></dd>
             <dt>SQL statements</dt><dd><code>#{queries.length}</code></dd>
+            <dt>Total runtime</dt><dd><code>#{h(runtime_label(@report.fetch(:total_query_runtime_ms)))}</code></dd>
           </dl>
           <h2>Query Timeline</h2>
           #{timeline_table}
@@ -514,9 +543,23 @@ module DurababbleMysqlHotPathReport
 
     def timeline_table
       rows = queries.map do |query|
-        "<tr><td>#{query.fetch(:sequence)}</td><td><code>#{h(query.fetch(:query_id).to_s)}</code></td><td>#{h(transaction_label(query))}</td><td><code>#{h(query.fetch(:callsite))}</code></td><td>#{h(rows_label(query))}</td><td>#{h(query.fetch(:description))}</td></tr>"
+        "<tr><td>#{query.fetch(:sequence)}</td><td><code>#{h(query.fetch(:query_id).to_s)}</code></td><td>#{h(runtime_label(query.fetch(:duration_ms, nil)))}</td><td>#{h(transaction_label(query))}</td><td><code>#{h(query.fetch(:callsite))}</code></td><td>#{h(rows_label(query))}</td><td>#{h(query.fetch(:description))}</td></tr>"
       end.join("\n")
-      "<table><thead><tr><th>#</th><th>Query</th><th>Transaction</th><th>Callsite</th><th>Rows</th><th>Purpose</th></tr></thead><tbody>#{rows}</tbody></table>"
+      <<~HTML
+        <table class="timeline">
+          <colgroup>
+            <col class="sequence">
+            <col class="query-id">
+            <col class="runtime">
+            <col class="transaction">
+            <col class="callsite">
+            <col class="rows">
+            <col class="purpose-col">
+          </colgroup>
+          <thead><tr><th>#</th><th>Query</th><th>Runtime</th><th>Transaction</th><th>Callsite</th><th>Rows</th><th>Purpose</th></tr></thead>
+          <tbody>#{rows}</tbody>
+        </table>
+      HTML
     end
 
     def query_section(query)
@@ -526,6 +569,7 @@ module DurababbleMysqlHotPathReport
           <p class="purpose">#{h(query.fetch(:description))}</p>
           <dl class="meta">
             <dt>Transaction</dt><dd>#{h(transaction_label(query))}</dd>
+            <dt>Runtime</dt><dd><code>#{h(runtime_label(query.fetch(:duration_ms, nil)))}</code></dd>
             <dt>Callsite</dt><dd><code>#{h(query.fetch(:callsite))}</code></dd>
             <dt>Params</dt><dd><code>#{h(format_params(query.fetch(:params)))}</code></dd>
             <dt>Rows</dt><dd>#{h(rows_label(query))}</dd>
@@ -653,6 +697,12 @@ module DurababbleMysqlHotPathReport
       parts << "affected=#{query[:affected_rows]}" if query[:affected_rows]
       parts << "error=#{query[:error]}" if query[:error]
       parts.empty? ? "" : parts.join(", ")
+    end
+
+    def runtime_label(value)
+      return "" if value.nil?
+
+      "#{format("%.3f", value)}ms"
     end
 
     def escape_table(value)
