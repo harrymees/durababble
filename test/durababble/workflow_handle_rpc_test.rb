@@ -205,7 +205,7 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_handle_workflow_rpc") do |store|
         approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
         waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
-        assert_equal "waiting", waiting.status
+        assert_equal("waiting", waiting.status)
 
         caller_id = store.enqueue_workflow(name: HandleRpcWorkflowCaller.workflow_name, input: { "workflow_id" => approval_id })
         run = resume_with_worker(backend, HandleRpcWorkflowCaller, caller_id, workflows: [HandleRpcApproval])
@@ -293,16 +293,30 @@ class DurababbleWorkflowHandleRpcTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_handle_rpc_workflow_query") do |store|
         approval_id = store.enqueue_workflow(name: HandleRpcApproval.workflow_name, input: { "request" => "approval" })
         waiting = Durababble::Engine.new(store:, worker_id: "approval-worker", migrate: false).resume(HandleRpcApproval, workflow_id: approval_id)
-        assert_equal "waiting", waiting.status
+        assert_equal("waiting", waiting.status)
+
+        query_owner = "approval-query-owner"
+        store.mark_workflow_running(approval_id, worker_id: query_owner, lease_seconds: 60)
+        store.local_workflow_rpc_node_id = query_owner
+        store.local_workflow_rpc_handlers = {
+          "summary" => lambda do |payload|
+            "#{payload.fetch("args").first}:#{payload.fetch("workflow_id")}"
+          end,
+        }
 
         caller_id = store.enqueue_workflow(name: HandleRpcWorkflowQueryCaller.workflow_name, input: { "workflow_id" => approval_id })
         run = Durababble::Engine.new(store:, worker_id: "query-caller", migrate: false).resume(HandleRpcWorkflowQueryCaller, workflow_id: caller_id)
 
-        assert_equal "completed", run.status
-        assert_equal "queried:#{approval_id}", run.result
-        assert_equal ["handle_rpc:workflow:handle-rpc-approval:summary"], store.steps_for(caller_id).map { |step| step.fetch("name") }
-        assert_equal ["completed"], store.steps_for(caller_id).map { |step| step.fetch("status") }
-        assert_empty store.inbox_messages_for(target_kind: "workflow", target_type: HandleRpcApproval.workflow_name, target_id: approval_id)
+        assert_equal("completed", run.status)
+        assert_equal("queried:#{approval_id}", run.result)
+        assert_equal(["handle_rpc:workflow:handle-rpc-approval:summary"], store.steps_for(caller_id).map { |step| step.fetch("name") })
+        assert_equal(["completed"], store.steps_for(caller_id).map { |step| step.fetch("status") })
+        assert_empty(store.inbox_messages_for(target_kind: "workflow", target_type: HandleRpcApproval.workflow_name, target_id: approval_id))
+      ensure
+        if store
+          store.local_workflow_rpc_node_id = nil
+          store.local_workflow_rpc_handlers = nil
+        end
       end
     end
 
