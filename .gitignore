@@ -8,3 +8,4 @@
 /.durababble-workspace.env
 /.envrc
 /bench/results/
+/docs/static/query-perf/*.html

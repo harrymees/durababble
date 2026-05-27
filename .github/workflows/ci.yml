@@ -138,9 +138,27 @@ jobs:
   docs-build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: sidekick_server_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
 
       - name: Install Hugo
         uses: peaceiris/actions-hugo@v3
@@ -148,5 +166,8 @@ jobs:
           hugo-version: "0.152.2"
           extended: true
 
-      - name: Build docs site
-        run: hugo --minify --destination docs/build
+      - name: Generate query reports and build docs site
+        env:
+          DURABABBLE_DATABASE_URL: mysql://root@127.0.0.1:3306/sidekick_server_test
+          DURABABBLE_MYSQL_HOST: 127.0.0.1
+        run: bundle exec rake docs:build
