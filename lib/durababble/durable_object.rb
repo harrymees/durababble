@@ -3,6 +3,7 @@
 
 require_relative "durable_method_dsl"
 require_relative "worker_identity"
+require_relative "execution_context"
 require_relative "error_formatting"
 
 module Durababble
@@ -50,8 +51,10 @@ module Durababble
         )
       end
 
-      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) -> String
-      def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs)
+      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) ?{ (?) -> untyped } -> String
+      def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs, &block)
+        raise ArgumentError, "blocks cannot be passed to durable object command `#{method_name}`: command arguments are serialized across nodes and blocks cannot be" if block
+
         store = Durababble.store_for(store:, engine:)
         store = store #: as untyped
         worker_pool ||= engine_worker_pool(engine)
@@ -59,12 +62,50 @@ module Durababble
         retry_policy = @exposed_commands[method_name]
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy
 
-        attributes = object_command_attributes(object_id: String(durable_id), method_name:)
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: object_type,
+            target_id: String(durable_id),
+            method_name:,
+            rpc_kind: "object_tell",
+            args:,
+            kwargs: kwargs.merge(idempotency_key:),
+            retry_policy:,
+          ) do |idempotency_key:, args:, kwargs:|
+            enqueue_tell(
+              store:,
+              worker_pool:,
+              object_id: String(durable_id),
+              method_name:,
+              args:,
+              kwargs:,
+              idempotency_key:,
+              retry_policy:,
+            )
+          end
+        end
+
+        enqueue_tell(
+          store:,
+          worker_pool:,
+          object_id: String(durable_id),
+          method_name:,
+          args:,
+          kwargs:,
+          idempotency_key:,
+          retry_policy:,
+        )
+      end
+
+      #: (store: Store, worker_pool: String, object_id: String, method_name: Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], idempotency_key: String?, retry_policy: RetryPolicy) -> String
+      def enqueue_tell(store:, worker_pool:, object_id:, method_name:, args:, kwargs:, idempotency_key:, retry_policy:)
+        attributes = object_command_attributes(object_id:, method_name:)
         Observability.trace("durababble.object.command.enqueue", attributes) do
           message_id = store.enqueue_object_command(
             worker_pool:,
             object_type: object_type,
-            object_id: String(durable_id),
+            object_id:,
             method_name: method_name.to_s,
             args:,
             kwargs:,
@@ -72,7 +113,7 @@ module Durababble
             idempotency_key:,
             max_attempts: retry_policy.maximum_attempts_limit,
           )
-          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: String(durable_id))
+          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
           message_id
         end
       end
@@ -248,9 +289,40 @@ module Durababble
     #: (Symbol, *Object?, **Object?) ?{ (Object?) -> Object? } -> Object?
     def method_missing(method_name, *args, **kwargs, &block)
       if @object_class.exposed_queries.key?(method_name)
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: @object_class.object_type,
+            target_id: @durable_id,
+            method_name:,
+            rpc_kind: "object_query",
+            args:,
+            kwargs:,
+          ) do |args:, kwargs:, **|
+            invoke_query(method_name, args:, kwargs:, block:)
+          end
+        end
+
         invoke_query(method_name, args:, kwargs:, block:)
       elsif (retry_policy = @object_class.exposed_commands[method_name])
-        invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
+        raise ArgumentError, "blocks cannot be passed to durable object command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
+
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "object",
+            target_type: @object_class.object_type,
+            target_id: @durable_id,
+            method_name:,
+            rpc_kind: "object_command",
+            args:,
+            kwargs:,
+            retry_policy:,
+          ) do |idempotency_key:, args:, kwargs:|
+            invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key:)
+          end
+        end
+
+        invoke_command(method_name, retry_policy:, args:, kwargs:)
       else
         super
       end
@@ -270,14 +342,13 @@ module Durababble
         attempts = 0
         begin
           if (lease = current_object_lease)
-            owner_worker_pool = object_lease_worker_pool(lease)
-            return invoke_owned_query(method_name, args:, kwargs:, block:, worker_pool: owner_worker_pool) if current_runtime_owns?(lease)
+            return invoke_owned_query(method_name, args:, kwargs:, block:, lease:) if current_runtime_owns?(lease)
 
             return invoke_remote_query(method_name, args:, kwargs:, lease:)
           end
 
           DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
-          invoke_local_query(method_name, args:, kwargs:, block:, worker_pool: @worker_pool)
+          invoke_local_query(method_name, args:, kwargs:, block:)
         rescue WorkflowRpc::NoActiveLease, WorkflowRpc::StaleLease
           attempts += 1
           retry if attempts < TRANSIENT_ROUTE_ATTEMPTS
@@ -291,12 +362,7 @@ module Durababble
     def current_object_lease
       return unless @store.respond_to?(:current_object_lease)
 
-      @store.current_object_lease(@object_class.object_type, @durable_id, worker_pool: @worker_pool)
-    end
-
-    #: (Hash[String, Object?]) -> String
-    def object_lease_worker_pool(lease)
-      String(lease.fetch("worker_pool", @worker_pool))
+      @store.current_object_lease(@object_class.object_type, @durable_id)
     end
 
     #: (Hash[String, Object?]) -> bool
@@ -306,8 +372,9 @@ module Durababble
       !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
     end
 
-    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, worker_pool: String) -> Object?
-    def invoke_owned_query(method_name, args:, kwargs:, block:, worker_pool:)
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, lease: Hash[String, Object?]) -> Object?
+    def invoke_owned_query(method_name, args:, kwargs:, block:, lease:)
+      worker_pool = lease_worker_pool(lease)
       handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
       if handler
         return handler.call(
@@ -317,13 +384,13 @@ module Durababble
       end
 
       DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
-      invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+      invoke_local_query(method_name, args:, kwargs:, block:)
     end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
     def invoke_remote_query(method_name, args:, kwargs:, lease:)
       worker_id = lease.fetch("worker_id")
-      worker_pool = object_lease_worker_pool(lease)
+      worker_pool = lease_worker_pool(lease)
       client = @store.rpc_client_factory.call(WorkerIdentity.address_for(worker_id.to_s))
       client.call_transient(
         worker_pool:,
@@ -336,28 +403,34 @@ module Durababble
       raise WorkflowRpc::NodeUnavailable, e.message
     end
 
-    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, worker_pool: String) -> Object?
-    def invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def invoke_local_query(method_name, args:, kwargs:, block:)
       state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
-      object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool:) #: as untyped
+      object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
       object.instance_variable_set(:@__durababble_query_context, true)
       kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
     end
 
-    #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
-    def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
+    #: (Hash[String, Object?]) -> String
+    def lease_worker_pool(lease)
+      lease.fetch("worker_pool", @worker_pool).to_s
+    end
+
+    #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: Object?) -> Object?
+    def invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key: nil)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
-        idempotency_key = kwargs.key?(:idempotency_key) ? kwargs.delete(:idempotency_key) : @idempotency_key
+        command_kwargs = kwargs.dup
+        command_idempotency_key = idempotency_key || (command_kwargs.key?(:idempotency_key) ? command_kwargs.delete(:idempotency_key) : @idempotency_key)
         command_id = @store.enqueue_object_command(
           worker_pool: @worker_pool,
           object_type: @object_class.object_type,
           object_id: @durable_id,
           method_name: method_name.to_s,
           args:,
-          kwargs:,
+          kwargs: command_kwargs,
           message_kind: "ask",
-          idempotency_key:,
+          idempotency_key: command_idempotency_key,
           max_attempts: retry_policy.maximum_attempts_limit,
         )
         @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)
@@ -444,7 +517,7 @@ module Durababble
 
     #: (worker_pool: untyped, object_type: untyped, object_id: untyped) -> void
     def assert_current_lease!(worker_pool:, object_type:, object_id:)
-      lease = @store.current_object_lease(object_type, object_id, worker_pool:)
+      lease = @store.current_object_lease(object_type, object_id)
       raise WorkflowRpc::NoActiveLease, "durable object #{object_type}/#{object_id} has no active owner" unless lease
 
       expected = node_id

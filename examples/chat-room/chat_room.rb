@@ -3,8 +3,14 @@
 
 require "json"
 require "time"
+require "active_support/isolated_execution_state"
 
 require_relative "../../lib/durababble"
+
+# Durababble requires :fiber isolation so each reactor fiber checks out its own
+# ActiveRecord connection. In a Rails+Falcon host the Falcon Railtie sets this
+# defensively; standalone scripts like this one set it explicitly.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
 module ChatRoomExample
   SYSTEM_USER = {

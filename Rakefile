@@ -2,15 +2,29 @@
 
 require "bundler/gem_tasks"
 require "rake/testtask"
+require "shellwords"
+
+MARKDOWN_PRETTIER_PATHS = [
+  "AGENTS.md",
+  "README.md",
+  "bench/**/*.md",
+  "docs/**/*.md",
+  "examples/**/*.md",
+].freeze
+
+def markdown_prettier_command(flag)
+  paths = MARKDOWN_PRETTIER_PATHS.map { |path| Shellwords.escape(path) }.join(" ")
+  "node_modules/.bin/prettier #{flag} #{paths}"
+end
 
 desc "Format Markdown files with Prettier"
 task "format:markdown" do
-  sh("pnpm run format:markdown")
+  sh(markdown_prettier_command("--write"))
 end
 
 desc "Check Markdown files with Prettier"
 task "check:markdown" do
-  sh("pnpm run check:markdown")
+  sh(markdown_prettier_command("--check"))
 end
 
 task :rubocop do

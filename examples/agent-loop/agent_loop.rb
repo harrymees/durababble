@@ -2,9 +2,15 @@
 # frozen_string_literal: true
 
 require "json"
+require "active_support/isolated_execution_state"
 
 require_relative "../../lib/durababble"
 require_relative "anthropic_client"
+
+# Durababble requires :fiber isolation so each reactor fiber checks out its own
+# ActiveRecord connection. In a Rails+Falcon host the Falcon Railtie sets this
+# defensively; standalone scripts like this one set it explicitly.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
 module AgentLoopExample
   # These are the tools the model can call. Each tool is implemented below by
@@ -91,32 +97,20 @@ module AgentLoopExample
   class << self
     attr_writer :llm_client
 
-    def configure(database_url: nil, schema: nil, llm_client: nil, workflow_worker_pool: "default", object_worker_pool: "default")
+    def configure(database_url: nil, schema: nil, llm_client: nil)
       @database_url = database_url
       @schema = schema
       @llm_client = llm_client if llm_client
-      @workflow_worker_pool = workflow_worker_pool
-      @object_worker_pool = object_worker_pool
     end
 
     def reset_configuration!
       @database_url = nil
       @schema = nil
       @llm_client = nil
-      @workflow_worker_pool = nil
-      @object_worker_pool = nil
     end
 
     def llm_client
       @llm_client ||= AnthropicClient.new
-    end
-
-    def workflow_worker_pool
-      @workflow_worker_pool || "default"
-    end
-
-    def object_worker_pool
-      @object_worker_pool || "default"
     end
 
     def tool_definitions
@@ -284,7 +278,7 @@ module AgentLoopExample
 
     step def record_session_started(session_id, request, max_turns)
       event = AgentLoopExample.with_store do |store|
-        VirtualFileSystem.at(session_id, store:, worker_pool: AgentLoopExample.object_worker_pool).log(
+        VirtualFileSystem.at(session_id, store:).log(
           "Agent request received",
           { "request" => request, "max_turns" => max_turns },
           idempotency_key: step_context.idempotency_key,
@@ -295,7 +289,7 @@ module AgentLoopExample
 
     step def call_model(session_id, messages, turn)
       AgentLoopExample.with_store do |store|
-        filesystem = VirtualFileSystem.at(session_id, store:, worker_pool: AgentLoopExample.object_worker_pool)
+        filesystem = VirtualFileSystem.at(session_id, store:)
         client = AgentLoopExample.llm_client
         model_name = client.respond_to?(:model_name) ? client.model_name : client.class.name
         filesystem.log(
@@ -343,7 +337,7 @@ module AgentLoopExample
       idempotency_key = "#{step_context.idempotency_key}:#{tool_use_id}:#{index}"
 
       AgentLoopExample.with_store do |store|
-        filesystem = VirtualFileSystem.at(session_id, store:, worker_pool: AgentLoopExample.object_worker_pool)
+        filesystem = VirtualFileSystem.at(session_id, store:)
         result = dispatch_tool(filesystem, name, input, idempotency_key)
         result.merge(
           "ok" => true,
@@ -365,7 +359,7 @@ module AgentLoopExample
 
     step def finish_session(session_id, transcript, stop_reason)
       snapshot = AgentLoopExample.with_store do |store|
-        filesystem = VirtualFileSystem.at(session_id, store:, worker_pool: AgentLoopExample.object_worker_pool)
+        filesystem = VirtualFileSystem.at(session_id, store:)
         filesystem.log(
           "Agent turn finished",
           { "stop_reason" => stop_reason },

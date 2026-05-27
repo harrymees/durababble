@@ -127,6 +127,24 @@ handle.cancel(reason: "customer requested cancellation")
 handle.terminate(reason: "operator hard stop")
 ```
 
+## Calling Handles From Workflow Code
+
+Workflow orchestration code can use the same workflow and durable-object handles that external callers use. You do not need to wrap every handle call in an explicit `step`; Durababble records the handle RPC itself as workflow history before dispatching it.
+
+```ruby
+class CollectApproval < Durababble::Workflow
+  def execute(input)
+    approval = ApprovalWorkflow.handle(input.fetch("approval_workflow_id"))
+    counter = ApprovalCounter.at(input.fetch("counter_id"))
+
+    counter.increment(1)
+    approval.approve(reason: "workflow")
+  end
+end
+```
+
+The calls above are persisted as ordered workflow command history entries with names such as `handle_rpc:object:approval_counter:increment` and `handle_rpc:workflow:approval_workflow:approve`. On replay or crash recovery, completed handle RPC results are returned from history and Durababble does not enqueue the outbound workflow/object command a second time. `DurableObject.tell(id, method, ...)` works the same way from workflow code and replays to the original tell message id.
+
 ### Deduplicating Workflow Starts
 
 Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.

@@ -20,7 +20,6 @@ module ChatRoomExample
       @port = port
       @database_url = database_url
       @schema = schema
-      @close_mutex = Mutex.new
       @closed = false
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
@@ -69,11 +68,9 @@ module ChatRoomExample
     end
 
     def close
-      @close_mutex.synchronize do
-        return if @closed
+      return if @closed
 
-        @closed = true
-      end
+      @closed = true
       @tcp_server&.close unless @tcp_server&.closed?
       @timer_stop = true
       @timer_thread&.join(1)

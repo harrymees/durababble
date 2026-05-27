@@ -11,6 +11,7 @@ require_relative "agent_loop"
 module AgentLoopExample
   class Server
     TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
+
     def initialize(host:, port:, database_url:, schema:)
       @host = host
       @port = port
@@ -126,7 +127,6 @@ module AgentLoopExample
       request = payload.fetch("request", "")
       workflow_id = @store.enqueue_workflow(
         name: AgentLoopWorkflow.workflow_name,
-        worker_pool: AgentLoopExample.workflow_worker_pool,
         input: {
           "session_id" => session_id,
           "request" => request,
@@ -156,7 +156,7 @@ module AgentLoopExample
       row = @store.workflow(workflow_id)
       input = row.fetch("input")
       session_id = input.fetch("session_id")
-      snapshot = VirtualFileSystem.at(session_id, store: @store, worker_pool: AgentLoopExample.object_worker_pool).snapshot
+      snapshot = VirtualFileSystem.at(session_id, store: @store).snapshot
       json(
         200,
         "workflow_id" => workflow_id,

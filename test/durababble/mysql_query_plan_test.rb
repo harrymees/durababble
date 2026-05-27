@@ -67,15 +67,10 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           params: ["object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
-        "current object activation lease probe" => {
-          sql: query_sql(:current_object_activation_lease),
-          params: ["counter", "object-1"],
-          expected_key_fragment: "PRIMARY",
-        },
-        "current object inbox lease probe" => {
+        "current object lease probe" => {
           sql: query_sql(:current_object_lease),
-          params: ["counter", "object-1"],
-          expected_key_fragment: "inbox_target",
+          params: ["counter", "object-1", "counter", "object-1"],
+          expected_key_fragment: ["PRIMARY", "inbox_target"],
         },
         "inbox idempotency probe" => {
           sql: query_sql(:existing_inbox_message_for_idempotency),
@@ -170,17 +165,19 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       access_paths.all? { |path| path.fetch("access_type") != "ALL" },
       "expected #{name} to avoid full table scans: #{JSON.pretty_generate(plan)}",
     )
-    assert(
-      access_paths.any? { |path| path.fetch("key", "").include?(expected_key_fragment) },
-      "expected #{name} to use index containing #{expected_key_fragment.inspect}, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
-    )
+    Array(expected_key_fragment).each do |fragment|
+      assert(
+        access_paths.any? { |path| path.fetch("key", "").include?(fragment) },
+        "expected #{name} to use index containing #{fragment.inspect}, got #{access_paths.inspect}: #{JSON.pretty_generate(plan)}",
+      )
+    end
   end
 
   def mysql_access_paths(node)
     case node
     when Hash
       current = []
-      current << node.slice("table_name", "access_type", "key", "rows") if node.key?("access_type")
+      current << node.slice("table_name", "access_type", "key", "rows") if node.key?("access_type") && !node.key?("materialized_from_subquery")
       current + node.values.flat_map { |value| mysql_access_paths(value) }
     when Array
       node.flat_map { |value| mysql_access_paths(value) }

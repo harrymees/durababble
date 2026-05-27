@@ -165,7 +165,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       @local_transient_handler = nil
     end
 
-    def current_object_lease(_object_type, _object_id, worker_pool: "default") = @lease
+    def current_object_lease(_object_type, _object_id) = @lease
 
     def rpc_client_factory = ->(_worker_id) { @client }
 
@@ -184,7 +184,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       @clients = clients
     end
 
-    def current_object_lease(_object_type, _object_id, worker_pool: "default")
+    def current_object_lease(_object_type, _object_id)
       @leases.length > 1 ? @leases.shift : @leases.first
     end
 
@@ -198,10 +198,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       @lease_checks = 0
     end
 
-    def current_object_lease(object_type, object_id, worker_pool: "default")
+    def current_object_lease(object_type, object_id)
       @lease_checks += 1
       @store.release_worker_leases!(worker_id: @worker_id) if @lease_checks == 2
-      @store.current_object_lease(object_type, object_id, worker_pool:)
+      @store.current_object_lease(object_type, object_id)
     end
 
     def method_missing(method_name, *args, **kwargs, &block)
@@ -848,7 +848,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   test "routes exposed object queries through the active owner instead of reading caller state" do
     client = QueryRoutingClient.new(result: "owner-value")
     store = QueryRoutingStore.new(
-      lease: { "worker_id" => "owner-node", "locked_until" => Time.now + 30 },
+      lease: { "worker_id" => "owner-node", "worker_pool" => "owner-pool", "locked_until" => Time.now + 30 },
       state: { "value" => "caller-stale" },
       client:,
     )
@@ -858,7 +858,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal(
       [
         {
-          worker_pool: "priority",
+          worker_pool: "owner-pool",
           class_name: QueryRoutingObject.object_type,
           durable_object_id: "object-1",
           method: "value",

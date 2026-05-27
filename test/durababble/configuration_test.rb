@@ -54,4 +54,43 @@ class DurababbleConfigurationTest < DurababbleTestCase
     error = assert_raises(Durababble::Error) { Durababble.wait_condition { true } }
     assert_match(/must run inside workflow orchestration/, error.message)
   end
+
+  test "assert_fiber_isolation! passes when isolation_level is :fiber" do
+    with_isolation_level(:fiber) do
+      assert_nil Durababble.assert_fiber_isolation!
+    end
+  end
+
+  test "assert_fiber_isolation! raises when isolation_level is :thread" do
+    with_isolation_level(:thread) do
+      error = assert_raises(Durababble::ConfigurationError) { Durababble.assert_fiber_isolation! }
+      assert_match(/isolation_level = :fiber/, error.message)
+      assert_match(/current: :thread/, error.message)
+    end
+  end
+
+  test "Engine#execute refuses to boot under :thread isolation" do
+    with_durababble_store(durababble_store_backends.first, "isolation_check") do |store|
+      workflow_class = Class.new(Durababble::Workflow) do
+        workflow_name "isolation-check-workflow"
+        def execute(_input)
+          :unreachable
+        end
+      end
+      engine = Durababble::Engine.new(store:, worker_id: "isolation-check-worker")
+      with_isolation_level(:thread) do
+        assert_raises(Durababble::ConfigurationError) { engine.run(workflow_class, input: nil) }
+      end
+    end
+  end
+
+  private
+
+  def with_isolation_level(level)
+    previous = ActiveSupport::IsolatedExecutionState.isolation_level
+    ActiveSupport::IsolatedExecutionState.isolation_level = level
+    yield
+  ensure
+    ActiveSupport::IsolatedExecutionState.isolation_level = previous
+  end
 end

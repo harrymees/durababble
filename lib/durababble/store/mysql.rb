@@ -221,10 +221,9 @@ module Durababble
       execute_store_query(:current_workflow_lease, params, worker_pool_sql:).first
     end
 
-    #: (Object?, Object?, ?worker_pool: String) -> Object?
-    def current_object_lease(object_type, object_id, worker_pool: "default")
-      execute_store_query(:current_object_activation_lease, [object_type, object_id]).first ||
-        execute_store_query(:current_object_lease, [object_type, object_id]).first
+    #: (Object?, Object?) -> Object?
+    def current_object_lease(object_type, object_id)
+      execute_store_query(:current_object_lease, [object_type, object_id, object_type, object_id]).first
     end
 
     #: (?now: Time) -> Integer
