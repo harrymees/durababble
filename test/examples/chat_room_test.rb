@@ -96,6 +96,11 @@ class ChatRoomExampleTest < DurababbleTestCase
           room.post_message("ghost", "i should not be here")
         end
         assert_match(/ghost/, error.message)
+        stop = true
+        worker_thread&.join(1)
+        worker_thread&.kill if worker_thread&.alive?
+        worker_store.release_worker_leases!(worker_id: "chat-room-object-test")
+
         assert_raises_matching(Durababble::ObjectReadBlocked, /dead_lettered mailbox head/) do
           room.snapshot
         end

@@ -81,11 +81,10 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "current object lease probe" => {
           sql: query_sql(:current_object_lease),
-          params: ["counter", "object-1", "counter", "object-1"],
-          expected_key_fragment: ["PRIMARY", "inbox_target"],
-          expected_access_types: ["const", "ref"],
-          allow_filesort: true,
-          allow_temporary_table: true,
+          params: ["counter", "object-1"],
+          expected_key_fragment: "PRIMARY",
+          expected_access_types: ["const"],
+          max_rows_examined_per_scan: 1,
         },
         "inbox idempotency probe" => {
           sql: query_sql(:existing_inbox_message_for_idempotency),
@@ -363,8 +362,10 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, idempotency_hash, shape_hash, payload, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('inbox-object-1-#{i}', 'object', 'counter', 'object-1', #{i}, 'ask', 'increment', 'op-object-1-#{i}', #{mysql_literal(idempotency_key)}, #{mysql_literal(idempotency_hash)}, 'shape', #{inbox_payload}, #{mysql_literal(i == 1 ? "running" : "pending")}, #{created_at}, #{mysql_literal(i == 1 ? "owner" : nil)}, #{mysql_literal(i == 1 ? now + 300 : nil)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("inbox")} (id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, payload, status, ready_at, created_at, updated_at) VALUES ('inbox-other-#{i}', 'object', 'counter', 'other-#{i}', 1, 'ask', 'increment', 'op-other-#{i}', NULL, 'shape', #{inbox_payload}, 'pending', #{created_at}, #{created_at}, #{created_at})")
     end
-    execute("INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at, locked_by, locked_until, created_at, updated_at) VALUES ('object', 'counter', 'object-1', 'running', #{mysql_literal(now - 3600)}, 'owner', #{mysql_literal(now + 300)}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
-    execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
+    # Seed a live object lease so the `current_object_lease` probe finds a matching row;
+    # without `locked_by`/`locked_until` populated, the planner short-circuits to
+    # "Impossible WHERE" and the EXPLAIN tree has no access-path nodes to inspect.
+    execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, locked_by, locked_until, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, 'owner', #{mysql_literal(now + 300)}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
     execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")
   rescue StandardError

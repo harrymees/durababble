@@ -375,6 +375,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       ready_at: Time.now,
     )
     store.claim_target_activation(worker_id: "node-a", lease_seconds: 30, target_kinds: ["object"], target_types: [RpcReadGateObject.object_type])
+    store.claim_object_lease(worker_pool: "default", object_type: RpcReadGateObject.object_type, object_id: "acct-1", worker_id: "node-a", lease_seconds: 30)
     server = start_rpc_server(
       node_id: "node-a",
       store:,
@@ -645,6 +646,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
     store.rearm_target_activation(target_kind: "object", target_type: "counter", target_id: "counter-1", ready_at: Time.now)
     store.claim_target_activation(worker_id: "node-b", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"])
+    store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "counter-1", worker_id: "node-b", lease_seconds: 30)
     object_moved_service = Durababble::Rpc::Service.new(
       node_id: "node-a",
       store:,

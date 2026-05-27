@@ -622,6 +622,15 @@ module Durababble
         end
       end
       drained
+    ensure
+      # The gated claim inside `claim_inbox_messages` acquires the unified object
+      # lease as part of taking command rows; releasing it when drain returns hands
+      # ownership back so another worker can claim. Skipping this release would
+      # strand the lease for `lease_seconds` after the worker idles, blocking any
+      # other node from picking up the next command. Every Store implementation
+      # is expected to provide `release_object_lease`; the base no-op falls
+      # through cleanly when no lease was actually taken.
+      @store.release_object_lease(object_type:, object_id:, worker_id: @worker_id)
     end
 
     private

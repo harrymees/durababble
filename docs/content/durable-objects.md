@@ -52,19 +52,15 @@ account = Account.at("acct_readme")
 ```ruby
 worker_database_url = respond_to?(:backend_descriptor) ? backend_descriptor.database_url : Durababble.default_database_url
 worker_store = Durababble::Store.connect(database_url: worker_database_url, schema: store.schema)
-worker = Durababble::Worker.new(
+runtime = Durababble::WorkerRuntime.start(
   store: worker_store,
+  worker_pool: "default",
   workflows: [],
   objects: [Account],
   worker_id: "account-worker-1",
   migrate: false,
 )
-worker_thread = Thread.new do
-  loop do
-    worker.run_until_idle
-    sleep 0.01
-  end
-end
+begin
 ```
 -->
 
@@ -77,9 +73,11 @@ account.balance
 <!-- DOCS:durable-object-example:hidden
 ```ruby
 object_result = account.balance
-worker_thread.kill
-worker_thread.join
-worker_store.close
+ensure
+  runtime&.shutdown
+  worker_store&.release_worker_leases!(worker_id: runtime.worker_id) if runtime
+  worker_store&.close
+end
 object_result
 ```
 -->

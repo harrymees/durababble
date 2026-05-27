@@ -46,7 +46,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_equal 1, heartbeat.affected_rows.to_i
 
         prepare_release_worker_leases_fixture
-        released = assert_sql_query_budget("release_worker_leases", mysql: 8, postgres: 4) do
+        released = assert_sql_query_budget("release_worker_leases", mysql: 9, postgres: 5) do
           store.release_worker_leases!(worker_id: "release-worker")
         end
         assert_equal 1, released.fetch("workflows")
@@ -132,7 +132,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes direct_claim, "id" => direct_claim_command_id, "status" => "running"
 
         inbox_claim_command_id = enqueue_object_command("inbox-claim-object")
-        inbox_messages = assert_sql_query_budget("claim_inbox_messages", mysql: 2, postgres: 2) do
+        inbox_messages = assert_sql_query_budget("claim_inbox_messages", mysql: 4, postgres: 3) do
           store.claim_inbox_messages(
             target_kind: "object",
             target_type: "counter",

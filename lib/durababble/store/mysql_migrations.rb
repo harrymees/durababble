@@ -143,7 +143,9 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          PRIMARY KEY (object_type, object_id)
+          PRIMARY KEY (object_type, object_id),
+          INDEX #{quote_column_name(index_name("durable_objects", "worker_lease"))} (locked_by),
+          INDEX #{quote_column_name(index_name("durable_objects", "expired_lease"))} (locked_until)
         )
       SQL
       execute(<<~SQL)
