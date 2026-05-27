@@ -163,24 +163,6 @@ module Durababble
         )
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id VARCHAR(191) PRIMARY KEY,
-          object_type VARCHAR(191) NOT NULL,
-          object_id VARCHAR(191) NOT NULL,
-          method_name VARCHAR(191) NOT NULL,
-          args LONGBLOB NOT NULL,
-          kwargs LONGBLOB NOT NULL,
-          status VARCHAR(32) NOT NULL,
-          result LONGBLOB,
-          error TEXT,
-          locked_by VARCHAR(191),
-          locked_until DATETIME(6),
-          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          completed_at DATETIME(6),
-          INDEX #{quote_column_name(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
-        )
-      SQL
       @migrated = true
       self
     end
