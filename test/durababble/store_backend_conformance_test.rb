@@ -375,6 +375,33 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not complete object commands for a different object with #{backend.name}" do
+      with_durababble_store(backend, "object_command_target_identity") do |store|
+        command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "object-a",
+          method_name: "write",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30),
+          "locked_by" => "object-worker",
+        )
+
+        assert_nil store.complete_object_command(
+          command_id:,
+          result: { "ok" => true },
+          object_type: "counter",
+          object_id: "object-b",
+          state: { "value" => "wrong-object" },
+          worker_id: "object-worker",
+        )
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "object-worker"
+        assert_nil store.object_state(object_type: "counter", object_id: "object-b")
+      end
+    end
+
     test "does not claim an earlier object command when asked for a later one with #{backend.name}" do
       with_durababble_store(backend, "object_command_fifo_claim") do |store|
         first = store.enqueue_object_command(
@@ -480,6 +507,58 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not complete workflow commands for a different workflow with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_target_identity") do |store|
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-a")
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-b")
+        first = store.enqueue_workflow_command(
+          workflow_id: "wf-a",
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method_name" => "approve", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-a-1",
+        )
+        second = store.enqueue_workflow_command(
+          workflow_id: "wf-a",
+          workflow_name: "approval",
+          method_name: "reject",
+          payload: { "method_name" => "reject", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-a-2",
+        )
+
+        store.claim_target_activation(worker_id: "command-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-a", worker_id: "command-worker", lease_seconds: 30, limit: 2)
+        assert_equal [first, second], claimed.map { |message| message.fetch("id") }
+
+        assert_nil store.complete_workflow_command(message_id: first, workflow_id: "wf-b", result: { "ok" => true }, worker_id: "command-worker")
+        assert_hash_includes store.inbox_message(first), "status" => "running", "locked_by" => "command-worker"
+        assert_nil store.fail_workflow_command(message_id: second, workflow_id: "wf-b", error: "wrong target", worker_id: "command-worker")
+        assert_hash_includes store.inbox_message(second), "status" => "running", "locked_by" => "command-worker"
+        assert_empty store.workflow_history_for("wf-a")
+        assert_empty store.workflow_history_for("wf-b")
+      end
+    end
+
+    test "does not enqueue workflow commands for a different workflow name with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_target_name") do |store|
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+
+        error = assert_raises(Durababble::Error) do
+          store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "other-approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+            idempotency_key: "wrong-name",
+          )
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} is approval, not other-approval/, error.message)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "other-approval", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "other-approval", target_id: workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id)
+      end
+    end
+
     test "scopes workflow claims and command activations by persisted worker pool with #{backend.name}" do
       with_durababble_store(backend, "workflow_pool_routing") do |store|
         pool_a_workflow = store.enqueue_workflow(name: "shared-workflow", input: { "pool" => "a" }, worker_pool: "pool-a")
@@ -561,6 +640,164 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
         activation = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
         assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same"
+      end
+    end
+
+    test "does not claim inbox messages across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "inbox_worker_pool_isolation") do |store|
+        payload = { "method_name" => "write", "args" => [], "kwargs" => {} }
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload:,
+          idempotency_key: "pool-a-message",
+        )
+
+        wrong_pool = store.claim_inbox_messages(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id: "pool-b-worker",
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_empty wrong_pool
+        assert_hash_includes store.inbox_message(message_id), "status" => "pending", "locked_by" => nil
+
+        right_pool = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id: "pool-a-worker",
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_equal [message_id], right_pool.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "filters inbox message inspection by worker pool with #{backend.name}" do
+      with_durababble_store(backend, "inbox_messages_for_worker_pool_isolation") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+
+        wrong_pool = store.inbox_messages_for(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+        right_pool = store.inbox_messages_for(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+        all_pools = store.inbox_messages_for(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+
+        assert_empty wrong_pool
+        assert_equal [message_id], right_pool.map { |message| message.fetch("id") }
+        assert_equal [message_id], all_pools.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "keeps object inbox messages on the first materialized worker pool with #{backend.name}" do
+      with_durababble_store(backend, "object_inbox_first_pool") do |store|
+        first_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["a"], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+        second_id = store.enqueue_inbox_message(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["b"], "kwargs" => {} },
+          idempotency_key: "pool-b-message",
+        )
+
+        messages = store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "same")
+        assert_equal ["pool-a", "pool-a"], messages.map { |message| message.fetch("worker_pool") }
+        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
+
+        activation = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same"
+        claimed = store.claim_inbox_messages(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "pool-a-worker", lease_seconds: 30, limit: 10)
+        assert_equal [first_id, second_id], claimed.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "does not complete target activations across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_completion_pool") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+
+        activation = store.claim_target_activation(worker_id: "shared-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same", "locked_by" => "shared-worker"
+        assert_nil store.target_activation(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same")
+
+        assert_nil store.complete_target_activation(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "shared-worker")
+        assert_hash_includes store.target_activation(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same"), "status" => "running", "locked_by" => "shared-worker"
+
+        claimed = store.claim_inbox_messages(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same", worker_id: "shared-worker", lease_seconds: 30, limit: 1)
+        assert_equal [message_id], claimed.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "does not rearm target activations across worker pools with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_rearm_pool") do |store|
+        store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+
+        activation = store.claim_target_activation(worker_id: "shared-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => "same", "status" => "running", "locked_by" => "shared-worker"
+
+        store.rearm_target_activation(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same", ready_at: Time.now)
+
+        assert_hash_includes store.target_activation(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same"), "status" => "running", "locked_by" => "shared-worker"
+        assert_nil store.claim_target_activation(worker_id: "other-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
       end
     end
 
@@ -715,6 +952,57 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           client_factory: lambda do |_address|
             raise "should not build a client without a live lease"
           end,
+        )
+      end
+    end
+
+    test "advisory-delivers object messages through the active lease worker pool with #{backend.name}" do
+      with_durababble_store(backend, "object_advisory_delivery_worker_pool") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+        worker_id = "pool-a-worker@127.0.0.1:34567"
+        claimed = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          worker_id:,
+          lease_seconds: 30,
+          limit: 1,
+        )
+        assert_equal [message_id], claimed.map { |message| message.fetch("id") }
+
+        wrong_client = AdvisoryDeliveryClient.new
+        delivered = store.deliver_target_message(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          client_factory: lambda do |address|
+            assert_equal("127.0.0.1:34567", address)
+            wrong_client
+          end,
+        )
+        assert_equal true, delivered
+        assert_equal(
+          [
+            {
+              worker_pool: "pool-a",
+              target_kind: "object",
+              target_class: "counter",
+              target_id: "same",
+              expected_worker_id: worker_id,
+            },
+          ],
+          wrong_client.deliveries,
         )
       end
     end

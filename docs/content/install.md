@@ -17,7 +17,7 @@ Durababble runs on top of ActiveRecord and uses adapter-specific SQL for leases,
 
 - **MySQL** and **MariaDB** via the `trilogy` adapter. This is the default local backend and the most heavily tested path.
 - **PostgreSQL** via the `postgresql` adapter.
-- **YugabyteDB** through the PostgreSQL-compatible `yugabyte` adapter. Tested through the optional YSQL path; CI exercises it when `DURABABBLE_YUGABYTE_DATABASE_URL` is set.
+- **YugabyteDB** through the PostgreSQL-compatible `yugabyte` adapter. Tested through the optional YSQL path when `DURABABBLE_YUGABYTE_DATABASE_URL` is set; standard PostgreSQL is the required PostgreSQL-family CI backend.
 
 Other ActiveRecord adapters are rejected at connect time with an explicit error. SQLite is not supported because the store relies on row-level locking and `SELECT … FOR UPDATE SKIP LOCKED` semantics that SQLite cannot provide.
 

@@ -113,7 +113,7 @@ module Durababble
             idempotency_key:,
             max_attempts: retry_policy.maximum_attempts_limit,
           )
-          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
+          store.deliver_target_message(worker_pool: inbox_worker_pool(store, message_id, fallback: worker_pool), target_kind: "object", target_type: object_type, target_id: object_id)
           message_id
         end
       end
@@ -146,6 +146,12 @@ module Durababble
         return "default" unless engine
 
         String(engine.worker_pool)
+      end
+
+      #: (Store, String, fallback: String) -> String
+      def inbox_worker_pool(store, message_id, fallback:)
+        message = store.inbox_message(message_id) if store.respond_to?(:inbox_message)
+        message&.fetch("worker_pool", fallback) || fallback
       end
 
       #: (object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
@@ -433,9 +439,20 @@ module Durababble
           idempotency_key: command_idempotency_key,
           max_attempts: retry_policy.maximum_attempts_limit,
         )
-        @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)
+        @store.deliver_target_message(
+          target_kind: "object",
+          target_type: @object_class.object_type,
+          target_id: @durable_id,
+          worker_pool: inbox_worker_pool(command_id),
+        )
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
+    end
+
+    #: (String) -> String
+    def inbox_worker_pool(message_id)
+      message = @store.inbox_message(message_id) if @store.respond_to?(:inbox_message)
+      message&.fetch("worker_pool", @worker_pool) || @worker_pool
     end
 
     #: (RetryPolicy) -> Numeric?

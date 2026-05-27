@@ -34,6 +34,19 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     end
   end
 
+  class RecordingLeaseStarter
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+    end
+
+    def call(workflow_id:)
+      @calls << workflow_id
+      raise Durababble::WorkflowRpc::NoActiveLease, "unexpected start"
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_workflow_rpc_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -62,6 +75,27 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
 
     assert_equal({ "seen" => 1 }, router.request(workflow_id:, command: "status", payload: { "value" => 1 }))
     assert_equal 1, client.requests.length
+  end
+
+  test "passes the active lease worker pool to route client factories" do
+    store = self.store
+    pooled_workflow_id = store.enqueue_workflow(name: "workflow-rpc-test", input: {}, worker_pool: "priority")
+    store.claim_workflow(workflow_id: pooled_workflow_id, worker_id: "worker-a", lease_seconds: 60, worker_pool: "priority")
+    handler = Durababble::WorkflowRpc::Handler.new(store:, node_id: "worker-a", handlers: {
+      "status" => ->(_payload) { { "ok" => true } },
+    })
+    client = InProcessWorkflowRpcClient.new(handler)
+    routed = []
+    router = Durababble::WorkflowRpc::Router.new(
+      store:,
+      rpc_client_factory: lambda do |worker_id, worker_pool:|
+        routed << [worker_id, worker_pool]
+        client
+      end,
+    )
+
+    assert_equal({ "ok" => true }, router.request(workflow_id: pooled_workflow_id, command: "status", payload: {}))
+    assert_equal [["worker-a", "priority"]], routed
   end
 
   test "rejects a stale in-flight RPC when the target lost the workflow lease before receive" do
@@ -138,6 +172,33 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     end
     assert_nil store.current_workflow_lease(workflow_id)
     assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+  end
+
+  test "does not internally start terminal workflows without active leases" do
+    store = self.store
+    terminal_workflows = [
+      ["canceled", "workflow-rpc-canceled", ->(id) { store.cancel_workflow(id, reason: "user canceled") }],
+      ["failed", "workflow-rpc-failed", ->(id) { store.fail_workflow(id, error: "fatal") }],
+    ]
+
+    terminal_workflows.each do |status, name, finish|
+      id = store.enqueue_workflow(name:, input: {})
+      finish.call(id)
+      starter = RecordingLeaseStarter.new
+      router = Durababble::WorkflowRpc::Router.new(
+        store:,
+        rpc_clients: { "worker-a" => InProcessWorkflowRpcClient.new(->(_payload) { nil }) },
+        retry_on_stale: true,
+        start_workflow: starter,
+      )
+
+      error = assert_raises(Durababble::WorkflowRpc::WorkflowNotRunning) do
+        router.request(workflow_id: id, command: "status", payload: {})
+      end
+      refute_instance_of(Durababble::WorkflowRpc::NoActiveLease, error)
+      assert_match(/#{status}/, error.message)
+      assert_empty starter.calls
+    end
   end
 
   test "raises no-active-lease without starting when retry-on-stale is disabled" do
@@ -442,6 +503,17 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
 
     assert_hash_includes lease, "worker_id" => "worker-b"
     assert_hash_includes store.current_workflow_lease(workflow_id), "worker_id" => "worker-b"
+  end
+
+  test "starts non-default pool workflows from the persisted workflow worker pool" do
+    store = self.store
+    pooled_workflow_id = store.enqueue_workflow(name: "workflow-rpc-test", input: {}, worker_pool: "priority")
+    starter = Durababble::WorkflowRpc::LeaseStarter.new(store:, worker_ids: ["worker-b"], lease_seconds: 9)
+
+    lease = starter.call(workflow_id: pooled_workflow_id)
+
+    assert_hash_includes lease, "worker_id" => "worker-b", "worker_pool" => "priority"
+    assert_hash_includes store.current_workflow_lease(pooled_workflow_id), "worker_id" => "worker-b", "worker_pool" => "priority"
   end
 
   test "awaits an externally started lease when no configured worker wins the claim" do

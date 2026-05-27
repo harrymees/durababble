@@ -82,7 +82,7 @@ module Durababble
   end
 
   interface _WorkflowRpcRouteClientFactory
-    def call: (String worker_id) -> _RpcRequester
+    def call: (String worker_id, worker_pool: String) -> _RpcRequester
   end
 
   interface _LeaseStarter
@@ -274,7 +274,7 @@ module Durababble
     def claim_next_workflow_command: (worker_pool: String, workflow_name: String, workflow_id: String, worker_id: String, lease_seconds: Numeric) -> workflow_row?
     def inbox_message: (String message_id) -> workflow_row?
     def wait_for_inbox_message: (String message_id, ?poll_interval: Numeric, ?timeout: Numeric?) -> serialized_payload
-    def inbox_messages_for: (?worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Array[workflow_row]
+    def inbox_messages_for: (?worker_pool: String?, target_kind: String, target_type: String, target_id: String) -> Array[workflow_row]
     def workflow: (String workflow_id) -> workflow_row
     def steps_for: (String workflow_id) -> Array[workflow_row]
     def step_attempts_for: (String workflow_id) -> Array[workflow_row]

@@ -71,12 +71,12 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
-          params: ["object", "counter", "object-1"],
+          params: ["default", "object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "inbox mailbox head probe" => {
           sql: query_sql(:inbox_head_for_update),
-          params: ["object", "counter", "object-1"],
+          params: ["default", "object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "current object lease probe" => {

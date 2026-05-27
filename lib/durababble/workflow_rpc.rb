@@ -61,22 +61,24 @@ module Durababble
 
       #: (workflow_id: untyped) -> untyped
       def call(workflow_id:)
-        Observability.trace("durababble.workflow_rpc.lease_start", "durababble.workflow.id" => workflow_id) do
+        workflow = @store.workflow(workflow_id)
+        worker_pool = workflow.fetch("worker_pool", "default").to_s
+        Observability.trace("durababble.workflow_rpc.lease_start", "durababble.workflow.id" => workflow_id, "durababble.worker.pool" => worker_pool) do
           @worker_ids.each do |worker_id|
-            claimed = @store.claim_workflow(workflow_id:, worker_id:, lease_seconds: @lease_seconds)
-            return await_started!(workflow_id) if claimed
+            claimed = @store.claim_workflow(workflow_id:, worker_id:, lease_seconds: @lease_seconds, worker_pool:)
+            return await_started!(workflow_id, worker_pool:) if claimed
           end
-          await_started!(workflow_id)
+          await_started!(workflow_id, worker_pool:)
         end
       end
 
       private
 
-      #: (untyped) -> untyped
-      def await_started!(workflow_id)
+      #: (untyped, worker_pool: String) -> untyped
+      def await_started!(workflow_id, worker_pool:)
         last_attempt = @await_attempts - 1
         @await_attempts.times do |attempt|
-          lease = @store.current_workflow_lease(workflow_id)
+          lease = @store.current_workflow_lease(workflow_id, worker_pool:)
           return lease if lease
 
           # No point sleeping after the final poll — we are about to give up.
@@ -139,7 +141,8 @@ module Durababble
         raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
 
         worker_id = lease.fetch("worker_id")
-        client = rpc_client_for(worker_id, workflow_id:)
+        worker_pool = lease.fetch("worker_pool", "default").to_s
+        client = rpc_client_for(worker_id, workflow_id:, worker_pool:)
         client.request("workflow_rpc", {
           "workflow_id" => workflow_id,
           "expected_worker_id" => worker_id,
@@ -156,8 +159,8 @@ module Durababble
         starter.call(workflow_id:)
       end
 
-      #: (untyped, workflow_id: untyped) -> untyped
-      def rpc_client_for(worker_id, workflow_id:)
+      #: (untyped, workflow_id: untyped, worker_pool: String) -> untyped
+      def rpc_client_for(worker_id, workflow_id:, worker_pool:)
         if @rpc_clients.respond_to?(:fetch)
           sentinel = Object.new
           client = @rpc_clients.fetch(worker_id, sentinel)
@@ -165,7 +168,7 @@ module Durababble
         end
 
         factory = @rpc_client_factory
-        return factory.call(worker_id) if factory
+        return factory.call(worker_id, worker_pool:) if factory
 
         raise NodeUnavailable, "workflow #{workflow_id} is leased by unavailable node #{worker_id}"
       end
