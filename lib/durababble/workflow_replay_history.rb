@@ -165,7 +165,8 @@ module Durababble
         # the exception path.
         return if retrying_step_failure?(event)
 
-        raise_duplicate_history!("terminal", command_id) if @terminal.key?(command_id)
+        existing = @terminal[command_id]
+        raise_duplicate_history!("terminal", command_id) if duplicate_terminal_history?(existing, event)
 
         @terminal[command_id] = event
       end
@@ -174,6 +175,13 @@ module Durababble
     #: (String, Integer) -> void
     def raise_duplicate_history!(kind, command_id)
       raise NonDeterminismError, "workflow replay history contains duplicate #{kind} history for command #{command_id}"
+    end
+
+    #: (Hash[String, Object?]?, Hash[String, Object?]) -> bool
+    def duplicate_terminal_history?(existing, event)
+      return false unless existing
+
+      existing.fetch("kind") != "step_waiting" || event.fetch("kind") == "step_waiting"
     end
 
     #: (Hash[String, Object?]) -> bool

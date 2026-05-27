@@ -45,6 +45,21 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     assert_match(/duplicate terminal history for command 0/, error.message)
   end
 
+  test "allows waiting commands to resolve later" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "sleep", "payload" => { "sleeping" => true } },
+      completed_event(0, event_index: 2),
+    ])
+    future = Durababble::CommandFuture.new(0)
+    delivered = []
+
+    history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "step" })
+    history.deliver_resolutions({ 0 => future }) { |event, _future| delivered << event.fetch("kind") }
+
+    assert_equal ["step_completed"], delivered
+  end
+
   test "remember_scheduled records the schedule and grows the event count" do
     history = Durababble::WorkflowReplayHistory.new([])
 
