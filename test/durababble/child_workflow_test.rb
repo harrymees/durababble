@@ -99,6 +99,20 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
     end
   end
 
+  class ParentAwaitTimeoutWorkflow < Durababble::Workflow
+    workflow_name "parent-await-child-timeout"
+
+    def execute(input)
+      handle = ChildEchoWorkflow.enqueue(
+        input.fetch("child"),
+        id: input.fetch("child_id"),
+        worker_pool: input.fetch("child_pool"),
+        cancellation: :abandon,
+      )
+      handle.await(poll_interval: input.fetch("poll_interval"), timeout: input.fetch("timeout"))
+    end
+  end
+
   class ParentStartsOtherPoolWorkflow < Durababble::Workflow
     workflow_name "parent-starts-other-pool-child"
 
@@ -234,6 +248,33 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         assert_equal "completed", run.fetch("status")
         assert_equal({ "child_id" => "child-wait-replay", "result" => { "echo" => "ok" } }, run.fetch("result"))
         assert_equal "completed", store.child_workflow_rows_for_parent(parent_workflow_id: workflow_id).first.fetch("status")
+      end
+    end
+
+    test "child await timeout deadline survives parent replay with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_timeout_replay") do |store|
+        workflow_id = store.enqueue_workflow(
+          name: ParentAwaitTimeoutWorkflow.workflow_name,
+          input: {
+            "child" => { "value" => "too-late" },
+            "child_id" => "child-await-timeout",
+            "child_pool" => "unserved-child-pool",
+            "poll_interval" => 60,
+            "timeout" => 5,
+          },
+        )
+        worker = worker_for(backend, store, workflows: [ParentAwaitTimeoutWorkflow])
+
+        worker.run_until_idle(max_ticks: 20)
+        assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+        assert_equal 1, store.wake_due_timers(now: Time.now + 60)
+
+        worker.run_until_idle(max_ticks: 20)
+        run = store.workflow(workflow_id)
+
+        assert_equal "failed", run.fetch("status")
+        assert_match(/timed out waiting for child workflow child-await-timeout/, run.fetch("error"))
+        assert_equal "pending", store.workflow("child-await-timeout").fetch("status")
       end
     end
 

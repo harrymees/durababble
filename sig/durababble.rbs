@@ -471,7 +471,7 @@ module Durababble
     def call_wait: (WaitRequest wait_request, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
     def call_handle_rpc: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload } -> serialized_payload
     def call_child_workflow_start: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, cancellation_policy: Symbol | String, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?) -> ChildWorkflowHandle[ChildInput, ChildOutput]
-    def call_child_workflow_observe: [ChildInput, ChildOutput] (ChildWorkflowHandle[ChildInput, ChildOutput] handle) -> workflow_row
+    def call_child_workflow_observe: [ChildInput, ChildOutput] (ChildWorkflowHandle[ChildInput, ChildOutput] handle, ?await_deadline: Time?) -> workflow_row
     def await_child_workflow: [ChildInput, ChildOutput] (ChildWorkflowHandle[ChildInput, ChildOutput] handle, poll_interval: Numeric, timeout: Numeric?) -> ChildOutput?
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def timer_after: (Numeric duration) -> Time

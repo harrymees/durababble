@@ -632,11 +632,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             parent_workflow_id: "running-owned",
             parent_command_id: 42,
             child_workflow_name: "child-demo",
-	            child_workflow_id: "child-workflow-existing",
-	            input: { "count" => 1 },
-	            worker_pool: "default",
-	            cancellation_policy: "request_cancel",
-	          )
+            child_workflow_id: "child-workflow-existing",
+            input: { "count" => 1 },
+            worker_pool: "default",
+            cancellation_policy: "request_cancel",
+          )
         end,
         allowed_indexes: ["workflows_pkey"],
         allow_post_filter_indexes: ["workflows_pkey"],

@@ -277,11 +277,11 @@ module Durababble
       )
     end
 
-    #: (ChildWorkflowHandle) -> Hash[String, Object?]
-    def call_child_workflow_observe(handle)
+    #: (ChildWorkflowHandle, ?await_deadline: Time?) -> Hash[String, Object?]
+    def call_child_workflow_observe(handle, await_deadline: nil)
       assert_workflow_task!("child workflow observe #{handle.workflow_id}")
       name = child_workflow_command_name("workflow", "observe")
-      shape = child_workflow_observe_shape(name:, child_workflow_id: handle.workflow_id)
+      shape = child_workflow_observe_shape(name:, child_workflow_id: handle.workflow_id, await_deadline:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
       command_id, future, scheduled_from_history = allocate_command(name:, shape:)
       synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(nil))
@@ -301,15 +301,23 @@ module Durababble
 
     #: (ChildWorkflowHandle, poll_interval: Numeric, timeout: Numeric?) -> Object?
     def await_child_workflow(handle, poll_interval:, timeout:)
-      deadline = timeout && (WorkflowDeterminism.allow_host_operations { @store.current_time } + timeout)
+      deadline = child_workflow_await_deadline(timeout)
+      await_time = (deadline && timeout ? deadline - timeout : nil) #: as Time?
       loop do
-        observed = call_child_workflow_observe(handle)
+        observed = call_child_workflow_observe(handle, await_deadline: deadline)
         return handle.await_result_from(observed) if WorkflowStatus.terminal?(observed)
-        if deadline && WorkflowDeterminism.allow_host_operations { @store.current_time } >= deadline
+
+        if deadline && await_time && await_time >= deadline
           raise CommandTimeout, "timed out waiting for child workflow #{handle.workflow_id}"
         end
 
-        Durababble.sleep(poll_interval, "child_workflow_id" => handle.workflow_id)
+        unless deadline
+          Durababble.sleep(poll_interval, "child_workflow_id" => handle.workflow_id)
+          next
+        end
+
+        current_time = await_time #: as Time
+        await_time = wait_for_child_workflow_poll(handle, poll_interval:, current_time:, deadline:)
       end
     end
 
@@ -441,6 +449,72 @@ module Durababble
       raise Error, "#{operation} must run inside a Durababble-managed workflow task"
     end
 
+    #: (Numeric?) -> Time?
+    def child_workflow_await_deadline(timeout)
+      return unless timeout
+
+      recorded = @replay_history.recorded_schedule(@next_command_id)
+      deadline = recorded_child_workflow_await_deadline(recorded)
+      return deadline if deadline
+
+      WorkflowDeterminism.allow_host_operations { @store.current_time + timeout }
+    end
+
+    #: (ChildWorkflowHandle, poll_interval: Numeric, current_time: Time, deadline: Time) -> Time
+    def wait_for_child_workflow_poll(handle, poll_interval:, current_time:, deadline:)
+      wait_request = recorded_child_workflow_await_wait_request || begin
+        poll_wake_at = current_time + poll_interval
+        wake_at = [poll_wake_at, deadline].min #: as Time
+        WaitRequest.new(
+          kind: "timer",
+          wake_at:,
+          event_key: nil,
+          context: {
+            "child_workflow_id" => handle.workflow_id,
+            "child_workflow_deadline_at" => deadline,
+            "child_workflow_wake_at" => wake_at,
+          },
+        )
+      end
+      result = call_wait(
+        wait_request,
+        name: child_workflow_command_name("workflow", "await"),
+        args: [handle.workflow_id],
+        kwargs: { poll_interval: },
+      )
+      context = result.is_a?(Hash) ? result : wait_request.context
+      context.fetch("child_workflow_wake_at") #: as Time
+    end
+
+    #: (Hash[String, Object?]?) -> Time?
+    def recorded_child_workflow_await_deadline(recorded)
+      payload = recorded&.fetch("payload", nil)
+      return unless payload.is_a?(Hash)
+
+      child_workflow = payload["child_workflow"]
+      return unless child_workflow.is_a?(Hash)
+
+      child_workflow["await_deadline_at"]
+    end
+
+    #: () -> WaitRequest?
+    def recorded_child_workflow_await_wait_request
+      scheduled = @replay_history.recorded_schedule(@next_command_id)
+      payload = scheduled&.fetch("payload", nil)
+      return unless payload.is_a?(Hash)
+      return unless payload["name"] == child_workflow_command_name("workflow", "await")
+
+      wait = payload["wait"]
+      return unless wait.is_a?(Hash)
+
+      WaitRequest.new(
+        kind: wait.fetch("kind"),
+        wake_at: wait["wake_at"],
+        event_key: wait["event_key"],
+        context: wait.fetch("context"),
+      )
+    end
+
     #: (?untyped, step: untyped, command_id: untyped) -> untyped
     def step_attributes(instance = nil, step:, command_id:)
       attributes = {
@@ -500,16 +574,18 @@ module Durababble
       }
     end
 
-    #: (name: String, child_workflow_id: String) -> Hash[String, Object?]
-    def child_workflow_observe_shape(name:, child_workflow_id:)
+    #: (name: String, child_workflow_id: String, await_deadline: Time?) -> Hash[String, Object?]
+    def child_workflow_observe_shape(name:, child_workflow_id:, await_deadline:)
+      child_workflow = {
+        "operation" => "observe",
+        "workflow_id" => child_workflow_id,
+      }
+      child_workflow["await_deadline_at"] = await_deadline if await_deadline
       {
         "name" => name,
         "args" => [],
         "kwargs" => {},
-        "child_workflow" => {
-          "operation" => "observe",
-          "workflow_id" => child_workflow_id,
-        },
+        "child_workflow" => child_workflow,
       }
     end
 
