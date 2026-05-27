@@ -383,15 +383,9 @@ module Durababble
 
       #: () -> Server
       def start
-        return self if @thread
+        return self if @thread || @task
 
-        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
-        @bound = http_endpoint.bound
-        @port = @bound.sockets.first.local_address.ip_port
-        @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
-        service = build_service
-        app = ->(request) { route(service, request) }
-        server = Async::HTTP::Server.new(app, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+        server = build_http_server
 
         # The socket is already bound/listening (above, on this thread); the
         # reactor thread only runs the accept loop. Hand the scheduler back
@@ -422,13 +416,24 @@ module Durababble
         self
       end
 
+      #: (?parent: Object) -> Server
+      def start_async(parent: Async::Task.current)
+        return self if @thread || @task
+
+        server = build_http_server
+        @task = parent.async { server.run }
+        self
+      end
+
       #: () -> void
       def stop
         @scheduler&.interrupt
+        @task&.stop
         @thread&.join
       ensure
         @bound&.close
         @thread = nil
+        @task = nil
         @scheduler = nil
         @bound = nil
         @port = nil
@@ -440,6 +445,17 @@ module Durababble
       end
 
       private
+
+      #: () -> Async::HTTP::Server
+      def build_http_server
+        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
+        @bound = http_endpoint.bound
+        @port = @bound.sockets.first.local_address.ip_port
+        @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
+        service = build_service
+        app = ->(request) { route(service, request) }
+        Async::HTTP::Server.new(app, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+      end
 
       #: () -> Service
       def build_service

@@ -207,7 +207,8 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: "outbox-expired-owner", input: {})
         outbox_id = store.enqueue_outbox(workflow_id:, topic: "events", payload: { "ok" => true }, key: "outbox:ack-expired-owner")
 
-        assert_hash_includes store.claim_outbox(worker_id: "expired-owner", lease_seconds: -1), "id" => outbox_id
+        assert_hash_includes store.claim_outbox(worker_id: "expired-owner", lease_seconds: 1), "id" => outbox_id
+        expire_outbox_lease!(outbox_id)
         store.ack_outbox(outbox_id, worker_id: "expired-owner")
         assert_hash_includes store.outbox_message(outbox_id), "status" => "processing", "locked_by" => "expired-owner"
 
@@ -280,6 +281,14 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       )
     end
     id
+  end
+
+  def expire_outbox_lease!(outbox_id)
+    if backend_descriptor.mysql?
+      store.send(:execute_params, "UPDATE #{table("outbox")} SET locked_until = ? WHERE id = ?", [timestamp(Time.now - 3600), outbox_id])
+    else
+      store.send(:execute_params, "UPDATE #{table("outbox")} SET locked_until = $2::timestamptz WHERE id = $1", [outbox_id, timestamp(Time.now - 3600)])
+    end
   end
 
   def table(name)

@@ -123,6 +123,20 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   end
 
+  class AsyncLifecycleStore < RuntimeBranchStore
+    def initialize
+      super(tick_results: [])
+      @claim_count = 0
+    end
+
+    def claim_runnable_workflow(**)
+      @claim_count += 1
+      raise "stop async runtime" if @claim_count > 1
+
+      nil
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_worker_lifecycle_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -216,6 +230,34 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
     runtime.close
     assert_equal false, store.closed
+  end
+
+  test "can run inside a caller-owned Async task without creating a runtime thread" do
+    store = AsyncLifecycleStore.new
+    runtime = Durababble::WorkerRuntime.new(
+      store:,
+      workflows: {},
+      worker_pool: "default",
+      poll_interval: 0.01,
+      migrate: false,
+    )
+
+    error = nil
+    Async do |task|
+      run_task = runtime.start_async(parent: task)
+      assert_same(run_task, runtime.wait(timeout: 0.2))
+      refute(runtime.instance_variable_get(:@thread), "async-owned runtime should not allocate a host thread")
+      run_task.wait
+    rescue RuntimeError => e
+      error = e
+    end
+
+    assert_instance_of(RuntimeError, error)
+    assert_equal("stop async runtime", error.message)
+    assert_equal(false, runtime.running?)
+    assert_nil(runtime.wait)
+  ensure
+    runtime&.shutdown(timeout: 1)
   end
 
   test "records lease conflicts from the polling loop without releasing leases" do
