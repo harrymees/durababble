@@ -34,6 +34,19 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     end
   end
 
+  class RecordingLeaseStarter
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+    end
+
+    def call(workflow_id:)
+      @calls << workflow_id
+      raise Durababble::WorkflowRpc::NoActiveLease, "unexpected start"
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_workflow_rpc_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -138,6 +151,33 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
     end
     assert_nil store.current_workflow_lease(workflow_id)
     assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+  end
+
+  test "does not internally start terminal workflows without active leases" do
+    store = self.store
+    terminal_workflows = [
+      ["canceled", "workflow-rpc-canceled", ->(id) { store.cancel_workflow(id, reason: "user canceled") }],
+      ["failed", "workflow-rpc-failed", ->(id) { store.fail_workflow(id, error: "fatal") }],
+    ]
+
+    terminal_workflows.each do |status, name, finish|
+      id = store.enqueue_workflow(name:, input: {})
+      finish.call(id)
+      starter = RecordingLeaseStarter.new
+      router = Durababble::WorkflowRpc::Router.new(
+        store:,
+        rpc_clients: { "worker-a" => InProcessWorkflowRpcClient.new(->(_payload) { nil }) },
+        retry_on_stale: true,
+        start_workflow: starter,
+      )
+
+      error = assert_raises(Durababble::WorkflowRpc::WorkflowNotRunning) do
+        router.request(workflow_id: id, command: "status", payload: {})
+      end
+      refute_instance_of(Durababble::WorkflowRpc::NoActiveLease, error)
+      assert_match(/#{status}/, error.message)
+      assert_empty starter.calls
+    end
   end
 
   test "raises no-active-lease without starting when retry-on-stale is disabled" do

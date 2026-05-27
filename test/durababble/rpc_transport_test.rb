@@ -207,6 +207,20 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     assert_raises_matching(Durababble::WorkflowRpc::WorkflowNotRunning, /completed/) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "missing", args: {})
     end
+
+    terminal_workflows = [
+      ["canceled", "rpc-transport-canceled", ->(id) { store.cancel_workflow(id, reason: "user canceled") }],
+      ["failed", "rpc-transport-failed", ->(id) { store.fail_workflow(id, error: "fatal") }],
+    ]
+    terminal_workflows.each do |status, name, finish|
+      id = store.enqueue_workflow(name:, input: {})
+      finish.call(id)
+      error = assert_raises(Durababble::WorkflowRpc::WorkflowNotRunning) do
+        client.call_transient(worker_pool: "default", workflow_id: id, method: "missing", args: {})
+      end
+      refute_instance_of(Durababble::WorkflowRpc::NoActiveLease, error)
+      assert_match(/#{status}/, error.message)
+    end
   ensure
     server&.stop
   end
