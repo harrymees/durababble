@@ -12,8 +12,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_cancel_step,
     :pg_cancel_workflow,
     :pg_cancel_workflow_with_worker,
-    :pg_claim_expired_target_activation,
-    :pg_claim_pending_target_activation,
     :pg_claim_selected_target_activation,
     :pg_claim_workflow_for_activation_update,
     :pg_complete_fence,
@@ -74,9 +72,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_cancel_workflow,
     :mysql_cancel_workflow_with_worker,
     :mysql_claim_expired_outbox,
-    :mysql_claim_expired_target_activation,
     :mysql_claim_pending_outbox,
-    :mysql_claim_pending_target_activation,
     :mysql_claim_runnable_workflow,
     :mysql_claim_selected_outbox,
     :mysql_claim_selected_target_activation,
@@ -534,6 +530,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
         call: -> { store.release_worker_leases!(worker_id: "owner") },
         allowed_indexes: ["workflows_worker_lease_idx", "outbox_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
       },
+      "claim_target_activation" => {
+        call: -> { store.claim_target_activation(worker_id: "plan-worker", lease_seconds: 60, target_kinds: ["object"], target_types: ["counter"]) },
+        allowed_indexes: ["target_activations_pkey", "target_activations_claim_idx"],
+        allow_post_filter_indexes: ["target_activations_claim_idx"],
+      },
       "heartbeat_step" => {
         call: -> { store.heartbeat_step(workflow_id: "running-owned", position: 0, worker_id: "owner", lease_seconds: 60, cursor: { "offset" => 1 }) },
         allowed_indexes: ["workflows_pkey", "steps_pkey", "step_attempts_workflow_position_status_started_idx"],
@@ -778,6 +779,14 @@ class DurababbleQueryPlanTest < DurababbleTestCase
 
       INSERT INTO #{quoted_schema}.object_wakeups (worker_pool, object_type, object_id, name, wake_at, payload, created_at, updated_at)
       SELECT 'default', 'counter', 'future-wakeup-' || i, 'default', now() + interval '1 hour', decode('#{serialized_outbox}', 'hex'), now() - (i || ' seconds')::interval, now()
+      FROM generate_series(1, 2000) AS i;
+
+      INSERT INTO #{quoted_schema}.target_activations (worker_pool, target_kind, target_type, target_id, status, ready_at, locked_by, locked_until, created_at, updated_at)
+      SELECT 'default', 'object', 'counter', 'pending-object-' || i, 'pending', CASE WHEN i = 1 THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END, NULL, NULL, now() - (i || ' seconds')::interval, now()
+      FROM generate_series(1, 2000) AS i;
+
+      INSERT INTO #{quoted_schema}.target_activations (worker_pool, target_kind, target_type, target_id, status, ready_at, locked_by, locked_until, created_at, updated_at)
+      SELECT 'default', 'object', 'counter', 'expired-object-' || i, 'running', now() - interval '1 hour', 'owner', CASE WHEN i = 1 THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END, now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 2000) AS i;
 
     SQL

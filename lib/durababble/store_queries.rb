@@ -14,6 +14,13 @@ module Durababble
         ELSE NULL
       END
     SQL
+    POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION = <<~SQL.chomp.freeze
+      CASE
+        WHEN status = 'pending' THEN ready_at
+        WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+        ELSE NULL
+      END
+    SQL
 
     class << self
       #: (untyped, backend: untyped, ?description: String?) { (untyped) -> untyped } -> void
@@ -107,8 +114,8 @@ module Durababble
       },
       "durable object mailbox" => {
         methods: ["Store.object_state", "Store.save_object_state", "Store.enqueue_inbox_message", "Store.claim_object_command", "Store.complete_object_command"],
-        indexes: ["durable_objects_pkey", "inbox_pkey", "inbox_target_status_sequence_idx", "inbox_idempotency_hash_idx", "target_activations_pkey", "target_activations_queue_idx"],
-        assertions: ["object primary-key lookup", "mailbox primary-key claim", "target-sequence and activation queue indexes"],
+        indexes: ["durable_objects_pkey", "inbox_pkey", "inbox_target_status_sequence_idx", "inbox_idempotency_hash_idx", "target_activations_pkey", "target_activations_claim_idx"],
+        assertions: ["object primary-key lookup", "mailbox primary-key claim", "target-sequence and activation claim indexes"],
         benchmarks: ["durable_object_command_claim"],
       },
     }.freeze
@@ -1032,23 +1039,12 @@ module Durababble
       SQL
     end
 
-    define(:pg_claim_pending_target_activation, backend: :postgres) do |store, filter_sql:|
+    define(:pg_claim_target_activation, backend: :postgres) do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE worker_pool = $1 AND status = 'pending' AND ready_at <= $2::timestamptz
+        WHERE worker_pool = $1
+          AND (#{POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) <= $2::timestamptz
           #{filter_sql}
-        ORDER BY ready_at, created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:pg_claim_expired_target_activation, backend: :postgres) do |store, filter_sql:|
-      <<~SQL.chomp
-        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE worker_pool = $1 AND status = 'running' AND locked_until < $2::timestamptz
-          #{filter_sql}
-        ORDER BY ready_at, created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
@@ -1753,23 +1749,12 @@ module Durababble
       "DELETE FROM #{table(store, "object_wakeups")} WHERE worker_pool = ? AND object_type = ? AND object_id = ?"
     end
 
-    define(:mysql_claim_pending_target_activation, backend: :mysql, description: "Probe ready target activations for this worker pool and target filter.") do |store, filter_sql:|
+    define(:mysql_claim_target_activation, backend: :mysql, description: "Probe the unified target activation queue for one claimable candidate in this worker pool.") do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
-        WHERE worker_pool = ? AND status = 'pending' AND ready_at <= ?
+        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "claim")})
+        WHERE worker_pool = ?
+          AND queue_available_at <= ?
           #{filter_sql}
-        ORDER BY ready_at, created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:mysql_claim_expired_target_activation, backend: :mysql, description: "Probe target activations abandoned by an expired lease.") do |store, filter_sql:|
-      <<~SQL.chomp
-        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "expired")})
-        WHERE worker_pool = ? AND status = 'running' AND locked_until < ?
-          #{filter_sql}
-        ORDER BY ready_at, created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
