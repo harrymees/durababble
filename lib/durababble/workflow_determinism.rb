@@ -74,7 +74,7 @@ module Durababble
       #: (workflow_id: untyped) { -> untyped } -> untyped
       def enforce(workflow_id:, &block)
         trace = TracePoint.new(:call, :c_call) do |event|
-          check_event!(workflow_id, event, locations: caller_locations(1, 24) || [])
+          check_event!(workflow_id, event)
         end
 
         enable_trace(trace, &block)
@@ -92,14 +92,18 @@ module Durababble
 
       private
 
-      #: (untyped, untyped, locations: Array[Thread::Backtrace::Location]) -> void
-      def check_event!(workflow_id, event, locations:)
+      #: (untyped, untyped, ?locations: Array[Thread::Backtrace::Location]?) -> void
+      def check_event!(workflow_id, event, locations: nil)
         return unless WorkflowExecutionContext.current
         return if allowed_host_operation?
 
-        callsite = callsite_location(locations)
-        violation = violation_for(event, callsite:)
+        violation, callsite_filtered = violation_candidate_for(event)
         return unless violation
+
+        # TracePoint runs for every call; capture callsites only after cheap filtering.
+        locations ||= caller_locations(1, 24) || []
+        callsite = callsite_location(locations)
+        return if callsite_filtered && !unsafe_callsite?(callsite)
 
         location = callsite ? " at #{callsite.path}:#{callsite.lineno}" : ""
         raise DeterminismError, "workflow #{workflow_id} orchestration cannot call #{violation}#{location}; move host I/O, wall-clock time, randomness, or blocking sleeps into a durable step"
@@ -126,20 +130,29 @@ module Durababble
 
       #: (untyped, callsite: untyped) -> String?
       def violation_for(event, callsite:)
+        violation, callsite_filtered = violation_candidate_for(event)
+        return unless violation
+        return if callsite_filtered && !unsafe_callsite?(callsite)
+
+        violation
+      end
+
+      #: (untyped) -> [String, bool]?
+      def violation_candidate_for(event)
         method_id = event.method_id
         receiver = event.self
         defined_class = event.defined_class
 
-        return "Kernel##{method_id}" if SLEEP_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class) && unsafe_callsite?(callsite)
-        return "Kernel##{method_id}" if KERNEL_IO_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class) && unsafe_callsite?(callsite)
-        return "Kernel##{method_id}" if RANDOM_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class) && unsafe_callsite?(callsite)
-        return "#{receiver}.#{method_id}" if RANDOM_METHODS.include?(method_id) && module_receiver_named?(receiver, "Random", "SecureRandom")
-        return "Random.new" if method_id == :initialize && class_named?(defined_class, "Random::Base")
-        return "Time.new" if method_id == :initialize && defined_class == Time
-        return "#{receiver}.#{method_id}" if TIME_METHODS.include?(method_id) && module_receiver_named?(receiver, "Time", "Date", "DateTime") && unsafe_callsite?(callsite)
-        return "#{receiver}.#{method_id}" if PROCESS_METHODS.include?(method_id) && module_receiver_named?(receiver, "Process") && unsafe_callsite?(callsite)
-        return "#{receiver}.#{method_id}" if IO_METHODS.include?(method_id) && io_receiver?(receiver) && unsafe_callsite?(callsite)
-        return "#{receiver}.#{method_id}" if FILE_SYSTEM_METHODS.include?(method_id) && file_system_receiver?(receiver) && unsafe_callsite?(callsite)
+        return ["Kernel##{method_id}", true] if SLEEP_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class)
+        return ["Kernel##{method_id}", true] if KERNEL_IO_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class)
+        return ["Kernel##{method_id}", true] if RANDOM_METHODS.include?(method_id) && kernel_receiver?(receiver, defined_class)
+        return ["#{receiver}.#{method_id}", false] if RANDOM_METHODS.include?(method_id) && module_receiver_named?(receiver, "Random", "SecureRandom")
+        return ["Random.new", false] if method_id == :initialize && class_named?(defined_class, "Random::Base")
+        return ["Time.new", false] if method_id == :initialize && defined_class == Time
+        return ["#{receiver}.#{method_id}", true] if TIME_METHODS.include?(method_id) && module_receiver_named?(receiver, "Time", "Date", "DateTime")
+        return ["#{receiver}.#{method_id}", true] if PROCESS_METHODS.include?(method_id) && module_receiver_named?(receiver, "Process")
+        return ["#{receiver}.#{method_id}", true] if IO_METHODS.include?(method_id) && io_receiver?(receiver)
+        return ["#{receiver}.#{method_id}", true] if FILE_SYSTEM_METHODS.include?(method_id) && file_system_receiver?(receiver)
 
         nil
       end
