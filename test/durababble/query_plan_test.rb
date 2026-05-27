@@ -85,9 +85,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_claim_selected_target_activation,
     :mysql_claim_selected_workflow,
     :mysql_claim_workflow_already_owned,
-    :mysql_claim_workflow_for_activation_lock,
     :mysql_claim_workflow_for_activation_update,
-    :mysql_claim_workflow_lock,
     :mysql_claim_workflow_update,
     :mysql_complete_fence,
     :mysql_complete_inbox_message,
@@ -96,10 +94,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_complete_wait,
     :mysql_complete_workflow,
     :mysql_complete_workflow_with_worker,
-    :mysql_count_inbox_leases,
-    :mysql_count_outbox_leases,
-    :mysql_count_target_activation_leases,
-    :mysql_count_workflow_leases,
+    :mysql_count_expired_workflow_leases,
     :mysql_current_object_lease,
     :mysql_current_workflow_lease,
     :mysql_dead_letter_inbox_message,
@@ -149,7 +144,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_mark_workflow_cancellation_delivered,
     :mysql_mark_workflow_running,
     :mysql_mark_workflow_running_with_worker,
-    :mysql_next_workflow_history_event_index,
     :mysql_object_state,
     :mysql_outbox_by_key,
     :mysql_outbox_message,
@@ -429,13 +423,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   test "mysql lease query builders accept explicit force indexes" do
     store = fake_store_with_prefix(:mysql)
     indexed_queries = {
-      count_workflow_leases: "workflows_worker_lease_idx",
       release_workflow_leases: "workflows_worker_lease_idx",
-      count_outbox_leases: "outbox_worker_lease_idx",
       release_outbox_leases: "outbox_worker_lease_idx",
-      count_inbox_leases: "inbox_worker_lease_idx",
       release_inbox_leases: "inbox_worker_lease_idx",
-      count_target_activation_leases: "target_activations_worker_lease_idx",
       release_target_activation_leases: "target_activations_worker_lease_idx",
     }
 

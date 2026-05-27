@@ -1105,9 +1105,7 @@ module Durababble
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
       execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
-      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-      event_index
+      execute_store_query(:insert_workflow_history, [workflow_id, kind, command_id, name, attempt_id, dump_serialized(payload), error, workflow_id])
     end
 
     #: (message_id: String, error: String) -> Object?

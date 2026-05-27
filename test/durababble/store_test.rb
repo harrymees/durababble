@@ -511,9 +511,10 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
       sql_result,
       sql_result,
+      sql_result([], affected_rows: 0),
       sql_result([{ "id" => "outbox-old" }]),
-      sql_result,
       sql_result([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
+      sql_result,
       sql_result([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
       sql_result,
@@ -1136,8 +1137,6 @@ class DurababbleStoreTest < DurababbleTestCase
       ])).with_fence(workflow_id: "wf", key: "slow", timeout: 0)
     end
     assert_equal "new-outbox", pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result,
-      sql_result,
       sql_result([{ "id" => "new-outbox" }]),
     ])).enqueue_outbox(workflow_id: "wf", topic: "email", payload: {}, key: "new")
     assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))

@@ -389,12 +389,13 @@ module Durababble
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
       # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row;
       # subsequent enqueues resolve to the same row and never deliver twice.
-      existing = execute_store_query(:outbox_by_key, [key]).first
-      return existing.fetch("id") if existing
-
       id = SecureRandom.uuid
-      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
-      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+      inserted = execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key]).first
+      if inserted
+        Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+        return inserted.fetch("id")
+      end
+
       execute_store_query(:outbox_by_key, [key]).first.fetch("id")
     end
 

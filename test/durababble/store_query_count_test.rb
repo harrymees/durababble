@@ -34,25 +34,26 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes claimed, "id" => runnable_id, "status" => "running"
 
         targeted_id = store.enqueue_workflow(name: "query-count-targeted-claim", input: { "ok" => true })
-        targeted = assert_sql_query_budget("claim_workflow", mysql: 4, postgres: 2) do
+        targeted = assert_sql_query_budget("claim_workflow", mysql: 2, postgres: 2) do
           store.claim_workflow(workflow_id: targeted_id, worker_id: "target-worker", lease_seconds: 30)
         end
         assert_hash_includes targeted, "id" => targeted_id, "status" => "running"
 
         heartbeat_id = store.create_workflow(name: "query-count-heartbeat", input: {}, worker_id: "heartbeat-worker", lease_seconds: 30)
-        heartbeat = assert_sql_query_budget("heartbeat", mysql: 2, postgres: 1) do
+        heartbeat = assert_sql_query_budget("heartbeat", mysql: 1, postgres: 1) do
           store.heartbeat(workflow_id: heartbeat_id, worker_id: "heartbeat-worker", lease_seconds: 30)
         end
         assert_equal 1, heartbeat.affected_rows.to_i
 
         prepare_release_worker_leases_fixture
-        released = assert_sql_query_budget("release_worker_leases", mysql: 9, postgres: 5) do
+        released = assert_sql_query_budget("release_worker_leases", mysql: 5, postgres: 5) do
           store.release_worker_leases!(worker_id: "release-worker")
         end
         assert_equal 1, released.fetch("workflows")
         assert_equal 1, released.fetch("outbox")
         assert_equal 1, released.fetch("inbox")
         assert_equal 1, released.fetch("target_activations")
+        assert_equal 1, released.fetch("durable_objects")
       end
     end
 
@@ -126,7 +127,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes store.inbox_message(enqueued_command_id), "status" => "pending"
 
         direct_claim_command_id = enqueue_object_command("direct-claim-object")
-        direct_claim = assert_sql_query_budget("claim_object_command", mysql: 5, postgres: 5) do
+        direct_claim = assert_sql_query_budget("claim_object_command", mysql: 3, postgres: 3) do
           store.claim_object_command(command_id: direct_claim_command_id, worker_id: "object-worker", lease_seconds: 30)
         end
         assert_hash_includes direct_claim, "id" => direct_claim_command_id, "status" => "running"

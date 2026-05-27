@@ -55,59 +55,44 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      updated = execute_store_query(:claim_workflow_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+      return workflow(workflow_id) if updated.affected_rows == 1
+
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
-      transaction do
-        row = execute_store_query(:claim_workflow_lock, [workflow_id, worker_pool, worker_id]).first
-        next unless row
-
-        execute_store_query(:claim_workflow_update, [worker_id, lease_seconds, workflow_id, worker_pool])
-        workflow(workflow_id)
-      end
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      updated = execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+      return workflow(workflow_id) if updated.affected_rows == 1
+
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
-      transaction do
-        row = execute_store_query(:claim_workflow_for_activation_lock, [workflow_id, worker_pool, worker_id]).first
-        next unless row
-
-        execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_seconds, workflow_id, worker_pool])
-        workflow(workflow_id)
-      end
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat_unchecked(workflow_id:, worker_id:, lease_seconds:)
-      execute_store_query(:heartbeat_workflow, [lease_seconds, workflow_id, worker_id])
-      owned = workflow_owned?(workflow_id:, worker_id:)
-      if owned
+      result = execute_store_query(:heartbeat_workflow, [lease_seconds, workflow_id, worker_id])
+      if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
       else
         Observability.count("durababble.leases.conflicts", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
       end
-      ActiveRecord::Result.empty(affected_rows: owned ? 1 : 0)
+      result
     end
 
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
       transaction do
         workflow_index = index_name("workflows", "worker_lease")
-        workflows = execute_store_query(:count_workflow_leases, [worker_id], index: workflow_index).first.fetch("count").to_i
-        execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index)
+        workflows = execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index).affected_rows.to_i
         outbox_index = index_name("outbox", "worker_lease")
-        outbox = execute_store_query(:count_outbox_leases, [worker_id], index: outbox_index).first.fetch("count").to_i
-        execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index)
+        outbox = execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index).affected_rows.to_i
         inbox_index = index_name("inbox", "worker_lease")
-        inbox = execute_store_query(:count_inbox_leases, [worker_id], index: inbox_index).first.fetch("count").to_i
-        execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index)
+        inbox = execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index).affected_rows.to_i
         target_activation_index = index_name("target_activations", "worker_lease")
-        target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
-        execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
+        target_activations = execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index).affected_rows.to_i
         objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows.to_i
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
@@ -362,12 +347,13 @@ module Durababble
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-      existing = execute_store_query(:outbox_by_key, [key]).first
-      return existing.fetch("id") if existing
-
       id = SecureRandom.uuid
-      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
-      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+      inserted = execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
+      if inserted.affected_rows.to_i.positive?
+        Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+        return id
+      end
+
       execute_store_query(:outbox_by_key, [key]).first.fetch("id")
     end
 
