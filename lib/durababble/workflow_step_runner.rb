@@ -96,33 +96,38 @@ module Durababble
       end
     end
 
+    # Control-flow errors are rejected onto the future unchanged; only an
+    # ordinary step failure is run through retry/terminal handling. Cancellation
+    # additionally records the canceled step before propagating.
+    PASS_THROUGH_STEP_ERRORS = [InjectedCrash, LeaseConflict, WorkflowSuspended, StepRetryScheduled, NonDeterminismError].freeze
+
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void
     def reject_step_error(error, command_id:, step:, attributes:)
+      future(command_id).reject(step_rejection_for(error, command_id:, step:, attributes:))
+    end
+
+    #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
+    def step_rejection_for(error, command_id:, step:, attributes:)
       if error.is_a?(CancellationError)
-        assert_workflow_lease!
-        synchronize_store do
-          @store.record_step_canceled(
-            workflow_id: @workflow_id,
-            command_id:,
-            error: "#{error.class}: #{error.message}",
-            worker_id: @worker_id,
-          )
-        end
-        future(command_id).reject(error)
-        return
+        record_step_cancellation(command_id, error)
+        return error
       end
+      return error if PASS_THROUGH_STEP_ERRORS.any? { |klass| error.is_a?(klass) }
 
-      if error.is_a?(InjectedCrash) || error.is_a?(LeaseConflict)
-        future(command_id).reject(error)
-        return
+      handle_step_error(error, command_id:, step:, attributes:)
+    end
+
+    #: (Integer, CancellationError) -> void
+    def record_step_cancellation(command_id, error)
+      assert_workflow_lease!
+      synchronize_store do
+        @store.record_step_canceled(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: "#{error.class}: #{error.message}",
+          worker_id: @worker_id,
+        )
       end
-
-      if error.is_a?(WorkflowSuspended) || error.is_a?(StepRetryScheduled) || error.is_a?(NonDeterminismError)
-        future(command_id).reject(error)
-        return
-      end
-
-      future(command_id).reject(handle_step_error(error, command_id:, step:, attributes:))
     end
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError

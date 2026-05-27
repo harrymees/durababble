@@ -135,19 +135,8 @@ module Durababble
     def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, worker_pool: "default")
       shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       result = transaction do
-        existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
-        if existing
-          raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
-
-          upsert_target_activation_without_transaction(
-            worker_pool: row_worker_pool(existing),
-            target_kind: existing.fetch("target_kind"),
-            target_type: existing.fetch("target_type"),
-            target_id: existing.fetch("target_id"),
-            ready_at: existing["ready_at"],
-          ) if activatable_inbox_status?(existing.fetch("status"))
-          next existing.fetch("id")
-        end
+        reused = reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:, shape_hash:)
+        next reused if reused
 
         sequence = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
         id = SecureRandom.uuid
@@ -184,19 +173,8 @@ module Durababble
         target_kind = "workflow"
         message_kind = "workflow_command"
         shape_hash = inbox_shape_hash(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
-        existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
-        if existing
-          raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message" unless existing.fetch("shape_hash") == shape_hash
-
-          upsert_target_activation_without_transaction(
-            worker_pool: row_worker_pool(existing),
-            target_kind: existing.fetch("target_kind"),
-            target_type: existing.fetch("target_type"),
-            target_id: existing.fetch("target_id"),
-            ready_at: existing["ready_at"],
-          ) if activatable_inbox_status?(existing.fetch("status"))
-          next existing.fetch("id")
-        end
+        reused = reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id, shape_hash:)
+        next reused if reused
 
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
 
@@ -408,6 +386,32 @@ module Durababble
     end
 
     private
+
+    # Returns the id of a prior inbox message that matches this idempotency key,
+    # re-activating its target so the message is processed again, or nil when no
+    # prior message exists. Raises IdempotencyKeyConflict when the key was used
+    # for a message with a different shape. Callers run this inside the enqueue
+    # transaction and short-circuit (`next`) when an id comes back.
+    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String, shape_hash: String) -> String?
+    def reuse_existing_inbox_message(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:, shape_hash:)
+      existing = existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      return unless existing
+
+      unless existing.fetch("shape_hash") == shape_hash
+        raise IdempotencyKeyConflict, "idempotency key #{idempotency_key} already used for a different inbox message"
+      end
+
+      if activatable_inbox_status?(existing.fetch("status"))
+        upsert_target_activation_without_transaction(
+          worker_pool: row_worker_pool(existing),
+          target_kind: existing.fetch("target_kind"),
+          target_type: existing.fetch("target_type"),
+          target_id: existing.fetch("target_id"),
+          ready_at: existing["ready_at"],
+        )
+      end
+      existing.fetch("id") #: as String
+    end
 
     #: (Object?, workflow_id: String, worker_id: String?, operation: String) -> Object?
     def require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)

@@ -32,16 +32,31 @@ module Durababble
           UnknownCommand.new(message)
         end
       end
+
+      # The error to raise when a workflow has no current lease: terminal/not-running
+      # workflows report WorkflowNotRunning, otherwise the lease is simply absent.
+      #: (untyped, untyped) -> untyped
+      def inactive_workflow_error(store, workflow_id)
+        row = store.workflow(workflow_id)
+        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
+
+        NoActiveLease.new("workflow #{workflow_id} has no active lease")
+      end
     end
 
     class LeaseStarter
+      # Base per-attempt spacing for the default lease-poll backoff. Kept small
+      # because we are only waiting for an already-claimed lease row to become
+      # visible, not for slow work to finish.
+      DEFAULT_AWAIT_RETRY_STEP_SECONDS = 0.05
+
       #: (store: untyped, worker_ids: untyped, ?lease_seconds: untyped, ?await_attempts: untyped, ?await_sleep: untyped) -> void
-      def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: ->(_attempt) {})
+      def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: nil)
         @store = store
         @worker_ids = worker_ids
         @lease_seconds = lease_seconds
         @await_attempts = await_attempts
-        @await_sleep = await_sleep
+        @await_sleep = await_sleep || default_await_sleep
       end
 
       #: (workflow_id: untyped) -> untyped
@@ -59,13 +74,24 @@ module Durababble
 
       #: (untyped) -> untyped
       def await_started!(workflow_id)
+        last_attempt = @await_attempts - 1
         @await_attempts.times do |attempt|
           lease = @store.current_workflow_lease(workflow_id)
           return lease if lease
 
-          @await_sleep.call(attempt)
+          # No point sleeping after the final poll — we are about to give up.
+          @await_sleep.call(attempt) unless attempt == last_attempt
         end
         raise NoActiveLease, "workflow #{workflow_id} could not be started with an active lease"
+      end
+
+      # Jittered, linearly growing sleep between lease polls. Routed through
+      # Backoff so a fleet awaiting the same workflow does not poll in lockstep.
+      # Runs on the worker host, outside workflow replay, so the randomness is
+      # determinism-safe.
+      #: () -> untyped
+      def default_await_sleep
+        ->(attempt) { Kernel.sleep(Backoff.linear(attempt + 1, step: DEFAULT_AWAIT_RETRY_STEP_SECONDS)) }
       end
     end
 
@@ -107,7 +133,7 @@ module Durababble
       #: (workflow_id: untyped, command: untyped, payload: untyped) -> untyped
       def route_once(workflow_id:, command:, payload:)
         lease = @store.current_workflow_lease(workflow_id)
-        raise inactive_workflow_error(workflow_id) unless lease
+        raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
 
         worker_id = lease.fetch("worker_id")
         client = @rpc_clients.fetch(worker_id) do
@@ -132,14 +158,6 @@ module Durababble
       #: (untyped) -> untyped
       def translate_remote_error(error)
         WorkflowRpc.remote_error_from_message(error.message) || error
-      end
-
-      #: (untyped) -> untyped
-      def inactive_workflow_error(workflow_id)
-        row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
-
-        NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end
     end
 
@@ -179,18 +197,10 @@ module Durababble
       #: (untyped) -> untyped
       def assert_current_lease!(workflow_id)
         lease = @store.current_workflow_lease(workflow_id)
-        raise inactive_workflow_error(workflow_id) unless lease
+        raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
         return if lease.fetch("worker_id") == @node_id
 
         raise StaleLease, "#{@node_id} no longer owns workflow #{workflow_id}; current owner is #{lease.fetch("worker_id")}"
-      end
-
-      #: (untyped) -> untyped
-      def inactive_workflow_error(workflow_id)
-        row = @store.workflow(workflow_id)
-        return WorkflowNotRunning.new("workflow #{workflow_id} is #{row.fetch("status")}") if WorkflowStatus.rpc_not_running?(row)
-
-        NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end
     end
   end

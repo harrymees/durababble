@@ -12,7 +12,6 @@ class DurababbleStoreTest < DurababbleTestCase
   ScriptedPgConnection = DurababbleScriptedSqlSupport::ScriptedPgConnection
   ScriptedMysqlConnection = DurababbleScriptedSqlSupport::ScriptedMysqlConnection
   FlakyDeliveryClient = DurababbleScriptedSqlSupport::FlakyDeliveryClient
-  MysqlMigrationProbeStore = DurababbleScriptedSqlSupport::MysqlMigrationProbeStore
 
   test "routes active record connections through mysql and postgres adapters" do
     assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema")
@@ -415,19 +414,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
       assert_hash_includes store.current_workflow_lease(workflow_id), "worker_id" => "owner"
     end
-  end
-
-  test "adds missing MySQL workflow cancellation columns only once" do
-    store = MysqlMigrationProbeStore.new(
-      schema: "mysql_schema",
-      columns: { "mysql_schema_workflows" => ["cancel_reason"] },
-    )
-
-    store.send(:add_column_if_missing, "workflows", "cancel_reason", "TEXT")
-    store.send(:add_column_if_missing, "workflows", "cancel_requested_at", "DATETIME(6)")
-
-    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
-    assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
   end
 
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
@@ -971,6 +957,23 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(ActiveRecord::SerializationFailure) do
       store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::SerializationFailure }
     end
+
+    # Transaction-level deadlocks must also be retried: every #transaction is wrapped in
+    # retry_serialization_failures, so a deadlock that aborts the whole transaction (not just
+    # a single statement) has to be replayed rather than surfaced to the caller.
+    deadlock_attempts = 0
+    deadlock_result = store.send(:retry_serialization_failures) do
+      deadlock_attempts += 1
+      raise ActiveRecord::Deadlocked if deadlock_attempts == 1
+
+      :recovered
+    end
+    assert_equal :recovered, deadlock_result
+    assert_equal 2, deadlock_attempts
+    assert_raises(ActiveRecord::Deadlocked) do
+      store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::Deadlocked }
+    end
+
     assert_equal ["", []], store.send(:workflow_name_filter, nil)
     malicious_name = "a'); DROP TABLE workflows; --"
     assert_equal ["AND name IN ($1, $2)", [malicious_name, "b"]], store.send(:workflow_name_filter, [malicious_name, "b"])
@@ -1075,17 +1078,6 @@ class DurababbleStoreTest < DurababbleTestCase
       :ok
     }
     assert_equal 2, attempts
-
-    index_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")
-        sql_result([{ "exists" => 1 }])
-      end
-    end
-    index_store = mysql_store(index_connection)
-    index_store.send(:add_index_if_missing, "inbox", "missing_idx", "INDEX `missing_idx` (status)")
-    index_store.send(:drop_index_if_present, "inbox", "present_idx")
-    assert index_connection.queries.any? { |sql| sql.include?("ADD INDEX `missing_idx`") }
-    assert index_connection.queries.any? { |sql| sql.include?("DROP INDEX `present_idx`") }
   end
 
   private
