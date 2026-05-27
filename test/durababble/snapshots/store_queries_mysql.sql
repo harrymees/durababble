@@ -514,7 +514,12 @@ WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 -- mysql_set_target_activation_pending
 INSERT INTO `durababble_mysql_snapshot_target_activations` (worker_pool, target_kind, target_type, target_id, status, ready_at)
 VALUES (?, ?, ?, ?, 'pending', ?)
-ON DUPLICATE KEY UPDATE status = 'pending', ready_at = VALUES(ready_at), locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+ON DUPLICATE KEY UPDATE
+  status = IF(worker_pool = VALUES(worker_pool), 'pending', status),
+  ready_at = IF(worker_pool = VALUES(worker_pool), VALUES(ready_at), ready_at),
+  locked_by = IF(worker_pool = VALUES(worker_pool), NULL, locked_by),
+  locked_until = IF(worker_pool = VALUES(worker_pool), NULL, locked_until),
+  updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
 
 -- mysql_steal_expired_leases
 UPDATE `durababble_mysql_snapshot_workflows`

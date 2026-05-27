@@ -1041,14 +1041,15 @@ module Durababble
       "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
 
-    # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
-    # writer's value so the routing pool for a target activation is fixed at creation time.
+    # Explicit rearm/reconcile writes are scoped to the activation's routing
+    # pool; a caller from another pool must not clear an active lease.
     define(:pg_set_target_activation_pending, backend: :postgres) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
         ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
           SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
+          WHERE #{table(store, "target_activations")}.worker_pool = EXCLUDED.worker_pool
       SQL
     end
 
@@ -1726,13 +1727,18 @@ module Durababble
       "DELETE FROM #{table(store, "target_activations")} WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?"
     end
 
-    # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
-    # writer's value so the routing pool for a target activation is fixed at creation time.
+    # Explicit rearm/reconcile writes are scoped to the activation's routing
+    # pool; a caller from another pool must not clear an active lease.
     define(:mysql_set_target_activation_pending, backend: :mysql) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
-        ON DUPLICATE KEY UPDATE status = 'pending', ready_at = VALUES(ready_at), locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        ON DUPLICATE KEY UPDATE
+          status = IF(worker_pool = VALUES(worker_pool), 'pending', status),
+          ready_at = IF(worker_pool = VALUES(worker_pool), VALUES(ready_at), ready_at),
+          locked_by = IF(worker_pool = VALUES(worker_pool), NULL, locked_by),
+          locked_until = IF(worker_pool = VALUES(worker_pool), NULL, locked_until),
+          updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
       SQL
     end
 
@@ -1972,6 +1978,7 @@ module Durababble
         INSERT INTO #{table(store, "target_activations")} (worker_pool, target_kind, target_type, target_id, status, ready_at)
         VALUES (?, ?, ?, ?, 'pending', ?)
         ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = 'pending', ready_at = excluded.ready_at, locked_by = NULL, locked_until = NULL, updated_at = dura_now()
+        WHERE worker_pool = excluded.worker_pool
       SQL
     end
 
