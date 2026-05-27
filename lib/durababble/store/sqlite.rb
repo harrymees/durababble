@@ -53,6 +53,8 @@ module Durababble
 
     #: (ActiveRecord::ConnectionAdapters::ConnectionPool, schema: String, ?owner: Object?) -> void
     def initialize(connection_pool, schema:, owner: nil)
+      @store_query_sql_cache = {}
+      @sqlite_translation_cache = {}
       super
       # An in-memory SQLite database lives inside a single connection — a second
       # connection from the pool is a different, empty database. Lease one
@@ -112,11 +114,15 @@ module Durababble
 
     #: (Symbol | String, **Object?) -> String
     def store_query_sql(id, **locals)
+      cache_key = store_query_sql_cache_key(id, locals)
+      cached = @store_query_sql_cache[cache_key]
+      return cached if cached
+
       resolved = qualified_store_query_id(id)
       sql = StoreQueries.sql(resolved, self, locals)
-      return sql if resolved.to_s.start_with?("sqlite_")
+      sql = translate_to_sqlite(sql) unless resolved.to_s.start_with?("sqlite_")
 
-      translate_to_sqlite(sql)
+      @store_query_sql_cache[cache_key] = sql.freeze
     end
 
     # Rewrites MySQL-dialect SQL into the SQLite subset this store speaks. The
@@ -125,6 +131,10 @@ module Durababble
     # only has to cover the mechanical substitutions.
     #: (String) -> String
     def translate_to_sqlite(sql)
+      source_sql = sql
+      cached = @sqlite_translation_cache[source_sql]
+      return cached if cached
+
       sql = sql.gsub(/\s*FORCE INDEX \([^)]*\)/i, "")
       sql = sql.gsub(/INSERT IGNORE INTO/i, "INSERT OR IGNORE INTO")
       # The integer clock counts microseconds, so a SECOND interval must be
@@ -136,7 +146,9 @@ module Durababble
       sql = sql.gsub(/NOW\(6\)/i, "dura_now()")
       sql = sql.gsub(/\bLEAST\(/i, "MIN(")
       sql = sql.gsub(/\bGREATEST\(/i, "MAX(")
-      sql.gsub(/\s*FOR UPDATE(?:\s+OF\s+\w+)?(?:\s+SKIP\s+LOCKED)?/i, "")
+      sql = sql.gsub(/\s*FOR UPDATE(?:\s+OF\s+\w+)?(?:\s+SKIP\s+LOCKED)?/i, "")
+
+      @sqlite_translation_cache[source_sql] = sql.freeze
     end
 
     #: (String) -> untyped
@@ -150,6 +162,31 @@ module Durababble
     #: (String, Array[Object?]) -> untyped
     def execute_params(sql, params)
       execute_store_query_sql(translate_to_sqlite(sql), params)
+    end
+
+    #: (SqliteStore) -> SqliteStore
+    def load_migrated_template!(template)
+      backup = SQLite3::Backup.new(raw_sqlite_connection, "main", template.send(:raw_sqlite_connection), "main")
+      backup.step(-1)
+      @migrated = true
+      self
+    ensure
+      backup&.finish
+    end
+
+    #: (Symbol | String, Hash[Symbol, Object?]) -> Object
+    def store_query_sql_cache_key(id, locals)
+      return id.to_sym if locals.empty?
+
+      [
+        id.to_sym,
+        locals.sort_by { |key, _| key.to_s }.map { |key, value| [key, value] }.freeze,
+      ].freeze
+    end
+
+    #: () -> SQLite3::Database
+    def raw_sqlite_connection
+      @connection.raw_connection
     end
 
     #: (**Object?) { () -> Object? } -> Object?

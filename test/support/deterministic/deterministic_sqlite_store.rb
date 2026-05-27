@@ -35,6 +35,9 @@ module Durababble
       #: untyped
       attr_reader :scheduler, :fault_plan
 
+      MIGRATED_TEMPLATE_MUTEX = Mutex.new
+      MIGRATED_TEMPLATES = {}
+
       class << self
         #: (scheduler: untyped, ?fault_plan: untyped, ?schema: String) -> DeterministicSqliteStore
         def build(scheduler:, fault_plan: nil, schema: "durababble")
@@ -49,11 +52,23 @@ module Durababble
           begin
             connection_class.establish_connection(adapter: "sqlite3", database: ":memory:", pool: 1)
             store = new(connection_class.connection_pool, scheduler:, fault_plan:, schema:, owner: connection_class)
-            store.migrate!
+            store.send(:load_migrated_template!, migrated_template(schema))
             store
           rescue StandardError
             Store.send(:remove_active_record_class_const, connection_class)
             raise
+          end
+        end
+
+        private
+
+        #: (String) -> SqliteStore
+        def migrated_template(schema)
+          MIGRATED_TEMPLATE_MUTEX.synchronize do
+            MIGRATED_TEMPLATES[schema] ||= begin
+              template = SqliteStore.build_in_memory(schema:)
+              template.migrate!
+            end
           end
         end
       end
@@ -127,12 +142,18 @@ module Durababble
       # process-global stub is safe for the length of one run.
       #: [T] () { () -> T } -> T
       def with_deterministic_uuids(&block)
+        singleton_class = SecureRandom.singleton_class
         original = SecureRandom.method(:uuid)
+        restore_singleton_uuid = singleton_class.public_method_defined?(:uuid, false)
         store = self
+        singleton_class.__send__(:remove_method, :uuid) if restore_singleton_uuid
         SecureRandom.define_singleton_method(:uuid) { store.send(:generate_uuid) }
         block.call
       ensure
-        SecureRandom.define_singleton_method(:uuid, original) if original
+        if singleton_class&.public_method_defined?(:uuid, false)
+          singleton_class.__send__(:remove_method, :uuid)
+        end
+        SecureRandom.define_singleton_method(:uuid, original) if restore_singleton_uuid
       end
 
       # --- Deterministic clock / identity seams ------------------------------
