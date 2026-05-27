@@ -330,6 +330,11 @@ SELECT * FROM "durababble_pg_snapshot"."inbox"
 WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
 ORDER BY sequence
 
+-- pg_inbox_messages_for_worker_pool
+SELECT * FROM "durababble_pg_snapshot"."inbox"
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+ORDER BY sequence
+
 -- pg_insert_fence
 INSERT INTO "durababble_pg_snapshot"."fences" (workflow_id, key, status, locked_by, locked_until)
 VALUES ($1, $2, 'running', $3, now() + ($4::int * interval '1 second'))

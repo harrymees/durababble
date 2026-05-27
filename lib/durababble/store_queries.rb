@@ -1252,6 +1252,14 @@ module Durababble
       SQL
     end
 
+    define(:pg_inbox_messages_for_worker_pool, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT * FROM #{table(store, "inbox")}
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+        ORDER BY sequence
+      SQL
+    end
+
     define(:pg_target_activation, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "target_activations")} WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4"
     end
@@ -1917,6 +1925,14 @@ module Durababble
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
         WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        ORDER BY sequence
+      SQL
+    end
+
+    define(:mysql_inbox_messages_for_worker_pool, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT * FROM #{table(store, "inbox")}
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
         ORDER BY sequence
       SQL
     end

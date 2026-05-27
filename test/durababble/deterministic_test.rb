@@ -63,6 +63,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     "parallel_wait_with_retrying_sibling",
     "wait_condition_command_wakeup",
     "wait_condition_sequential_command_wakeups",
+    "inbox_messages_for_worker_pool_isolation",
     "mailbox_worker_pool_first_writer",
     "mailbox_worker_pool_isolation",
     "target_activation_worker_pool_completion_isolation",
@@ -660,6 +661,16 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_empty result.violations
     assert_includes result.trace, "wrong_pool_claim claimed=[]"
     assert_includes result.trace, "right_pool_claim"
+  end
+
+  test "filters inbox message inspection by worker pool" do
+    result = Durababble::Deterministic.prove("inbox_messages_for_worker_pool_isolation", seed: 1)
+
+    assert_empty result.violations
+    assert_includes result.trace, "pool_filtered_inbox_inspection"
+    assert_includes result.trace, "wrong_pool=[]"
+    assert_includes result.trace, "right_pool="
+    assert_includes result.trace, "all_pools="
   end
 
   test "keeps object mailbox messages on the first worker pool" do

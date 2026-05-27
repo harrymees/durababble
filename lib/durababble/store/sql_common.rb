@@ -265,9 +265,13 @@ module Durababble
       decode_row(row) if row
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Array[Hash[String, Object?]]
-    def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: "default")
-      execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
+    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String?) -> Array[Hash[String, Object?]]
+    def inbox_messages_for(target_kind:, target_type:, target_id:, worker_pool: nil)
+      if worker_pool
+        execute_store_query(:inbox_messages_for_worker_pool, [worker_pool, target_kind, target_type, target_id]).map { |row| decode_row(row) }
+      else
+        execute_store_query(:inbox_messages_for, [target_kind, target_type, target_id]).map { |row| decode_row(row) }
+      end
     end
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?

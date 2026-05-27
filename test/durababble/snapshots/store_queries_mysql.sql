@@ -339,6 +339,11 @@ SELECT * FROM `durababble_mysql_snapshot_inbox`
 WHERE target_kind = ? AND target_type = ? AND target_id = ?
 ORDER BY sequence
 
+-- mysql_inbox_messages_for_worker_pool
+SELECT * FROM `durababble_mysql_snapshot_inbox`
+WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
+ORDER BY sequence
+
 -- mysql_insert_fence
 INSERT IGNORE INTO `durababble_mysql_snapshot_fences` (workflow_id, `key`, status, locked_by, locked_until)
 VALUES (?, ?, 'running', ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))

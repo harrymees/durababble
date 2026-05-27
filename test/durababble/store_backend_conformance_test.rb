@@ -682,6 +682,43 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "filters inbox message inspection by worker pool with #{backend.name}" do
+      with_durababble_store(backend, "inbox_messages_for_worker_pool_isolation") do |store|
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          idempotency_key: "pool-a-message",
+        )
+
+        wrong_pool = store.inbox_messages_for(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+        right_pool = store.inbox_messages_for(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+        all_pools = store.inbox_messages_for(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+        )
+
+        assert_empty wrong_pool
+        assert_equal [message_id], right_pool.map { |message| message.fetch("id") }
+        assert_equal [message_id], all_pools.map { |message| message.fetch("id") }
+      end
+    end
+
     test "keeps object inbox messages on the first materialized worker pool with #{backend.name}" do
       with_durababble_store(backend, "object_inbox_first_pool") do |store|
         first_id = store.enqueue_inbox_message(
