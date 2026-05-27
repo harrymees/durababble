@@ -175,6 +175,42 @@ module Durababble
         CREATE INDEX IF NOT EXISTS #{index_name("object_wakeups", "due")}
         ON #{table("object_wakeups")} (wake_at, created_at)
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("child_workflows")} (
+          id TEXT PRIMARY KEY,
+          origin_kind TEXT NOT NULL,
+          parent_workflow_id TEXT,
+          parent_workflow_name TEXT,
+          parent_command_id INTEGER,
+          parent_object_type TEXT,
+          parent_object_id TEXT,
+          parent_object_command_id TEXT,
+          child_workflow_name TEXT NOT NULL,
+          child_workflow_id TEXT NOT NULL,
+          worker_pool TEXT NOT NULL DEFAULT 'default',
+          idempotency_key TEXT NOT NULL,
+          cancellation_policy TEXT NOT NULL,
+          input BLOB NOT NULL,
+          status TEXT NOT NULL,
+          result BLOB,
+          error TEXT,
+          created_at INTEGER NOT NULL DEFAULT (dura_now()),
+          updated_at INTEGER NOT NULL DEFAULT (dura_now()),
+          completed_at INTEGER,
+          UNIQUE (parent_workflow_id, parent_command_id),
+          UNIQUE (parent_object_type, parent_object_id, parent_object_command_id, idempotency_key),
+          FOREIGN KEY (parent_workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          FOREIGN KEY (child_workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS #{index_name("child_workflows", "parent_workflow")}
+        ON #{table("child_workflows")} (parent_workflow_id, created_at)
+      SQL
+      execute(<<~SQL)
+        CREATE INDEX IF NOT EXISTS #{index_name("child_workflows", "parent_object")}
+        ON #{table("child_workflows")} (parent_object_type, parent_object_id, created_at)
+      SQL
       create_inbox_tables!
       @migrated = true
       self

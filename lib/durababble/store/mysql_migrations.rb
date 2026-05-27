@@ -169,6 +169,37 @@ module Durababble
           INDEX #{quote_column_name(index_name("object_wakeups", "due"))} (wake_at, created_at)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("child_workflows")} (
+          id VARCHAR(191) PRIMARY KEY,
+          origin_kind VARCHAR(32) NOT NULL,
+          parent_workflow_id VARCHAR(191),
+          parent_workflow_name VARCHAR(191),
+          parent_command_id INT,
+          parent_object_type VARCHAR(191),
+          parent_object_id VARCHAR(191),
+          parent_object_command_id VARCHAR(191),
+          child_workflow_name VARCHAR(191) NOT NULL,
+          child_workflow_id VARCHAR(191) NOT NULL,
+          worker_pool VARCHAR(191) NOT NULL DEFAULT 'default',
+          idempotency_key VARCHAR(191) NOT NULL,
+          cancellation_policy VARCHAR(32) NOT NULL,
+          input LONGBLOB NOT NULL,
+          status VARCHAR(32) NOT NULL,
+          result LONGBLOB,
+          error TEXT,
+          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          completed_at DATETIME(6),
+          UNIQUE KEY #{quote_column_name(index_name("child_workflows", "workflow_command_unique"))} (parent_workflow_id, parent_command_id),
+          UNIQUE KEY #{quote_column_name(index_name("child_workflows", "object_command_key_unique"))} (parent_object_type, parent_object_id, parent_object_command_id, idempotency_key),
+          INDEX #{quote_column_name(index_name("child_workflows", "parent_workflow"))} (parent_workflow_id, created_at),
+          INDEX #{quote_column_name(index_name("child_workflows", "parent_object"))} (parent_object_type, parent_object_id, created_at),
+          INDEX #{quote_column_name(index_name("child_workflows", "child"))} (child_workflow_id),
+          FOREIGN KEY (parent_workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          FOREIGN KEY (child_workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
+        )
+      SQL
       create_inbox_tables!
       @migrated = true
       self

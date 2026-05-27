@@ -145,6 +145,38 @@ end
 
 The calls above are persisted as ordered workflow command history entries with names such as `handle_rpc:object:approval_counter:increment` and `handle_rpc:workflow:approval_workflow:approve`. On replay or crash recovery, completed handle RPC results are returned from history and Durababble does not enqueue the outbound workflow/object command a second time. `DurableObject.tell(id, method, ...)` works the same way from workflow code and replays to the original tell message id.
 
+## Child Workflows
+
+Workflow orchestration can start another workflow as a child with `start_child` or `start_workflow`. The call returns a `Durababble::ChildWorkflowHandle`, which has `workflow_id`, `worker_pool`, `status`, `result`, `error`, `await`, `cancel`, `terminate`, and `ref`.
+
+```ruby
+class ShipOrder < Durababble::Workflow
+  def execute(order)
+    handle = start_child(
+      CreateShipment,
+      { "order_id" => order.fetch("id") },
+      id: "shipment-#{order.fetch('id')}",
+      cancellation: :request_cancel,
+    )
+
+    shipment = handle.await
+    notify_customer(order, shipment)
+  end
+
+  step def notify_customer(order, shipment)
+    Notifications.shipped(order.fetch("id"), shipment.fetch("tracking_number"), idempotency_key: step_context.idempotency_key)
+  end
+end
+```
+
+Starting a child is itself a durable workflow command. Durababble records the start command before inserting the child workflow row and parent/child link row; if the parent crashes after that point, replay reattaches to the existing child instead of creating another one. Passing `id:` gives the child a deterministic workflow id. If `id:` is omitted, Durababble derives one from the parent workflow id, command id, child workflow name, input, worker pool, and idempotency key.
+
+`handle.await` observes the child through recorded workflow commands. If the child is still pending or running, the parent records a timer wait and suspends normally; a crash while waiting resumes from the same child handle. When the child completes, `await` returns the child result. If the child fails, cancels, or is terminated, `await` raises `Durababble::ChildWorkflowFailed`, `Durababble::ChildWorkflowCanceled`, or `Durababble::ChildWorkflowTerminated`, so parent workflow code can rescue and handle the outcome.
+
+Child workflows inherit the parent worker pool unless `worker_pool:` is supplied. A child in another worker pool is not claimed by parent-pool workers, and a child whose workflow class is not registered in any worker remains pending and inspectable until a matching worker is deployed or an operator cancels/terminates it.
+
+Cancellation is explicit. `cancellation: :request_cancel` asks Durababble to request child cancellation when the parent observes cooperative cancellation. `cancellation: :abandon` leaves the child running or pending if the parent is canceled. Parent hard termination does not request child cancellation or run cleanup; use the child handle if the child should be stopped separately.
+
 ### Deduplicating Workflow Starts
 
 Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.

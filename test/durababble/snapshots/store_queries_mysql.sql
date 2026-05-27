@@ -43,6 +43,18 @@ SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_
   cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 
+-- mysql_child_workflow_link_by_child_id_for_update
+SELECT * FROM `durababble_mysql_snapshot_child_workflows` WHERE child_workflow_id = ? FOR UPDATE
+
+-- mysql_child_workflow_link_for_update
+SELECT * FROM `durababble_mysql_snapshot_child_workflows` WHERE id = ? FOR UPDATE
+
+-- mysql_child_workflows_for_object
+SELECT * FROM `durababble_mysql_snapshot_child_workflows` WHERE parent_object_type = ? AND parent_object_id = ? ORDER BY created_at ASC
+
+-- mysql_child_workflows_for_parent
+SELECT * FROM `durababble_mysql_snapshot_child_workflows` WHERE parent_workflow_id = ? ORDER BY created_at ASC
+
 -- mysql_claim_expired_fence
 UPDATE `durababble_mysql_snapshot_fences`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), result = NULL, error = NULL, completed_at = NULL
@@ -338,6 +350,19 @@ SELECT * FROM `durababble_mysql_snapshot_inbox`
 WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 ORDER BY sequence
 
+-- mysql_insert_child_workflow_link
+INSERT INTO `durababble_mysql_snapshot_child_workflows` (
+  id, origin_kind, parent_workflow_id, parent_workflow_name, parent_command_id,
+  parent_object_type, parent_object_id, parent_object_command_id,
+  child_workflow_name, child_workflow_id, worker_pool, idempotency_key,
+  cancellation_policy, input, status
+) VALUES (
+  ?, ?, ?, ?, ?,
+  ?, ?, ?,
+  ?, ?, ?, ?,
+  ?, ?, ?
+)
+
 -- mysql_insert_fence
 INSERT IGNORE INTO `durababble_mysql_snapshot_fences` (workflow_id, `key`, status, locked_by, locked_until)
 VALUES (?, ?, 'running', ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))
@@ -604,6 +629,15 @@ DELETE FROM `durababble_mysql_snapshot_target_activations` WHERE target_kind = '
 
 -- mysql_terminate_workflow_waits
 UPDATE `durababble_mysql_snapshot_waits` SET status = 'canceled', completed_at = NOW(6) WHERE workflow_id = ? AND status = 'pending'
+
+-- mysql_update_child_workflow_link_observation
+UPDATE `durababble_mysql_snapshot_child_workflows`
+SET status = ?,
+    result = ?,
+    error = ?,
+    updated_at = ?,
+    completed_at = ?
+WHERE id = ?
 
 -- mysql_update_latest_attempt
 UPDATE `durababble_mysql_snapshot_step_attempts`

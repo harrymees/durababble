@@ -391,6 +391,50 @@ module Durababble
       "SELECT * FROM #{table(store, "workflows")} WHERE id = $1"
     end
 
+    define(:pg_child_workflow_link_for_update, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE id = $1 FOR UPDATE"
+    end
+
+    define(:pg_child_workflow_link_by_child_id_for_update, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE child_workflow_id = $1 FOR UPDATE"
+    end
+
+    define(:pg_child_workflows_for_parent, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE parent_workflow_id = $1 ORDER BY created_at ASC"
+    end
+
+    define(:pg_child_workflows_for_object, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE parent_object_type = $1 AND parent_object_id = $2 ORDER BY created_at ASC"
+    end
+
+    define(:pg_update_child_workflow_link_observation, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "child_workflows")}
+        SET status = $1,
+            result = $2::bytea,
+            error = $3,
+            updated_at = $4::timestamptz,
+            completed_at = $5::timestamptz
+        WHERE id = $6
+      SQL
+    end
+
+    define(:pg_insert_child_workflow_link, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "child_workflows")} (
+          id, origin_kind, parent_workflow_id, parent_workflow_name, parent_command_id,
+          parent_object_type, parent_object_id, parent_object_command_id,
+          child_workflow_name, child_workflow_id, worker_pool, idempotency_key,
+          cancellation_policy, input, status
+        ) VALUES (
+          $1, $2, $3, $4, $5,
+          $6, $7, $8,
+          $9, $10, $11, $12,
+          $13, $14::bytea, $15
+        )
+      SQL
+    end
+
     define(:pg_steps_for, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "steps")} WHERE workflow_id = $1 ORDER BY position"
     end
@@ -665,6 +709,50 @@ module Durababble
 
     define(:mysql_workflow, backend: :mysql, description: "Read one workflow row by id after a claim or for runtime state.") do |store|
       "SELECT * FROM #{table(store, "workflows")} WHERE id = ?"
+    end
+
+    define(:mysql_child_workflow_link_for_update, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE id = ? FOR UPDATE"
+    end
+
+    define(:mysql_child_workflow_link_by_child_id_for_update, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE child_workflow_id = ? FOR UPDATE"
+    end
+
+    define(:mysql_child_workflows_for_parent, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE parent_workflow_id = ? ORDER BY created_at ASC"
+    end
+
+    define(:mysql_child_workflows_for_object, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "child_workflows")} WHERE parent_object_type = ? AND parent_object_id = ? ORDER BY created_at ASC"
+    end
+
+    define(:mysql_update_child_workflow_link_observation, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "child_workflows")}
+        SET status = ?,
+            result = ?,
+            error = ?,
+            updated_at = ?,
+            completed_at = ?
+        WHERE id = ?
+      SQL
+    end
+
+    define(:mysql_insert_child_workflow_link, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "child_workflows")} (
+          id, origin_kind, parent_workflow_id, parent_workflow_name, parent_command_id,
+          parent_object_type, parent_object_id, parent_object_command_id,
+          child_workflow_name, child_workflow_id, worker_pool, idempotency_key,
+          cancellation_policy, input, status
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?
+        )
+      SQL
     end
 
     define(:mysql_steps_for, backend: :mysql, description: "Read step rows for a workflow in command order.") do |store|

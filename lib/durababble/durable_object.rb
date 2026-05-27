@@ -1,6 +1,8 @@
 # typed: true
 # frozen_string_literal: true
 
+require "digest"
+
 require_relative "durable_method_dsl"
 require_relative "execution_context"
 require_relative "error_formatting"
@@ -240,10 +242,66 @@ module Durababble
       true
     end
 
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
+    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon)
+      raise Error, "cannot start workflows from an exposed query" if @__durababble_query_context
+      raise Error, "durable object workflow starts can only be scheduled from object commands" unless command_context
+
+      workflow_class = workflow_class #: as untyped
+      context = command_context #: as CommandContext
+      child_workflow_name = workflow_class.workflow_name
+      child_worker_pool = worker_pool || @worker_pool
+      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{child_workflow_name}"
+      resolved_id = id || generated_child_workflow_id(child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key: resolved_key)
+      policy = normalize_child_cancellation_policy(cancellation)
+      link = @store.start_child_workflow(
+        origin_kind: "object",
+        parent_object_type: self.class.object_type,
+        parent_object_id: durable_id,
+        parent_object_command_id: context.command_id,
+        child_workflow_name:,
+        child_workflow_id: resolved_id,
+        input:,
+        worker_pool: child_worker_pool,
+        idempotency_key: resolved_key,
+        cancellation_policy: policy,
+      )
+      ChildWorkflowHandle.new(
+        workflow_class,
+        link.fetch("child_workflow_id"),
+        store: @store,
+        worker_pool: link.fetch("worker_pool"),
+        cancellation_policy: link.fetch("cancellation_policy"),
+      )
+    end
+
     #: () -> bool
     def state_dirty? = @state_dirty
 
     private
+
+    #: (child_workflow_name: String, input: Object?, worker_pool: String, idempotency_key: String) -> String
+    def generated_child_workflow_id(child_workflow_name:, input:, worker_pool:, idempotency_key:)
+      context = command_context #: as CommandContext
+      digest = Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
+        "object_type" => self.class.object_type,
+        "object_id" => durable_id,
+        "command_id" => context.command_id,
+        "child_workflow_name" => child_workflow_name,
+        "input" => input,
+        "worker_pool" => worker_pool,
+        "idempotency_key" => idempotency_key,
+      }))
+      "child-#{digest[0, 48]}"
+    end
+
+    #: (Symbol | String) -> String
+    def normalize_child_cancellation_policy(policy)
+      normalized = policy.to_s
+      return normalized if ["request_cancel", "abandon"].include?(normalized)
+
+      raise ArgumentError, "unknown child workflow cancellation policy: #{policy.inspect}"
+    end
 
     #: (Object?) -> String
     def coerce_wake_name(name)

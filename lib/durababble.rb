@@ -74,6 +74,10 @@ module Durababble
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
   class WorkflowAlreadyExists < Error; end
+  class ChildWorkflowError < Error; end
+  class ChildWorkflowFailed < ChildWorkflowError; end
+  class ChildWorkflowCanceled < ChildWorkflowError; end
+  class ChildWorkflowTerminated < ChildWorkflowError; end
 
   class PayloadTooLarge < Error
     #: Symbol

@@ -35,6 +35,18 @@ UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2
 -- pg_cancel_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()
 
+-- pg_child_workflow_link_by_child_id_for_update
+SELECT * FROM "durababble_pg_snapshot"."child_workflows" WHERE child_workflow_id = $1 FOR UPDATE
+
+-- pg_child_workflow_link_for_update
+SELECT * FROM "durababble_pg_snapshot"."child_workflows" WHERE id = $1 FOR UPDATE
+
+-- pg_child_workflows_for_object
+SELECT * FROM "durababble_pg_snapshot"."child_workflows" WHERE parent_object_type = $1 AND parent_object_id = $2 ORDER BY created_at ASC
+
+-- pg_child_workflows_for_parent
+SELECT * FROM "durababble_pg_snapshot"."child_workflows" WHERE parent_workflow_id = $1 ORDER BY created_at ASC
+
 -- pg_claim_expired_fence
 UPDATE "durababble_pg_snapshot"."fences"
 SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), result = NULL, error = NULL, completed_at = NULL
@@ -312,6 +324,19 @@ SELECT * FROM "durababble_pg_snapshot"."inbox"
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 ORDER BY sequence
 
+-- pg_insert_child_workflow_link
+INSERT INTO "durababble_pg_snapshot"."child_workflows" (
+  id, origin_kind, parent_workflow_id, parent_workflow_name, parent_command_id,
+  parent_object_type, parent_object_id, parent_object_command_id,
+  child_workflow_name, child_workflow_id, worker_pool, idempotency_key,
+  cancellation_policy, input, status
+) VALUES (
+  $1, $2, $3, $4, $5,
+  $6, $7, $8,
+  $9, $10, $11, $12,
+  $13, $14::bytea, $15
+)
+
 -- pg_insert_fence
 INSERT INTO "durababble_pg_snapshot"."fences" (workflow_id, key, status, locked_by, locked_until)
 VALUES ($1, $2, 'running', $3, now() + ($4::int * interval '1 second'))
@@ -581,6 +606,15 @@ DELETE FROM "durababble_pg_snapshot"."target_activations" WHERE target_kind = 'w
 
 -- pg_terminate_workflow_waits
 UPDATE "durababble_pg_snapshot"."waits" SET status = 'canceled', completed_at = now() WHERE workflow_id = $1 AND status = 'pending'
+
+-- pg_update_child_workflow_link_observation
+UPDATE "durababble_pg_snapshot"."child_workflows"
+SET status = $1,
+    result = $2::bytea,
+    error = $3,
+    updated_at = $4::timestamptz,
+    completed_at = $5::timestamptz
+WHERE id = $6
 
 -- pg_update_latest_attempt
 UPDATE "durababble_pg_snapshot"."step_attempts"

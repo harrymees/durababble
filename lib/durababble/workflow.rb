@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "securerandom"
+require "digest"
 
 require_relative "durable_method_dsl"
 require_relative "execution_context"
@@ -185,6 +186,115 @@ module Durababble
       raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
 
       Durababble.wait_condition(timeout:, &block)
+    end
+
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
+    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel)
+      raise Error, "cannot start child workflows from an exposed query" if @__durababble_query_context
+
+      __durababble_execution__.call_child_workflow_start(
+        workflow_class,
+        input,
+        id:,
+        worker_pool:,
+        idempotency_key:,
+        cancellation_policy: cancellation,
+      )
+    end
+
+    alias_method :start_workflow, :start_child
+  end
+
+  class ChildWorkflowHandle
+    TERMINAL_FAILURE_ERRORS = {
+      "failed" => ChildWorkflowFailed,
+      "canceled" => ChildWorkflowCanceled,
+      "terminated" => ChildWorkflowTerminated,
+    }.freeze
+
+    #: (Class, String, store: Store, worker_pool: String, cancellation_policy: String) -> void
+    def initialize(workflow_class, workflow_id, store:, worker_pool:, cancellation_policy:)
+      @workflow_class = workflow_class #: as untyped
+      @workflow_id = workflow_id
+      @store = store #: as untyped
+      @worker_pool = worker_pool
+      @cancellation_policy = cancellation_policy
+    end
+
+    #: String
+    attr_reader :workflow_id
+    #: String
+    attr_reader :worker_pool
+    #: String
+    attr_reader :cancellation_policy
+
+    #: () -> WorkflowRef
+    def ref
+      @workflow_class.handle(@workflow_id, store: @store, worker_pool: @worker_pool)
+    end
+
+    #: () -> String
+    def status
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_child_workflow_observe(self).fetch("status")
+      end
+
+      @store.observe_child_workflow(@workflow_id).fetch("status")
+    end
+
+    #: () -> Object?
+    def result
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_child_workflow_observe(self).fetch("result")
+      end
+
+      @store.observe_child_workflow(@workflow_id)["result"]
+    end
+
+    #: () -> String?
+    def error
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_child_workflow_observe(self)["error"]
+      end
+
+      @store.observe_child_workflow(@workflow_id)["error"]
+    end
+
+    #: (?poll_interval: Numeric, ?timeout: Numeric?) -> Object?
+    def await(poll_interval: 1, timeout: nil)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.await_child_workflow(self, poll_interval:, timeout:)
+      end
+
+      deadline = timeout && Time.now + timeout
+      loop do
+        observed = @store.observe_child_workflow(@workflow_id)
+        return await_result_from(observed) if WorkflowStatus.terminal?(observed)
+        raise CommandTimeout, "timed out waiting for child workflow #{@workflow_id}" if deadline && Time.now >= deadline
+
+        sleep(poll_interval)
+      end
+    end
+
+    #: (?reason: Object?) -> Run
+    def cancel(reason: nil)
+      ref.cancel(reason:)
+    end
+
+    #: (?reason: Object?) -> Run
+    def terminate(reason: nil)
+      ref.terminate(reason:)
+    end
+
+    #: (Hash[String, Object?]) -> Object?
+    def await_result_from(observed)
+      status = observed.fetch("status")
+      return observed["result"] if status == "completed"
+
+      error_class = TERMINAL_FAILURE_ERRORS.fetch(status, ChildWorkflowError)
+      error = observed["error"]
+      message = error.to_s.empty? ? "child workflow #{@workflow_id} #{status}" : error.to_s
+      raise error_class, message
     end
   end
 

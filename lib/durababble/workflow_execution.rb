@@ -3,6 +3,7 @@
 
 require "async"
 require "thread"
+require "digest"
 
 require_relative "command_future"
 require_relative "execution_context"
@@ -203,6 +204,105 @@ module Durababble
       result #: as Result
     end
 
+    #: (Class, Object?, cancellation_policy: Symbol | String, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?) -> ChildWorkflowHandle
+    def call_child_workflow_start(workflow_class, input, cancellation_policy:, id: nil, worker_pool: nil, idempotency_key: nil)
+      workflow_class = workflow_class #: as untyped
+      assert_workflow_task!("child workflow start #{workflow_class.workflow_name}")
+      child_workflow_name = workflow_class.workflow_name
+      child_worker_pool = worker_pool || @worker_pool
+      normalized_policy = normalize_child_cancellation_policy(cancellation_policy)
+      name = child_workflow_command_name(child_workflow_name, "start")
+      shape = child_workflow_start_shape(
+        name:,
+        child_workflow_name:,
+        child_workflow_id: id,
+        input:,
+        worker_pool: child_worker_pool,
+        idempotency_key:,
+        cancellation_policy: normalized_policy,
+      )
+      raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
+      command_id, future, scheduled_from_history = allocate_command(name:, shape:)
+      synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(nil))
+      attributes = child_workflow_attributes(child_workflow_name:, child_workflow_id: id, command_id:, operation: "start")
+      observability_attributes = attributes #: as untyped
+      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+
+      unless @replay_history.terminal_recorded?(command_id)
+        reserve_scheduled_followup_events!(scheduled_from_history)
+        dispatch_command!(command_id, step: synthetic_step, attributes:) do
+          resolved_id = id || generated_child_workflow_id(command_id:, child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key:)
+          resolved_key = idempotency_key || child_workflow_idempotency_key(command_id)
+          @store.start_child_workflow(
+            origin_kind: "workflow",
+            parent_workflow_id: @workflow_id,
+            parent_workflow_name: @workflow_class.workflow_name,
+            parent_command_id: command_id,
+            child_workflow_name:,
+            child_workflow_id: resolved_id,
+            input:,
+            worker_pool: child_worker_pool,
+            idempotency_key: resolved_key,
+            cancellation_policy: normalized_policy,
+          ).slice(
+            "child_workflow_id",
+            "child_workflow_name",
+            "worker_pool",
+            "idempotency_key",
+            "cancellation_policy",
+            "status",
+            "result",
+            "error",
+          )
+        end
+      end
+
+      observed = await_command_result(future, command_id)
+      ChildWorkflowHandle.new(
+        workflow_class,
+        observed.fetch("child_workflow_id"),
+        store: @store,
+        worker_pool: observed.fetch("worker_pool"),
+        cancellation_policy: observed.fetch("cancellation_policy"),
+      )
+    end
+
+    #: (ChildWorkflowHandle) -> Hash[String, Object?]
+    def call_child_workflow_observe(handle)
+      assert_workflow_task!("child workflow observe #{handle.workflow_id}")
+      name = child_workflow_command_name("workflow", "observe")
+      shape = child_workflow_observe_shape(name:, child_workflow_id: handle.workflow_id)
+      raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
+      command_id, future, scheduled_from_history = allocate_command(name:, shape:)
+      synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(nil))
+      attributes = child_workflow_attributes(child_workflow_name: "workflow", child_workflow_id: handle.workflow_id, command_id:, operation: "observe")
+      observability_attributes = attributes #: as untyped
+      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+
+      unless @replay_history.terminal_recorded?(command_id)
+        reserve_scheduled_followup_events!(scheduled_from_history)
+        dispatch_command!(command_id, step: synthetic_step, attributes:) do
+          @store.observe_child_workflow(handle.workflow_id).slice("status", "result", "error")
+        end
+      end
+
+      await_command_result(future, command_id)
+    end
+
+    #: (ChildWorkflowHandle, poll_interval: Numeric, timeout: Numeric?) -> Object?
+    def await_child_workflow(handle, poll_interval:, timeout:)
+      deadline = timeout && (WorkflowDeterminism.allow_host_operations { @store.current_time } + timeout)
+      loop do
+        observed = call_child_workflow_observe(handle)
+        return handle.await_result_from(observed) if WorkflowStatus.terminal?(observed)
+        if deadline && WorkflowDeterminism.allow_host_operations { @store.current_time } >= deadline
+          raise CommandTimeout, "timed out waiting for child workflow #{handle.workflow_id}"
+        end
+
+        Durababble.sleep(poll_interval, "child_workflow_id" => handle.workflow_id)
+      end
+    end
+
     # Awaits a command future, delivering pending workflow commands at the resulting
     # safe point. With interrupt_on_command a freshly-delivered command must re-evaluate
     # its condition rather than leave the wait parked, so WorkflowCommandDelivered can be
@@ -368,6 +468,41 @@ module Durababble
       }
     end
 
+    #: (name: String, child_workflow_name: String, child_workflow_id: String?, input: Object?, worker_pool: String, idempotency_key: String?, cancellation_policy: String) -> Hash[String, Object?]
+    def child_workflow_start_shape(name:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:)
+      {
+        "name" => name,
+        "args" => [input],
+        "kwargs" => {
+          "id" => child_workflow_id,
+          "worker_pool" => worker_pool,
+          "idempotency_key" => idempotency_key,
+          "cancellation_policy" => cancellation_policy,
+        },
+        "child_workflow" => {
+          "operation" => "start",
+          "workflow_name" => child_workflow_name,
+          "workflow_id" => child_workflow_id,
+          "worker_pool" => worker_pool,
+          "cancellation_policy" => cancellation_policy,
+          "idempotency_key" => idempotency_key,
+        },
+      }
+    end
+
+    #: (name: String, child_workflow_id: String) -> Hash[String, Object?]
+    def child_workflow_observe_shape(name:, child_workflow_id:)
+      {
+        "name" => name,
+        "args" => [],
+        "kwargs" => {},
+        "child_workflow" => {
+          "operation" => "observe",
+          "workflow_id" => child_workflow_id,
+        },
+      }
+    end
+
     #: (name: String, target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[Object?], kwargs: Hash[Symbol, Object?], idempotency_key: Object?) -> Hash[String, Object?]
     def handle_rpc_command_shape(name:, target_kind:, target_type:, target_id:, method_name:, rpc_kind:, args:, kwargs:, idempotency_key:)
       {
@@ -402,6 +537,11 @@ module Durababble
       "handle_rpc:#{target_kind}:#{target_type}:#{method_name}"
     end
 
+    #: (String, String) -> String
+    def child_workflow_command_name(child_workflow_name, operation)
+      "child_workflow:#{child_workflow_name}:#{operation}"
+    end
+
     #: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, command_id: Integer) -> Hash[String, Object?]
     def handle_rpc_attributes(target_kind:, target_type:, target_id:, method_name:, rpc_kind:, command_id:)
       {
@@ -417,9 +557,48 @@ module Durababble
       }
     end
 
+    #: (child_workflow_name: String, child_workflow_id: String?, command_id: Integer, operation: String) -> Hash[String, Object?]
+    def child_workflow_attributes(child_workflow_name:, child_workflow_id:, command_id:, operation:)
+      {
+        "durababble.workflow.id" => @workflow_id,
+        "durababble.step.name" => child_workflow_command_name(child_workflow_name, operation),
+        "durababble.step.index" => command_id,
+        "durababble.worker.id" => @worker_id,
+        "durababble.child_workflow.name" => child_workflow_name,
+        "durababble.child_workflow.id" => child_workflow_id,
+        "durababble.child_workflow.operation" => operation,
+      }
+    end
+
     #: (Integer) -> String
     def handle_rpc_idempotency_key(command_id)
       "durababble:v1:workflow:#{@workflow_id}:handle-rpc:#{command_id}"
+    end
+
+    #: (Integer) -> String
+    def child_workflow_idempotency_key(command_id)
+      "durababble:v1:workflow:#{@workflow_id}:child-workflow:#{command_id}"
+    end
+
+    #: (command_id: Integer, child_workflow_name: String, input: Object?, worker_pool: String, idempotency_key: String?) -> String
+    def generated_child_workflow_id(command_id:, child_workflow_name:, input:, worker_pool:, idempotency_key:)
+      digest = Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
+        "parent_workflow_id" => @workflow_id,
+        "command_id" => command_id,
+        "child_workflow_name" => child_workflow_name,
+        "input" => input,
+        "worker_pool" => worker_pool,
+        "idempotency_key" => idempotency_key,
+      }))
+      "child-#{digest[0, 48]}"
+    end
+
+    #: (Symbol | String) -> String
+    def normalize_child_cancellation_policy(policy)
+      normalized = policy.to_s
+      return normalized if ["request_cancel", "abandon"].include?(normalized)
+
+      raise ArgumentError, "unknown child workflow cancellation policy: #{policy.inspect}"
     end
 
     #: (untyped, name: untyped, shape: untyped, event_budget: Integer) -> bool
@@ -780,9 +959,28 @@ module Durababble
     #: (untyped, ?fallback_reason: untyped) -> untyped
     def cancellation_error_from(cancellation, fallback_reason: nil)
       @cancellation_delivered = true
+      propagate_child_cancellation!(cancellation&.fetch("reason", fallback_reason))
       synchronize_store { @store.mark_workflow_cancellation_delivered(workflow_id: @workflow_id) } if cancellation
       reason = cancellation&.fetch("reason", fallback_reason)
       CancellationError.new(reason, workflow_id: @workflow_id)
+    end
+
+    #: (Object?) -> void
+    def propagate_child_cancellation!(reason)
+      links = synchronize_store { @store.child_workflows_for_parent(parent_workflow_id: @workflow_id) }
+      links.each do |link|
+        next unless link.fetch("cancellation_policy") == "request_cancel"
+        next if WorkflowStatus.terminal?(link)
+
+        synchronize_store do
+          @store.request_workflow_cancellation(
+            workflow_id: link.fetch("child_workflow_id"),
+            reason: reason.to_s.empty? ? "parent workflow #{@workflow_id} canceled" : reason,
+          )
+        end
+      rescue KeyError
+        next
+      end
     end
 
     #: (untyped) -> bool

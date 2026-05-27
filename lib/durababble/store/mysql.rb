@@ -19,7 +19,7 @@ module Durababble
 
     #: () -> Object?
     def drop_schema!
-      ["target_activations", "inbox", "mailbox_sequences", "object_wakeups", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute_store_query(:drop_table, [], table_name: name) }
+      ["target_activations", "inbox", "mailbox_sequences", "object_wakeups", "durable_objects", "child_workflows", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute_store_query(:drop_table, [], table_name: name) }
       @migrated = false
     end
 

@@ -143,6 +143,32 @@ module Durababble
           PRIMARY KEY (worker_pool, object_type, object_id, name)
         )
       SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("child_workflows")} (
+          id text PRIMARY KEY,
+          origin_kind text NOT NULL,
+          parent_workflow_id text REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          parent_workflow_name text,
+          parent_command_id integer,
+          parent_object_type text,
+          parent_object_id text,
+          parent_object_command_id text,
+          child_workflow_name text NOT NULL,
+          child_workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
+          worker_pool text NOT NULL DEFAULT 'default',
+          idempotency_key text NOT NULL,
+          cancellation_policy text NOT NULL,
+          input bytea NOT NULL,
+          status text NOT NULL,
+          result bytea,
+          error text,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          completed_at timestamptz,
+          UNIQUE (parent_workflow_id, parent_command_id),
+          UNIQUE (parent_object_type, parent_object_id, parent_object_command_id, idempotency_key)
+        )
+      SQL
       create_inbox_tables!
       create_performance_indexes!
       @migrated = true
@@ -223,6 +249,9 @@ module Durababble
       create_postgres_index("waits_workflow_created_idx", "ON #{table("waits")} (workflow_id ASC, created_at ASC)")
       create_postgres_index("waits_workflow_status_idx", "ON #{table("waits")} (workflow_id ASC, status ASC)")
       create_postgres_index("object_wakeups_due_idx", "ON #{table("object_wakeups")} (wake_at ASC, created_at ASC)")
+      create_postgres_index("child_workflows_parent_workflow_idx", "ON #{table("child_workflows")} (parent_workflow_id ASC, created_at ASC)")
+      create_postgres_index("child_workflows_parent_object_idx", "ON #{table("child_workflows")} (parent_object_type ASC, parent_object_id ASC, created_at ASC)")
+      create_postgres_index("child_workflows_child_idx", "ON #{table("child_workflows")} (child_workflow_id ASC)")
       create_postgres_index("step_attempts_workflow_started_position_idx", "ON #{table("step_attempts")} (workflow_id ASC, started_at ASC, position ASC)")
       create_postgres_index("step_attempts_workflow_position_status_started_idx", "ON #{table("step_attempts")} (workflow_id ASC, position ASC, status ASC, started_at DESC)")
       create_postgres_index("outbox_queue_idx", "ON #{table("outbox")} (status ASC, created_at ASC)")
