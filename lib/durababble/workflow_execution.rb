@@ -13,19 +13,19 @@ require_relative "workflow"
 
 module Durababble
   class WorkflowExecution
-    #: Object
+    #: Store
     attr_reader :store
 
-    #: (store: untyped, workflow_id: untyped, worker_id: untyped, lease_seconds: untyped, history: untyped, root_task: untyped, workflow_class: untyped, workflow: untyped, worker_pool: untyped, ?crash_after: untyped, ?history_warning_logged: bool) -> void
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, history: Array[Hash[String, Object?]], root_task: Object, workflow_class: Class, workflow: Object, worker_pool: String, ?crash_after: Symbol?, ?history_warning_logged: bool) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @worker_pool = worker_pool
-      @root_task = root_task
-      @workflow_class = workflow_class
-      @workflow = workflow
+      @root_task = root_task #: as untyped
+      @workflow_class = workflow_class #: as untyped
+      @workflow = workflow #: as untyped
       @crash_after = crash_after
       @next_command_id = 0
       @futures = {}
@@ -64,12 +64,13 @@ module Durababble
       @cancellation_delivered
     end
 
-    #: () -> untyped
+    #: () -> StepContext
     def step_context
-      StepExecutionContext.current || @step_contexts[Async::Task.current]
+      context = StepExecutionContext.current || @step_contexts.fetch(Async::Task.current)
+      context #: as StepContext
     end
 
-    #: (untyped) -> void
+    #: (Object) -> void
     def register_workflow_task(task)
       return if @workflow_tasks.key?(task)
 
@@ -78,7 +79,7 @@ module Durababble
       @futures.each_value(&:wake)
     end
 
-    #: (untyped) -> void
+    #: (Object) -> void
     def unregister_workflow_task(task)
       return unless @workflow_tasks.delete(task)
 
@@ -88,7 +89,7 @@ module Durababble
       @futures.each_value(&:wake)
     end
 
-    #: () { (?) -> untyped } -> untyped
+    #: () { () -> Object? } -> Object?
     def block_current_workflow_task(&block)
       task = Async::Task.current
       return block.call unless @workflow_tasks.key?(task)
@@ -102,8 +103,9 @@ module Durababble
       @futures.each_value(&:wake) if task
     end
 
-    #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) { -> untyped } -> untyped
+    #: (Object, method_name: Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) { () -> Object? } -> Object?
     def call_step(instance, method_name:, args:, kwargs:, &block)
+      instance = instance #: as untyped
       assert_workflow_task!("durable step #{method_name}")
       step = instance.class.step_definition(method_name)
       shape = step_command_shape(step:, args:, kwargs:)
@@ -119,7 +121,7 @@ module Durababble
       await_command_result(future, command_id)
     end
 
-    #: (untyped, name: untyped, ?args: untyped, ?kwargs: untyped, ?interrupt_on_command: bool) -> untyped
+    #: (WaitRequest, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?interrupt_on_command: bool) -> Object?
     def call_wait(wait_request, name:, args: [], kwargs: {}, interrupt_on_command: false)
       assert_workflow_task!("durable wait #{name}")
       shape = wait_command_shape(name:, wait_request:, args:, kwargs:)
@@ -133,7 +135,7 @@ module Durababble
       await_command_result(future, command_id, interrupt_on_command:)
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object? } -> Object?
+    #: [Result] (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Result } -> Result
     def call_handle_rpc(target_kind:, target_type:, target_id:, method_name:, rpc_kind:, args:, kwargs:, retry_policy: nil, &block)
       assert_workflow_task!("durable handle RPC #{target_kind}:#{target_type}##{method_name}")
       command_kwargs = kwargs.dup
@@ -197,7 +199,7 @@ module Durababble
       deliver_recorded_resolutions!
       result = await_with_command_delivery(future, command_id)
       raise_if_cancel_requested!
-      result
+      result #: as Result
     end
 
     # Awaits a command future, delivering pending workflow commands at the resulting
@@ -216,7 +218,7 @@ module Durababble
     # Without (2) a command committed in the same instant the workflow went quiescent could
     # be stranded behind an already-rejected future; without (1) a sibling's delivery would
     # not interrupt a wait that is about to suspend.
-    #: (untyped, untyped, ?interrupt_on_command: bool) -> untyped
+    #: (Object, Integer, ?interrupt_on_command: bool) -> Object?
     def await_with_command_delivery(future, command_id, interrupt_on_command: false)
       result = begin
         await_command_future(future, command_id, interrupt_on_command:)
@@ -232,7 +234,7 @@ module Durababble
       result
     end
 
-    #: (?timeout: untyped) { -> bool } -> bool
+    #: (?timeout: Numeric?) { () -> bool } -> bool
     def wait_condition(timeout: nil, &block)
       loop do
         deliver_workflow_commands_at_safe_point!
@@ -251,7 +253,7 @@ module Durababble
       end
     end
 
-    #: (untyped) -> bool
+    #: (Numeric?) -> bool
     def wait_condition_command_delivered?(timeout)
       wait_request = WaitRequest.new(
         kind: "timer",
@@ -265,7 +267,7 @@ module Durababble
       true
     end
 
-    #: (untyped) -> untyped
+    #: (Numeric) -> Time
     def timer_after(duration)
       WorkflowDeterminism.allow_host_operations { retry_run_at(duration) }
     end
@@ -642,9 +644,10 @@ module Durababble
 
       result = invoke_workflow_command(method_name, args:, kwargs:)
       reserve_workflow_command_history_event!
+      message_id = message.fetch("id").to_s
       synchronize_store do
         @store.complete_workflow_command(
-          message_id: message.fetch("id"),
+          message_id:,
           workflow_id: @workflow_id,
           result:,
           worker_id: @worker_id,
@@ -706,9 +709,10 @@ module Durababble
     #: (Hash[String, Object?], String) -> void
     def fail_workflow_command_message(message, error)
       reserve_workflow_command_history_event!
+      message_id = message.fetch("id").to_s
       synchronize_store do
         @store.fail_workflow_command(
-          message_id: message.fetch("id"),
+          message_id:,
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,
