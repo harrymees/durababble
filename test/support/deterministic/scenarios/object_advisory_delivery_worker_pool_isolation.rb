@@ -62,7 +62,7 @@ module Durababble
           )
 
           h.check("object advisory delivery ignores a lease from another worker pool") do
-            !wrong_pool_delivered && deliveries.count { |delivery| delivery.fetch(:worker_pool) == "pool-b" }.zero?
+            !wrong_pool_delivered && deliveries.none? { |delivery| delivery.fetch(:worker_pool) == "pool-b" }
           end
           h.check("object advisory delivery still reaches the active pool lease") do
             right_pool_delivered && deliveries.map { |delivery| delivery.fetch(:worker_pool) } == ["pool-a"]

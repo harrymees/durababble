@@ -493,7 +493,7 @@ class DurababbleStoreTest < DurababbleTestCase
     new_connection = ScriptedPgConnection.new(params_results: [
       sql_result,
       sql_result,
-      sql_result([{ "last_sequence" => "0" }]),
+      sql_result([{ "worker_pool" => "default", "last_sequence" => "0" }]),
       sql_result,
       sql_result,
     ])
@@ -644,7 +644,7 @@ class DurababbleStoreTest < DurababbleTestCase
       payload: { "approved" => true },
     )
     new_connection = ScriptedMysqlConnection.new do |sql|
-      sql_result([{ "last_sequence" => 0 }]) if sql.include?("SELECT last_sequence")
+      sql_result([{ "worker_pool" => "default", "last_sequence" => 0 }]) if sql.include?("SELECT worker_pool, last_sequence")
     end
     new_id = mysql_store(new_connection).enqueue_inbox_message(
       target_kind: "workflow",

@@ -1,6 +1,7 @@
 {
   "name": "durababble",
   "private": true,
+  "packageManager": "pnpm@10.28.0",
   "scripts": {
     "format:markdown": "prettier --write \"AGENTS.md\" \"README.md\" \"bench/**/*.md\" \"docs/**/*.md\" \"examples/**/*.md\"",
     "check:markdown": "prettier --check \"AGENTS.md\" \"README.md\" \"bench/**/*.md\" \"docs/**/*.md\" \"examples/**/*.md\""
