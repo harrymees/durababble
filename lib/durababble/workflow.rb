@@ -123,7 +123,7 @@ module Durababble
         alias_method(original, method_name)
         define_method(method_name) do |*args, **kwargs, &block|
           workflow = self #: as untyped
-          raise Error, "cannot call workflow steps from an exposed query" if workflow.instance_variable_get(:@__durababble_query_context)
+          raise Error, "cannot call workflow steps from an exposed query" if WorkflowQueryContext.current
 
           execution = workflow.__durababble_execution__
           execution.call_step(workflow, method_name:, args:, kwargs:) do
@@ -145,15 +145,6 @@ module Durababble
       @__durababble_execution__ || raise(Error, "durable step #{self.class.name}##{label} called outside workflow execution")
     end
 
-    #: () { () -> Object? } -> Object?
-    def __durababble_with_query_context__(&block)
-      previous = @__durababble_query_context
-      @__durababble_query_context = true
-      block.call
-    ensure
-      @__durababble_query_context = previous
-    end
-
     #: () -> StepContext
     def step_context
       __durababble_execution__.step_context
@@ -161,34 +152,36 @@ module Durababble
 
     #: (Time, ?Object?) -> Object?
     def wait_until(time, context = {})
-      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.wait_until(time, context)
     end
 
     #: (Time, ?Object?) -> Object?
     def sleep_until(time, context = {})
-      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.sleep_until(time, context)
     end
 
     #: (Numeric, ?Object?) -> Object?
     def sleep(duration, context = {})
-      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.sleep(duration, context)
     end
 
     #: (?timeout: Numeric?) { -> bool } -> bool
     def wait_condition(timeout: nil, &block)
-      raise Error, "cannot schedule workflow waits from an exposed query" if @__durababble_query_context
+      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.wait_condition(timeout:, &block)
     end
   end
 
   class WorkflowRef
+    COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
+
     #: (Class, String, store: Store, ?worker_pool: String?) -> void
     def initialize(workflow_class, workflow_id, store:, worker_pool: nil)
       @workflow_class = workflow_class #: as untyped
@@ -318,7 +311,7 @@ module Durababble
         end
 
         route_query(method_name, args:, kwargs:)
-      elsif @workflow_class.exposed_commands.key?(method_name)
+      elsif (retry_policy = @workflow_class.exposed_commands[method_name])
         raise ArgumentError, "blocks cannot be passed to workflow command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
 
         if (execution = WorkflowExecutionContext.current)
@@ -330,15 +323,15 @@ module Durababble
             rpc_kind: "workflow_command",
             args:,
             kwargs:,
-            retry_policy: @workflow_class.exposed_commands.fetch(method_name),
+            retry_policy:,
           ) do |idempotency_key:, args:, kwargs:|
             rpc_args = args #: as Array[Object?]
             rpc_kwargs = kwargs #: as Hash[Symbol, Object?]
-            invoke_command(method_name, args: rpc_args, kwargs: rpc_kwargs, idempotency_key:)
+            invoke_command(method_name, retry_policy:, args: rpc_args, kwargs: rpc_kwargs, idempotency_key:)
           end
         end
 
-        invoke_command(method_name, args:, kwargs:)
+        invoke_command(method_name, retry_policy:, args:, kwargs:)
       else
         super
       end
@@ -364,6 +357,7 @@ module Durababble
         "method" => method_name.to_s,
         "args" => args,
         "kwargs" => kwargs,
+        "rpc_kind" => "workflow_query",
       }
       router = WorkflowRpc::Router.new(
         store: @store,
@@ -390,8 +384,8 @@ module Durababble
       factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
     end
 
-    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: String?) -> Object?
-    def invoke_command(method_name, args:, kwargs:, idempotency_key: nil)
+    #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: String?) -> Object?
+    def invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key: nil)
       command_kwargs = kwargs.dup
       idempotency_key ||= string_idempotency_key(command_kwargs.delete(:idempotency_key)) if command_kwargs.key?(:idempotency_key)
       payload = { "method" => method_name.to_s, "args" => args, "kwargs" => command_kwargs }
@@ -401,6 +395,7 @@ module Durababble
         method_name: method_name.to_s,
         payload:,
         idempotency_key:,
+        max_attempts: retry_policy.maximum_attempts_limit,
       )
       @store.deliver_target_message(
         worker_pool: inbox_worker_pool(message_id),
@@ -408,12 +403,21 @@ module Durababble
         target_type: @workflow_class.workflow_name,
         target_id: @workflow_id,
       )
-      @store.wait_for_inbox_message(message_id)
+      @store.wait_for_inbox_message(message_id, timeout: command_wait_timeout(retry_policy))
     end
 
     #: (Object?) -> String?
     def string_idempotency_key(value)
       value&.to_s
+    end
+
+    #: (RetryPolicy) -> Numeric?
+    def command_wait_timeout(retry_policy)
+      attempts = retry_policy.maximum_attempts
+      return unless attempts.finite?
+
+      retry_delay = (1...attempts.to_i).sum { |attempt_number| retry_policy.delay_for_attempt(attempt_number) }
+      COMMAND_WAIT_TIMEOUT_SLACK_SECONDS + retry_delay
     end
   end
 end

@@ -37,7 +37,7 @@ module Durababble
       end
 
       workflow = entry.fetch(:workflow)
-      workflow.__durababble_with_query_context__ do
+      WorkflowQueryContext.with_current(true) do
         kwargs.empty? ? workflow.public_send(method_name, *args) : workflow.public_send(method_name, *args, **kwargs)
       end
     end

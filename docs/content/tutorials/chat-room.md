@@ -281,38 +281,40 @@ The runtime needs to know about both classes. The announcement workflow calls th
 ```ruby
 TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
 
-runtime = Durababble::WorkerRuntime.start(
-  database_url:,
-  schema:,
-  workflows: [ScheduledAnnouncementWorkflow],
-  objects: [ChatRoom],
-  worker_pool: "default",
-  concurrency: 2,
-  poll_interval: 0.05,
-  migrate: false,
-)
-
-begin
-  room = ChatRoom.at("lobby")
-  room.join("u1", "Alice", idempotency_key: "join-alice")
-  room.set_topic("u1", "Durable chat", idempotency_key: "topic-1")
-  room.post_message("u1", "hello from the room object", idempotency_key: "message-1")
-
-  handle = ScheduledAnnouncementWorkflow.start({
-    "room" => "lobby",
-    "text" => "Daily standup starts now.",
-    "delay_seconds" => 0,
-  })
-
-  sleep(0.05) until TERMINAL_STATUSES.include?(handle.status)
-  raise handle.error if handle.status == "failed"
-
-  puts JSON.pretty_generate(
-    "announcement" => handle.result,
-    "room" => room.snapshot,
+Async do
+  runtime = Durababble::WorkerRuntime.start(
+    database_url:,
+    schema:,
+    workflows: [ScheduledAnnouncementWorkflow],
+    objects: [ChatRoom],
+    worker_pool: "default",
+    concurrency: 2,
+    poll_interval: 0.05,
+    migrate: false,
   )
-ensure
-  runtime.shutdown
+
+  begin
+    room = ChatRoom.at("lobby")
+    room.join("u1", "Alice", idempotency_key: "join-alice")
+    room.set_topic("u1", "Durable chat", idempotency_key: "topic-1")
+    room.post_message("u1", "hello from the room object", idempotency_key: "message-1")
+
+    handle = ScheduledAnnouncementWorkflow.start({
+      "room" => "lobby",
+      "text" => "Daily standup starts now.",
+      "delay_seconds" => 0,
+    })
+
+    sleep(0.05) until TERMINAL_STATUSES.include?(handle.status)
+    raise handle.error if handle.status == "failed"
+
+    puts JSON.pretty_generate(
+      "announcement" => handle.result,
+      "room" => room.snapshot,
+    )
+  ensure
+    runtime.shutdown
+  end
 end
 ```
 

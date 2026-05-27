@@ -426,7 +426,7 @@ A worker pool is served by processes repeatedly calling `Durababble::Worker#tick
 
 Runnable workflows are pending rows, retryable failed rows whose non-null `next_run_at` is due, canceling rows with no live lease whose `next_run_at` is null or due, and expired running leases that are recoverable. Terminal failed rows with no retry deadline are not claimable.
 
-`Durababble::WorkerRuntime` is the preferred app/process lifecycle entrypoint. It runs one worker pool with configurable `concurrency:`, schedules up to that many worker work items concurrently with `async` fibers, avoids running the same durable target identity twice inside the process, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and releases still-held workflow, inbox, target-activation, and outbox leases if the timeout is exceeded.
+`Durababble::WorkerRuntime` is the preferred app/process lifecycle entrypoint. It must be started from a caller-owned `Async` task (or with an explicit parent passed to `start_async`), runs one worker pool with configurable `concurrency:`, schedules up to that many worker work items concurrently with `async` fibers, avoids running the same durable target identity twice inside the process, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and releases still-held workflow, inbox, target-activation, and outbox leases if the timeout is exceeded.
 
 `Engine#resume` refuses to execute work owned by another live worker. Lease holders must re-check ownership before mutating durable state.
 

@@ -123,6 +123,16 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   end
 
+  class AsyncLifecycleStore < RuntimeBranchStore
+    def initialize
+      super(tick_results: [])
+    end
+
+    def claim_runnable_workflow(**)
+      nil
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_worker_lifecycle_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -186,12 +196,31 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
 
+    error = nil
     with_isolation_level(:thread) do
-      error = assert_raises(Durababble::ConfigurationError) { runtime.start }
-      assert_match(/isolation_level = :fiber/, error.message)
+      Async do
+        runtime.start
+      rescue Durababble::ConfigurationError => e
+        error = e
+      end
     end
+    assert_instance_of(Durababble::ConfigurationError, error)
+    assert_match(/isolation_level = :fiber/, error.message)
 
     assert_equal false, runtime.running?
+  end
+
+  test "requires a caller-owned Async task to start" do
+    runtime = Durababble::WorkerRuntime.new(
+      store: RuntimeBranchStore.new,
+      workflows: {},
+      worker_pool: "default",
+      migrate: false,
+    )
+
+    error = assert_raises(Durababble::ConfigurationError) { runtime.start }
+    assert_match(/active Async task/, error.message)
+    assert_equal(false, runtime.running?)
   end
 
   test "is idempotent when started more than once and stopped more than once" do
@@ -204,18 +233,44 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
 
-    assert_same runtime, runtime.start
-    assert_equal runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id)
-    assert_match(/\Adefault-[0-9a-f]{12}@#{Regexp.escape(runtime.rpc_address)}\z/, runtime.worker_id)
-    first_thread = runtime.wait(timeout: 0.05)
-    assert(first_thread.is_a?(Thread) || first_thread.nil?, "expected wait to return a thread or nil")
-    assert_same runtime, runtime.start
-    assert_equal :stopped, runtime.shutdown(timeout: 1)
-    assert_equal :stopped, runtime.shutdown(timeout: 1)
-    assert_nil runtime.wait
+    with_started_runtime(runtime) do
+      assert_equal runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id)
+      assert_match(/\Adefault-[0-9a-f]{12}@#{Regexp.escape(runtime.rpc_address)}\z/, runtime.worker_id)
+      first_task = runtime.wait(timeout: 0.05)
+      assert(first_task.is_a?(Async::Task) || first_task.nil?, "expected wait to return a task or nil")
+      assert_same runtime, runtime.start
+      assert_equal :stopped, runtime.shutdown(timeout: 1)
+      assert_equal :stopped, runtime.shutdown(timeout: 1)
+      assert_nil runtime.wait
 
-    runtime.close
-    assert_equal false, store.closed
+      runtime.close
+      assert_equal false, store.closed
+    end
+  end
+
+  test "can run inside a caller-owned Async task" do
+    store = AsyncLifecycleStore.new
+    runtime = Durababble::WorkerRuntime.new(
+      store:,
+      workflows: {},
+      worker_pool: "default",
+      poll_interval: 0.01,
+      migrate: false,
+    )
+
+    Async do |task|
+      run_task = runtime.start_async(parent: task)
+      assert_instance_of(Async::Task, run_task)
+      assert_equal(true, runtime.running?)
+      assert_nil(runtime.wait(timeout: 0.01))
+      assert_equal(:stopped, runtime.shutdown(timeout: 1))
+      run_task.wait
+    end
+
+    assert_equal(false, runtime.running?)
+    assert_nil(runtime.wait)
+  ensure
+    runtime&.shutdown(timeout: 1)
   end
 
   test "records lease conflicts from the polling loop without releasing leases" do
@@ -229,12 +284,13 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
 
-    runtime.start
-    runtime.wait(timeout: 1)
+    with_started_runtime(runtime) do
+      runtime.wait(timeout: 1)
 
-    assert_kind_of Durababble::LeaseConflict, runtime.last_error
-    assert_equal :stopped, runtime.shutdown(timeout: 1)
-    assert_empty store.released
+      assert_kind_of Durababble::LeaseConflict, runtime.last_error
+      assert_equal :stopped, runtime.shutdown(timeout: 1)
+      assert_empty store.released
+    end
   end
 
   test "records unexpected polling errors without closing caller stores" do
@@ -247,13 +303,14 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
 
-    runtime.start
-    eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
-    runtime.close
+    with_started_runtime(runtime) do
+      eventually(timeout: 3) { assert_kind_of RuntimeError, runtime.last_error }
+      runtime.close
 
-    assert_kind_of RuntimeError, runtime.last_error
-    assert_equal "boom", runtime.last_error.message
-    assert_equal false, store.closed
+      assert_kind_of RuntimeError, runtime.last_error
+      assert_equal "boom", runtime.last_error.message
+      assert_equal false, store.closed
+    end
   end
 
   test "logs unexpected polling errors so recurring failures are not silent" do
@@ -269,8 +326,9 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
 
-    runtime.start
-    eventually(timeout: 3) { assert_match(/boom/, log_output.string) }
+    with_started_runtime(runtime) do
+      eventually(timeout: 3) { assert_match(/boom/, log_output.string) }
+    end
   ensure
     runtime&.close
     Durababble.logger = previous_logger
@@ -285,15 +343,16 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-    rpc_server = runtime.instance_variable_get(:@rpc_server)
-    rpc_server_store = rpc_server&.instance_variable_get(:@store)
+    with_started_runtime(runtime) do
+      rpc_server = runtime.instance_variable_get(:@rpc_server)
+      rpc_server_store = rpc_server&.instance_variable_get(:@store)
 
-    refute_nil(rpc_server_store)
-    assert_same(runtime.store, rpc_server_store)
-    owner = runtime.store.instance_variable_get(:@owner)
-    runtime.close
-    refute(owner.connection_pool.active_connection?)
+      refute_nil(rpc_server_store)
+      assert_same(runtime.store, rpc_server_store)
+      owner = runtime.store.instance_variable_get(:@owner)
+      runtime.close
+      refute(owner.connection_pool.active_connection?)
+    end
   ensure
     runtime&.close
   end
@@ -316,20 +375,21 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-    assert_equal true, completed.pop
+    with_started_runtime(runtime) do
+      assert_equal true, completed.pop
 
-    assert_equal :stopped, runtime.shutdown(timeout: 1)
+      assert_equal :stopped, runtime.shutdown(timeout: 1)
 
-    assert_equal false, runtime.running?
-    assert_hash_includes(
-      store.workflow(workflow_id),
-      "status" => "completed",
-      "result" => { "done" => true },
-      "locked_by" => nil,
-      "locked_until" => nil,
-    )
-    assert_equal ["completed"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+      assert_equal false, runtime.running?
+      assert_hash_includes(
+        store.workflow(workflow_id),
+        "status" => "completed",
+        "result" => { "done" => true },
+        "locked_by" => nil,
+        "locked_until" => nil,
+      )
+      assert_equal ["completed"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+    end
   end
 
   test "runs multiple workflow tasks concurrently inside one runtime" do
@@ -362,18 +422,21 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-
-    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
-    assert_operator(max_active, :>=, 2)
-    release = true
-    eventually(timeout: 3) do
-      assert_equal(["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") })
+    Async do
+      runtime.start
+      begin
+        eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+        assert_operator(max_active, :>=, 2)
+        release = true
+        eventually(timeout: 3) do
+          assert_equal(["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") })
+        end
+        assert_equal(:stopped, runtime.shutdown(timeout: 1))
+      ensure
+        release = true
+        runtime&.shutdown(timeout: 1)
+      end
     end
-    assert_equal(:stopped, runtime.shutdown(timeout: 1))
-  ensure
-    release = true
-    runtime&.shutdown(timeout: 1)
   end
 
   test "waits for active work instead of spinning when queued deliveries arrive while saturated" do
@@ -386,16 +449,16 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       migrate: false,
     )
     worker = SaturatedDeliveryWorker.new(runtime:)
-    thread = Thread.new do
-      runtime.instance_variable_set(:@thread, Thread.current)
-      Async { |task| runtime.send(:run_loop, task, worker) }
-    end
+    Async do |task|
+      loop_task = task.async { |async_task| runtime.send(:run_loop, async_task, worker) }
 
-    eventually(timeout: 1) { assert(worker.slow_completed?) }
-    eventually(timeout: 1) { assert(worker.delivery_completed?) }
-  ensure
-    runtime&.shutdown(timeout: 1)
-    thread&.join(1)
+      eventually(timeout: 1) { assert(worker.slow_completed?) }
+      eventually(timeout: 1) { assert(worker.delivery_completed?) }
+      runtime.shutdown(timeout: 1)
+      loop_task.wait
+    ensure
+      runtime&.shutdown(timeout: 1)
+    end
   end
 
   test "clears each active target after concurrently scheduled child work completes" do
@@ -457,14 +520,13 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_host: "127.0.0.1",
       rpc_port: 0,
     )
-    runtime.start
-
-    eventually(timeout: 3) do
-      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "recorded" => "ok" })
+    with_started_runtime(runtime) do
+      eventually(timeout: 3) do
+        assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "recorded" => "ok" })
+      end
+      assert_equal({ "value" => "ok" }, store.object_state(object_type: object.object_type, object_id: "object-1"))
     end
-    assert_equal({ "value" => "ok" }, store.object_state(object_type: object.object_type, object_id: "object-1"))
   ensure
-    runtime&.shutdown(timeout: 1)
     caller_store&.close
   end
 
@@ -500,27 +562,27 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-    assert_equal("wf", started.pop)
-    message_id = store.enqueue_workflow_command(
-      workflow_id:,
-      workflow_name: workflow.workflow_name,
-      method_name: "approve",
-      payload: { "method" => "approve", "args" => [], "kwargs" => {} },
-    )
+    with_started_runtime(runtime) do
+      assert_equal("wf", started.pop)
+      message_id = store.enqueue_workflow_command(
+        workflow_id:,
+        workflow_name: workflow.workflow_name,
+        method_name: "approve",
+        payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+      )
 
-    sleep(0.25)
-    assert_equal(0, started.length)
-    assert_equal(1, store.step_attempts_for(workflow_id).length)
+      sleep(0.25)
+      assert_equal(0, started.length)
+      assert_equal(1, store.step_attempts_for(workflow_id).length)
 
-    release = true
-    eventually(timeout: 3) do
-      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "done" => true })
-      assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "approved" => true })
+      release = true
+      eventually(timeout: 3) do
+        assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "done" => true })
+        assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "approved" => true })
+      end
     end
   ensure
     release = true
-    runtime&.shutdown(timeout: 1)
   end
 
   test "does not renew an expired in-flight workflow lease by reclaiming its own active target" do
@@ -545,25 +607,29 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       lease_seconds: 1,
       migrate: false,
     )
-    runtime.start
-    assert_equal(true, started.pop)
-    original_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+    Async do
+      runtime.start
+      begin
+        assert_equal(true, started.pop)
+        original_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
 
-    eventually(timeout: 3) { assert_operator(Time.now, :>, original_locked_until + 0.15) }
-    sleep(0.15)
+        eventually(timeout: 3) { assert_operator(Time.now, :>, original_locked_until + 0.15) }
+        sleep(0.15)
 
-    current_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
-    assert_operator(
-      current_locked_until,
-      :<=,
-      original_locked_until + 0.05,
-      "active workflow lease should not be renewed by duplicate in-process scheduling",
-    )
-  ensure
-    runtime&.shutdown(timeout: 0.05)
-    release = true
-    runtime&.wait(timeout: 1)
-    runtime&.shutdown(timeout: 1)
+        current_locked_until = parse_time(store.workflow(workflow_id).fetch("locked_until"))
+        assert_operator(
+          current_locked_until,
+          :<=,
+          original_locked_until + 0.05,
+          "active workflow lease should not be renewed by duplicate in-process scheduling",
+        )
+      ensure
+        runtime&.shutdown(timeout: 0.05)
+        release = true
+        runtime&.wait(timeout: 1)
+        runtime&.shutdown(timeout: 1)
+      end
+    end
   end
 
   test "keeps commands for one object id serialized while other runtime slots are available" do
@@ -598,17 +664,15 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-
-    eventually(timeout: 3) do
-      assert_hash_includes(store.inbox_message(first_id), "status" => "completed")
-      assert_hash_includes(store.inbox_message(second_id), "status" => "completed")
+    with_started_runtime(runtime) do
+      eventually(timeout: 3) do
+        assert_hash_includes(store.inbox_message(first_id), "status" => "completed")
+        assert_hash_includes(store.inbox_message(second_id), "status" => "completed")
+      end
+      assert_equal([1, 2], queue_values(entered, 2))
+      assert_equal(1, max_active)
+      assert_equal([1, 2], store.object_state(object_type: object.object_type, object_id: "shared"))
     end
-    assert_equal([1, 2], queue_values(entered, 2))
-    assert_equal(1, max_active)
-    assert_equal([1, 2], store.object_state(object_type: object.object_type, object_id: "shared"))
-  ensure
-    runtime&.shutdown(timeout: 1)
   end
 
   test "shutdown timeout releases every in-flight workflow lease from a concurrent runtime" do
@@ -638,32 +702,36 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       lease_seconds: 60,
       migrate: false,
     )
-    runtime.start
-    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+    Async do
+      runtime.start
+      begin
+        eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
 
-    assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
-    workflow_ids.each do |workflow_id|
-      assert_hash_includes(store.workflow(workflow_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
-      assert_equal(["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") })
-    end
+        assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
+        workflow_ids.each do |workflow_id|
+          assert_hash_includes(store.workflow(workflow_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+          assert_equal(["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") })
+        end
 
-    release = true
-    runtime.wait(timeout: 1)
-    recovery = Durababble::Worker.new(
-      store:,
-      workflows: { workflow.name => workflow },
-      worker_id: "concurrent-recovery",
-      lease_seconds: 60,
-      migrate: false,
-    )
-    assert_equal(2, recovery.run_until_idle(max_ticks: 4))
-    workflow_ids.each do |workflow_id|
-      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "id" => store.workflow(workflow_id).fetch("input").fetch("id"), "attempt" => 2 })
-      assert_equal(["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+        release = true
+        runtime.wait(timeout: 1)
+        recovery = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.name => workflow },
+          worker_id: "concurrent-recovery",
+          lease_seconds: 60,
+          migrate: false,
+        )
+        assert_equal(2, recovery.run_until_idle(max_ticks: 4))
+        workflow_ids.each do |workflow_id|
+          assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "id" => store.workflow(workflow_id).fetch("input").fetch("id"), "attempt" => 2 })
+          assert_equal(["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+        end
+      ensure
+        release = true
+        runtime&.shutdown(timeout: 1)
+      end
     end
-  ensure
-    release = true
-    runtime&.shutdown(timeout: 1)
   end
 
   test "stops claiming work on shutdown timeout, revokes owned leases, and lets another worker retry incomplete steps" do
@@ -690,30 +758,37 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       lease_seconds: 60,
       migrate: false,
     )
-    runtime.start
-    assert_equal 1, entered.pop
+    Async do
+      runtime.start
+      begin
+        assert_equal(1, entered.pop)
 
-    assert_equal :timeout, runtime.shutdown(timeout: 0.05)
+        assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
 
-    revoked = store.workflow(workflow_id)
-    assert_hash_includes revoked, "status" => "pending", "locked_by" => nil, "locked_until" => nil
-    assert_equal "running", store.steps_for(workflow_id).first.fetch("status")
+        revoked = store.workflow(workflow_id)
+        assert_hash_includes(revoked, "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+        assert_equal("running", store.steps_for(workflow_id).first.fetch("status"))
 
-    release_zombie << true
-    runtime.wait(timeout: 1)
+        release_zombie << true
+        runtime.wait(timeout: 1)
 
-    recovery = Durababble::Worker.new(
-      store:,
-      workflows: { workflow.name => workflow },
-      worker_id: "recovery",
-      lease_seconds: 60,
-      migrate: false,
-    )
-    assert_equal 1, recovery.run_until_idle(max_ticks: 2)
+        recovery = Durababble::Worker.new(
+          store:,
+          workflows: { workflow.name => workflow },
+          worker_id: "recovery",
+          lease_seconds: 60,
+          migrate: false,
+        )
+        assert_equal(1, recovery.run_until_idle(max_ticks: 2))
 
-    row = store.workflow(workflow_id)
-    assert_hash_includes row, "status" => "completed", "result" => { "attempt" => 2 }
-    assert_equal ["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+        row = store.workflow(workflow_id)
+        assert_hash_includes(row, "status" => "completed", "result" => { "attempt" => 2 })
+        assert_equal(["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+      ensure
+        release_zombie << true if runtime&.running?
+        runtime&.shutdown(timeout: 1)
+      end
+    end
   end
 
   test "shutdown timeout revokes object inbox and activation leases for immediate recovery" do
@@ -741,42 +816,46 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_host: "127.0.0.1",
       rpc_port: 0,
     )
-    runtime.start
-    message_id = blocking_object.tell("object-1", :record, store:)
-    assert_equal(1, entered.pop)
-    assert_hash_includes(store.inbox_message(message_id), "status" => "running", "locked_by" => runtime.worker_id)
-    assert_hash_includes(
-      store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
-      "status" => "running",
-      "locked_by" => runtime.worker_id,
-    )
+    Async do
+      runtime.start
+      begin
+        message_id = blocking_object.tell("object-1", :record, store:)
+        assert_equal(1, entered.pop)
+        assert_hash_includes(store.inbox_message(message_id), "status" => "running", "locked_by" => runtime.worker_id)
+        assert_hash_includes(
+          store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
+          "status" => "running",
+          "locked_by" => runtime.worker_id,
+        )
 
-    assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
-    assert_hash_includes(store.inbox_message(message_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
-    assert_hash_includes(
-      store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
-      "status" => "pending",
-      "locked_by" => nil,
-      "locked_until" => nil,
-    )
+        assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
+        assert_hash_includes(store.inbox_message(message_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+        assert_hash_includes(
+          store.target_activation(target_kind: "object", target_type: blocking_object.object_type, target_id: "object-1"),
+          "status" => "pending",
+          "locked_by" => nil,
+          "locked_until" => nil,
+        )
 
-    release_zombie << true
-    runtime.wait(timeout: 1)
+        release_zombie << true
+        runtime.wait(timeout: 1)
 
-    recovery = Durababble::Worker.new(
-      store:,
-      workflows: {},
-      objects: [blocking_object],
-      worker_id: "object-recovery",
-      lease_seconds: 60,
-      migrate: false,
-    )
-    assert_equal(1, recovery.run_until_idle(max_ticks: 2))
-    assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "attempt" => 2 })
-    assert_equal({ "attempt" => 2 }, store.object_state(object_type: blocking_object.object_type, object_id: "object-1"))
-  ensure
-    release_zombie << true if runtime&.running?
-    runtime&.shutdown(timeout: 1)
+        recovery = Durababble::Worker.new(
+          store:,
+          workflows: {},
+          objects: [blocking_object],
+          worker_id: "object-recovery",
+          lease_seconds: 60,
+          migrate: false,
+        )
+        assert_equal(1, recovery.run_until_idle(max_ticks: 2))
+        assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "attempt" => 2 })
+        assert_equal({ "attempt" => 2 }, store.object_state(object_type: blocking_object.object_type, object_id: "object-1"))
+      ensure
+        release_zombie << true if runtime&.running?
+        runtime&.shutdown(timeout: 1)
+      end
+    end
   end
 
   test "only claims workflow names served by this runtime's worker pool" do
@@ -797,12 +876,13 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       poll_interval: 0.01,
       migrate: false,
     )
-    runtime.start
-    eventually(timeout: 2) { assert_equal "completed", store.workflow(pool_workflow_id).fetch("status") }
-    assert_equal :stopped, runtime.shutdown(timeout: 1)
+    with_started_runtime(runtime) do
+      eventually(timeout: 2) { assert_equal "completed", store.workflow(pool_workflow_id).fetch("status") }
+      assert_equal :stopped, runtime.shutdown(timeout: 1)
 
-    assert_hash_includes store.workflow(pool_workflow_id), "status" => "completed"
-    assert_hash_includes store.workflow(other_workflow_id), "status" => "pending", "locked_by" => nil
+      assert_hash_includes store.workflow(pool_workflow_id), "status" => "completed"
+      assert_hash_includes store.workflow(other_workflow_id), "status" => "pending", "locked_by" => nil
+    end
   end
 
   test "wakes the active leaseholder runtime through DeliverMessage instead of waiting for the next poll" do
@@ -827,34 +907,35 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_host: "127.0.0.1",
       rpc_port: 0,
     )
-    runtime.start
-    assert_equal(runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id))
+    caller_store = nil
+    with_started_runtime(runtime) do
+      assert_equal(runtime.rpc_address, Durababble::WorkerIdentity.address_for(runtime.worker_id))
 
-    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
-    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30)
-    assert_hash_includes(
-      store.workflow(workflow_id),
-      "status" => "running",
-      "locked_by" => runtime.worker_id,
-    )
+      workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+      store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30)
+      assert_hash_includes(
+        store.workflow(workflow_id),
+        "status" => "running",
+        "locked_by" => runtime.worker_id,
+      )
 
-    caller_store = Durababble::Store.connect(database_url:, schema:)
-    started_at = Time.now
-    result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
-    elapsed = Time.now - started_at
+      caller_store = Durababble::Store.connect(database_url:, schema:)
+      started_at = Time.now
+      result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
+      elapsed = Time.now - started_at
 
-    assert_equal({ "approved_by" => "operator" }, result)
-    assert_operator(elapsed, :<, 3)
-    assert_nil(
-      store.target_activation(
-        target_kind: "workflow",
-        target_type: workflow.workflow_name,
-        target_id: workflow_id,
-      ),
-    )
+      assert_equal({ "approved_by" => "operator" }, result)
+      assert_operator(elapsed, :<, 3)
+      assert_nil(
+        store.target_activation(
+          target_kind: "workflow",
+          target_type: workflow.workflow_name,
+          target_id: workflow_id,
+        ),
+      )
+    end
   ensure
     caller_store&.close
-    runtime&.shutdown(timeout: 1)
   end
 
   test "address-routed DeliverMessage wakes a non-default pool runtime" do
@@ -879,42 +960,40 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_host: "127.0.0.1",
       rpc_port: 0,
     )
-    runtime.start
-
-    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30, worker_pool: "pool-a")
-    message_id = store.enqueue_workflow_command(
-      workflow_id:,
-      workflow_name: workflow.workflow_name,
-      method_name: "approve",
-      payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "operator" } },
-    )
-
-    Durababble::Rpc::Client.new(address: runtime.rpc_address).deliver_message(
-      worker_pool: "default",
-      target_kind: "workflow",
-      target_class: workflow.workflow_name,
-      target_id: workflow_id,
-    )
-    sleep(0.05)
-    assert_hash_includes(store.inbox_message(message_id), "status" => "pending")
-
-    Durababble::Rpc::Client.new(address: runtime.rpc_address).deliver_message(
-      worker_pool: "pool-a",
-      target_kind: "workflow",
-      target_class: workflow.workflow_name,
-      target_id: workflow_id,
-    )
-
-    eventually(timeout: 3) do
-      assert_hash_includes(
-        store.inbox_message(message_id),
-        "status" => "completed",
-        "result" => { "approved_by" => "operator" },
+    with_started_runtime(runtime) do
+      workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
+      store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30, worker_pool: "pool-a")
+      message_id = store.enqueue_workflow_command(
+        workflow_id:,
+        workflow_name: workflow.workflow_name,
+        method_name: "approve",
+        payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "operator" } },
       )
+
+      Durababble::Rpc::Client.new(address: runtime.rpc_address).deliver_message(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_class: workflow.workflow_name,
+        target_id: workflow_id,
+      )
+      sleep(0.05)
+      assert_hash_includes(store.inbox_message(message_id), "status" => "pending")
+
+      Durababble::Rpc::Client.new(address: runtime.rpc_address).deliver_message(
+        worker_pool: "pool-a",
+        target_kind: "workflow",
+        target_class: workflow.workflow_name,
+        target_id: workflow_id,
+      )
+
+      eventually(timeout: 3) do
+        assert_hash_includes(
+          store.inbox_message(message_id),
+          "status" => "completed",
+          "result" => { "approved_by" => "operator" },
+        )
+      end
     end
-  ensure
-    runtime&.shutdown(timeout: 1)
   end
 
   test "activation fallback forwards a failed command wake to the active leaseholder" do
@@ -949,35 +1028,33 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_host: "127.0.0.1",
       rpc_port: 0,
     )
-    runtime_a.start
-    runtime_b.start
+    caller_store = nil
+    with_started_runtime(runtime_a, runtime_b) do
+      workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
+      store.claim_workflow(workflow_id:, worker_id: runtime_a.worker_id, lease_seconds: 30, worker_pool: "pool-a")
+      caller_store = Durababble::Store.connect(database_url:, schema:)
+      caller_store.rpc_client_factory = ->(_address) { ForcedUnavailableDeliveryClient.new }
+      def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.01, timeout: 3)
+        super
+      end
 
-    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
-    store.claim_workflow(workflow_id:, worker_id: runtime_a.worker_id, lease_seconds: 30, worker_pool: "pool-a")
-    caller_store = Durababble::Store.connect(database_url:, schema:)
-    caller_store.rpc_client_factory = ->(_address) { ForcedUnavailableDeliveryClient.new }
-    def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.01, timeout: 3)
-      super
+      started_at = Time.now
+      result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
+      elapsed = Time.now - started_at
+
+      assert_equal({ "approved_by" => "operator" }, result)
+      assert_operator(elapsed, :<, 3)
+      assert_nil(
+        store.target_activation(
+          target_kind: "workflow",
+          target_type: workflow.workflow_name,
+          target_id: workflow_id,
+        ),
+      )
     end
-
-    started_at = Time.now
-    result = workflow.handle(workflow_id, store: caller_store).approve(reason: "operator")
-    elapsed = Time.now - started_at
-
-    assert_equal({ "approved_by" => "operator" }, result)
-    assert_operator(elapsed, :<, 3)
-    assert_nil(
-      store.target_activation(
-        target_kind: "workflow",
-        target_type: workflow.workflow_name,
-        target_id: workflow_id,
-      ),
-    )
   ensure
     caller_store&.close
-    runtime_b&.shutdown(timeout: 1)
     runtime_b_store&.close
-    runtime_a&.shutdown(timeout: 1)
   end
 
   private
@@ -999,6 +1076,15 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       raise if Time.now >= deadline
 
       sleep(0.01)
+    end
+  end
+
+  def with_started_runtime(*runtimes)
+    Async do
+      runtimes.each(&:start)
+      yield
+    ensure
+      runtimes.reverse_each { |runtime| runtime&.shutdown(timeout: 1) }
     end
   end
 

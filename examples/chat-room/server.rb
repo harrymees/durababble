@@ -23,7 +23,7 @@ module ChatRoomExample
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
       ChatRoomExample.configure(database_url:, schema:, workflow_worker_pool: WORKFLOW_WORKER_POOL, object_worker_pool: OBJECT_WORKER_POOL)
-      @workflow_runtime = Durababble::WorkerRuntime.start(
+      @workflow_runtime = Durababble::WorkerRuntime.new(
         workflows: [ScheduledAnnouncementWorkflow],
         objects: [],
         database_url:,
@@ -31,7 +31,7 @@ module ChatRoomExample
         worker_pool: ChatRoomExample.workflow_worker_pool,
         poll_interval: 0.05,
       )
-      @object_runtime = Durababble::WorkerRuntime.start(
+      @object_runtime = Durababble::WorkerRuntime.new(
         workflows: [],
         objects: [ChatRoom],
         database_url:,
@@ -41,11 +41,11 @@ module ChatRoomExample
       )
       # WorkerRuntime processes activations and inbox messages, but durable
       # timers (Durababble.sleep / wait_until) still need an external mechanism
-      # to mark waits ready. A tiny background thread polling wake_due_timers
+      # to mark waits ready. A tiny async task polling wake_due_timers
       # keeps scheduled announcements with non-zero delays moving forward.
       @timer_store = Durababble::Store.connect(database_url:, schema:)
       @timer_stop = false
-      @timer_thread = Thread.new { run_timer_loop }
+      @timer_task = nil
       @tcp_server = TCPServer.new(@host, @port)
     end
 
@@ -55,10 +55,19 @@ module ChatRoomExample
     end
 
     def run
-      puts "Chat room example listening on #{url}"
-      loop do
-        socket = @tcp_server.accept
-        handle(socket)
+      Async do
+        @workflow_runtime.start
+        @object_runtime.start
+        @timer_task = Async::Task.current.async { run_timer_loop }
+        puts "Chat room example listening on #{url}"
+        loop do
+          socket = @tcp_server.accept
+          handle(socket)
+        end
+      rescue IOError
+        nil
+      ensure
+        shutdown_runtimes
       end
     rescue Interrupt, IOError
       nil
@@ -69,10 +78,6 @@ module ChatRoomExample
     def close
       @tcp_server&.close unless @tcp_server&.closed?
       @timer_stop = true
-      @timer_thread&.join(1)
-      @timer_thread&.kill if @timer_thread&.alive?
-      @workflow_runtime&.shutdown
-      @object_runtime&.shutdown
       @timer_store&.close
       @store&.close
     rescue IOError
@@ -80,6 +85,14 @@ module ChatRoomExample
     end
 
     private
+
+    def shutdown_runtimes
+      @timer_stop = true
+      @timer_task&.stop
+      @timer_task = nil
+      @workflow_runtime&.shutdown
+      @object_runtime&.shutdown
+    end
 
     def run_timer_loop
       until @timer_stop

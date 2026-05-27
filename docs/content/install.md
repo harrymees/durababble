@@ -69,18 +69,23 @@ Durababble checks out connections as needed from the configured ActiveRecord poo
 
 A `Durababble::Worker` is enough for a single process: it polls the store, claims leases, and drains workflows and object inboxes. In production you usually run many workers across many pods, and they need to reach each other over the network so that simple RPCs (`expose`) and live command delivery (`expose_command`) can land on the worker that currently owns the workflow or durable object.
 
-`Durababble::WorkerRuntime` wraps a `Worker` with an HTTP/2 RPC server (built on `async-http`) and is the production-shaped entry point. Each runtime advertises a worker identity in the form `worker-id@host:port`; the random worker id distinguishes this process incarnation, and the address suffix is the routable RPC endpoint. The lease row written when the runtime claims a workflow records that full identity as the owner. Any other worker that wants to RPC into the lease holder reads the same row, dials the address suffix, and sends the full expected identity so a new worker at a recycled address rejects messages meant for the old process:
+`Durababble::WorkerRuntime` wraps a `Worker` with an HTTP/2 RPC server (built on `async-http`) and is the production-shaped entry point. Start it from a caller-owned `Async` reactor (or pass an explicit parent task to `start_async`) so the scheduler and RPC server share the host application's async lifecycle. Each runtime advertises a worker identity in the form `worker-id@host:port`; the random worker id distinguishes this process incarnation, and the address suffix is the routable RPC endpoint. The lease row written when the runtime claims a workflow records that full identity as the owner. Any other worker that wants to RPC into the lease holder reads the same row, dials the address suffix, and sends the full expected identity so a new worker at a recycled address rejects messages meant for the old process:
 
 ```ruby
-runtime = Durababble::WorkerRuntime.start(
-  store:,
-  workflows: [FulfillOrder],
-  objects: [Account],
-  worker_pool: "orders",
-  concurrency: Integer(ENV.fetch("DURABABBLE_WORKER_CONCURRENCY", "8")),
-  rpc_host: ENV.fetch("POD_IP"),  # the address other pods can reach this one at
-  rpc_port: 50_051,
-)
+Async do
+  runtime = Durababble::WorkerRuntime.start(
+    store:,
+    workflows: [FulfillOrder],
+    objects: [Account],
+    worker_pool: "orders",
+    concurrency: Integer(ENV.fetch("DURABABBLE_WORKER_CONCURRENCY", "8")),
+    rpc_host: ENV.fetch("POD_IP"),  # the address other pods can reach this one at
+    rpc_port: 50_051,
+  )
+  sleep
+ensure
+  runtime&.shutdown(timeout: 10)
+end
 ```
 
 `concurrency:` defaults to `1`. Raise it when you want denser compute in one Ruby process: the runtime schedules that many workflow tasks, target activations, and durable-object command drains at once using `async` fibers, while keeping one active work item per durable target identity inside the process. Size the application database pool for that concurrency plus RPC handlers and normal app traffic. In ActiveRecord applications, Durababble assumes fiber-isolated execution state is enabled before the runtime starts, for example `ActiveSupport::IsolatedExecutionState.isolation_level = :fiber`.

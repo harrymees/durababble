@@ -148,19 +148,22 @@ The high-risk durability and lease claims above are also modeled in Alloy. The C
 
 ## Application worker lifecycle
 
-`WorkerRuntime` is the intended entrypoint for embedding Durababble in a Rails or similar long-lived app process:
+`WorkerRuntime` is the intended entrypoint for embedding Durababble in a Rails or similar long-lived app process. The runtime is async-native, so boot it from a caller-owned `Async` reactor and shut it down from that same lifecycle:
 
 ```ruby
-WORKER = Durababble::WorkerRuntime.start(
-  database_url: ENV.fetch("DATABASE_URL"),
-  workflows: MyApp::DurableWorkflows.for_pool("default"),
-  worker_pool: "default",
-  concurrency: Integer(ENV.fetch("DURABABBLE_WORKER_CONCURRENCY", "8")),
-  rpc_host: ENV.fetch("POD_IP", "127.0.0.1"),
-  rpc_port: ENV.fetch("DURABABBLE_RPC_PORT", "50051").to_i
-)
-
-at_exit { WORKER.shutdown(timeout: 10) }
+Async do
+  worker = Durababble::WorkerRuntime.start(
+    database_url: ENV.fetch("DATABASE_URL"),
+    workflows: MyApp::DurableWorkflows.for_pool("default"),
+    worker_pool: "default",
+    concurrency: Integer(ENV.fetch("DURABABBLE_WORKER_CONCURRENCY", "8")),
+    rpc_host: ENV.fetch("POD_IP", "127.0.0.1"),
+    rpc_port: ENV.fetch("DURABABBLE_RPC_PORT", "50051").to_i
+  )
+  sleep
+ensure
+  worker&.shutdown(timeout: 10)
+end
 ```
 
 The runtime only claims workflow names and object types present in its registries, so separate pools can run different durable families without claiming work they cannot execute. `concurrency:` defaults to `1`; larger values let one Ruby process schedule that many workflow tasks, target activations, or object command drains at once in `async` fibers. The scheduler still keeps one in-flight work item per durable target identity inside the process, so duplicate workflow activations are deferred and commands for one object id remain serialized while unrelated targets use other slots. Host applications should size their ActiveRecord pool for the runtime concurrency plus RPC handlers and ordinary application traffic, and ActiveRecord apps are expected to run with fiber-isolated execution state.
