@@ -145,7 +145,7 @@ module Durababble
         "locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()\n" \
         "WHERE id = $1\n  " \
         "AND (\n    " \
-        "status = 'pending'\n    " \
+        "(status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))\n    " \
         "OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())\n    " \
         "OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))\n    " \
         "OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))\n  " \

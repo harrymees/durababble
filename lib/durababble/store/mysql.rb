@@ -35,8 +35,9 @@ module Durababble
             AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
         SQL
       else
+        # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
         execute_params(
-          "UPDATE #{table("workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
+          "UPDATE #{table("workflows")} SET status = 'running', error = NULL, next_run_at = NULL, updated_at = NOW(6) WHERE id = ? AND status = 'pending' AND locked_by IS NULL",
           [workflow_id],
         )
       end
@@ -120,7 +121,7 @@ module Durababble
           SELECT id FROM #{table("workflows")}
           WHERE id = ?
             AND (
-              status = 'pending'
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
               OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
@@ -151,7 +152,9 @@ module Durababble
           SELECT id FROM #{table("workflows")}
           WHERE id = ?
             AND (
-              status IN ('pending', 'waiting', 'canceling')
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+              OR status = 'waiting'
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
               OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
               OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
             )

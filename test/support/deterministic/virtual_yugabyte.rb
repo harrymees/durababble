@@ -132,11 +132,16 @@ module Durababble
         row = @workflows.fetch(workflow_id)
         return deep(row) if WorkflowStatus.terminal?(row)
 
-        row["status"] = "running"
-        row["error"] = nil
         if worker_id
+          row["status"] = "running"
+          row["error"] = nil
           row["locked_by"] = worker_id
           row["locked_until"] = scheduler.time + lease_seconds
+          row["next_run_at"] = nil
+        elsif row.fetch("status") == "pending" && row.fetch("locked_by").nil?
+          # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
+          row["status"] = "running"
+          row["error"] = nil
           row["next_run_at"] = nil
         end
         deep(row)

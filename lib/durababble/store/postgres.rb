@@ -71,7 +71,9 @@ module Durababble
             locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
         WHERE id = $1
           AND (
-            status IN ('pending', 'waiting', 'canceling')
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+            OR status = 'waiting'
+            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
             OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
           )
@@ -259,11 +261,11 @@ module Durababble
       if worker_id
         claim_workflow(workflow_id:, worker_id:, lease_seconds:)
       else
+        # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
         execute_params(<<~SQL, [workflow_id])
           UPDATE #{table("workflows")}
           SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-          WHERE id = $1
-            AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
+          WHERE id = $1 AND status = 'pending' AND locked_by IS NULL
         SQL
       end
     end
