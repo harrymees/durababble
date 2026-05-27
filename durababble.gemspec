@@ -33,17 +33,19 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency("activerecord", ">= 7.1", "< 9.0")
   spec.add_dependency("async", "~> 2.24")
+  spec.add_dependency("async-http", "~> 0.90")
   spec.add_dependency("bigdecimal", "~> 3.2")
   spec.add_dependency("concurrent-ruby", "~> 1.3")
-  spec.add_dependency("grpc", "~> 1.70")
   spec.add_dependency("opentelemetry-api", "~> 1.10")
   spec.add_dependency("opentelemetry-metrics-api", "~> 0.6")
   spec.add_dependency("paquito", "~> 1.0")
   spec.add_dependency("pg", "~> 1.5")
   spec.add_dependency("trilogy", "~> 2.9")
 
+  spec.add_development_dependency("csv", "~> 3.3")
   spec.add_development_dependency("minitest", "< 6")
   spec.add_development_dependency("mocha", "~> 2.7")
+  spec.add_development_dependency("rake", "~> 13.3")
   spec.add_development_dependency("rbs", "~> 3.9")
   spec.add_development_dependency("rubocop", "~> 1.80")
   spec.add_development_dependency("rubocop-minitest", "~> 0.38")
@@ -51,4 +53,5 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency("rubocop-sorbet", "~> 0.10")
   spec.add_development_dependency("simplecov", "~> 0.22")
   spec.add_development_dependency("sorbet", "~> 0.5")
+  spec.add_development_dependency("sqlite3", "~> 2.1")
 end

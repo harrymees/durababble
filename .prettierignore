@@ -1,0 +1,6 @@
+.agents/
+.bundle/
+WORKFLOW.md
+coverage/
+docs/build/
+tmp/

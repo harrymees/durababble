@@ -1,12 +1,13 @@
 # typed: true
 # frozen_string_literal: true
 
+require_relative "error_formatting"
 require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, retry_run_at:, crash:)
+    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Integer, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, retry_run_at:, crash:)
       @store = store #: as untyped
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -18,6 +19,7 @@ module Durababble
       @raise_if_cancel_requested = raise_if_cancel_requested
       @assert_workflow_lease = assert_workflow_lease
       @suspend_workflow_immediately = suspend_workflow_immediately
+      @defer_workflow_suspension = defer_workflow_suspension
       @retry_run_at = retry_run_at
       @crash = crash
     end
@@ -86,44 +88,52 @@ module Durababble
         )
       end
       crash!(:wait_recorded)
-      error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-      future(command_id).reject(error)
+      if suspend_workflow
+        error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
+        future(command_id).reject(error)
+      else
+        @defer_workflow_suspension.call(command_id)
+      end
     end
+
+    # Control-flow errors are rejected onto the future unchanged; only an
+    # ordinary step failure is run through retry/terminal handling. Cancellation
+    # additionally records the canceled step before propagating.
+    PASS_THROUGH_STEP_ERRORS = [InjectedCrash, LeaseConflict, WorkflowSuspended, StepRetryScheduled, NonDeterminismError].freeze
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> void
     def reject_step_error(error, command_id:, step:, attributes:)
+      future(command_id).reject(step_rejection_for(error, command_id:, step:, attributes:))
+    end
+
+    #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
+    def step_rejection_for(error, command_id:, step:, attributes:)
       if error.is_a?(CancellationError)
-        assert_workflow_lease!
-        synchronize_store do
-          @store.record_step_canceled(
-            workflow_id: @workflow_id,
-            command_id:,
-            error: "#{error.class}: #{error.message}",
-            worker_id: @worker_id,
-          )
-        end
-        future(command_id).reject(error)
-        return
+        record_step_cancellation(command_id, error)
+        return error
       end
+      return error if PASS_THROUGH_STEP_ERRORS.any? { |klass| error.is_a?(klass) }
 
-      if error.is_a?(InjectedCrash) || error.is_a?(LeaseConflict)
-        future(command_id).reject(error)
-        return
+      handle_step_error(error, command_id:, step:, attributes:)
+    end
+
+    #: (Integer, CancellationError) -> void
+    def record_step_cancellation(command_id, error)
+      assert_workflow_lease!
+      synchronize_store do
+        @store.record_step_canceled(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: "#{error.class}: #{error.message}",
+          worker_id: @worker_id,
+        )
       end
-
-      if error.is_a?(WorkflowSuspended) || error.is_a?(StepRetryScheduled) || error.is_a?(NonDeterminismError)
-        future(command_id).reject(error)
-        return
-      end
-
-      future(command_id).reject(handle_step_error(error, command_id:, step:, attributes:))
     end
 
     #: (StandardError, command_id: Integer, step: Object, attributes: Hash[String, Object?]) -> StandardError
     def handle_step_error(error, command_id:, step:, attributes:)
       step = step #: as untyped
-      message = "#{error.class}: #{error.message}"
-      assert_workflow_lease!
+      message = ErrorFormatting.format_error(error)
       attempt_number = attempt_number_for(command_id)
       attributes = attributes.merge(
         "durababble.step.attempt" => attempt_number,
@@ -131,8 +141,7 @@ module Durababble
       )
       Observability.count("durababble.workflow.step.failures", attributes)
       unless step.retry_policy.retryable?(error, attempt_number:)
-        synchronize_store { @store.record_step_failed(workflow_id: @workflow_id, command_id:, error: message, worker_id: @worker_id) }
-        return error
+        return record_final_step_failure(command_id, message:, fallback_error: error)
       end
 
       delay = step.retry_policy.delay_for_attempt(attempt_number)
@@ -141,15 +150,40 @@ module Durababble
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
       synchronize_store do
+        run_at = @retry_run_at.call(delay)
         @store.record_step_failed_and_schedule_retry(
           workflow_id: @workflow_id,
           command_id:,
           error: message,
           worker_id: @worker_id,
-          run_at: @retry_run_at.call(delay),
+          run_at:,
         )
       end
-      StepRetryScheduled.new(message)
+      crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
+    end
+
+    #: (Integer, message: String, fallback_error: StandardError) -> StandardError
+    def record_final_step_failure(command_id, message:, fallback_error:)
+      synchronize_store do
+        @store.record_step_failed(
+          workflow_id: @workflow_id,
+          command_id:,
+          error: message,
+          worker_id: @worker_id,
+          terminal: true,
+          error_class: fallback_error.class.name,
+          error_message: fallback_error.message,
+        )
+      end
+      crash_or(:step_failed_recorded, fallback_error)
+    end
+
+    #: (Symbol, StandardError) -> StandardError
+    def crash_or(point, error)
+      crash!(point)
+      error
+    rescue InjectedCrash => crash
+      crash
     end
 
     #: (Integer) -> Heartbeat
@@ -181,7 +215,7 @@ module Durababble
     #: (Integer) -> Integer
     def attempt_number_for(command_id)
       count = synchronize_store do
-        @store.step_attempts_for(@workflow_id).count { |attempt| attempt.fetch("position").to_i == command_id }
+        @store.step_attempt_count_for(workflow_id: @workflow_id, command_id:)
       end
       count = count #: as untyped
       count.to_i

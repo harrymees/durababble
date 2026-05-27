@@ -2,24 +2,100 @@
 # frozen_string_literal: true
 
 require "digest"
+require "logger"
 
 require_relative "durababble/version"
 require_relative "durababble/statuses"
 require_relative "durababble/observability"
+require_relative "durababble/backoff"
 
 module Durababble
   DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
   DEFAULT_SCHEMA_PREFIX = "durababble"
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
+  DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000
+  DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS = 8_000
+  DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+  PAYLOAD_LIMIT_DEFAULTS = {
+    workflow_input: DEFAULT_MAX_PAYLOAD_BYTES,
+    workflow_result: DEFAULT_MAX_PAYLOAD_BYTES,
+    step_output: DEFAULT_MAX_PAYLOAD_BYTES,
+    object_state: DEFAULT_MAX_PAYLOAD_BYTES,
+    inbox_payload: DEFAULT_MAX_PAYLOAD_BYTES,
+    rpc_argument: DEFAULT_MAX_PAYLOAD_BYTES,
+  }.freeze
+  PAYLOAD_LIMIT_ENVS = {
+    workflow_input: ["DURABABBLE_MAX_WORKFLOW_INPUT_BYTES", "DURABABBLE_MAX_WORKFLOW_ARGS_BYTES"],
+    workflow_result: ["DURABABBLE_MAX_WORKFLOW_RESULT_BYTES"],
+    step_output: ["DURABABBLE_MAX_STEP_OUTPUT_BYTES"],
+    object_state: ["DURABABBLE_MAX_OBJECT_STATE_BYTES"],
+    inbox_payload: ["DURABABBLE_MAX_INBOX_PAYLOAD_BYTES"],
+    rpc_argument: ["DURABABBLE_MAX_RPC_ARGUMENT_BYTES"],
+  }.freeze
+  PAYLOAD_LIMIT_LABELS = {
+    workflow_input: "workflow input",
+    workflow_result: "workflow result",
+    step_output: "step output",
+    object_state: "object state",
+    inbox_payload: "inbox payload",
+    rpc_argument: "rpc argument",
+  }.freeze
+  PAYLOAD_LIMIT_ALIASES = {
+    workflow_args: :workflow_input,
+    workflow_error: :workflow_result,
+  }.freeze
 
   class Error < StandardError; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
   class DeterminismError < Error; end
   class NonDeterminismError < DeterminismError; end
+
+  class WorkflowHistoryLimitExceeded < Error
+    #: untyped
+    attr_reader :workflow_id, :history_events, :max_history_events
+
+    #: (untyped, history_events: Integer, max_history_events: Integer) -> void
+    def initialize(workflow_id, history_events:, max_history_events:)
+      @workflow_id = workflow_id
+      @history_events = history_events
+      @max_history_events = max_history_events
+      super("workflow #{workflow_id} has #{history_events} history events, exceeding max #{max_history_events}")
+    end
+  end
+
   class FenceTimeout < Error; end
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
+  class WorkflowAlreadyExists < Error; end
+
+  class PayloadTooLarge < Error
+    #: Symbol
+    attr_reader :surface
+    #: String?
+    attr_reader :context
+    #: Integer
+    attr_reader :bytesize
+    #: Integer
+    attr_reader :max_bytes
+
+    #: (Symbol | String surface, bytesize: Integer, max_bytes: Integer, ?context: String?) -> void
+    def initialize(surface, bytesize:, max_bytes:, context: nil)
+      @surface = surface.to_sym
+      @context = context
+      @bytesize = bytesize
+      @max_bytes = max_bytes
+      context_suffix = context.to_s.empty? ? "" : " for #{context}"
+      super("#{surface_name(@surface)} payload#{context_suffix} is #{bytesize} bytes, exceeding max #{max_bytes} bytes")
+    end
+
+    private
+
+    #: (Symbol) -> String
+    def surface_name(surface)
+      surface.to_s.tr("_", " ")
+    end
+  end
 
   class CancellationError < Error
     #: String?
@@ -41,11 +117,17 @@ module Durababble
     attr_reader :default_store
     #: Engine?
     attr_reader :default_engine
+    #: untyped
+    attr_writer :logger
+    #: untyped
+    attr_writer :max_workflow_history_events
+    #: untyped
+    attr_writer :workflow_history_warning_events
 
     #: (Store?) -> Engine?
     def default_store=(store)
       @default_store = store
-      @default_engine = store ? Engine.new(store:, migrate: false) : nil
+      @default_engine = store ? Engine.new(store:) : nil
     end
 
     #: (Engine?) -> Store?
@@ -77,6 +159,70 @@ module Durababble
       "#{trimmed_base}_#{suffix}"
     end
 
+    #: () -> Integer
+    def max_workflow_history_events
+      configured = if instance_variable_defined?(:@max_workflow_history_events)
+        @max_workflow_history_events
+      else
+        ENV.fetch("DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS", DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS)
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "max workflow history events must be positive" unless value.positive?
+      end
+    end
+
+    #: () -> Integer
+    def workflow_history_warning_events
+      configured = if instance_variable_defined?(:@workflow_history_warning_events)
+        @workflow_history_warning_events
+      else
+        ENV.fetch("DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS", DEFAULT_WARN_WORKFLOW_HISTORY_EVENTS)
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "workflow history warning events must be positive" unless value.positive?
+      end
+    end
+
+    #: () -> Hash[Symbol, Integer]
+    def payload_limits
+      PAYLOAD_LIMIT_DEFAULTS.each_with_object({}) do |(surface, default_value), limits|
+        limits[surface] = payload_limit(surface, default_value)
+      end
+    end
+
+    #: (Hash[Symbol | String, Integer | String] limits) -> Hash[Symbol | String, Integer | String]
+    def payload_limits=(limits)
+      @payload_limits = normalize_payload_limits(limits)
+    end
+
+    #: () -> untyped
+    def logger
+      return @logger if instance_variable_defined?(:@logger)
+
+      @logger = Logger.new($stderr).tap { |logger| logger.level = Logger::WARN }
+    end
+
+    #: (workflow_id: untyped, history_events: Integer, max_history_events: Integer) -> bool
+    def warn_workflow_history_events(workflow_id:, history_events:, max_history_events:)
+      warning_events = workflow_history_warning_events
+      return false if history_events < warning_events
+
+      logger&.warn(
+        "Durababble workflow #{workflow_id} has #{history_events} workflow history events; " \
+          "warning threshold is #{warning_events}, max is #{max_history_events}",
+      )
+      true
+    end
+
+    #: (surface: Symbol | String, bytesize: Integer, ?context: String?) -> true
+    def enforce_payload_limit!(surface:, bytesize:, context: nil)
+      surface = surface.to_sym
+      max_bytes = payload_limit_for_surface(surface)
+      return true if bytesize <= max_bytes
+
+      raise PayloadTooLarge.new(surface, bytesize:, max_bytes:, context:)
+    end
+
     #: (database_url: String, ?schema: String) -> Store
     def configure(database_url:, schema: default_schema)
       @default_store&.close
@@ -100,7 +246,7 @@ module Durababble
 
     #: () -> Engine
     def engine
-      @default_engine ||= Engine.new(store:, migrate: false)
+      @default_engine ||= Engine.new(store:)
     end
 
     #: (?engine: Engine?, ?store: Store?) -> Engine
@@ -108,7 +254,7 @@ module Durababble
       raise ArgumentError, "pass store: or engine:, not both" if store && engine
 
       return engine if engine
-      return Engine.new(store:, migrate: false) if store
+      return Engine.new(store:) if store
 
       self.engine
     end
@@ -156,6 +302,42 @@ module Durababble
 
     private
 
+    #: (Symbol, Integer) -> Integer
+    def payload_limit(surface, default_value)
+      configured_limits = instance_variable_defined?(:@payload_limits) ? normalize_payload_limits(@payload_limits) : {}
+      configured = if configured_limits.key?(surface)
+        configured_limits.fetch(surface)
+      elsif (env_name = PAYLOAD_LIMIT_ENVS.fetch(surface).find { |name| ENV.key?(name) })
+        ENV.fetch(env_name)
+      else
+        default_value
+      end
+      Integer(configured).tap do |value|
+        raise ArgumentError, "#{PAYLOAD_LIMIT_LABELS.fetch(surface)} payload limit must be positive" unless value.positive?
+      end
+    end
+
+    #: (Symbol | String) -> Integer
+    def payload_limit_for_surface(surface)
+      payload_limits.fetch(canonical_payload_limit_surface(surface))
+    end
+
+    #: (Hash[Symbol | String, Integer | String]) -> Hash[Symbol, Integer | String]
+    def normalize_payload_limits(limits)
+      limits.each_with_object({}) do |(surface, value), normalized|
+        normalized[canonical_payload_limit_surface(surface)] = value
+      end
+    end
+
+    #: (Symbol | String) -> Symbol
+    def canonical_payload_limit_surface(surface)
+      surface = surface.to_sym
+      surface = PAYLOAD_LIMIT_ALIASES.fetch(surface, surface)
+      return surface if PAYLOAD_LIMIT_DEFAULTS.key?(surface)
+
+      raise ArgumentError, "unknown payload limit surface: #{surface}"
+    end
+
     #: (Object?) -> String
     def schema_component(value)
       component = value.to_s.downcase.gsub(/[^a-z0-9_]+/, "_").gsub(/\A_+|_+\z/, "")
@@ -168,6 +350,7 @@ require_relative "durababble/retry_policy"
 require_relative "durababble/workflow"
 require_relative "durababble/durable_object"
 require_relative "durababble/wait_request"
+require_relative "durababble/worker_identity"
 require_relative "durababble/store_queries"
 require_relative "durababble/store"
 require_relative "durababble/engine"

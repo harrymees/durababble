@@ -100,6 +100,8 @@ class DurababbleObservabilityTest < DurababbleTestCase
   end
 
   class RuntimeStore
+    include Durababble::TestSupport::FakeStoreCommandClaiming
+
     attr_reader :workflows, :steps, :attempts, :history
 
     def initialize
@@ -111,30 +113,38 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def migrate! = self
-    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil) = nil
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, worker_pool: "default") = nil
 
-    def enqueue_workflow(name:, input:)
+    def enqueue_workflow(name:, input:, id: nil, worker_pool: "default")
+      @next_id += 1
+      id ||= "wf-#{@next_id}"
+      @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "pending", "input" => input, "created_at" => Time.now }
+      id
+    end
+
+    def create_workflow(name:, input:, worker_id:, lease_seconds:, worker_pool: "default")
       @next_id += 1
       id = "wf-#{@next_id}"
-      @workflows[id] = { "id" => id, "name" => name, "status" => "pending", "input" => input, "created_at" => Time.now }
+      @workflows[id] = { "id" => id, "name" => name, "worker_pool" => worker_pool, "status" => "running", "input" => input, "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds, "created_at" => Time.now }
       id
     end
 
     def workflow(workflow_id) = @workflows.fetch(workflow_id)
 
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       row = @workflows.fetch(workflow_id)
+      return unless row.fetch("worker_pool", "default") == worker_pool
       return if row.fetch("status") == "running" && row["locked_by"] != worker_id
 
       row.merge!("status" => "running", "locked_by" => worker_id, "locked_until" => Time.now + lease_seconds)
       row
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
-      row = @workflows.values.find { |workflow| workflow.fetch("status") == "pending" && (!workflow_names || workflow_names.include?(workflow.fetch("name"))) }
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+      row = @workflows.values.find { |workflow| workflow.fetch("worker_pool", "default") == worker_pool && workflow.fetch("status") == "pending" && (!workflow_names || workflow_names.include?(workflow.fetch("name"))) }
       return unless row
 
-      claim_workflow(workflow_id: row.fetch("id"), worker_id:, lease_seconds:)
+      claim_workflow(workflow_id: row.fetch("id"), worker_id:, lease_seconds:, worker_pool:)
     end
 
     def workflow_owned?(workflow_id:, worker_id:)
@@ -143,9 +153,18 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def workflow_cancellation(_workflow_id) = nil
+    def target_activation(target_kind:, target_type:, target_id:, worker_pool: "default") = nil
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:, worker_pool: "default") = []
 
     def step_attempts_for(workflow_id) = attempts[workflow_id]
+
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      position ||= command_id
+      attempts[workflow_id].count { |attempt| attempt.fetch("position").to_i == position.to_i }
+    end
+
     def workflow_history_for(workflow_id) = history[workflow_id]
+    def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
@@ -169,12 +188,18 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_completed", "command_id" => position, "payload" => result)
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "failed", "error" => error)
       attempts[workflow_id].last.merge!("status" => "failed", "error" => error)
-      append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "error" => error)
+      payload = nil
+      if terminal
+        payload = { "terminal" => true }
+        payload["error_class"] = error_class if error_class
+        payload["error_message"] = error_message if error_message
+      end
+      append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "payload" => payload, "error" => error)
     end
 
     def complete_workflow(workflow_id, result:, worker_id: nil)
@@ -201,12 +226,18 @@ class DurababbleObservabilityTest < DurababbleTestCase
     end
 
     def migrate! = self
-    def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
+    def object_state(object_type:, object_id:, worker_pool: "default") = @state[[worker_pool, object_type, object_id]]
 
-    def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
+    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+      state = @state[[worker_pool, object_type, object_id]]
+      state.nil? ? Durababble::Store::NO_OBJECT_STATE : state
+    end
+
+    def enqueue_object_command(worker_pool: "default", object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil)
       command_id = "cmd-#{@commands.length + 1}"
       @commands[command_id] = {
         "id" => command_id,
+        "worker_pool" => worker_pool,
         "target_kind" => "object",
         "target_type" => object_type,
         "target_id" => object_id,
@@ -243,9 +274,10 @@ class DurababbleObservabilityTest < DurababbleTestCase
       end
     end
 
-    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
+    def claim_inbox_messages(worker_pool: "default", target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, limit:)
       rows = @commands.values.select do |command|
-        command.fetch("target_kind") == target_kind &&
+        command.fetch("worker_pool", "default") == worker_pool &&
+          command.fetch("target_kind") == target_kind &&
           command.fetch("target_type") == target_type &&
           command.fetch("target_id") == target_id &&
           ["pending", "failed", "running"].include?(command.fetch("status"))
@@ -262,9 +294,10 @@ class DurababbleObservabilityTest < DurababbleTestCase
       { "id" => command_id }
     end
 
-    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, worker_id: nil)
-      @state[[object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
-      @commands.fetch(command_id).merge!("status" => "completed", "result" => result, "locked_by" => nil, "worker_id" => worker_id)
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Durababble::Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
+      command = @commands.fetch(command_id)
+      @state[[command.fetch("worker_pool", "default"), object_type, object_id]] = state if object_type && object_id && !state.equal?(Durababble::Store::NO_OBJECT_STATE)
+      command.merge!("status" => "completed", "result" => result, "locked_by" => nil, "worker_id" => worker_id)
       Result.new(1)
     end
 

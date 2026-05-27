@@ -119,6 +119,10 @@
       {{- $subdirActive := false }}
       {{- $isIndexPage := false }}
       {{- $subdirIndex := .index }}
+      {{- $collapsible := true }}
+      {{- if and $subdirIndex (isset $subdirIndex.Params "collapsible") }}
+        {{- $collapsible = $subdirIndex.Params.collapsible }}
+      {{- end }}
       {{- range .pages }}
         {{- if eq $currentPage.RelPermalink .RelPermalink }}
           {{- $subdirActive = true }}
@@ -129,23 +133,38 @@
       {{- end }}
       {{- $subdirId := printf "%s-%s" ($currentDir | anchorize) (.name | anchorize) }}
       <li class="td-sidebar-nav__section-title td-sidebar-nav__section with-child{{ if $subdirActive }} active-path{{ end }}">
-        <input type="checkbox" id="section-{{ $subdirId }}"{{ if $subdirActive }} checked{{ end }} />
-        <label for="section-{{ $subdirId }}" class="section-toggle">
-          {{- if $subdirIndex -}}
-            <a href="{{ $subdirIndex.RelPermalink }}"
-               class="section-title-link{{ if $isIndexPage }} active{{ end }}"
-               onclick="event.stopPropagation();">
-              <span class="section-title">
-                {{- or $subdirIndex.Params.linkTitle (or $subdirIndex.Title (replace .name `-` ` ` | title)) -}}
-              </span>
-            </a>
-            <span class="toggle-icon">▼</span>
-          {{- else -}}
-            <span class="section-title">{{ replace .name `-` ` ` | title }}</span>
-            <span class="toggle-icon">▼</span>
-          {{- end -}}
-        </label>
-        <ul class="section-pages collapsible">
+        {{- if $collapsible }}
+          <input type="checkbox" id="section-{{ $subdirId }}"{{ if $subdirActive }} checked{{ end }} />
+          <label for="section-{{ $subdirId }}" class="section-toggle">
+            {{- if $subdirIndex -}}
+              <a href="{{ $subdirIndex.RelPermalink }}"
+                 class="section-title-link{{ if $isIndexPage }} active{{ end }}"
+                 onclick="event.stopPropagation();">
+                <span class="section-title">
+                  {{- or $subdirIndex.Params.linkTitle (or $subdirIndex.Title (replace .name `-` ` ` | title)) -}}
+                </span>
+              </a>
+              <span class="toggle-icon">▼</span>
+            {{- else -}}
+              <span class="section-title">{{ replace .name `-` ` ` | title }}</span>
+              <span class="toggle-icon">▼</span>
+            {{- end -}}
+          </label>
+        {{- else }}
+          <div class="section-toggle section-toggle--static">
+            {{- if $subdirIndex -}}
+              <a href="{{ $subdirIndex.RelPermalink }}"
+                 class="section-title-link{{ if $isIndexPage }} active{{ end }}">
+                <span class="section-title">
+                  {{- or $subdirIndex.Params.linkTitle (or $subdirIndex.Title (replace .name `-` ` ` | title)) -}}
+                </span>
+              </a>
+            {{- else -}}
+              <span class="section-title">{{ replace .name `-` ` ` | title }}</span>
+            {{- end -}}
+          </div>
+        {{- end }}
+        <ul class="section-pages{{ if $collapsible }} collapsible{{ else }} section-pages--open{{ end }}">
           {{- template "filetree" (dict "currentDir" (printf "%s%s/" $currentDir .name) "pages" .pages "currentPage" $currentPage) -}}
         </ul>
       </li>

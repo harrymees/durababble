@@ -2,12 +2,21 @@
 # frozen_string_literal: true
 
 require_relative "durable_method_dsl"
+require_relative "error_formatting"
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
+  ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
     extend DurableMethodDSL
+
+    UNINITIALIZED = Object.new.freeze
+
+    # Wake names are stored in the indexed `name` column on `object_wakeups`
+    # (VARCHAR(191) / text). Bound the byte length so a name never silently
+    # truncates against the index width.
+    WAKE_NAME_MAX_BYTES = 191
 
     class << self
       #: (Class) -> void
@@ -30,13 +39,20 @@ module Durababble
 
       #: (Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?) -> DurableObjectRef
       def handle(durable_id, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil)
-        DurableObjectRef.new(self, String(durable_id), store: Durababble.store_for(store:, engine:))
+        DurableObjectRef.new(
+          self,
+          String(durable_id),
+          store: Durababble.store_for(store:, engine:),
+          worker_pool: worker_pool || engine_worker_pool(engine),
+          idempotency_key:,
+        )
       end
 
-      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?idempotency_key: String?, **Object?) -> String
-      def tell(durable_id, method_name, *args, store: nil, engine: nil, idempotency_key: nil, **kwargs)
+      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) -> String
+      def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs)
         store = Durababble.store_for(store:, engine:)
         store = store #: as untyped
+        worker_pool ||= engine_worker_pool(engine)
         method_name = method_name.to_sym
         retry_policy = @exposed_commands[method_name]
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy
@@ -44,6 +60,7 @@ module Durababble
         attributes = object_command_attributes(object_id: String(durable_id), method_name:)
         Observability.trace("durababble.object.command.enqueue", attributes) do
           message_id = store.enqueue_object_command(
+            worker_pool:,
             object_type: object_type,
             object_id: String(durable_id),
             method_name: method_name.to_s,
@@ -51,28 +68,44 @@ module Durababble
             kwargs:,
             message_kind: "tell",
             idempotency_key:,
-            max_attempts: inbox_max_attempts(retry_policy),
+            max_attempts: retry_policy.maximum_attempts_limit,
           )
-          store.deliver_target_message(target_kind: "object", target_type: object_type, target_id: String(durable_id))
+          store.deliver_target_message(worker_pool:, target_kind: "object", target_type: object_type, target_id: String(durable_id))
           message_id
         end
       end
 
-      private
-
-      #: (RetryPolicy) -> Integer?
-      def inbox_max_attempts(retry_policy)
-        attempts = retry_policy.maximum_attempts
-        attempts.finite? ? attempts.to_i : nil
+      #: (Object, object_type: String, object_id: String, ?worker_pool: String) -> Object?
+      def state_from_store(store, object_type:, object_id:, worker_pool: "default")
+        store = store #: as untyped
+        state = store.object_state_entry(worker_pool:, object_type:, object_id:)
+        state.equal?(Store::NO_OBJECT_STATE) ? UNINITIALIZED : state
       end
 
-      #: (object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
-      def object_command_attributes(object_id:, method_name:)
+      # Single source for the object-command observability attribute bundle, so
+      # the attribute key names are defined once and shared by both the class
+      # (tell) and instance (DurableObjectRef) command paths.
+      #: (object_type: String, object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
+      def command_attributes(object_type:, object_id:, method_name:)
         {
           "durababble.object.type" => object_type,
           "durababble.object.id" => object_id,
           "durababble.object.method" => method_name,
         }
+      end
+
+      private
+
+      #: (Engine?) -> String
+      def engine_worker_pool(engine)
+        return "default" unless engine
+
+        String(engine.worker_pool)
+      end
+
+      #: (object_id: String, method_name: Symbol | String) -> Hash[String, Object?]
+      def object_command_attributes(object_id:, method_name:)
+        command_attributes(object_type:, object_id:, method_name:)
       end
     end
 
@@ -80,14 +113,20 @@ module Durababble
     attr_reader :durable_id
     #: CommandContext?
     attr_reader :command_context
+    #: String
+    attr_reader :worker_pool
+    #: Array[ObjectWakeupChange]
+    attr_reader :wakeup_changes
 
-    #: (?durable_id: String?, ?state: Object?, ?store: Store?, ?command_context: CommandContext?) -> void
-    def initialize(durable_id: nil, state: nil, store: nil, command_context: nil)
+    #: (?durable_id: String?, ?state: Object?, ?store: Store?, ?command_context: CommandContext?, ?worker_pool: String) -> void
+    def initialize(durable_id: nil, state: UNINITIALIZED, store: nil, command_context: nil, worker_pool: "default")
       @durable_id = durable_id
       @current_state = state
       @store = store #: as untyped
       @command_context = command_context
+      @worker_pool = worker_pool
       @state_dirty = false
+      @wakeup_changes = []
       @__durababble_query_context = false
     end
 
@@ -98,7 +137,9 @@ module Durababble
 
     #: () -> Object?
     def current_state
-      @current_state.nil? ? initialize_state : @current_state
+      return @current_state unless @current_state.equal?(UNINITIALIZED)
+
+      @current_state = initialize_state
     end
 
     #: (Object?) -> Object?
@@ -107,22 +148,68 @@ module Durababble
 
       @current_state = new_state
       @state_dirty = true
-      @store&.save_object_state(object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
+      @store&.save_object_state(worker_pool: @worker_pool, object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
       new_state
+    end
+
+    # Schedule a named wake for this object. Re-scheduling the same name before
+    # it fires replaces that name's wake time and payload; other names are left
+    # untouched. Wakes are committed atomically with the command, so a failed or
+    # retried command never leaves behind an orphaned process-local timer.
+    #: (name: String, at: Time, ?payload: Object?) -> Time
+    def schedule_wake(name:, at:, payload: nil)
+      raise Error, "cannot schedule durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be scheduled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:schedule, coerce_wake_name(name), at, payload)
+      at
+    end
+
+    # Cancel a single named wake. Wakes that are not scheduled are a no-op.
+    #: (name: String) -> bool
+    def cancel_wake(name:)
+      raise Error, "cannot cancel durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be canceled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:cancel, coerce_wake_name(name), nil, nil)
+      true
+    end
+
+    # Cancel every pending wake for this object.
+    #: () -> bool
+    def cancel_all_wakes
+      raise Error, "cannot cancel durable object wakeups from an exposed query" if @__durababble_query_context
+      raise Error, "durable object wakeups can only be canceled from object commands" unless command_context
+
+      @wakeup_changes << ObjectWakeupChange.new(:cancel_all, nil, nil, nil)
+      true
     end
 
     #: () -> bool
     def state_dirty? = @state_dirty
+
+    private
+
+    #: (Object?) -> String
+    def coerce_wake_name(name)
+      name = String(name)
+      raise Error, "durable object wake name cannot be empty" if name.empty?
+      raise Error, "durable object wake name cannot exceed #{WAKE_NAME_MAX_BYTES} bytes" if name.bytesize > WAKE_NAME_MAX_BYTES
+
+      name
+    end
   end
 
   class DurableObjectRef
     COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
 
-    #: (Object, String, store: Store) -> void
-    def initialize(object_class, durable_id, store:)
+    #: (Object, String, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
+    def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
       @object_class = object_class #: as untyped
       @durable_id = durable_id
       @store = store #: as untyped
+      @worker_pool = worker_pool || "default"
+      @idempotency_key = idempotency_key
     end
 
     #: String
@@ -150,10 +237,10 @@ module Durababble
     def invoke_query(method_name, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
-        state = @store.object_state(object_type: @object_class.object_type, object_id: @durable_id)
-        object = @object_class.new(durable_id: @durable_id, state:, store: @store)
+        state = DurableObject.state_from_store(@store, worker_pool: @worker_pool, object_type: @object_class.object_type, object_id: @durable_id)
+        object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
-        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+        object.public_send(method_name, *args, **kwargs, &block)
       end
     end
 
@@ -161,8 +248,9 @@ module Durababble
     def invoke_command(method_name, retry_policy:, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
-        idempotency_key = kwargs.delete(:idempotency_key)
+        idempotency_key = kwargs.key?(:idempotency_key) ? kwargs.delete(:idempotency_key) : @idempotency_key
         command_id = @store.enqueue_object_command(
+          worker_pool: @worker_pool,
           object_type: @object_class.object_type,
           object_id: @durable_id,
           method_name: method_name.to_s,
@@ -170,17 +258,11 @@ module Durababble
           kwargs:,
           message_kind: "ask",
           idempotency_key:,
-          max_attempts: inbox_max_attempts(retry_policy),
+          max_attempts: retry_policy.maximum_attempts_limit,
         )
-        @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id)
+        @store.deliver_target_message(target_kind: "object", target_type: @object_class.object_type, target_id: @durable_id, worker_pool: @worker_pool)
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
-    end
-
-    #: (RetryPolicy) -> Integer?
-    def inbox_max_attempts(retry_policy)
-      attempts = retry_policy.maximum_attempts
-      attempts.finite? ? attempts.to_i : nil
     end
 
     #: (RetryPolicy) -> Numeric?
@@ -194,21 +276,18 @@ module Durababble
 
     #: (method_name: Symbol | String) -> Hash[String, Object?]
     def object_attributes(method_name:)
-      {
-        "durababble.object.type" => @object_class.object_type,
-        "durababble.object.id" => @durable_id,
-        "durababble.object.method" => method_name,
-      }
+      DurableObject.command_attributes(object_type: @object_class.object_type, object_id: @durable_id, method_name:)
     end
   end
 
   class DurableObjectExecutor
-    #: (store: untyped, objects: untyped, worker_id: untyped, lease_seconds: untyped) -> void
-    def initialize(store:, objects:, worker_id:, lease_seconds:)
+    #: (store: untyped, objects: untyped, worker_id: untyped, lease_seconds: untyped, ?worker_pool: String) -> void
+    def initialize(store:, objects:, worker_id:, lease_seconds:, worker_pool: "default")
       @store = store
       @objects = normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
+      @worker_pool = worker_pool
     end
 
     #: (untyped, object_id: untyped, ?limit: untyped) -> untyped
@@ -217,6 +296,7 @@ module Durababble
       drained = 0
       while drained < limit
         messages = @store.claim_inbox_messages(
+          worker_pool: @worker_pool,
           target_kind: "object",
           target_type: object_type,
           target_id: object_id,
@@ -272,7 +352,7 @@ module Durababble
       Observability.trace("durababble.object.command", attributes) do
         object = build_object(object_class, object_id:, message:)
         args, kwargs = object_args(message)
-        result = kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
+        result = object.public_send(method_name, *args, **kwargs)
         complete_message(object, message, result:, attributes:)
         Observability.count("durababble.object.command.successes", attributes)
         result
@@ -287,18 +367,19 @@ module Durababble
     def dispatch_wake(object_class, object_id:, message:)
       object = build_object(object_class, object_id:, message:)
       result = if object.respond_to?(:on_wake)
-        object.public_send(:on_wake, payload: message.fetch("payload"))
+        object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
       end
       complete_message(object, message, result:)
     rescue LeaseConflict
       raise
     rescue StandardError => e
-      terminal_failure(message, "#{e.class}: #{e.message}")
+      terminal_failure(message, ErrorFormatting.format_error(e))
     end
 
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def build_object(object_class, object_id:, message:)
-      state = @store.object_state(object_type: object_class.object_type, object_id:)
+      worker_pool = message.fetch("worker_pool", @worker_pool)
+      state = DurableObject.state_from_store(@store, worker_pool:, object_type: object_class.object_type, object_id:)
       context = CommandContext.new(
         object_type: object_class.object_type,
         durable_id: object_id,
@@ -306,7 +387,7 @@ module Durababble
         attempt_number: message.fetch("attempts").to_i,
         idempotency_key: "durababble:v1:object:#{object_class.object_type}:#{object_id}:command:#{message.fetch("id")}",
       )
-      object_class.new(durable_id: object_id, state:, store: @store, command_context: context) #: as untyped
+      object_class.new(durable_id: object_id, state:, store: @store, command_context: context, worker_pool:) #: as untyped
     end
 
     #: (untyped) -> untyped
@@ -323,13 +404,14 @@ module Durababble
 
     #: (untyped, untyped, result: untyped, ?attributes: untyped) -> untyped
     def complete_message(object, message, result:, attributes: {})
-      completed = if object.state_dirty?
+      completed = if object.state_dirty? || object.wakeup_changes.any?
         @store.complete_object_command(
           command_id: message.fetch("id"),
           result:,
           object_type: object.class.object_type,
           object_id: object.durable_id,
-          state: object.current_state,
+          state: object.state_dirty? ? object.current_state : Store::NO_OBJECT_STATE,
+          wakeup_changes: object.wakeup_changes,
           worker_id: @worker_id,
         )
       else
@@ -344,7 +426,7 @@ module Durababble
     #: (untyped, retry_policy: untyped, error: untyped, attributes: untyped) -> untyped
     def handle_command_error(message, retry_policy:, error:, attributes:)
       attempt_number = message.fetch("attempts").to_i
-      serialized_error = "#{error.class}: #{error.message}"
+      serialized_error = ErrorFormatting.format_error(error)
       Observability.count("durababble.object.command.failures", attributes.merge("error.type" => error.class.name))
       if retry_policy&.retryable?(error, attempt_number:)
         delay = retry_policy.delay_for_attempt(attempt_number)
@@ -361,8 +443,7 @@ module Durababble
 
     #: (untyped) -> untyped
     def retry_run_at(delay)
-      base = @store.respond_to?(:current_time) ? @store.current_time : Time.now
-      base + delay
+      @store.current_time + delay
     end
 
     #: (untyped, object_id: untyped, message: untyped, method_name: untyped) -> untyped

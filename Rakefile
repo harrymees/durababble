@@ -4,6 +4,16 @@ require "bundler/gem_tasks"
 require "rbconfig"
 require "rake/testtask"
 
+desc "Format Markdown files with Prettier"
+task "format:markdown" do
+  sh("npm run format:markdown")
+end
+
+desc "Check Markdown files with Prettier"
+task "check:markdown" do
+  sh("npm run check:markdown")
+end
+
 task :rubocop do
   sh("bundle exec rubocop")
 end
@@ -32,19 +42,41 @@ end
 
 task formal: [:alloy, :sigils]
 
-task lint: [:rubocop, :typecheck]
+task lint: [:rubocop, :typecheck, "check:markdown"]
 
+# The Deterministic Simulation Testing files. They run uninstrumented in their
+# own CI job (`rake dst`) rather than under the coverage gate: the seed sweeps
+# iterate the same lib/ lines thousands of times, adding ~no incremental
+# coverage but ~2.5x wall time under SimpleCov. They exercise only the in-memory
+# SQLite store, so the job needs no database service.
+DST_TEST_FILES = [
+  "test/durababble/deterministic_test.rb",
+  "test/durababble/dst_mutation_test.rb",
+].freeze
+
+# The coverage-gated suite: every test EXCEPT the DST simulation files.
 Rake::TestTask.new(:test) do |task|
   task.libs << "test"
-  task.pattern = "test/**/*_test.rb"
+  task.test_files = FileList["test/**/*_test.rb"].exclude(*DST_TEST_FILES)
+end
+
+desc "Run the Deterministic Simulation Testing suite (uninstrumented; full seed sweep)"
+Rake::TestTask.new(:dst) do |task|
+  task.libs << "test"
+  task.test_files = FileList[*DST_TEST_FILES]
 end
 
 namespace :test do
-  desc "Run the full test suite with SimpleCov line and branch coverage gates"
+  desc "Run the (non-DST) test suite with SimpleCov line and branch coverage gates"
   task :coverage do
     ENV["DURABABBLE_COVERAGE"] = "1"
     Rake::Task[:test].invoke
   end
+
+  desc "DST mutation check: revert each known crash-recovery fix and confirm a scenario goes red"
+  task :mutation do
+    ruby("-Ilib -Itest test/durababble/dst_mutation_test.rb")
+  end
 end
 
-task default: :test
+task default: [:test, :dst]

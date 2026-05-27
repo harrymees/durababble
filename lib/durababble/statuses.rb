@@ -8,13 +8,15 @@ module Durababble
     WAITING = "waiting"
     CANCELING = "canceling"
     CANCELED = "canceled"
+    TERMINATED = "terminated"
     FAILED = "failed"
     COMPLETED = "completed"
 
-    ALL = [PENDING, RUNNING, WAITING, CANCELING, CANCELED, FAILED, COMPLETED].freeze
+    ALL = [PENDING, RUNNING, WAITING, CANCELING, CANCELED, TERMINATED, FAILED, COMPLETED].freeze
     COMPLETED_STATUSES = [COMPLETED, CANCELED].freeze
+    TERMINAL_STATUSES = [COMPLETED, CANCELED, TERMINATED].freeze
     SUSPENDED_OR_RUNNABLE = [PENDING, WAITING, CANCELING].freeze
-    RPC_NOT_RUNNING = [COMPLETED, WAITING].freeze
+    RPC_NOT_RUNNING = [COMPLETED, TERMINATED, WAITING].freeze
 
     class << self
       #: (String | Hash[String, Object?]) -> bool
@@ -24,7 +26,7 @@ module Durababble
 
       #: (Hash[String, Object?]) -> bool
       def terminal?(row)
-        completed?(row) || final_failed?(row)
+        TERMINAL_STATUSES.include?(status_of(row)) || final_failed?(row)
       end
 
       #: (Hash[String, Object?]) -> bool
@@ -57,14 +59,18 @@ module Durababble
   end
 
   module StepStatus
+    SCHEDULED = "scheduled"
     RUNNING = "running"
     WAITING = "waiting"
     CANCELED = "canceled"
     FAILED = "failed"
     COMPLETED = "completed"
 
-    ALL = [RUNNING, WAITING, CANCELED, FAILED, COMPLETED].freeze
-    LIVE = [RUNNING, WAITING].freeze
+    # `scheduled` is the durable state a step occupies between record_step_scheduled
+    # and record_step_started — a worker that crashes in that window leaves the row
+    # here with no attempt yet.
+    ALL = [SCHEDULED, RUNNING, WAITING, CANCELED, FAILED, COMPLETED].freeze
+    LIVE = [SCHEDULED, RUNNING, WAITING].freeze
   end
 
   module AttemptStatus
@@ -113,7 +119,12 @@ module Durababble
     FAILED = "failed"
     RUNNING = "running"
     DEAD_LETTERED = "dead_lettered"
+    # A delivered command is retained in the inbox table as `completed` (UPDATE,
+    # not DELETE), so it is a valid persisted status even though it is never an
+    # activatable mailbox head.
+    COMPLETED = "completed"
 
+    ALL = [PENDING, FAILED, RUNNING, DEAD_LETTERED, COMPLETED].freeze
     ACTIVATABLE = [PENDING, FAILED, RUNNING].freeze
 
     class << self

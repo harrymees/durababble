@@ -22,6 +22,38 @@ module DurababbleScriptedSqlSupport
     end
   end
 
+  class ScriptedConnectionPool
+    attr_reader :connection, :checked_out, :disconnected
+
+    def initialize(connection)
+      @connection = connection
+      @checked_out = 0
+      @checkout_depth = 0
+      @disconnected = false
+    end
+
+    def with_connection
+      return yield @connection if @checkout_depth.positive?
+
+      @checked_out += 1
+      @checkout_depth += 1
+      begin
+        yield @connection
+      ensure
+        @checkout_depth -= 1
+      end
+    end
+
+    def disconnect!
+      @disconnected = true
+      @connection.close if @connection.respond_to?(:close)
+    end
+
+    def active_connection?
+      @checkout_depth.positive?
+    end
+  end
+
   class ScriptedPgConnection
     attr_reader :exec_params_calls, :exec_calls, :closed
 
@@ -49,7 +81,7 @@ module DurababbleScriptedSqlSupport
       end
     end
 
-    def transaction(requires_new: true)
+    def transaction(requires_new: true, **_options)
       yield
     end
 
@@ -92,7 +124,7 @@ module DurababbleScriptedSqlSupport
       @result_for_query&.call(sql) || DurababbleScriptedSqlSupport.sql_result
     end
 
-    def transaction(requires_new: true)
+    def transaction(requires_new: true, **_options)
       yield
     end
 
@@ -150,33 +182,6 @@ module DurababbleScriptedSqlSupport
     end
   end
 
-  class MysqlMigrationProbeStore < Durababble::MysqlStore
-    attr_reader :executed
-
-    def initialize(schema:, columns: {})
-      super(ScriptedMysqlConnection.new, schema:)
-      @columns = columns
-      @executed = []
-    end
-
-    def execute_params(sql, params)
-      @executed << [:execute_params, sql, params]
-      table = params.first
-      column = params[1]
-      rows = if sql.include?("information_schema.columns")
-        @columns.fetch(table, []).include?(column) ? [{ "exists" => 1 }] : []
-      else
-        []
-      end
-      DurababbleScriptedSqlSupport.sql_result(rows)
-    end
-
-    def execute(sql)
-      @executed << [:execute, sql]
-      DurababbleScriptedSqlSupport.sql_result
-    end
-  end
-
   def sql_result(rows = [], affected_rows: rows.length)
     DurababbleScriptedSqlSupport.sql_result(rows, affected_rows:)
   end
@@ -185,5 +190,9 @@ module DurababbleScriptedSqlSupport
     Durababble::Store::SERIALIZER.dump(value).then { |bytes| "\\x#{bytes.unpack1("H*")}" }
   end
 
-  private :sql_result, :pg_dump
+  def scripted_pool(connection)
+    DurababbleScriptedSqlSupport::ScriptedConnectionPool.new(connection)
+  end
+
+  private :sql_result, :pg_dump, :scripted_pool
 end

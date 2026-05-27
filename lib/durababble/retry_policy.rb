@@ -46,14 +46,22 @@ module Durababble
       true
     end
 
+    # The attempt cap as a finite Integer, or nil when retries are unbounded
+    # (maximum_attempts is Float::INFINITY). Matches the nullable inbox
+    # `max_attempts` column, where nil means "no cap".
+    #: () -> Integer?
+    def maximum_attempts_limit
+      maximum_attempts.finite? ? maximum_attempts.to_i : nil
+    end
+
     #: (Integer) -> Float
     def delay_for_attempt(attempt_number)
       explicit = schedule[attempt_number - 1]
       return explicit if explicit
 
       delay = initial_interval * (backoff_coefficient**(attempt_number - 1))
-      delay = [delay, maximum_interval].min if maximum_interval
-      delay || 0.0
+      cap = maximum_interval
+      cap && delay > cap ? cap : delay
     end
 
     private

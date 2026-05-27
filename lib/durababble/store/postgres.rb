@@ -5,87 +5,55 @@ module Durababble
   class PostgresStore < SqlStore
     include PostgresMigrations
 
+    # Retry budgets for serialization/deadlock failures. Backoff grows linearly
+    # per attempt and is jittered to decorrelate competing transactions.
+    # The statement path tolerates more attempts with a coarser step because it
+    # wraps individual statements that may legitimately collide repeatedly.
+    MAX_SERIALIZATION_RETRY_ATTEMPTS = 5
+    SERIALIZATION_RETRY_STEP_SECONDS = 0.001
+    MAX_STATEMENT_RETRY_ATTEMPTS = 20
+    STATEMENT_RETRY_STEP_SECONDS = 0.05
+
     #: () -> Object?
     def drop_schema!
-      execute("DROP SCHEMA IF EXISTS #{quoted_schema} CASCADE")
+      execute_store_query(:drop_schema)
       @migrated = false
     end
 
-    #: (name: String, input: Object?) -> Object?
-    def enqueue_workflow(name:, input:)
-      # [DURABABBLE-WF-1] The workflow row is durable before any claim path can run it.
-      id = SecureRandom.uuid
-      execute_params(
-        "INSERT INTO #{table("workflows")} (id, name, status, input) VALUES ($1, $2, 'pending', $3::bytea)",
-        [id, name, dump_serialized(input)],
-      )
-      id
-    end
-
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil)
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
       return if workflow_names&.empty?
 
-      # [DURABABBLE-LEASE-1] Queue selection and lease assignment happen under row locks.
-      name_filter, name_params = workflow_name_filter(workflow_names)
+      name_filter, name_params = workflow_name_filter(workflow_names, offset: 4)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
-          candidates = []
-          candidates.concat(execute_params(store_query_sql(:pg_claim_pending_workflow, name_filter:), name_params).to_a)
-          candidates.concat(execute_params(store_query_sql(:pg_claim_due_pending_workflow, name_filter:), name_params).to_a)
-          candidates.concat(execute_params(store_query_sql(:pg_claim_failed_workflow, name_filter:), name_params).to_a)
-          candidates.concat(execute_params(store_query_sql(:pg_claim_canceling_workflow, name_filter:), name_params).to_a)
-          candidates.concat(execute_params(store_query_sql(:pg_claim_expired_workflow, name_filter:), name_params).to_a)
-
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
-          next nil unless candidate
-
-          execute_params(store_query_sql(:pg_claim_selected_workflow), [candidate.fetch("id"), worker_id, lease_seconds]).first
-        end
+        execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params, name_filter:).first
       end
       typed_row = row #: as untyped
       observe_claim_latency(typed_row, "workflow") if typed_row
       decode_row(typed_row) if typed_row
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> Object?
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:)
-      already_owned = execute_params(store_query_sql(:pg_claim_workflow_already_owned), [workflow_id, worker_id]).first
+    #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
-      row = execute_params(store_query_sql(:pg_claim_workflow_update), [workflow_id, worker_id, lease_seconds]).first
+      row = execute_store_query(:claim_workflow_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
       decode_row(row) if row
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> Object?
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:)
-      already_owned = execute_params(<<~SQL, [workflow_id, worker_id]).first
-        SELECT * FROM #{table("workflows")}
-        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-      SQL
+    #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
-      row = execute_params(<<~SQL, [workflow_id, worker_id, lease_seconds]).first
-        UPDATE #{table("workflows")}
-        SET status = 'running', error = NULL, locked_by = $2,
-            locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
-        WHERE id = $1
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR status = 'waiting'
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'running' AND (locked_by = $2 OR locked_until < now()))
-          )
-        RETURNING *
-      SQL
+      row = execute_store_query(:claim_workflow_for_activation_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
       decode_row(row) if row
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-      # [DURABABBLE-LEASE-2] Heartbeats extend only an unexpired lease held by this worker.
-      result = execute_params(store_query_sql(:pg_heartbeat_workflow), [workflow_id, worker_id, lease_seconds])
+      result = execute_store_query(:heartbeat_workflow, [workflow_id, worker_id, lease_seconds])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
       else
@@ -94,19 +62,13 @@ module Durababble
       result
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
-    def workflow_owned?(workflow_id:, worker_id:)
-      !!execute_params(store_query_sql(:pg_workflow_owned), [workflow_id, worker_id]).first
-    end
-
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
-      # [DURABABBLE-LEASE-3] Shutdown releases owned workflow/outbox/inbox leases for recovery.
-      @connection.transaction(requires_new: true) do
-        workflows = execute_params(store_query_sql(:pg_release_workflow_leases), [worker_id]).affected_rows
-        outbox = execute_params(store_query_sql(:pg_release_outbox_leases), [worker_id]).affected_rows
-        inbox = execute_params(store_query_sql(:pg_release_inbox_leases), [worker_id]).affected_rows
-        target_activations = execute_params(store_query_sql(:pg_release_target_activation_leases), [worker_id]).affected_rows
+      transaction do
+        workflows = execute_store_query(:release_workflow_leases, [worker_id]).affected_rows
+        outbox = execute_store_query(:release_outbox_leases, [worker_id]).affected_rows
+        inbox = execute_store_query(:release_inbox_leases, [worker_id]).affected_rows
+        target_activations = execute_store_query(:release_target_activation_leases, [worker_id]).affected_rows
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
@@ -115,34 +77,13 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, run_at: Time) -> Object?
     def schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
-      result = execute_params(<<~SQL, [workflow_id, worker_id, timestamp(run_at)])
-        UPDATE #{table("workflows")}
-        SET status = CASE
-            WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-            ELSE 'pending'
-          END,
-          locked_by = NULL, locked_until = NULL, next_run_at = $3::timestamptz, runnable_immediately = false, updated_at = now()
-        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-      SQL
+      result = execute_store_query(:schedule_workflow_retry, [workflow_id, worker_id, timestamp(run_at)])
       result.affected_rows.to_i == 1 ? result : nil
     end
 
     #: (workflow_id: String, ?worker_id: String?) -> bool
     def suspend_workflow(workflow_id:, worker_id: nil)
-      result = execute_params(<<~SQL, [workflow_id, worker_id])
-        UPDATE #{table("workflows")}
-        SET status = CASE
-              WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-              WHEN EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending') THEN 'waiting'
-              ELSE 'pending'
-            END,
-            locked_by = NULL,
-            locked_until = NULL,
-            runnable_immediately = true,
-            updated_at = now()
-        WHERE id = $1 AND status = 'running'
-          AND ($2::text IS NULL OR (locked_by = $2::text AND locked_until >= now()))
-      SQL
+      result = execute_store_query(:suspend_workflow, [workflow_id, worker_id])
       return true if result.affected_rows == 1
 
       WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
@@ -150,13 +91,13 @@ module Durababble
 
     #: (String, ?now: Time) -> Object?
     def make_workflow_due!(workflow_id, now: Time.now)
-      execute_params("UPDATE #{table("workflows")} SET next_run_at = NULL, runnable_immediately = true, updated_at = $2::timestamptz WHERE id = $1", [workflow_id, timestamp(now)])
+      execute_store_query(:make_workflow_due, [workflow_id, timestamp(now)])
     end
 
     #: (workflow_id: String, reason: String) -> Object?
     def request_workflow_cancellation(workflow_id:, reason:)
-      @connection.transaction(requires_new: true) do
-        row = execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
+      transaction do
+        row = execute_store_query(:lock_workflow_for_update, [workflow_id]).first
         raise KeyError, "workflow not found: #{workflow_id}" unless row
 
         decoded = decode_row(row)
@@ -164,205 +105,178 @@ module Durababble
 
         first_request = row["cancel_requested_at"].nil?
         if first_request
-          execute_params(<<~SQL, [workflow_id, reason])
-            UPDATE #{table("workflows")}
-            SET cancel_reason = $2, cancel_requested_at = now(), updated_at = now()
-            WHERE id = $1
-          SQL
+          execute_store_query(:request_workflow_cancellation, [workflow_id, reason])
         end
         cancel_pending_waits_for_workflow(workflow_id) if first_request
 
         if first_request && !WorkflowStatus.running?(decoded)
-          execute_params(<<~SQL, [workflow_id])
-            UPDATE #{table("workflows")}
-            SET status = 'canceling', locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-            WHERE id = $1 AND status NOT IN ('completed', 'canceled')
-          SQL
+          execute_store_query(:mark_workflow_canceling_for_request, [workflow_id])
         end
 
         workflow(workflow_id)
       end
     end
 
+    #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
+    def request_workflow_termination(workflow_id:, reason: nil)
+      error = workflow_termination_error(reason)
+      result = transaction do
+        row = execute_store_query(:lock_workflow_for_termination, [workflow_id]).first
+        raise KeyError, "workflow not found: #{workflow_id}" unless row
+
+        decoded = decode_row(row)
+        next decoded if WorkflowStatus.terminal?(decoded)
+
+        execute_store_query(:terminate_workflow, [workflow_id, dump_serialized(nil), error])
+        terminate_workflow_dependents(workflow_id, error:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error })
+
+        workflow(workflow_id)
+      end
+      result #: as Hash[String, Object?]
+    end
+
     #: (String) -> Object?
     def workflow_cancellation(workflow_id)
-      row = execute_params(<<~SQL, [workflow_id]).first
-        SELECT id AS workflow_id, cancel_reason AS reason,
-          cancel_requested_at AS requested_at, cancel_delivered_at AS delivered_at
-        FROM #{table("workflows")}
-        WHERE id = $1 AND cancel_requested_at IS NOT NULL
-      SQL
+      row = execute_store_query(:workflow_cancellation, [workflow_id]).first
       row&.transform_values(&:itself)
     end
 
     #: (workflow_id: String) -> Object?
     def mark_workflow_cancellation_delivered(workflow_id:)
-      execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("workflows")}
-        SET cancel_delivered_at = COALESCE(cancel_delivered_at, now()), updated_at = now()
-        WHERE id = $1 AND cancel_requested_at IS NOT NULL
-      SQL
+      execute_store_query(:mark_workflow_cancellation_delivered, [workflow_id])
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
-      # [DURABABBLE-LEASE-2] Step heartbeat stores progress only while the workflow lease is live.
       command_id = normalize_command_id(command_id, position)
-      renewed = @connection.transaction(requires_new: true) do
-        workflow = execute_params(store_query_sql(:pg_heartbeat_step_workflow), [workflow_id, worker_id, lease_seconds]).first
+      renewed = transaction do
+        workflow = execute_store_query(:heartbeat_step_workflow, [workflow_id, worker_id, lease_seconds]).first
         next nil unless workflow
 
         serialized_cursor = dump_serialized(cursor)
-        step = execute_params(store_query_sql(:pg_heartbeat_step_row), [workflow_id, command_id, serialized_cursor]).first
+        step = execute_store_query(:heartbeat_step_row, [workflow_id, command_id, serialized_cursor]).first
         next nil unless step
 
-        execute_params(store_query_sql(:pg_heartbeat_latest_attempt), [workflow_id, command_id, serialized_cursor])
+        execute_store_query(:heartbeat_latest_attempt, [workflow_id, command_id, serialized_cursor])
         workflow
       end
+      renewed = renewed #: as untyped
       renewed&.fetch("locked_until")
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
-      row = execute_params("SELECT heartbeat_cursor FROM #{table("steps")} WHERE workflow_id = $1 AND position = $2", [workflow_id, command_id]).first
+      row = execute_store_query(:step_heartbeat_cursor, [workflow_id, command_id]).first
       decode_row(row).fetch("heartbeat_cursor") if row
     end
 
-    #: (String) -> Object?
-    def current_workflow_lease(workflow_id)
-      row = execute_params(store_query_sql(:pg_current_workflow_lease), [workflow_id]).first
+    #: (String, ?worker_pool: String?) -> Object?
+    def current_workflow_lease(workflow_id, worker_pool: nil)
+      worker_pool_sql = worker_pool ? "AND worker_pool = $2" : ""
+      params = worker_pool ? [workflow_id, worker_pool] : [workflow_id]
+      row = execute_store_query(:current_workflow_lease, params, worker_pool_sql:).first
       row&.transform_values(&:itself)
     end
 
-    #: (Object?, Object?) -> Object?
-    def current_object_lease(object_type, object_id)
-      row = execute_params(<<~SQL, [object_type, object_id]).first
-        SELECT target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table("inbox")}
-        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= now()
-        ORDER BY sequence
-        LIMIT 1
-      SQL
+    #: (Object?, Object?, ?worker_pool: String) -> Object?
+    def current_object_lease(object_type, object_id, worker_pool: "default")
+      row = execute_store_query(:current_object_lease, [worker_pool, object_type, object_id]).first
       row&.transform_values(&:itself)
     end
 
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
-      # [DURABABBLE-LEASE-3] Expired workflow leases are reclaimed durably for another owner.
-      result = execute_params(store_query_sql(:pg_steal_expired_leases), [timestamp(now)])
+      result = execute_store_query(:steal_expired_leases, [timestamp(now)])
       Observability.count("durababble.leases.expired_recovery", by: result.affected_rows.to_i)
       result.affected_rows
     end
 
-    #: (String, ?worker_id: String?, ?lease_seconds: Integer) -> Object?
-    def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60)
+    #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
+    def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
       if worker_id
-        claim_workflow(workflow_id:, worker_id:, lease_seconds:)
+        claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool:)
       else
-        # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
-        execute_params(<<~SQL, [workflow_id])
-          UPDATE #{table("workflows")}
-          SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-          WHERE id = $1 AND status = 'pending' AND locked_by IS NULL
-        SQL
+        execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
       end
     end
 
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
-      update = if worker_id
-        execute_params(
-          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now() AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = $1 AND status IN ('running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending')",
-          [workflow_id, dump_serialized(result), worker_id],
-        )
-      else
-        execute_params(
-          "UPDATE #{table("workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM #{table("steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("step_attempts")} WHERE workflow_id = $1 AND status IN ('running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM #{table("waits")} WHERE workflow_id = $1 AND status = 'pending')",
-          [workflow_id, dump_serialized(result)],
-        )
+      serialized_result = dump_workflow_result(workflow_id:, result:)
+      transaction do
+        update = if worker_id
+          execute_store_query(:complete_workflow_with_worker, [workflow_id, serialized_result, worker_id])
+        else
+          execute_store_query(:complete_workflow, [workflow_id, serialized_result])
+        end
+        require_workflow_completion_update!(update, workflow_id:, worker_id:)
+        cancel_live_workflow_dependents(workflow_id)
+        update
       end
-      require_workflow_completion_update!(update, workflow_id:, worker_id:)
     end
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
-      @connection.transaction(requires_new: true) do
-        update = if worker_id
-          execute_params(
-            "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()",
-            [workflow_id, dump_serialized(result), reason, worker_id],
-          )
+      serialized_result = dump_workflow_result(workflow_id:, result:, context: "cancellation result")
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow cancellation") do
+        if worker_id
+          execute_store_query(:cancel_workflow_with_worker, [workflow_id, serialized_result, reason, worker_id])
         else
-          execute_params(
-            "UPDATE #{table("workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
-            [workflow_id, dump_serialized(result), reason],
-          )
+          execute_store_query(:cancel_workflow, [workflow_id, serialized_result, reason])
         end
-        require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow cancellation")
-        cancel_incomplete_workflow_work_for_terminal_without_transaction(workflow_id:, error: reason) if update.affected_rows.to_i == 1
       end
     end
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      transaction do
-        update = if worker_id
-          execute_params(
-            "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()",
-            [workflow_id, error, worker_id],
-          )
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+        if worker_id
+          execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
         else
-          execute_params(
-            "UPDATE #{table("workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))",
-            [workflow_id, error],
-          )
+          execute_store_query(:fail_workflow, [workflow_id, error])
         end
-        require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow failure")
-        fail_incomplete_workflow_steps_without_transaction(workflow_id:, error:)
       end
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
     def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
-      # [DURABABBLE-CONCURRENCY-1] Scheduled command history is the replay contract for concurrent workflow fibers.
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
-        execute_params(<<~SQL, [workflow_id, command_id, name])
-          INSERT INTO #{table("steps")} (workflow_id, position, name, status, updated_at)
-          VALUES ($1, $2, $3, 'scheduled', now())
-          ON CONFLICT (workflow_id, position) DO NOTHING
-        SQL
+        execute_store_query(:insert_scheduled_step, [workflow_id, command_id, name])
       end
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
     def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
-      # [DURABABBLE-STEP-2] Recovery appends a retry attempt and closes stale running attempts.
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        execute_params(store_query_sql(:pg_supersede_running_step_attempts), [workflow_id, command_id])
-        execute_params(store_query_sql(:pg_upsert_step_running), [workflow_id, command_id, name])
+        execute_store_query(:supersede_running_step_attempts, [workflow_id, command_id])
+        execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
         attempt_id = SecureRandom.uuid
-        execute_params(store_query_sql(:pg_insert_step_attempt), [attempt_id, workflow_id, command_id, name])
+        execute_store_query(:insert_step_attempt, [attempt_id, workflow_id, command_id, name])
         append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
         attempt_id
       end
     end
 
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      command_id = normalize_command_id(command_id, position)
+      row = execute_store_query(:step_attempt_count_for, [workflow_id, command_id]).first
+      row.fetch("count").to_i
+    end
+
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
     def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        execute_params(
-          "UPDATE #{table("steps")} SET status = 'canceled', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2 AND status IN ('scheduled', 'running', 'waiting')",
-          [workflow_id, command_id, error],
-        )
+        execute_store_query(:cancel_step, [workflow_id, command_id, error])
         update_latest_attempt_serialized(workflow_id:, command_id:, status: "canceled", serialized_result: dump_serialized(nil), error:)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_canceled", command_id:, error:)
       end
@@ -371,11 +285,11 @@ module Durababble
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
     def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
-      @connection.transaction(requires_new: true) do
+      transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        execute_params(store_query_sql(:pg_upsert_waiting_step), [workflow_id, command_id, name, dump_serialized(wait_request.context)])
+        execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
         wait_id = SecureRandom.uuid
-        execute_params(store_query_sql(:pg_insert_wait), [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
+        execute_store_query(:insert_wait, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
         append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
         if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
@@ -396,36 +310,25 @@ module Durababble
 
     #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
-      # [DURABABBLE-FENCE-1] The fence row is inserted before yielding to the side effect.
       token = SecureRandom.uuid
-      inserted = execute_params(<<~SQL, [workflow_id, key, token, timeout])
-        INSERT INTO #{table("fences")} (workflow_id, key, status, locked_by, locked_until)
-        VALUES ($1, $2, 'running', $3, now() + ($4::int * interval '1 second'))
-        ON CONFLICT (workflow_id, key) DO NOTHING
-      SQL
+      inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
+      claimed = inserted.affected_rows == 1
+      claimed ||= execute_store_query(:claim_expired_fence, [token, timeout, workflow_id, key]).affected_rows == 1
 
-      if inserted.affected_rows == 1
+      if claimed
         begin
           result = block.call
-          execute_params(<<~SQL, [workflow_id, key, token, dump_serialized(result)])
-            UPDATE #{table("fences")}
-            SET status = 'completed', result = $4::bytea, error = NULL, completed_at = now()
-            WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
-          SQL
+          execute_store_query(:complete_fence, [workflow_id, key, token, dump_serialized(result)])
           return result
         rescue StandardError => e
-          execute_params(<<~SQL, [workflow_id, key, token, "#{e.class}: #{e.message}"])
-            UPDATE #{table("fences")}
-            SET status = 'failed', error = $4, completed_at = now()
-            WHERE workflow_id = $1 AND key = $2 AND locked_by = $3
-          SQL
+          execute_store_query(:fail_fence, [workflow_id, key, token, "#{e.class}: #{e.message}"])
           raise
         end
       end
 
       deadline = Time.now + timeout
       loop do
-        row = execute_params("SELECT status, result, error FROM #{table("fences")} WHERE workflow_id = $1 AND key = $2", [workflow_id, key]).first
+        row = execute_store_query(:read_fence, [workflow_id, key]).first
         decoded = decode_row(row) if row
         unless decoded
           raise FenceTimeout, "timed out waiting for fence #{key}" if Time.now >= deadline
@@ -448,28 +351,27 @@ module Durababble
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
-      # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row.
-      existing = execute_params(store_query_sql(:pg_outbox_by_key), [key]).first
+      existing = execute_store_query(:outbox_by_key, [key]).first
       return existing.fetch("id") if existing
 
       id = SecureRandom.uuid
-      execute_params(store_query_sql(:pg_insert_outbox), [id, workflow_id, topic, dump_serialized(payload), key])
+      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
       Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
-      execute_params(store_query_sql(:pg_outbox_by_key), [key]).first.fetch("id")
+      execute_store_query(:outbox_by_key, [key]).first.fetch("id")
     end
 
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox(worker_id:, lease_seconds:)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
+        transaction do
           candidates = []
-          candidates.concat(execute_params(store_query_sql(:pg_claim_pending_outbox), []).to_a)
-          candidates.concat(execute_params(store_query_sql(:pg_claim_expired_outbox), []).to_a)
+          candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
+          candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
 
           candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
-          execute_params(store_query_sql(:pg_claim_selected_outbox), [candidate.fetch("id"), worker_id, lease_seconds]).first
+          execute_store_query(:claim_selected_outbox, [candidate.fetch("id"), worker_id, lease_seconds]).first
         end
       end
       typed_row = row #: as untyped
@@ -479,352 +381,248 @@ module Durababble
 
     #: (String, worker_id: String) -> Object?
     def ack_outbox(outbox_id, worker_id:)
-      # [DURABABBLE-OUTBOX-1] Only the sender that owns the processing lease can ack.
-      result = execute_params(store_query_sql(:pg_ack_outbox), [outbox_id, worker_id])
+      result = execute_store_query(:ack_outbox, [outbox_id, worker_id])
       Observability.count("durababble.outbox.processed", "durababble.worker.id" => worker_id) if result.affected_rows.to_i.positive?
       result
     end
 
-    #: (object_type: String, object_id: String, state: Object?) -> Object?
-    def save_object_state(object_type:, object_id:, state:)
-      execute_params(store_query_sql(:pg_save_object_state), [object_type, object_id, dump_serialized(state)])
+    #: (object_type: String, object_id: String, state: Object?, ?worker_pool: String) -> Object?
+    def save_object_state(object_type:, object_id:, state:, worker_pool: "default")
+      serialized_state = dump_object_state(object_type:, object_id:, state:)
+      execute_store_query(:save_object_state, [worker_pool, object_type, object_id, serialized_state])
       state
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time) -> Object?
-    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now)
+    #: (worker_pool: String, object_type: String, object_id: String, name: String, wake_at: Object?, payload: Object?) -> Object?
+    def upsert_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:, wake_at:, payload:)
+      wake_at = wake_at #: as Time
+      serialized_payload = dump_serialized(payload, surface: :inbox_payload, context: "object wakeup #{object_type}/#{object_id} (#{name})")
+      execute_store_query(:upsert_object_wakeup, [worker_pool, object_type, object_id, name, timestamp(wake_at), serialized_payload])
+    end
+
+    #: (worker_pool: String, object_type: String, object_id: String, name: String) -> Object?
+    def delete_object_wakeup_without_transaction(worker_pool:, object_type:, object_id:, name:)
+      execute_store_query(:delete_object_wakeup, [worker_pool, object_type, object_id, name])
+    end
+
+    #: (worker_pool: String, object_type: String, object_id: String) -> Object?
+    def delete_all_object_wakeups_without_transaction(worker_pool:, object_type:, object_id:)
+      execute_store_query(:delete_all_object_wakeups, [worker_pool, object_type, object_id])
+    end
+
+    #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
       return if target_kinds&.empty? || target_types&.empty?
 
-      filter_sql, filter_params = target_activation_filter(target_kinds:, target_types:, offset: 2)
+      filter_sql, filter_params = target_activation_filter(target_kinds:, target_types:, offset: 3)
       row = retry_serialization_failures do
-        @connection.transaction(requires_new: true) do
+        transaction do
           candidates = []
-          candidates.concat(execute_params(<<~SQL, [timestamp(now)] + filter_params).to_a)
-            SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
-            WHERE status = 'pending' AND ready_at <= $1::timestamptz
-              #{filter_sql}
-            ORDER BY ready_at, created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-          SQL
-          candidates.concat(execute_params(<<~SQL, [timestamp(now)] + filter_params).to_a)
-            SELECT target_kind, target_type, target_id, ready_at, created_at FROM #{table("target_activations")}
-            WHERE status = 'running' AND locked_until < $1::timestamptz
-              #{filter_sql}
-            ORDER BY ready_at, created_at
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-          SQL
+          candidates.concat(execute_store_query(:claim_pending_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
+          candidates.concat(execute_store_query(:claim_expired_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
           candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
-          execute_params(<<~SQL, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
-            UPDATE #{table("target_activations")}
-            SET status = 'running',
-                locked_by = $4,
-                locked_until = now() + ($5::int * interval '1 second'),
-                updated_at = now()
-            WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-            RETURNING *
-          SQL
+          execute_store_query(:claim_selected_target_activation, [worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
         end
       end
       typed_row = row #: as untyped
       decode_row(typed_row) if typed_row
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time) -> Object?
-    def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now)
-      @connection.transaction(requires_new: true) do
-        activation = execute_params(<<~SQL, [target_kind, target_type, target_id, worker_id]).first
-          SELECT 1 FROM #{table("target_activations")}
-          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-            AND status = 'running' AND locked_by = $4
-            AND locked_until >= now()
-          FOR UPDATE
-        SQL
+    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
+    def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
+      transaction do
+        activation = execute_store_query(:lock_target_activation_for_completion, [worker_pool, target_kind, target_type, target_id, worker_id]).first
         next nil unless activation
 
-        reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:)
+        reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:)
       end
     end
 
     private
 
-    #: (String) -> Object?
-    def cancel_pending_waits_for_workflow(workflow_id)
-      execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("waits")}
-        SET status = 'canceled', completed_at = now()
-        WHERE workflow_id = $1 AND status = 'pending'
-      SQL
-      execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("steps")}
-        SET status = 'canceled', error = 'workflow cancellation requested', updated_at = now()
-        WHERE workflow_id = $1 AND status = 'waiting'
-      SQL
-      execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("step_attempts")}
-        SET status = 'canceled', error = 'workflow cancellation requested', completed_at = now()
-        WHERE workflow_id = $1 AND status = 'waiting'
-      SQL
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+      workflow_id = id
+      serialized_input = dump_workflow_input(name:, input:)
+      if worker_id
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, serialized_input, worker_id, lease_seconds || 60])
+      else
+        execute_store_query(:insert_workflow, [workflow_id, name, worker_pool, status, serialized_input])
+      end
+      workflow_id
+    rescue ActiveRecord::RecordNotUnique
+      raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
-    #: (workflow_id: String, error: String) -> Object?
-    def cancel_incomplete_workflow_work_for_terminal_without_transaction(workflow_id:, error:)
-      execute_params(<<~SQL, [workflow_id])
-        UPDATE #{table("waits")}
-        SET status = 'canceled', completed_at = now()
-        WHERE workflow_id = $1 AND status = 'pending'
-      SQL
-      execute_params(<<~SQL, [workflow_id, error])
-        UPDATE #{table("steps")}
-        SET status = 'canceled', error = $2, updated_at = now()
-        WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')
-      SQL
-      execute_params(<<~SQL, [workflow_id, error])
-        UPDATE #{table("step_attempts")}
-        SET status = 'canceled', error = $2, completed_at = now()
-        WHERE workflow_id = $1 AND status IN ('running', 'waiting')
-      SQL
+    #: (String, error: String) -> void
+    def terminate_workflow_dependents(workflow_id, error:)
+      # Called only while request_workflow_termination holds the workflow row lock inside a transaction.
+      execute_store_query(:terminate_workflow_waits, [workflow_id])
+      execute_store_query(:terminate_workflow_steps, [workflow_id, error])
+      execute_store_query(:terminate_workflow_step_attempts, [workflow_id, error])
+      execute_store_query(:terminate_workflow_inbox, [workflow_id, error])
+      execute_store_query(:terminate_workflow_target_activations, [workflow_id])
     end
 
     #: (command_id: String, worker_id: String?) -> Object?
     def lock_object_command_for_completion(command_id:, worker_id:)
       if worker_id
-        execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT * FROM #{table("inbox")}
-          WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-          FOR UPDATE
-        SQL
+        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
       else
-        execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
+        execute_store_query(:lock_inbox_message, [command_id]).first
       end
     end
 
     #: (message_id: String, worker_id: String) -> Object?
     def lock_inbox_message_for_completion(message_id:, worker_id:)
-      execute_params(<<~SQL, [message_id, worker_id]).first
-        SELECT * FROM #{table("inbox")}
-        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-        FOR UPDATE
-      SQL
+      execute_store_query(:lock_inbox_message_for_worker, [message_id, worker_id]).first
     end
 
     #: (command_id: String, worker_id: String?) -> Object?
     def lock_inbox_message_for_failure(command_id:, worker_id:)
       if worker_id
-        execute_params(<<~SQL, [command_id, worker_id]).first
-          SELECT * FROM #{table("inbox")}
-          WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-          FOR UPDATE
-        SQL
+        execute_store_query(:lock_inbox_message_for_worker, [command_id, worker_id]).first
       else
-        execute_params("SELECT * FROM #{table("inbox")} WHERE id = $1 FOR UPDATE", [command_id]).first
+        execute_store_query(:lock_inbox_message, [command_id]).first
       end
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
-    def upsert_target_activation_without_transaction(target_kind:, target_type:, target_id:, ready_at: nil)
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
+    def upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at: nil)
       ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
-      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_timestamp])
-        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
-        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
-          SET status = CASE
-                WHEN #{table("target_activations")}.status = 'running' THEN #{table("target_activations")}.status
-                ELSE 'pending'
-              END,
-              ready_at = LEAST(#{table("target_activations")}.ready_at, EXCLUDED.ready_at),
-              updated_at = now()
-      SQL
+      execute_store_query(:upsert_target_activation, [worker_pool, target_kind, target_type, target_id, ready_timestamp])
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
-    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now: Time.now)
-      head = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-        SELECT *
-        FROM #{table("inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
-        ORDER BY sequence
-        LIMIT 1
-        FOR UPDATE
-      SQL
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
+    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
+      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(worker_pool:, workflow_id: target_id))
+        dead_letter_terminal_workflow_inbox_without_transaction(
+          worker_pool:,
+          target_type:,
+          target_id:,
+          error: terminal_error,
+        )
+        delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
+        return
+      end
+
+      head = execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
-        set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
+        set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
       else
-        execute_params(<<~SQL, [target_kind, target_type, target_id])
-          DELETE FROM #{table("target_activations")}
-          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-        SQL
+        delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
       end
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
-    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:)
-      ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
-      execute_params(<<~SQL, [target_kind, target_type, target_id, ready_timestamp])
-        INSERT INTO #{table("target_activations")} (target_kind, target_type, target_id, status, ready_at)
-        VALUES ($1, $2, $3, 'pending', $4::timestamptz)
-        ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
-          SET status = 'pending',
-              ready_at = EXCLUDED.ready_at,
-              locked_by = NULL,
-              locked_until = NULL,
-              updated_at = now()
-      SQL
+    #: (worker_pool: String, workflow_id: String) -> String?
+    def terminal_workflow_target_error(worker_pool:, workflow_id:)
+      row = execute_params("SELECT status, error FROM #{table("workflows")} WHERE worker_pool = $1 AND id = $2 FOR UPDATE", [worker_pool, workflow_id]).first
+      return unless row && WorkflowStatus.terminal?(row)
+
+      status = row.fetch("status")
+      error = row["error"]
+      suffix = error.to_s.empty? ? "" : ": #{error}"
+      "workflow #{workflow_id} is terminal #{status}#{suffix}"
     end
 
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def allocate_mailbox_sequence(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id])
-        INSERT INTO #{table("mailbox_sequences")} (target_kind, target_type, target_id, last_sequence)
-        VALUES ($1, $2, $3, 0)
-        ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
-      SQL
-      row = execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-        SELECT last_sequence
-        FROM #{table("mailbox_sequences")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-        FOR UPDATE
-      SQL
-      sequence = row.fetch("last_sequence").to_i + 1
-      execute_params(<<~SQL, [target_kind, target_type, target_id, sequence])
-        UPDATE #{table("mailbox_sequences")}
-        SET last_sequence = $4, updated_at = now()
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-      SQL
-      sequence
-    end
-
-    #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
-    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
-      return unless idempotency_key
-
-      execute_params(<<~SQL, [target_kind, target_type, target_id, idempotency_key]).first
-        SELECT id, target_kind, target_type, target_id, status, ready_at, shape_hash
-        FROM #{table("inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3 AND idempotency_key = $4
-        FOR UPDATE
-      SQL
-    end
-
-    #: (String) -> Object?
-    def lock_workflow_for_update(workflow_id)
-      execute_params("SELECT * FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id]).first
-    end
-
-    #: (workflow_id: String, worker_id: String) -> bool
-    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
-      execute_params(<<~SQL, [workflow_id, worker_id]).first
-        SELECT 1
-        FROM #{table("workflows")}
-        WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
-        FOR UPDATE
-      SQL
-    end
-
-    #: (id: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
-    def insert_inbox_message_without_transaction(id:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
-      execute_params(<<~SQL, [id, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, shape_hash, dump_serialized(payload), timestamp_or_nil(ready_at), max_attempts])
-        INSERT INTO #{table("inbox")} (
-          id, target_kind, target_type, target_id, sequence, message_kind, method_name,
-          operation_id, idempotency_key, shape_hash, payload, status, ready_at, max_attempts
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bytea, 'pending', $12::timestamptz, $13)
-      SQL
-    end
-
-    #: (target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
-    def inbox_claim_rows_for_update(target_kind:, target_type:, target_id:, limit:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id, limit])
-        SELECT *
-        FROM #{table("inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
-        ORDER BY sequence
-        LIMIT $4
-        FOR UPDATE
-      SQL
-    end
-
-    #: (target_kind: String, target_type: String, target_id: String) -> Object?
-    def inbox_head_for_update(target_kind:, target_type:, target_id:)
-      execute_params(<<~SQL, [target_kind, target_type, target_id]).first
-        SELECT *
-        FROM #{table("inbox")}
-        WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
-          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
-        ORDER BY sequence
-        LIMIT 1
-        FOR UPDATE
-      SQL
-    end
-
-    #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
-    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
-      execute_params(<<~SQL, [message_id, worker_id, lease_seconds])
-        UPDATE #{table("inbox")}
-        SET status = 'running',
-            attempts = attempts + 1,
-            locked_by = $2,
-            locked_until = now() + ($3::int * interval '1 second'),
-            updated_at = now()
-        WHERE id = $1
-      SQL
-    end
-
-    #: (message_id: String, result: Object?) -> Object?
-    def complete_inbox_message_without_transaction(message_id:, result:)
-      execute_params(
-        "UPDATE #{table("inbox")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, completed_at = now(), updated_at = now() WHERE id = $1",
-        [message_id, dump_serialized(result)],
-      )
-    end
-
-    #: (message_id: String, error: String) -> Object?
-    def fail_inbox_message_without_transaction(message_id:, error:)
-      execute_params(<<~SQL, [message_id, error])
-        UPDATE #{table("inbox")}
-        SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END,
-            error = $2,
-            locked_by = NULL,
-            locked_until = NULL,
-            dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN now() ELSE dead_lettered_at END,
-            updated_at = now()
-        WHERE id = $1
-      SQL
-    end
-
-    #: (message_id: String, error: String, ready_at: Time) -> Object?
-    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
-      execute_params(<<~SQL, [message_id, error, timestamp(ready_at)])
-        UPDATE #{table("inbox")}
-        SET status = 'pending',
-            error = $2,
-            ready_at = $3::timestamptz,
-            locked_by = NULL,
-            locked_until = NULL,
-            updated_at = now()
-        WHERE id = $1
-      SQL
-    end
-
-    #: (message_id: String, error: String) -> Object?
-    def dead_letter_inbox_message_without_transaction(message_id:, error:)
-      execute_params(<<~SQL, [message_id, error])
+    #: (worker_pool: String, target_type: String, target_id: String, error: String) -> Object?
+    def dead_letter_terminal_workflow_inbox_without_transaction(worker_pool:, target_type:, target_id:, error:)
+      execute_params(<<~SQL, [worker_pool, target_type, target_id, error])
         UPDATE #{table("inbox")}
         SET status = 'dead_lettered',
-            error = $2,
+            error = $4,
             locked_by = NULL,
             locked_until = NULL,
             dead_lettered_at = now(),
             updated_at = now()
-        WHERE id = $1
+        WHERE worker_pool = $1 AND target_kind = 'workflow' AND target_type = $2 AND target_id = $3
+          AND status IN ('pending', 'failed', 'running')
       SQL
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    def delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
+      execute_store_query(:delete_target_activation, [worker_pool, target_kind, target_type, target_id])
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
+    def set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
+      ready_timestamp = timestamp_or_nil(ready_at) || timestamp(Time.now)
+      execute_store_query(:set_target_activation_pending, [worker_pool, target_kind, target_type, target_id, ready_timestamp])
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+      execute_store_query(:insert_mailbox_sequence, [worker_pool, target_kind, target_type, target_id])
+      row = execute_store_query(:mailbox_sequence_for_update, [worker_pool, target_kind, target_type, target_id]).first
+      sequence = row.fetch("last_sequence").to_i + 1
+      execute_store_query(:update_mailbox_sequence, [worker_pool, target_kind, target_type, target_id, sequence])
+      sequence
+    end
+
+    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    def existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      return unless idempotency_key
+
+      idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      execute_store_query(:existing_inbox_message_for_idempotency, [idempotency_hash]).first
+    end
+
+    #: (String) -> Object?
+    def lock_workflow_for_update(workflow_id)
+      execute_store_query(:lock_workflow_for_update, [workflow_id]).first
+    end
+
+    #: (workflow_id: String, worker_id: String) -> bool
+    def lock_owned_workflow_for_update(workflow_id:, worker_id:)
+      execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
+    end
+
+    #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
+    def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
+      idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      serialized_payload = dump_inbox_payload(target_kind:, target_type:, target_id:, message_kind:, payload:)
+      execute_store_query(:insert_inbox_message, [id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, idempotency_hash, shape_hash, serialized_payload, timestamp_or_nil(ready_at), max_attempts])
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
+    def inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
+      execute_store_query(:inbox_claim_rows_for_update, [worker_pool, target_kind, target_type, target_id, limit])
+    end
+
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    def inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
+      execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
+    end
+
+    #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
+    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
+      execute_store_query(:mark_inbox_row_running, [message_id, worker_id, lease_seconds])
+    end
+
+    #: (message_id: String, result: Object?) -> Object?
+    def complete_inbox_message_without_transaction(message_id:, result:)
+      serialized_result = dump_inbox_result(message_id:, result:)
+      execute_store_query(:complete_inbox_message, [message_id, serialized_result])
+    end
+
+    #: (message_id: String, error: String) -> Object?
+    def fail_inbox_message_without_transaction(message_id:, error:)
+      execute_store_query(:fail_inbox_message, [message_id, error])
+    end
+
+    #: (message_id: String, error: String, ready_at: Time) -> Object?
+    def retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
+      execute_store_query(:retry_inbox_message, [message_id, error, timestamp(ready_at)])
+    end
+
+    #: (message_id: String, error: String) -> Object?
+    def dead_letter_inbox_message_without_transaction(message_id:, error:)
+      execute_store_query(:dead_letter_inbox_message, [message_id, error])
     end
 
     #: (target_kinds: Array[String]?, target_types: Array[String]?, ?offset: Integer) -> [String, Array[String]]
@@ -844,13 +642,25 @@ module Durababble
       ["AND #{filters.join(" AND ")}", params]
     end
 
-    #: (Time) -> Integer
-    def complete_timer_waits(now)
-      # [DURABABBLE-WAIT-1] Locked timer completion makes concurrent wakeups observe one winner.
-      @connection.transaction(requires_new: true) do
-        returning = execute_params(store_query_sql(:pg_complete_waits, where_sql: "w.kind = 'timer'\n    AND w.wake_at <= $1::timestamptz", payload_param: 2), [now, dump_serialized({})])
+    #: (Time, Integer) -> Integer
+    def complete_timer_waits(now, batch_size)
+      completed = transaction do
+        returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
         finish_completed_waits(returning, {})
       end
+      completed = completed #: as Integer
+      completed
+    end
+
+    #: (Time, Integer) -> Integer
+    def complete_object_wakeups(now, batch_size)
+      completed = transaction do
+        wakeups = execute_store_query(:due_object_wakeups, [now, batch_size]).map { |row| decode_row(row) }
+        deliver_due_object_wakeups(wakeups)
+      end
+      completed = completed #: as Integer
+      report_object_wakeups_completed(completed)
+      completed
     end
 
     #: (Object, Hash[String, Object?]) -> Integer
@@ -861,41 +671,26 @@ module Durababble
         record_wait_latency(wait)
         context = wait.fetch("context").merge(payload)
         record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-        execute_params(store_query_sql(:pg_mark_wait_workflow_pending), [wait.fetch("workflow_id")])
       end
+      mark_waits_workflows_pending(rows)
       Observability.count("durababble.waits.completed", by: rows.length)
       rows.length
     end
 
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
     def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
-      serialized = dump_serialized(result)
-      execute_params(store_query_sql(:pg_complete_step), [workflow_id, command_id, serialized])
+      serialized = dump_step_output(workflow_id:, command_id:, result:)
+      execute_store_query(:complete_step, [workflow_id, command_id, serialized])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "completed", serialized_result: serialized, error: nil)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?payload: Object?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, payload: nil)
-      execute_params(
-        "UPDATE #{table("steps")} SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2",
-        [workflow_id, command_id, error],
-      )
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
+      execute_store_query(:fail_step, [workflow_id, command_id, error])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:, retrying:)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
-    end
-
-    #: (workflow_id: String, error: String) -> Object?
-    def fail_incomplete_workflow_steps_without_transaction(workflow_id:, error:)
-      # [DURABABBLE-WF-1] A workflow failure closes active running step rows in the same transaction.
-      execute_params(
-        "UPDATE #{table("steps")} SET status = 'failed', error = $2, updated_at = now() WHERE workflow_id = $1 AND status = 'running'",
-        [workflow_id, error],
-      )
-      execute_params(
-        "UPDATE #{table("step_attempts")} SET status = 'failed', result = $2::bytea, error = $3, completed_at = now() WHERE workflow_id = $1 AND status = 'running'",
-        [workflow_id, dump_serialized(nil), error],
-      )
     end
 
     #: (workflow_id: String, command_id: Integer, status: String, result: Object?, error: String?) -> Object?
@@ -905,20 +700,14 @@ module Durababble
 
     #: (workflow_id: String, command_id: Integer, status: String, serialized_result: Object?, error: String?) -> Object?
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
-      execute_params(store_query_sql(:pg_update_latest_attempt), [workflow_id, command_id, status, serialized_result, error])
+      execute_store_query(:update_latest_attempt, [workflow_id, command_id, status, serialized_result, error])
     end
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: String?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-      execute_params("SELECT id FROM #{table("workflows")} WHERE id = $1 FOR UPDATE", [workflow_id])
-      event_index = execute_params(
-        "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table("workflow_history")} WHERE workflow_id = $1",
-        [workflow_id],
-      ).first.fetch("event_index").to_i
-      execute_params(<<~SQL, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-        INSERT INTO #{table("workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
-      SQL
+      execute_store_query(:lock_workflow_history_workflow, [workflow_id])
+      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
+      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
       event_index
     end
 
@@ -931,15 +720,15 @@ module Durababble
     end
 
     #: (?max_attempts: Integer) { () -> Object? } -> Object?
-    def retry_serialization_failures(max_attempts: 5, &block)
+    def retry_serialization_failures(max_attempts: MAX_SERIALIZATION_RETRY_ATTEMPTS, &block)
       attempts = 0
       begin
         block.call
-      rescue ActiveRecord::SerializationFailure
+      rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
         raise if attempts >= max_attempts
 
-        sleep(0.001 * attempts)
+        sleep(Backoff.linear(attempts, step: SERIALIZATION_RETRY_STEP_SECONDS))
         retry
       end
     end
@@ -948,31 +737,45 @@ module Durababble
     def execute(sql)
       attempts = 0
       begin
-        @connection.exec_query(sql)
+        with_connection do |active_record_connection|
+          active_record_connection.exec_query(sql)
+        end
       rescue ActiveRecord::SerializationFailure, ActiveRecord::Deadlocked
         attempts += 1
-        raise if attempts >= 20
+        raise if attempts >= MAX_STATEMENT_RETRY_ATTEMPTS
 
-        sleep(0.05 * attempts)
+        sleep(Backoff.linear(attempts, step: STATEMENT_RETRY_STEP_SECONDS))
         retry
+      end
+    end
+
+    #: () -> Symbol
+    def store_query_prefix
+      :pg
+    end
+
+    #: (String, Array[Object?]) -> untyped
+    def execute_store_query_sql(sql, params)
+      with_connection do |active_record_connection|
+        active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
       end
     end
 
     #: (String, Array[Object?]) -> untyped
     def execute_params(sql, params)
-      @connection.exec_query(sql, "Durababble SQL", params, prepare: false)
+      execute_store_query_sql(sql, params)
     end
 
-    #: () { () -> Object? } -> Object?
-    def transaction(&block)
-      retry_serialization_failures { @connection.transaction(requires_new: true, &block) }
+    #: (**Object?) { () -> Object? } -> Object?
+    def transaction(**options, &block)
+      retry_serialization_failures { super(**options, &block) }
     end
 
-    #: (Array[String]?) -> [String, Array[String]]
-    def workflow_name_filter(workflow_names)
+    #: (Array[String]?, ?offset: Integer) -> [String, Array[String]]
+    def workflow_name_filter(workflow_names, offset: 1)
       return ["", []] unless workflow_names
 
-      ["AND name IN (#{postgres_placeholders(1, workflow_names.length)})", workflow_names]
+      ["AND name IN (#{postgres_placeholders(offset, workflow_names.length)})", workflow_names]
     end
 
     #: (Integer, Integer) -> Object?
@@ -987,17 +790,17 @@ module Durababble
 
     #: (String) -> Object?
     def table(name)
-      "#{quoted_schema}.#{@connection.quote_column_name(name.to_s)}"
+      "#{quoted_schema}.#{quote_column_name(name.to_s)}"
     end
 
     #: () -> Object?
     def quoted_schema
-      @connection.quote_column_name(schema.to_s)
+      quote_column_name(schema.to_s)
     end
 
-    #: (Object?) -> Object?
-    def dump_serialized(value)
-      "\\x#{SERIALIZER.dump(value).unpack1("H*")}"
+    #: (Object?, ?surface: Symbol?, ?context: String?) -> Object?
+    def dump_serialized(value, surface: nil, context: nil)
+      "\\x#{dump_serialized_bytes(value, surface:, context:).unpack1("H*")}"
     end
 
     #: (Object?) -> Object?

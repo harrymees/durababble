@@ -17,7 +17,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
   end
 
-  durababble_store_backends.each do |backend|
+  durababble_conformance_store_backends.each do |backend|
     test "migrates, enqueues, claims, completes, and decodes serialized workflow state with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "conformance", input: { "count" => 1 })
@@ -44,6 +44,109 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") },
         )
         assert_equal [{ "name" => "increment", "args" => [{ "count" => 1 }], "kwargs" => {} }, nil, { "count" => 2 }], store.workflow_history_for(workflow_id).map { |event| event["payload"] }
+      end
+    end
+
+    test "enqueues explicit workflow ids and rejects duplicate ids without side effects with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id") do |store|
+        workflow_id = "wf-explicit-#{SecureRandom.hex(4)}"
+
+        assert_equal workflow_id, store.enqueue_workflow(name: "explicit-id", input: { "count" => 1 }, id: workflow_id)
+        assert_hash_includes(
+          store.workflow(workflow_id),
+          "id" => workflow_id,
+          "name" => "explicit-id",
+          "status" => "pending",
+          "input" => { "count" => 1 },
+        )
+
+        error = assert_raises(Durababble::WorkflowAlreadyExists) do
+          store.enqueue_workflow(name: "explicit-id", input: { "count" => 2 }, id: workflow_id)
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
+
+        assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "pending"
+        assert_equal [], store.workflow_history_for(workflow_id)
+        assert_equal [], store.steps_for(workflow_id)
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
+      end
+    end
+
+    test "completed workflows still reject duplicate explicit workflow ids with #{backend.name}" do
+      with_durababble_store(backend, "explicit_workflow_id_completed") do |store|
+        workflow_id = "wf-completed-#{SecureRandom.hex(4)}"
+
+        assert_equal workflow_id, store.enqueue_workflow(name: "explicit-completed", input: { "count" => 1 }, id: workflow_id)
+        store.complete_workflow(workflow_id, result: { "count" => 2 })
+        assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "count" => 2 }
+
+        error = assert_raises(Durababble::WorkflowAlreadyExists) do
+          store.enqueue_workflow(name: "explicit-completed", input: { "count" => 3 }, id: workflow_id)
+        end
+        assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
+
+        assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "completed", "result" => { "count" => 2 }
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
+      end
+    end
+
+    test "concurrent duplicate explicit workflow id enqueues create one workflow row with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; this test spins up concurrent independent Store.connect handles") if backend.sqlite?
+
+      with_durababble_store(backend, "explicit_workflow_id_race") do |store|
+        workflow_id = "wf-race-#{SecureRandom.hex(4)}"
+        queue = Queue.new
+        thread_count = 8
+        mutex = Mutex.new
+        condition = ConditionVariable.new
+        ready = 0
+        release = false
+
+        threads = thread_count.times.map do |index|
+          Thread.new do
+            thread_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              mutex.synchronize do
+                ready += 1
+                condition.broadcast
+                condition.wait(mutex) until release
+              end
+              queue << [:ok, thread_store.enqueue_workflow(name: "explicit-race", input: { "winner" => index }, id: workflow_id)]
+            rescue Durababble::WorkflowAlreadyExists => e
+              queue << [:duplicate, e.message]
+            rescue StandardError => e
+              queue << [:error, e]
+            ensure
+              thread_store.close
+            end
+          end
+        end
+
+        mutex.synchronize do
+          condition.wait(mutex) until ready == thread_count
+          release = true
+          condition.broadcast
+        end
+
+        results = thread_count.times.map { queue.pop }
+        threads.each(&:join)
+
+        errors = results.select { |status, _value| status == :error }.map(&:last)
+        raise errors.first unless errors.empty?
+
+        assert_equal 1, results.count { |status, _value| status == :ok }
+        assert_equal thread_count - 1, results.count { |status, _value| status == :duplicate }
+        assert_equal [workflow_id], results.select { |status, _value| status == :ok }.map(&:last)
+        assert_hash_includes store.workflow(workflow_id), "id" => workflow_id, "name" => "explicit-race", "status" => "pending"
+        assert_equal [], store.workflow_history_for(workflow_id)
+        assert_equal [], store.steps_for(workflow_id)
+        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
+        assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
       end
     end
 
@@ -158,6 +261,39 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "drains due timers across bounded wake batches with #{backend.name}" do
+      with_durababble_store(backend, "timer_batches") do |store|
+        first_workflow = store.create_workflow(name: "timer-batch", input: {})
+        second_workflow = store.create_workflow(name: "timer-batch", input: {})
+        due_at = Time.utc(2026, 1, 1, 0, 0, 0)
+
+        [first_workflow, second_workflow].each_with_index do |workflow_id, index|
+          store.record_wait(
+            workflow_id:,
+            position: 0,
+            name: "sleep",
+            wait_request: Durababble.wait_until(due_at, { "timer" => index }),
+          )
+        end
+
+        assert_equal 2, store.wake_due_timers(now: due_at + 1, batch_size: 1)
+        assert_equal ["completed"], store.waits_for(first_workflow).map { |wait| wait.fetch("status") }
+        assert_equal ["completed"], store.waits_for(second_workflow).map { |wait| wait.fetch("status") }
+      end
+    end
+
+    test "counts step attempts for one command with #{backend.name}" do
+      with_durababble_store(backend, "attempt_count") do |store|
+        workflow_id = store.create_workflow(name: "attempt-count", input: {})
+
+        3.times { store.record_step_started(workflow_id:, command_id: 0, name: "flaky") }
+        2.times { store.record_step_started(workflow_id:, command_id: 1, name: "other") }
+
+        assert_equal 3, store.step_attempt_count_for(workflow_id:, command_id: 0)
+        assert_equal 2, store.step_attempt_count_for(workflow_id:, position: 1)
+      end
+    end
+
     test "deduplicates fenced work and replays completed or failed results with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.create_workflow(name: "fenced", input: {})
@@ -187,6 +323,28 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
             raise "should not run"
           end
         end
+      end
+    end
+
+    test "reclaims expired running fences with #{backend.name}" do
+      with_durababble_store(backend, "fence_reclaim") do |store|
+        workflow_id = store.create_workflow(name: "stale-fence", input: {})
+        fence_key = "charge:stale"
+        calls = 0
+
+        store.send(:execute_store_query, :insert_fence, [workflow_id, fence_key, "abandoned-worker", -1])
+
+        result = store.with_fence(workflow_id:, key: fence_key, poll_interval: 0.001, timeout: 1) do
+          calls += 1
+          { "charged_by" => "reclaimer" }
+        end
+
+        assert_equal({ "charged_by" => "reclaimer" }, result)
+        assert_equal 1, calls
+        replayed = store.with_fence(workflow_id:, key: fence_key, poll_interval: 0.001, timeout: 1) do
+          raise "completed fence should replay without running the block"
+        end
+        assert_equal result, replayed
       end
     end
 
@@ -450,6 +608,89 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "scopes workflow claims and command activations by persisted worker pool with #{backend.name}" do
+      with_durababble_store(backend, "workflow_pool_routing") do |store|
+        pool_a_workflow = store.enqueue_workflow(name: "shared-workflow", input: { "pool" => "a" }, worker_pool: "pool-a")
+        pool_b_workflow = store.enqueue_workflow(name: "shared-workflow", input: { "pool" => "b" }, worker_pool: "pool-b")
+
+        assert_nil store.claim_runnable_workflow(
+          worker_id: "default-worker",
+          lease_seconds: 30,
+          workflow_names: ["shared-workflow"],
+          worker_pool: "default",
+        )
+
+        claimed_a = store.claim_runnable_workflow(
+          worker_id: "pool-a-worker",
+          lease_seconds: 30,
+          workflow_names: ["shared-workflow"],
+          worker_pool: "pool-a",
+        )
+        assert_hash_includes claimed_a, "id" => pool_a_workflow, "worker_pool" => "pool-a", "locked_by" => "pool-a-worker"
+
+        claimed_b = store.claim_runnable_workflow(
+          worker_id: "pool-b-worker",
+          lease_seconds: 30,
+          workflow_names: ["shared-workflow"],
+          worker_pool: "pool-b",
+        )
+        assert_hash_includes claimed_b, "id" => pool_b_workflow, "worker_pool" => "pool-b", "locked_by" => "pool-b-worker"
+
+        command_id = store.enqueue_workflow_command(
+          workflow_id: pool_a_workflow,
+          workflow_name: "shared-workflow",
+          method_name: "approve",
+          payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+        )
+        assert_hash_includes store.inbox_message(command_id), "worker_pool" => "pool-a"
+        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["shared-workflow"], worker_pool: "pool-b")
+        activation = store.claim_target_activation(worker_id: "right-pool", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["shared-workflow"], worker_pool: "pool-a")
+        assert_hash_includes activation, "worker_pool" => "pool-a", "target_id" => pool_a_workflow
+      end
+    end
+
+    test "scopes object state, mailbox sequence, and inbox idempotency by worker pool with #{backend.name}" do
+      with_durababble_store(backend, "object_pool_routing") do |store|
+        store.save_object_state(worker_pool: "pool-a", object_type: "counter", object_id: "same", state: { "pool" => "a" })
+        store.save_object_state(worker_pool: "pool-b", object_type: "counter", object_id: "same", state: { "pool" => "b" })
+
+        assert_equal({ "pool" => "a" }, store.object_state(worker_pool: "pool-a", object_type: "counter", object_id: "same"))
+        assert_equal({ "pool" => "b" }, store.object_state(worker_pool: "pool-b", object_type: "counter", object_id: "same"))
+        assert_nil store.object_state(worker_pool: "default", object_type: "counter", object_id: "same")
+
+        pool_a_message = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["a"], "kwargs" => {} },
+          idempotency_key: "natural-key",
+        )
+        pool_b_message = store.enqueue_inbox_message(
+          worker_pool: "pool-b",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "same",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => ["b"], "kwargs" => {} },
+          idempotency_key: "natural-key",
+        )
+
+        refute_equal pool_a_message, pool_b_message
+        assert_equal [1], store.inbox_messages_for(worker_pool: "pool-a", target_kind: "object", target_type: "counter", target_id: "same").map { |message| message.fetch("sequence").to_i }
+        assert_equal [1], store.inbox_messages_for(worker_pool: "pool-b", target_kind: "object", target_type: "counter", target_id: "same").map { |message| message.fetch("sequence").to_i }
+
+        assert_nil store.claim_target_activation(worker_id: "wrong-pool", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "default")
+        activation_a = store.claim_target_activation(worker_id: "pool-a-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-a")
+        activation_b = store.claim_target_activation(worker_id: "pool-b-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"], worker_pool: "pool-b")
+        assert_hash_includes activation_a, "worker_pool" => "pool-a", "target_id" => "same"
+        assert_hash_includes activation_b, "worker_pool" => "pool-b", "target_id" => "same"
+      end
+    end
+
     test "does not claim future target activations until ready with #{backend.name}" do
       with_durababble_store(backend, "target_activation_future") do |store|
         store.migrate!
@@ -618,7 +859,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_advisory_delivery") do |store|
         store.migrate!
         workflow_id = store.enqueue_workflow(name: "approval", input: {})
-        store.claim_workflow(workflow_id:, worker_id: "127.0.0.1:12345", lease_seconds: 30)
+        worker_id = "worker-1@127.0.0.1:12345"
+        store.claim_workflow(workflow_id:, worker_id:, lease_seconds: 30)
 
         client = AdvisoryDeliveryClient.new
         delivered = store.deliver_target_message(
@@ -639,12 +881,13 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
               target_kind: "workflow",
               target_class: "approval",
               target_id: workflow_id,
+              expected_worker_id: worker_id,
             },
           ],
           client.deliveries,
         )
 
-        store.suspend_workflow(workflow_id:, worker_id: "127.0.0.1:12345")
+        store.suspend_workflow(workflow_id:, worker_id:)
         assert_equal false, store.deliver_target_message(
           target_kind: "workflow",
           target_type: "approval",
@@ -657,6 +900,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "keeps committed inbox rows claimable after caller crash with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; a second Store.connect handle is a separate database") if backend.sqlite?
+
       with_durababble_store(backend, "inbox_crash_after_commit") do |store|
         store.migrate!
         workflow_id = store.enqueue_workflow(name: "approval", input: {})
@@ -687,6 +932,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     end
 
     test "allocates unique contiguous mailbox sequences under concurrent enqueue with #{backend.name}" do
+      skip("in-memory SQLite is a single serialized connection; this test spins up concurrent independent connections") if backend.sqlite?
+
       with_durababble_store(backend, "inbox_concurrent") do |store|
         store.migrate!
         errors = Queue.new
@@ -816,6 +1063,32 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
         assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).affected_rows
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
+      end
+    end
+
+    test "heartbeat_step treats the fenced lease renewal as authoritative for #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        workflow_id = store.enqueue_workflow(name: "heartbeat-fence", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 30)
+        store.record_step_started(workflow_id:, position: 0, name: "fenced")
+
+        # The genuine owner renews successfully while it holds the lease.
+        refute_nil store.heartbeat_step(workflow_id:, position: 0, worker_id: "owner", lease_seconds: 30, cursor: { "offset" => 1 })
+
+        # Simulate losing the lease in the window between an ownership read and the
+        # fenced renewal UPDATE: the conditional UPDATE matches zero rows. The renewal
+        # result must be authoritative, so heartbeat_step must report failure (nil)
+        # rather than trusting a stale ownership read or an unscoped locked_until lookup.
+        original = store.method(:execute_store_query)
+        store.define_singleton_method(:execute_store_query) do |id, params = [], **locals|
+          if id == :heartbeat_step_workflow
+            ActiveRecord::Result.empty(affected_rows: 0)
+          else
+            original.call(id, params, **locals)
+          end
+        end
+
+        assert_nil store.heartbeat_step(workflow_id:, position: 0, worker_id: "owner", lease_seconds: 30, cursor: { "offset" => 2 })
       end
     end
 
@@ -1043,7 +1316,20 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
   def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)
     table = store.send(:table, "target_activations")
-    if backend.mysql?
+    if backend.sqlite?
+      # SqliteStore stores locked_until as an integer microsecond clock; subtract
+      # 1 hour worth of integer ticks from dura_now() so the comparison matches
+      # the integer clock the translated NOW(6) reads.
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = dura_now() - (3600 * #{store.send(:seconds_scale)})
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [target_kind, target_type, target_id],
+      )
+    elsif backend.mysql?
       expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
       store.send(
         :execute_params,

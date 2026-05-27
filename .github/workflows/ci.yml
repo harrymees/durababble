@@ -46,6 +46,38 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
+  dst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # The fuzz sweep (every scenario × 100 seeds) dominates wall time and was
+    # pushing a single job past the 20-minute cap. Shard the seed space across
+    # parallel jobs via DST_FUZZ_SEEDS so each shard covers every scenario over a
+    # slice of seeds; together they exercise the full 1..100 range. Split into
+    # five shards (20 seeds each) as the scenario count grows, keeping each
+    # shard comfortably under the cap.
+    strategy:
+      fail-fast: false
+      matrix:
+        seeds: ["1..20", "21..40", "41..60", "61..80", "81..100"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      # The Deterministic Simulation Testing suite runs uninstrumented and
+      # against the in-memory SQLite store only, so it needs no database
+      # service and no SimpleCov. Kept out of the coverage gate because its
+      # seed sweeps add ~no incremental coverage but dominate wall time.
+      - name: Run deterministic simulation suite
+        env:
+          DST_FUZZ_SEEDS: ${{ matrix.seeds }}
+        run: bundle exec rake dst
+
   lint-typecheck:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -58,7 +90,15 @@ jobs:
           ruby-version: "3.4"
           bundler-cache: true
 
-      - name: Run RuboCop, RBS validation, and typecheck
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run RuboCop, RBS validation, typecheck, and Markdown format check
         run: bundle exec rake lint
 
   formal:

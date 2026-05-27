@@ -7,6 +7,13 @@ module Concurrent
 end
 
 module Async
+  class TimeoutError < StandardError; end
+
+  class Scheduler
+    def interrupt; end
+    def terminate; end
+  end
+
   class Condition
     def initialize; end
     def wait; end
@@ -17,18 +24,63 @@ module Async
     def self.current; end
     def async(&blk); end
     def wait; end
+    def with_timeout(duration, exception = nil, message = nil, &blk); end
   end
+
+  module HTTP
+    class Endpoint
+      def self.parse(string, **options); end
+      def bound; end
+      def protocol; end
+      def scheme; end
+    end
+
+    class Client
+      def initialize(endpoint, **options); end
+      def post(path, headers = nil, body = nil); end
+      def get(path, headers = nil, body = nil); end
+      def close; end
+    end
+
+    class Server
+      def initialize(app, endpoint, **options); end
+      def run; end
+    end
+
+    module Protocol
+      class HTTP1; end
+      class HTTP2; end
+    end
+  end
+end
+
+module Protocol
+  module HTTP
+    class Response
+      def self.[](status, headers = nil, body = nil); end
+    end
+  end
+
+  module HTTP2
+    class Error < StandardError; end
+  end
+end
+
+class Fiber
+  def self.scheduler; end
 end
 
 module ActiveRecord
   class ActiveRecordError < StandardError; end
   class Deadlocked < ActiveRecordError; end
   class PreparedStatementInvalid < ActiveRecordError; end
+  class RecordNotUnique < ActiveRecordError; end
   class SerializationFailure < ActiveRecordError; end
 
   class Base
     def self.abstract_class=(value); end
     def self.connection_class=(value); end
+    sig { returns(ActiveRecord::ConnectionAdapters::ConnectionPool) }
     def self.connection_pool; end
     def self.establish_connection(config); end
   end
@@ -45,75 +97,54 @@ module ActiveRecord
       def with_connection(&block); end
     end
   end
+
+  module ConnectionAdapters
+    class AbstractAdapter
+      sig { returns(String) }
+      def adapter_name; end
+
+      sig { params(sql: String, name: T.nilable(String), binds: T::Array[T.nilable(Object)], prepare: T::Boolean).returns(ActiveRecord::Result) }
+      def exec_query(sql, name = nil, binds = [], prepare: false); end
+
+      sig { params(identifier: String).returns(String) }
+      def quote_column_name(identifier); end
+
+      sig do
+        type_parameters(:Result)
+          .params(requires_new: T::Boolean, options: T.nilable(Object), block: T.proc.returns(T.type_parameter(:Result)))
+          .returns(T.type_parameter(:Result))
+      end
+      def transaction(requires_new: true, **options, &block); end
+    end
+
+    class ConnectionPool
+      sig do
+        type_parameters(:Result)
+          .params(block: T.proc.params(connection: AbstractAdapter).returns(T.type_parameter(:Result)))
+          .returns(T.type_parameter(:Result))
+      end
+      def with_connection(&block); end
+
+      sig { returns(AbstractAdapter) }
+      def lease_connection; end
+
+      sig { void }
+      def disconnect!; end
+
+      sig { returns(T::Boolean) }
+      def active_connection?; end
+    end
+  end
 end
 
 module Kernel
   def Async(&blk); end
-end
-
-module Google
-  module Protobuf
-    class DescriptorPool
-      def self.generated_pool; end
-      def build(&blk); end
-      def lookup(name); end
-    end
-
-    class Descriptor
-      def msgclass; end
-    end
-
-    class FileDescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class DescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class FieldDescriptorProto
-      def initialize(**kwargs); end
-    end
-
-    class OneofDescriptorProto
-      def initialize(**kwargs); end
-    end
-  end
+  def Sync(&blk); end
 end
 
 module Prism
   module LexCompat
     class Result; end
-  end
-end
-
-module GRPC
-  class BadStatus < StandardError; end
-  class BadStatus
-    def details; end
-  end
-
-  class DeadlineExceeded < BadStatus; end
-  class Unauthenticated < BadStatus; end
-  class Unavailable < BadStatus; end
-
-  module GenericService
-    mixes_in_class_methods(ClassMethods)
-
-    module ClassMethods
-      attr_accessor :marshal_class_method, :unmarshal_class_method, :service_name
-
-      def rpc(name, request_class, response_class); end
-      def rpc_stub_class; end
-    end
-  end
-
-  class RpcServer
-    def initialize(**kwargs); end
-    def add_http2_port(address, credentials); end
-    def handle(service); end
-    def run; end
-    def stop; end
   end
 end
 
@@ -152,56 +183,51 @@ class Trilogy
   def query(sql); end
 end
 
+module SQLite3
+  class ConstraintException < StandardError; end
+
+  class Blob < String
+    def initialize(value); end
+  end
+end
+
 module Durababble
   class Store
-    def current_workflow_lease(workflow_id); end
+    def current_workflow_lease(workflow_id, worker_pool: nil); end
     def decode_row(row); end
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def enqueue_inbox_message(**kwargs); end
     def inbox_message(message_id); end
     def load_serialized(value); end
-    def reconcile_target_activation_without_transaction(target_kind:, target_type:, target_id:, now:); end
-    def set_target_activation_pending_without_transaction(target_kind:, target_type:, target_id:, ready_at:); end
+    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:); end
+    def set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:); end
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:); end
   end
 
   module MysqlMigrations
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def execute(sql); end
     def execute_params(sql, params); end
     def index_name(table_name, suffix); end
+    def quote_column_name(identifier); end
     def raw_table_name(name); end
     def table(name); end
     def table_prefix; end
   end
 
   module PostgresMigrations
-    def dump_serialized(value); end
+    def dump_serialized(value, surface: nil, context: nil); end
     def execute(sql); end
     def execute_params(sql, params); end
+    def quote_column_name(identifier); end
     def quoted_schema; end
     def schema; end
     def table(name); end
   end
 
-  module Rpc
-    module Proto
-      class Message
-        def initialize(**kwargs); end
-        def self.decode(value); end
-        def self.encode(value); end
-      end
-
-      class AwakenBatchRequest < Message; end
-      class AwakenBatchResponse < Message; end
-      class DeliverMessageRequest < Message; end
-      class DeliverMessageResponse < Message; end
-      class EvictLeaseRequest < Message; end
-      class EvictLeaseResponse < Message; end
-      class LeaseMoved < Message; end
-      class RemoteError < Message; end
-      class TransientRequest < Message; end
-      class TransientResponse < Message; end
-    end
+  module SqliteMigrations
+    def execute(sql); end
+    def index_name(table_name, suffix); end
+    def table(name); end
   end
 end

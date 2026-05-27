@@ -12,25 +12,19 @@ class DurababbleStoreTest < DurababbleTestCase
   ScriptedPgConnection = DurababbleScriptedSqlSupport::ScriptedPgConnection
   ScriptedMysqlConnection = DurababbleScriptedSqlSupport::ScriptedMysqlConnection
   FlakyDeliveryClient = DurababbleScriptedSqlSupport::FlakyDeliveryClient
-  MysqlMigrationProbeStore = DurababbleScriptedSqlSupport::MysqlMigrationProbeStore
 
   test "routes active record connections through mysql and postgres adapters" do
-    assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection: ScriptedMysqlConnection.new, schema: "schema")
-    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection: ScriptedPgConnection.new, schema: "schema")
-    assert_kind_of Durababble::PostgresStore, Durababble::Store.new(ScriptedPgConnection.new, schema: "schema")
+    assert_kind_of Durababble::MysqlStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedPgConnection.new), schema: "schema")
+    assert_kind_of Durababble::PostgresStore, Durababble::Store.new(connection_pool: scripted_pool(ScriptedPgConnection.new), schema: "schema")
     assert_raises(ArgumentError) { Durababble::Store.new(schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::Store.new(scripted_pool(ScriptedPgConnection.new), schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::MysqlStore.new(ScriptedMysqlConnection.new, schema: "schema") }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(schema: "schema") }
 
-    pool = Struct.new(:connection) do
-      def lease_connection = connection
-    end.new(ScriptedMysqlConnection.new)
-    owner_pool = Struct.new(:disconnected) do
-      def disconnect!
-        self.disconnected = true
-      end
-    end.new(false)
+    owner_pool = scripted_pool(ScriptedMysqlConnection.new)
     owner = Struct.new(:connection_pool).new(owner_pool)
-    store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema", owner:)
+    store = Durababble::Store.from_active_record(connection_pool: owner_pool, schema: "schema", owner:)
     assert_kind_of Durababble::MysqlStore, store
     store.close
     assert owner_pool.disconnected
@@ -38,10 +32,101 @@ class DurababbleStoreTest < DurababbleTestCase
     unsupported = Object.new
     unsupported.define_singleton_method(:adapter_name) { "SQLite" }
     assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection: unsupported, schema: "schema") }
+    assert_raises(ArgumentError) { Durababble::Store.from_active_record(connection_pool: scripted_pool(unsupported), schema: "schema") }
     assert_equal "postgresql", Durababble::Store.send(:active_record_config_for, "postgres://user:pass@example.test:5432/db").fetch(:adapter)
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "mysql://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "trilogy", Durababble::Store.send(:active_record_config_for, "trilogy://user:pass@example.test:3306/db").fetch(:adapter)
     assert_equal "sqlite", Durababble::Store.send(:active_record_config_for, "sqlite:///tmp/durababble.sqlite").fetch(:adapter)
+  end
+
+  test "stores checkout connections from the active record pool as needed" do
+    pool = scripted_pool(ScriptedMysqlConnection.new)
+
+    store = Durababble::Store.from_active_record(connection_pool: pool, schema: "schema")
+
+    assert_equal "schema", store.schema
+    refute_respond_to store, :pooled_connections
+    assert_equal 1, pool.checked_out
+
+    before_query = pool.checked_out
+    store.send(:execute_params, "SELECT ?", [1])
+
+    assert_operator pool.checked_out, :>, before_query
+
+    before_transaction = pool.checked_out
+    store.send(:transaction) do
+      store.send(:execute_params, "SELECT ?", [1])
+      store.send(:execute_params, "SELECT ?", [2])
+    end
+
+    assert_equal before_transaction + 1, pool.checked_out
+  end
+
+  test "database url query parameters are preserved in active record config" do
+    config = Durababble::Store.send(
+      :active_record_config_for,
+      "postgres://user:p%40ss@example.test:5432/db?sslmode=require&connect_timeout=5&application_name=durababble",
+    )
+
+    assert_equal "postgresql", config.fetch(:adapter)
+    assert_equal "user", config.fetch(:username)
+    assert_equal "p@ss", config.fetch(:password)
+    assert_equal "example.test", config.fetch(:host)
+    assert_equal 5432, config.fetch(:port)
+    assert_equal "db", config.fetch(:database)
+    assert_equal "require", config.fetch(:sslmode)
+    assert_equal "5", config.fetch(:connect_timeout)
+    assert_equal "durababble", config.fetch(:application_name)
+
+    mysql_config = Durababble::Store.send(
+      :active_record_config_for,
+      "mysql://user:pass@example.test/db?socket=%2Ftmp%2Fmysql.sock&read_timeout=10",
+    )
+
+    assert_equal "trilogy", mysql_config.fetch(:adapter)
+    assert_equal "/tmp/mysql.sock", mysql_config.fetch(:socket)
+    assert_equal "10", mysql_config.fetch(:read_timeout)
+  end
+
+  test "close removes generated active record connection constants" do
+    owner = nil
+    const_name = nil
+    owner = Durababble::Store.send(:active_record_class_for, "mysql://root@example.invalid/durababble_test")
+    const_name = owner.instance_variable_get(:@durababble_store_connection_const_name)
+    assert_kind_of(String, const_name)
+    assert_equal("Durababble::#{const_name}", owner.name)
+    assert(Durababble.const_defined?(const_name, false))
+
+    store = Durababble::Store.from_active_record(connection_pool: scripted_pool(ScriptedMysqlConnection.new), schema: "schema", owner:)
+    store.close
+
+    refute(Durababble.const_defined?(const_name, false))
+    store.close
+  ensure
+    owner&.connection_pool&.disconnect!
+    Durababble.send(:remove_const, const_name) if const_name && Durababble.const_defined?(const_name, false)
+  end
+
+  test "generated active record cleanup ignores nil owners" do
+    assert_nil Durababble::Store.send(:remove_active_record_class_const, nil)
+  end
+
+  test "observe_claim_latency ignores missing rows" do
+    assert_nil shared_store.send(:observe_claim_latency, nil, "workflow")
+  end
+
+  test "observe_claim_latency accepts serialized timestamps" do
+    assert_nil shared_store.send(:observe_claim_latency, { "created_at" => "2024-01-01T00:00:00Z" }, "workflow")
+  end
+
+  test "record_wait_latency accepts serialized timestamps" do
+    wait = {
+      "kind" => "timer",
+      "created_at" => "2024-01-01T00:00:00Z",
+      "completed_at" => "2024-01-01T00:00:01Z",
+    }
+
+    assert_nil shared_store.send(:record_wait_latency, wait)
   end
 
   test "inbox_row_claimable? rejects blocked inbox statuses" do
@@ -104,9 +189,150 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "position" => 3, "command_id" => 3 }, store.send(:with_command_id, { "position" => 3 }))
   end
 
+  test "current_target_lease ignores unsupported target kinds" do
+    assert_nil shared_store.send(:current_target_lease, target_kind: "queue", target_type: "approval", target_id: "wf", worker_pool: "default")
+  end
+
+  test "postgres enqueue_workflow inserts the pending row in one statement" do
+    connection = ScriptedPgConnection.new
+    store = pg_store(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    refute_includes sql, "UPDATE"
+    assert_equal "demo", params[1]
+    assert_equal "default", params[2]
+    assert_equal "pending", params[3]
+  end
+
+  test "postgres enqueue_workflow uses an explicit id and maps duplicate ids" do
+    connection = ScriptedPgConnection.new
+    store = pg_store(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    _sql, params = connection.exec_params_calls.first
+    assert_equal "wf-explicit", params[0]
+
+    duplicate = pg_store(
+      ScriptedPgConnection.new(params_results: [->(_sql, _params) { raise ActiveRecord::RecordNotUnique, "duplicate key value violates unique constraint" }]),
+      schema: "durababble_test",
+    )
+    error = assert_raises(Durababble::WorkflowAlreadyExists) do
+      duplicate.enqueue_workflow(name: "demo", input: {}, id: "wf-explicit")
+    end
+    assert_match(/workflow wf-explicit already exists/, error.message)
+  end
+
+  test "postgres create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedPgConnection.new
+    store = pg_store(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
+    refute_includes sql, "UPDATE"
+    assert_equal "demo", params[1]
+    assert_equal "default", params[2]
+    assert_equal "running", params[3]
+    assert_equal "worker-a", params[5]
+    assert_equal 9, params[6]
+  end
+
+  test "mysql enqueue_workflow inserts the pending row in one statement" do
+    connection = ScriptedMysqlConnection.new
+    store = mysql_store(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 })
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.queries.length
+    sql = connection.queries.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    refute_includes sql, "UPDATE"
+  end
+
+  test "mysql enqueue_workflow uses an explicit id and maps duplicate ids" do
+    connection = ScriptedMysqlConnection.new
+    store = mysql_store(connection, schema: "durababble_test")
+
+    workflow_id = store.enqueue_workflow(name: "demo", input: { "count" => 1 }, id: "wf-explicit")
+
+    assert_equal "wf-explicit", workflow_id
+    sql = connection.queries.first
+    assert_includes sql, "'wf-explicit'"
+
+    duplicate = mysql_store(
+      ScriptedMysqlConnection.new { |_sql| raise ActiveRecord::RecordNotUnique, "Duplicate entry 'wf-explicit' for key 'PRIMARY'" },
+      schema: "durababble_test",
+    )
+    error = assert_raises(Durababble::WorkflowAlreadyExists) do
+      duplicate.enqueue_workflow(name: "demo", input: {}, id: "wf-explicit")
+    end
+    assert_match(/workflow wf-explicit already exists/, error.message)
+  end
+
+  test "mysql create_workflow inserts the initial running row in one statement" do
+    connection = ScriptedMysqlConnection.new
+    store = mysql_store(connection, schema: "durababble_test")
+
+    workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 }, worker_id: "worker-a", lease_seconds: 9)
+
+    assert_match(/\A[0-9a-f-]{36}\z/, workflow_id)
+    assert_equal 1, connection.queries.length
+    sql = connection.queries.first
+    assert_includes sql, "INSERT INTO"
+    assert_includes sql, "status"
+    assert_includes sql, "locked_by"
+    assert_includes sql, "locked_until"
+    refute_includes sql, "UPDATE"
+  end
+
+  test "postgres claim_runnable_workflow claims pending work with one update returning statement" do
+    connection = ScriptedPgConnection.new(params_results: [
+      sql_result([{
+        "id" => "workflow-1",
+        "name" => "demo",
+        "status" => "running",
+        "input" => pg_dump({ "count" => 1 }),
+        "created_at" => Time.utc(2026, 1, 1),
+        "locked_by" => "worker-a",
+        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+      }]),
+    ])
+    store = pg_store(connection, schema: "durababble_test")
+
+    claimed = store.claim_runnable_workflow(worker_id: "worker-a", lease_seconds: 9, workflow_names: ["demo"])
+
+    assert_equal "workflow-1", claimed.fetch("id")
+    assert_equal({ "count" => 1 }, claimed.fetch("input"))
+    assert_equal 1, connection.exec_params_calls.length
+    sql, params = connection.exec_params_calls.first
+    assert_includes sql, "WITH candidate AS"
+    assert_includes sql, "UPDATE"
+    assert_includes sql, "RETURNING workflows.*"
+    assert_includes sql, "FOR UPDATE SKIP LOCKED"
+    assert_equal ["default", "worker-a", 9, "demo"], params
+  end
+
   test "migrates and persists workflow plus step state" do
     with_durababble_store(durababble_store_backends.first, "store_test") do |store|
       workflow_id = store.create_workflow(name: "demo", input: { "count" => 1 })
+
+      assert_hash_includes store.workflow(workflow_id), "status" => "running", "input" => { "count" => 1 }
 
       store.record_step_started(workflow_id:, position: 0, name: "add_one")
       store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 })
@@ -204,65 +430,8 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  test "migrates legacy JSONB runtime columns into Paquito bytea columns in Yugabyte" do
-    with_yugabyte_store(migrate: false) do |store|
-      connection = PG.connect(durababble_yugabyte_database_url)
-      connection.exec("CREATE SCHEMA #{PG::Connection.quote_ident(schema)}")
-      connection.exec(<<~SQL)
-        CREATE TABLE #{PG::Connection.quote_ident(schema)}.workflows (
-          id text PRIMARY KEY,
-          name text NOT NULL,
-          status text NOT NULL,
-          input jsonb NOT NULL DEFAULT '{}'::jsonb,
-          result jsonb,
-          error text,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          updated_at timestamptz NOT NULL DEFAULT now()
-        )
-      SQL
-      connection.exec_params(
-        "INSERT INTO #{PG::Connection.quote_ident(schema)}.workflows (id, name, status, input, result) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
-        ["legacy", "demo", "completed", '{"count":1}', '{"count":2}'],
-      )
-      connection.close
-
-      store.migrate!
-
-      assert_equal({ "count" => 1 }, store.workflow("legacy").fetch("input"))
-      assert_equal({ "count" => 2 }, store.workflow("legacy").fetch("result"))
-      data_type = PG.connect(durababble_yugabyte_database_url) do |verify|
-        verify.exec_params(<<~SQL, [schema, "workflows", "input"]).first.fetch("data_type")
-          SELECT data_type
-          FROM information_schema.columns
-          WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
-        SQL
-      end
-      assert_equal("bytea", data_type)
-    ensure
-      connection&.close unless connection&.finished?
-    end
-  end
-
-  test "adds missing MySQL workflow cancellation columns only once" do
-    store = MysqlMigrationProbeStore.new(
-      schema: "mysql_schema",
-      columns: { "mysql_schema_workflows" => ["cancel_reason"] },
-    )
-
-    store.send(:add_column_if_missing, "workflows", "cancel_reason", "TEXT")
-    store.send(:add_column_if_missing, "workflows", "cancel_requested_at", "DATETIME(6)")
-
-    executed_sql = store.executed.select { |kind, _sql, _params| kind == :execute }.map { |_kind, sql| sql }
-    assert_equal ["ALTER TABLE `mysql_schema_workflows` ADD COLUMN `cancel_requested_at` DATETIME(6)"], executed_sql
-  end
-
   test "handles postgres queue, lease, wait, fence, outbox, and object command miss paths" do
     connection = ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending", "created_at" => "2024-01-02T00:00:00Z" }]),
-      sql_result([{ "id" => "failed", "created_at" => "2024-01-01T00:00:00Z" }]),
-      sql_result,
-      sql_result,
-      sql_result,
       sql_result([{ "id" => "failed", "input" => pg_dump({ "count" => 1 }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({ "ok" => true }) }]),
       sql_result,
@@ -314,6 +483,7 @@ class DurababbleStoreTest < DurababbleTestCase
     store = pg_store
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -341,10 +511,10 @@ class DurababbleStoreTest < DurababbleTestCase
     inbox_insert = new_connection.exec_params_calls.find do |sql, _params|
       sql.include?("INSERT INTO") && sql.include?("inbox") && !sql.include?("target_activations")
     end
-    assert_equal "signal:wf-1", inbox_insert.fetch(1)[8]
+    assert_equal "signal:wf-1", inbox_insert.fetch(1)[9]
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_inbox_message(
       target_kind: "workflow",
       target_type: "approval",
@@ -356,7 +526,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "pending-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_inbox_message(
       target_kind: "workflow",
@@ -370,7 +540,7 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_inbox_message(
         target_kind: "workflow",
         target_type: "approval",
@@ -387,6 +557,7 @@ class DurababbleStoreTest < DurababbleTestCase
     payload = { "method" => "approve", "args" => [], "kwargs" => { reason: "ok" } }
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -395,8 +566,8 @@ class DurababbleStoreTest < DurababbleTestCase
       payload:,
     )
     new_connection = ScriptedPgConnection.new(params_results: [
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
       sql_result,
-      sql_result([{ "id" => "wf-1", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "last_sequence" => "0" }]),
       sql_result,
@@ -415,7 +586,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert new_connection.exec_params_calls.any? { |sql, _params| sql.include?("SELECT * FROM") && sql.include?("workflows") && sql.include?("FOR UPDATE") }
 
     duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }]),
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
       workflow_name: "approval",
@@ -426,7 +598,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-command", duplicate
 
     pending_duplicate = pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result([{ "id" => "pending-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
+      sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+      sql_result([{ "id" => "pending-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }]),
       sql_result,
     ])).enqueue_workflow_command(
       workflow_id: "wf-1",
@@ -439,7 +612,8 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
-        sql_result([{ "id" => "existing-command", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
+        sql_result([{ "id" => "wf-1", "worker_pool" => "default", "status" => "running", "next_run_at" => nil }]),
+        sql_result([{ "id" => "existing-command", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }]),
       ])).enqueue_workflow_command(
         workflow_id: "wf-1",
         workflow_name: "approval",
@@ -464,6 +638,7 @@ class DurababbleStoreTest < DurababbleTestCase
     store = mysql_store
     shape_hash = store.send(
       :inbox_shape_hash,
+      worker_pool: "default",
       target_kind: "workflow",
       target_type: "approval",
       target_id: "wf-1",
@@ -491,8 +666,8 @@ class DurababbleStoreTest < DurababbleTestCase
     refute_includes inbox_insert, "retained_until"
 
     duplicate = mysql_store(ScriptedMysqlConnection.new do |sql|
-      if sql.include?("idempotency_key =")
-        sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
+      if sql.include?("idempotency_hash =")
+        sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end).enqueue_inbox_message(
       target_kind: "workflow",
@@ -505,8 +680,8 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "existing-inbox-id", duplicate
 
     pending_duplicate_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("idempotency_key =")
-        sql_result([{ "id" => "pending-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
+      if sql.include?("idempotency_hash =")
+        sql_result([{ "id" => "pending-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "pending", "ready_at" => nil, "shape_hash" => shape_hash }])
       end
     end
     pending_duplicate = mysql_store(pending_duplicate_connection).enqueue_inbox_message(
@@ -522,8 +697,8 @@ class DurababbleStoreTest < DurababbleTestCase
 
     assert_raises(Durababble::IdempotencyKeyConflict) do
       mysql_store(ScriptedMysqlConnection.new do |sql|
-        if sql.include?("idempotency_key =")
-          sql_result([{ "id" => "existing-inbox-id", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
+        if sql.include?("idempotency_hash =")
+          sql_result([{ "id" => "existing-inbox-id", "worker_pool" => "default", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf-1", "status" => "completed", "ready_at" => nil, "shape_hash" => "different" }])
         end
       end).enqueue_inbox_message(
         target_kind: "workflow",
@@ -587,7 +762,7 @@ class DurababbleStoreTest < DurababbleTestCase
     )
 
     helper = pg_store
-    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, target_kind: "workflow", target_type: "approval", target_id: "wf")
+    assert_nil helper.send(:existing_inbox_message_for_idempotency, nil, worker_pool: "default", target_kind: "workflow", target_type: "approval", target_id: "wf")
     assert helper.send(:activatable_inbox_status?, "pending")
     refute helper.send(:activatable_inbox_status?, "completed")
     assert_equal ["", []], helper.send(:target_activation_filter, target_kinds: nil, target_types: nil)
@@ -637,6 +812,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "owned" => 1 }]),
       sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "0" }]),
       sql_result,
@@ -647,6 +823,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "owned" => 1 }]),
       sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
+      sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result,
       sql_result([{ "event_index" => "1" }]),
       sql_result,
@@ -716,43 +893,29 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "terminal workflow updates choose fenced and unfenced SQL paths" do
-    pg_fenced_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-    ])
+    # complete_workflow / cancel_workflow / fail_workflow each also issue the idempotent
+    # wait/step/attempt cleanup cascade (three extra queries per terminal transition), so
+    # each terminal call emits four queries; scope the fence assertions to the terminal
+    # workflow-row updates (the only queries that touch runnable_immediately). Provide one
+    # affected_rows:1 result per emitted query so every fenced workflow-row update sees a
+    # live lease rather than falling onto a default empty result and raising LeaseConflict.
+    pg_fenced_connection = ScriptedPgConnection.new(params_results: Array.new(12) { sql_result([], affected_rows: 1) })
     pg_fenced_store = pg_store(pg_fenced_connection)
     pg_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 8, pg_fenced_connection.exec_params_calls.length
-    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("UPDATE") && sql.include?("workflows") }
+    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
     assert_equal 3, pg_fenced_workflow_updates.length
     assert pg_fenced_workflow_updates.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
 
-    pg_unfenced_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-    ])
+    pg_unfenced_connection = ScriptedPgConnection.new(params_results: Array.new(6) { sql_result([], affected_rows: 1) })
     pg_unfenced_store = pg_store(pg_unfenced_connection)
     pg_unfenced_store.complete_workflow("wf", result: { "ok" => true })
     pg_unfenced_store.cancel_workflow("wf", reason: "stop")
     pg_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 8, pg_unfenced_connection.exec_params_calls.length
-    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("UPDATE") && sql.include?("workflows") }
+    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
     assert_equal 3, pg_unfenced_workflow_updates.length
     assert pg_unfenced_workflow_updates.none? { |sql, _params| sql.include?("AND locked_by =") }
 
@@ -762,8 +925,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 8, mysql_fenced_connection.queries.length
-    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("UPDATE") && sql.include?("workflows") }
+    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") }
     assert_equal 3, mysql_fenced_workflow_updates.length
     assert mysql_fenced_workflow_updates.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
 
@@ -773,8 +935,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
     mysql_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 8, mysql_unfenced_connection.queries.length
-    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("UPDATE") && sql.include?("workflows") }
+    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") }
     assert_equal 3, mysql_unfenced_workflow_updates.length
     assert mysql_unfenced_workflow_updates.none? { |sql| sql.include?("AND locked_by =") }
 
@@ -784,7 +945,7 @@ class DurababbleStoreTest < DurababbleTestCase
     end
   end
 
-  test "handles postgres fence replay, serialization migration, retry, and helper branches" do
+  test "handles postgres fence replay, retry, and helper branches" do
     completed = { "status" => "completed", "result" => pg_dump({ "done" => true }), "error" => nil }
     failed = { "status" => "failed", "result" => nil, "error" => "boom" }
     connection = ScriptedPgConnection.new(
@@ -792,22 +953,11 @@ class DurababbleStoreTest < DurababbleTestCase
         sql_result([], affected_rows: 1),
         sql_result([], affected_rows: 1),
         sql_result([], affected_rows: 0),
+        sql_result([], affected_rows: 0),
         sql_result([completed]),
         sql_result([], affected_rows: 0),
+        sql_result([], affected_rows: 0),
         sql_result([failed]),
-        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        sql_result([{ "column_name" => "id" }]),
-        sql_result,
-        sql_result,
-        sql_result([{ "data_type" => "bytea", "is_nullable" => "YES" }]),
-        sql_result,
-      ],
-      exec_results: [
-        sql_result,
-        sql_result([
-          { "id" => "one", "payload" => "{\"ok\":true}" },
-          { "id" => "two", "payload" => nil },
-        ]),
       ],
     )
     store = pg_store(connection)
@@ -815,9 +965,6 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal({ "created" => true }, store.with_fence(workflow_id: "wf", key: "created") { { "created" => true } })
     assert_equal({ "done" => true }, store.with_fence(workflow_id: "wf", key: "done", timeout: 0))
     assert_raises(Durababble::Error) { store.with_fence(workflow_id: "wf", key: "failed", timeout: 0) }
-    store.send(:migrate_serialized_column!, "outbox", "payload", not_null: true)
-    store.send(:migrate_serialized_column!, "outbox", "payload")
-    store.send(:migrate_serialized_column!, "outbox", "missing")
 
     attempts = 0
     result = store.send(:retry_serialization_failures) do
@@ -830,6 +977,23 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_raises(ActiveRecord::SerializationFailure) do
       store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::SerializationFailure }
     end
+
+    # Transaction-level deadlocks must also be retried: every #transaction is wrapped in
+    # retry_serialization_failures, so a deadlock that aborts the whole transaction (not just
+    # a single statement) has to be replayed rather than surfaced to the caller.
+    deadlock_attempts = 0
+    deadlock_result = store.send(:retry_serialization_failures) do
+      deadlock_attempts += 1
+      raise ActiveRecord::Deadlocked if deadlock_attempts == 1
+
+      :recovered
+    end
+    assert_equal :recovered, deadlock_result
+    assert_equal 2, deadlock_attempts
+    assert_raises(ActiveRecord::Deadlocked) do
+      store.send(:retry_serialization_failures, max_attempts: 1) { raise ActiveRecord::Deadlocked }
+    end
+
     assert_equal ["", []], store.send(:workflow_name_filter, nil)
     malicious_name = "a'); DROP TABLE workflows; --"
     assert_equal ["AND name IN ($1, $2)", [malicious_name, "b"]], store.send(:workflow_name_filter, [malicious_name, "b"])
@@ -902,25 +1066,11 @@ class DurababbleStoreTest < DurababbleTestCase
       pg_store(ScriptedPgConnection.new(exec_results: Array.new(20) { ->(_sql) { raise ActiveRecord::Deadlocked } }))
         .send(:execute, "SELECT 1")
     end
-
-    migration_connection = ScriptedPgConnection.new(
-      params_results: [
-        sql_result([{ "data_type" => "jsonb", "is_nullable" => "YES" }]),
-        sql_result([{ "column_name" => "id" }]),
-      ],
-      exec_results: [
-        sql_result,
-        sql_result([{ "id" => "one", "payload" => "{\"ok\":true}" }]),
-        sql_result,
-        sql_result,
-      ],
-    )
-    pg_store(migration_connection).send(:migrate_serialized_column!, "outbox", "payload")
   end
 
   test "uses active record mysql quoting, sanitization, and transaction retry" do
     connection = ScriptedMysqlConnection.new
-    store = Durababble::MysqlStore.new(connection, schema: "branch-schema-with-a-very-long-name-that-will-be-hashed")
+    store = mysql_store(connection, schema: "branch-schema-with-a-very-long-name-that-will-be-hashed")
 
     assert_match(/\Adura_[0-9a-f]{10}\z/, store.send(:table_prefix))
     assert_equal "`dura_#{Digest::SHA1.hexdigest("branch_schema_with_a_very_long_name_that_will_be_hashed")[0, 10]}_workflows`", store.send(:table, "workflows")
@@ -931,7 +1081,10 @@ class DurababbleStoreTest < DurababbleTestCase
     store.send(:execute_params, "SELECT * FROM workflows WHERE name IN (?)", [["x'; DROP TABLE workflows; --", "safe"]])
     assert_equal "SELECT * FROM workflows WHERE name IN ('x''; DROP TABLE workflows; --','safe')", connection.queries.last
     assert_equal ["AND name IN (?, ?)", ["x'; DROP TABLE workflows; --", "safe"]], store.send(:workflow_name_filter, ["x'; DROP TABLE workflows; --", "safe"])
+    assert_equal ["", []], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: nil)
     assert_equal ["AND target_kind IN (?)", ["workflow'); DROP TABLE inbox; --"]], store.send(:target_activation_filter_sql, target_kinds: ["workflow'); DROP TABLE inbox; --"], target_types: nil)
+    assert_equal ["AND target_type IN (?)", ["approval"]], store.send(:target_activation_filter_sql, target_kinds: nil, target_types: ["approval"])
+    assert_raises(ArgumentError) { store.send(:normalize_command_id, nil, nil) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?, ?", [1]) }
     assert_raises(ActiveRecord::PreparedStatementInvalid) { store.send(:execute_params, "SELECT ?", [1, 2]) }
     assert store.send(:retryable_mysql_error?, ActiveRecord::Deadlocked.new("deadlocked"))
@@ -945,33 +1098,22 @@ class DurababbleStoreTest < DurababbleTestCase
       :ok
     }
     assert_equal 2, attempts
-
-    index_connection = ScriptedMysqlConnection.new do |sql|
-      if sql.include?("information_schema.statistics") && sql.include?("'present_idx'")
-        sql_result([{ "exists" => 1 }])
-      end
-    end
-    index_store = mysql_store(index_connection)
-    index_store.send(:add_index_if_missing, "inbox", "missing_idx", "INDEX `missing_idx` (status)")
-    index_store.send(:drop_index_if_present, "inbox", "present_idx")
-    assert index_connection.queries.any? { |sql| sql.include?("ADD INDEX `missing_idx`") }
-    assert index_connection.queries.any? { |sql| sql.include?("DROP INDEX `present_idx`") }
   end
 
   private
 
   def shared_store
     Durababble::Store.allocate.tap do |store|
-      store.send(:initialize, ScriptedPgConnection.new, schema: "schema")
+      store.send(:initialize, scripted_pool(ScriptedPgConnection.new), schema: "schema")
     end
   end
 
-  def pg_store(connection = ScriptedPgConnection.new)
-    Durababble::Store.new(connection, schema: "branch_schema")
+  def pg_store(connection = ScriptedPgConnection.new, schema: "branch_schema")
+    Durababble::Store.new(connection_pool: scripted_pool(connection), schema:)
   end
 
-  def mysql_store(connection = ScriptedMysqlConnection.new)
-    Durababble::MysqlStore.new(connection, schema: "branch_schema")
+  def mysql_store(connection = ScriptedMysqlConnection.new, schema: "branch_schema")
+    Durababble::MysqlStore.new(scripted_pool(connection), schema:)
   end
 
   def with_yugabyte_store(migrate: true, &block)

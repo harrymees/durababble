@@ -82,7 +82,11 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       message ? [message] : []
     end
 
-    def object_state(object_type:, object_id:) = @state
+    def object_state(object_type:, object_id:, worker_pool: "default") = @state
+
+    def object_state_entry(object_type:, object_id:, worker_pool: "default")
+      @state.nil? ? Durababble::Store::NO_OBJECT_STATE : @state
+    end
 
     def complete_object_command(command_id:, result:, **kwargs)
       @completed << [command_id, result]
@@ -100,11 +104,12 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   class AskWaitStore
-    attr_reader :enqueued, :waits, :migrations
+    attr_reader :enqueued, :waits, :deliveries, :migrations
 
     def initialize
       @enqueued = []
       @waits = []
+      @deliveries = []
       @migrations = 0
     end
 
@@ -118,7 +123,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       "cmd-#{@enqueued.length}"
     end
 
-    def deliver_target_message(**) = false
+    def deliver_target_message(**kwargs)
+      @deliveries << kwargs
+      false
+    end
 
     def wait_for_inbox_message(message_id, poll_interval: 0.05, timeout: 10)
       @waits << { message_id:, poll_interval:, timeout: }
@@ -154,13 +162,69 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   end
 
   class WakeTestObject < Durababble::DurableObject
-    def on_wake(payload:)
-      update_state(payload.merge("woken" => true))
+    def on_wake(name:, payload:)
+      update_state(payload.merge("woken" => true, "wake_name" => name))
       "awake"
     end
   end
 
+  class AlarmTestObject < Durababble::DurableObject
+    def initialize_state
+      { "scheduled" => [], "wakes" => [], "canceled" => [] }
+    end
+
+    expose_command def schedule_alarm(name, at, payload)
+      schedule_wake(name:, at:, payload:)
+      update_state(current_state.merge("scheduled" => current_state.fetch("scheduled") + [name]))
+      "scheduled"
+    end
+
+    expose_command def schedule_many(specs)
+      specs.each { |spec| schedule_wake(name: spec.fetch("name"), at: spec.fetch("at"), payload: spec.fetch("payload")) }
+      update_state(current_state.merge("scheduled" => current_state.fetch("scheduled") + specs.map { |spec| spec.fetch("name") }))
+      "scheduled-many"
+    end
+
+    expose_command def schedule_alarm_without_state(name, at, payload)
+      schedule_wake(name:, at:, payload:)
+      payload
+    end
+
+    expose_command def cancel_alarm(name)
+      cancel_wake(name:)
+      update_state(current_state.merge("canceled" => current_state.fetch("canceled") + [name]))
+      "canceled"
+    end
+
+    expose_command def cancel_all_alarms
+      cancel_all_wakes
+      update_state(current_state.merge("canceled_all" => true))
+      "canceled-all"
+    end
+
+    expose def snapshot
+      current_state
+    end
+
+    def on_wake(name:, payload:)
+      update_state(current_state.merge("wakes" => current_state.fetch("wakes") + [{ "name" => name, "payload" => payload }]))
+      payload
+    end
+  end
+
   class NoWakeTestObject < Durababble::DurableObject
+  end
+
+  class PersistedNilStateObject < Durababble::DurableObject
+    object_type "persisted_nil_state_object"
+
+    def initialize_state
+      { "initialized" => true }
+    end
+
+    expose def snapshot
+      current_state
+    end
   end
 
   class RetryStateTestCounter < Durababble::DurableObject
@@ -237,7 +301,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       update_state(current_state.merge("messages" => current_state.fetch("messages") + [message]))
     end
 
-    def on_wake(payload:)
+    def on_wake(name:, payload:)
       messages = current_state.fetch("messages")
       update_state(
         "messages" => [],
@@ -245,6 +309,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           {
             "messages" => messages,
             "reason" => payload.fetch("reason"),
+            "wake" => name,
           },
         ],
       )
@@ -266,7 +331,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       update_state("value" => value, "expires_at" => expires_at, "expired" => false)
     end
 
-    def on_wake(payload:)
+    def on_wake(name:, payload:)
       expires_at = current_state.fetch("expires_at")
       return current_state unless expires_at && payload.fetch("now") >= expires_at
 
@@ -372,6 +437,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal(
       [
         {
+          worker_pool: "default",
           target_kind: "object",
           target_type: ClaimlessTestObject.object_type,
           target_id: "object-1",
@@ -397,7 +463,91 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     save_store.define_singleton_method(:save_object_state) { |**kwargs| saved << kwargs }
     object = anonymous_object.new(durable_id: "obj-1", store: save_store)
     object.update_state({ "saved" => true })
-    assert_equal [{ object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+    assert_equal [{ worker_pool: "default", object_type: anonymous_object.object_type, object_id: "obj-1", state: { "saved" => true } }], saved
+  end
+
+  test "memoizes nil initialized durable object state" do
+    nil_state_object = Class.new(Durababble::DurableObject) do
+      attr_reader :initializations
+
+      def initialize(*args, **kwargs)
+        @initializations = 0
+        super
+      end
+
+      def initialize_state
+        @initializations += 1
+        nil
+      end
+    end
+    object = nil_state_object.new
+
+    assert_nil object.current_state
+    assert_nil object.current_state
+    assert_equal 1, object.initializations
+  end
+
+  test "records and rejects durable object wake changes in the right contexts" do
+    wake_at = Time.utc(2026, 5, 25, 14, 0, 0)
+    later_at = Time.utc(2026, 5, 25, 15, 0, 0)
+    context = Durababble::CommandContext.new("alarm_test_object", "alarm-guard", "cmd-guard", 1, "idem")
+
+    command_object = AlarmTestObject.new(durable_id: "alarm-guard", command_context: context)
+    assert_same wake_at, command_object.schedule_wake(name: "ttl", at: wake_at, payload: { "name" => "guard" })
+    assert_same later_at, command_object.schedule_wake(name: "retry", at: later_at)
+    assert_equal true, command_object.cancel_wake(name: "ttl")
+    assert_equal true, command_object.cancel_all_wakes
+
+    changes = command_object.wakeup_changes
+    assert_equal 4, changes.length
+    assert_equal [:schedule, :schedule, :cancel, :cancel_all], changes.map(&:action)
+    assert_equal ["ttl", "retry", "ttl", nil], changes.map(&:name)
+    assert_equal [wake_at, later_at, nil, nil], changes.map(&:wake_at)
+    assert_equal({ "name" => "guard" }, changes.first.payload)
+    assert_nil changes.fetch(1).payload
+
+    assert_raises_matching(Durababble::Error, /wake name cannot be empty/) do
+      command_object.schedule_wake(name: "", at: wake_at)
+    end
+    assert_raises_matching(Durababble::Error, /wake name cannot exceed 191 bytes/) do
+      command_object.schedule_wake(name: "a" * 192, at: wake_at)
+    end
+    assert_raises_matching(Durababble::Error, /wake name cannot be empty/) do
+      command_object.cancel_wake(name: "")
+    end
+
+    no_command_object = AlarmTestObject.new(durable_id: "alarm-guard")
+    assert_raises_matching(Durababble::Error, /can only be scheduled from object commands/) do
+      no_command_object.schedule_wake(name: "ttl", at: wake_at)
+    end
+    assert_raises_matching(Durababble::Error, /can only be canceled from object commands/) do
+      no_command_object.cancel_wake(name: "ttl")
+    end
+    assert_raises_matching(Durababble::Error, /can only be canceled from object commands/) do
+      no_command_object.cancel_all_wakes
+    end
+
+    query_object = AlarmTestObject.new(durable_id: "alarm-guard", command_context: context)
+    query_object.instance_variable_set(:@__durababble_query_context, true)
+    assert_raises_matching(Durababble::Error, /cannot schedule durable object wakeups from an exposed query/) do
+      query_object.schedule_wake(name: "ttl", at: wake_at)
+    end
+    assert_raises_matching(Durababble::Error, /cannot cancel durable object wakeups from an exposed query/) do
+      query_object.cancel_wake(name: "ttl")
+    end
+    assert_raises_matching(Durababble::Error, /cannot cancel durable object wakeups from an exposed query/) do
+      query_object.cancel_all_wakes
+    end
+  end
+
+  durababble_store_backends.each do |backend|
+    test "does not reinitialize persisted nil durable object state with #{backend.name}" do
+      with_durababble_store(backend, "nil_object_state") do |store|
+        store.save_object_state(object_type: PersistedNilStateObject.object_type, object_id: "nil-state", state: nil)
+
+        assert_nil PersistedNilStateObject.handle("nil-state", store:).snapshot
+      end
+    end
   end
 
   test "completes read-only commands and fails them when the completion lease is lost" do
@@ -476,6 +626,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           "target_type" => WakeTestObject.object_type,
           "target_id" => "wake-object",
           "message_kind" => "wake",
+          "method_name" => "timer-wake",
           "payload" => { "reason" => "timer" },
           "attempts" => 1,
         },
@@ -490,7 +641,10 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     )
     assert_equal 1, wake_executor.drain_object_inbox(WakeTestObject.object_type, object_id: "wake-object")
     assert_equal [["wake-1", "awake"]], wake.completed
-    assert_equal({ "reason" => "timer", "woken" => true }, wake.object_state(object_type: WakeTestObject.object_type, object_id: "wake-object"))
+    assert_equal(
+      { "reason" => "timer", "woken" => true, "wake_name" => "timer-wake" },
+      wake.object_state(object_type: WakeTestObject.object_type, object_id: "wake-object"),
+    )
 
     no_wake = BranchCommandStore.new(messages: [
       {
@@ -516,26 +670,26 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   test "covers object at, unknown tell, and unbounded retry metadata branches" do
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", store: Object.new)
     assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.handle("clean", store: Object.new)
-    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new, migrate: false))
+    assert_instance_of Durababble::DurableObjectRef, CleanCommandObject.at("clean", engine: Durababble::Engine.new(store: Object.new))
     assert_not_respond_to CleanCommandObject, :ref
     assert_raises(NoMethodError) { CleanCommandObject.tell("clean", :missing, store: Object.new) }
-    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new, migrate: false)) }
+    assert_raises(ArgumentError) { CleanCommandObject.at("clean", store: Object.new, engine: Durababble::Engine.new(store: Object.new)) }
 
     unbounded = Durababble::RetryPolicy.new(maximum_attempts: nil)
-    assert_nil CleanCommandObject.send(:inbox_max_attempts, unbounded)
-    assert_nil CleanCommandObject.handle("clean", store: Object.new).send(:inbox_max_attempts, unbounded)
+    assert_nil unbounded.maximum_attempts_limit
+    assert_equal 3, Durababble::RetryPolicy.new(maximum_attempts: 3).maximum_attempts_limit
   end
 
   test "durable object handles and tells use default and explicit engines" do
     explicit_store = AskWaitStore.new
-    explicit_engine = Durababble::Engine.new(store: explicit_store, migrate: false)
+    explicit_engine = Durababble::Engine.new(store: explicit_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-1", engine: explicit_engine).read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-1", :read_only, engine: explicit_engine))
     assert_equal(["ask", "tell"], explicit_store.enqueued.map { |command| command.fetch(:message_kind) })
     assert_equal(0, explicit_store.migrations)
 
     default_store = AskWaitStore.new
-    Durababble.default_engine = Durababble::Engine.new(store: default_store, migrate: false)
+    Durababble.default_engine = Durababble::Engine.new(store: default_store)
     assert_equal("waited:cmd-1", CleanCommandObject.at("object-2").read_only)
     assert_equal("cmd-2", CleanCommandObject.tell("object-2", :read_only))
     assert_equal(["ask", "tell"], default_store.enqueued.map { |command| command.fetch(:message_kind) })
@@ -561,6 +715,19 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal "waited:cmd-1", UnboundedAskObject.handle("object-1", store:).eventually
     assert_nil store.enqueued.first.fetch(:max_attempts)
     assert_nil store.waits.first.fetch(:timeout)
+  end
+
+  test "durable object handles use configured worker pool and idempotency defaults" do
+    store = AskWaitStore.new
+    handle = CleanCommandObject.handle("object-1", store:, worker_pool: "priority", idempotency_key: "default-key")
+
+    assert_equal "waited:cmd-1", handle.read_only
+    assert_equal "default-key", store.enqueued.first.fetch(:idempotency_key)
+    assert_equal "priority", store.deliveries.first.fetch(:worker_pool)
+
+    assert_equal "waited:cmd-2", handle.read_only(idempotency_key: "override-key")
+    assert_equal "override-key", store.enqueued.last.fetch(:idempotency_key)
+    assert_equal "priority", store.deliveries.last.fetch(:worker_pool)
   end
 
   durababble_store_backends.each do |backend|
@@ -712,6 +879,118 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       end
     end
 
+    test "schedules replaces cancels and delivers multiple named durable object wakes with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_wake_api") do |store|
+        worker = object_worker(store, AlarmTestObject)
+        wake_at = Time.utc(2026, 5, 25, 12, 0, 0)
+
+        # Two independently named wakes on one object, scheduled in separate commands.
+        AlarmTestObject.tell("alarm-1", :schedule_alarm, "ttl", wake_at, { "kind" => "ttl" }, store:)
+        assert_equal :worked, worker.tick
+        AlarmTestObject.tell("alarm-1", :schedule_alarm, "retry", wake_at, { "kind" => "retry" }, store:)
+        assert_equal :worked, worker.tick
+        # Re-scheduling an existing name replaces its payload without adding a second row.
+        AlarmTestObject.tell("alarm-1", :schedule_alarm, "ttl", wake_at, { "kind" => "ttl-v2" }, store:)
+        assert_equal :worked, worker.tick
+        assert_equal ["ttl", "retry", "ttl"], AlarmTestObject.at("alarm-1", store:).snapshot.fetch("scheduled")
+
+        assert_equal 0, store.wake_due_timers(now: wake_at - 1)
+        assert_empty wake_inbox(store, "alarm-1")
+
+        # Both surviving named wakes mature into separate wake inbox messages.
+        assert_equal 2, store.wake_due_timers(now: wake_at + 1)
+        wake_messages = wake_inbox(store, "alarm-1")
+        assert_equal 2, wake_messages.length
+        assert_equal ["retry", "ttl"], wake_messages.map { |message| message.fetch("method_name") }.sort
+        payloads = wake_messages.map { |message| message.fetch("payload") }
+        assert_includes payloads, { "kind" => "ttl-v2" }
+        assert_includes payloads, { "kind" => "retry" }
+
+        # One tick drains every matured wake; each delivers its own name to on_wake.
+        assert_equal :worked, worker.tick
+        delivered = AlarmTestObject.at("alarm-1", store:).snapshot.fetch("wakes").map { |wake| [wake.fetch("name"), wake.fetch("payload")] }.sort_by(&:first)
+        assert_equal([["retry", { "kind" => "retry" }], ["ttl", { "kind" => "ttl-v2" }]], delivered)
+
+        # schedule_many records several names atomically in a single command.
+        AlarmTestObject.tell(
+          "alarm-many",
+          :schedule_many,
+          [
+            { "name" => "a", "at" => wake_at, "payload" => { "n" => 1 } },
+            { "name" => "b", "at" => wake_at, "payload" => { "n" => 2 } },
+            { "name" => "c", "at" => wake_at, "payload" => { "n" => 3 } },
+          ],
+          store:,
+        )
+        assert_equal :worked, worker.tick
+        assert_equal 3, store.wake_due_timers(now: wake_at + 1)
+        assert_equal 3, wake_inbox(store, "alarm-many").length
+        assert_equal :worked, worker.tick
+        assert_equal ["a", "b", "c"], AlarmTestObject.at("alarm-many", store:).snapshot.fetch("wakes").map { |wake| wake.fetch("name") }.sort
+
+        # Stateless command (no update_state) still persists and delivers its wake.
+        AlarmTestObject.tell("alarm-stateless", :schedule_alarm_without_state, "solo", wake_at, { "kind" => "solo" }, store:)
+        assert_equal :worked, worker.tick
+        assert_nil store.object_state(object_type: AlarmTestObject.object_type, object_id: "alarm-stateless")
+        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
+        assert_equal :worked, worker.tick
+        assert_equal ["solo"], AlarmTestObject.at("alarm-stateless", store:).snapshot.fetch("wakes").map { |wake| wake.fetch("name") }
+
+        # cancel_wake removes one named wake while others survive.
+        AlarmTestObject.tell("alarm-cancel", :schedule_alarm, "keep", wake_at, { "kind" => "keep" }, store:)
+        assert_equal :worked, worker.tick
+        AlarmTestObject.tell("alarm-cancel", :schedule_alarm, "drop", wake_at, { "kind" => "drop" }, store:)
+        assert_equal :worked, worker.tick
+        AlarmTestObject.tell("alarm-cancel", :cancel_alarm, "drop", store:)
+        assert_equal :worked, worker.tick
+        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
+        assert_equal ["keep"], wake_inbox(store, "alarm-cancel").map { |message| message.fetch("method_name") }
+        assert_equal :worked, worker.tick
+        assert_equal ["keep"], AlarmTestObject.at("alarm-cancel", store:).snapshot.fetch("wakes").map { |wake| wake.fetch("name") }
+        assert_equal ["drop"], AlarmTestObject.at("alarm-cancel", store:).snapshot.fetch("canceled")
+
+        # cancel_all_wakes clears every remaining named wake for the object.
+        AlarmTestObject.tell(
+          "alarm-clear",
+          :schedule_many,
+          [
+            { "name" => "x", "at" => wake_at, "payload" => { "n" => 1 } },
+            { "name" => "y", "at" => wake_at, "payload" => { "n" => 2 } },
+          ],
+          store:,
+        )
+        assert_equal :worked, worker.tick
+        AlarmTestObject.tell("alarm-clear", :cancel_all_alarms, store:)
+        assert_equal :worked, worker.tick
+        assert_equal 0, store.wake_due_timers(now: wake_at + 2)
+        assert_empty wake_inbox(store, "alarm-clear")
+        assert_equal true, AlarmTestObject.at("alarm-clear", store:).snapshot.fetch("canceled_all")
+      end
+    end
+
+    test "delivers named object wakes after store restart and due wake conversion with #{backend.name}" do
+      with_durababble_store(backend, "durable_object_wake_recovery") do |initial_store|
+        wake_at = Time.utc(2026, 5, 25, 13, 0, 0)
+        worker = object_worker(initial_store, AlarmTestObject)
+        AlarmTestObject.tell("alarm-recovery", :schedule_alarm, "recovered", wake_at, { "kind" => "recovered" }, store: initial_store)
+        assert_equal :worked, worker.tick
+
+        schema_name = schema
+        initial_store.close
+        @durababble_store = Durababble::Store.connect(database_url: backend.database_url, schema: schema_name)
+        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
+
+        store.close
+        @durababble_store = Durababble::Store.connect(database_url: backend.database_url, schema: schema_name)
+        recovered_worker = object_worker(store, AlarmTestObject)
+        assert_equal :worked, recovered_worker.tick
+        wakes = AlarmTestObject.at("alarm-recovery", store:).snapshot.fetch("wakes")
+        assert_equal([["recovered", { "kind" => "recovered" }]], wakes.map { |wake| [wake.fetch("name"), wake.fetch("payload")] })
+        wake_message = wake_inbox(store, "alarm-recovery").find { |message| message.fetch("method_name") == "recovered" }
+        assert_equal "completed", wake_message.fetch("status")
+      end
+    end
+
     test "dead-lettered object mailbox heads block later messages with #{backend.name}" do
       with_durababble_store(backend, "durable_object_blocked_head") do |store|
         failing_object = Class.new(Durababble::DurableObject) do
@@ -793,6 +1072,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           target_type: CloudflareBatcherExample.object_type,
           target_id: "batcher",
           message_kind: "wake",
+          method_name: "flush",
           payload: { "reason" => "alarm" },
         )
         wait_for_object_activation(CloudflareBatcherExample, "batcher")
@@ -800,7 +1080,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
         assert_equal(
           {
             "messages" => [],
-            "flushes" => [{ "messages" => ["first", "second"], "reason" => "alarm" }],
+            "flushes" => [{ "messages" => ["first", "second"], "reason" => "alarm", "wake" => "flush" }],
           },
           CloudflareBatcherExample.at("batcher", store:).snapshot,
         )
@@ -820,6 +1100,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           target_type: CloudflareTtlExample.object_type,
           target_id: "cache-key",
           message_kind: "wake",
+          method_name: "expire",
           payload: { "now" => 99 },
         )
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
@@ -831,6 +1112,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
           target_type: CloudflareTtlExample.object_type,
           target_id: "cache-key",
           message_kind: "wake",
+          method_name: "expire",
           payload: { "now" => 101 },
         )
         wait_for_object_activation(CloudflareTtlExample, "cache-key")
@@ -901,6 +1183,24 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
   def object_worker(store, *objects)
     Durababble::Worker.new(store:, workflows: {}, objects:, worker_id: "object-worker", lease_seconds: 30, migrate: false)
+  end
+
+  def wake_inbox(store, object_id, object_type: AlarmTestObject.object_type)
+    store
+      .inbox_messages_for(target_kind: "object", target_type: object_type, target_id: object_id)
+      .select { |message| message.fetch("message_kind") == "wake" }
+  end
+
+  def run_object_command(worker, backend, object_class, object_id, command)
+    caller = call_object_command_async(backend, object_class, object_id, command)
+    wait_for_object_activation(object_class, object_id)
+    run_worker_until_result(worker, caller.fetch(:queue))
+    status, value = caller.fetch(:queue).pop
+    caller.fetch(:thread).join
+    assert_equal(:ok, status)
+    value
+  ensure
+    caller&.fetch(:thread)&.kill if caller&.fetch(:thread)&.alive?
   end
 
   def call_object_command_async(backend, object_class, object_id, command)
