@@ -335,7 +335,9 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         workflow_id = workflow.enqueue({}, store:)
 
         workflow.handle(workflow_id, store:).terminate(reason: "fenced")
-        store.complete_workflow(workflow_id, result: { "done" => true })
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(workflow_id, result: { "done" => true })
+        end
         store.fail_workflow(workflow_id, error: "late failure")
         store.cancel_workflow(workflow_id, reason: "late cancel")
 

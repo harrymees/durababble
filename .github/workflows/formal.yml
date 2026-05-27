@@ -1,0 +1,39 @@
+name: formal
+
+# The Alloy verification suite is slow (~30 minutes on the GitHub-hosted runner)
+# and only meaningful when the formal model or its verifier change. Ruby-side
+# sigil drift is caught on every PR by `test/durababble/formal_sigil_drift_test.rb`
+# which rides the fast `test` job in the main `ci` workflow.
+on:
+  pull_request:
+    paths:
+      - formal/**
+      - scripts/verify-alloy.sh
+      - .github/workflows/formal.yml
+  push:
+    branches: [main]
+    paths:
+      - formal/**
+      - scripts/verify-alloy.sh
+      - .github/workflows/formal.yml
+
+jobs:
+  alloy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Verify Alloy models
+        run: scripts/verify-alloy.sh

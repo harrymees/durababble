@@ -49,14 +49,14 @@ class DurababbleDstMutationTest < DurababbleTestCase
 
   test "non-terminal exhausted step failure is caught by step_failure_crash_matrix" do
     # Bug 1, exhausted path: the final step failure is recorded as terminal so
-    # replay does NOT re-run the step. Treat it as non-terminal and replay re-runs
-    # the (fenced) side effect, so the once-only effect fires twice.
-    mutation = proc { |_event| false }
+    # replay does NOT re-run the step. Mis-classify it as retrying and replay
+    # re-runs the (fenced) side effect, so the once-only effect fires twice.
+    mutation = proc { |_event| true }
 
     assert_mutation_detected(
       "step_failure_crash_matrix",
       Durababble::WorkflowReplayHistory,
-      :terminal_step_failure?,
+      :retrying_step_failure?,
       mutation,
     )
   end

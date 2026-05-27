@@ -6,7 +6,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Theme toggle functionality
   const themeToggle = document.getElementById('theme-toggle');
   const themeIcon = document.querySelector('.theme-icon');
-  
+
   // Get stored theme or default to dark
   const getStoredTheme = () => localStorage.getItem('dev-theme') || 'dark';
   const setStoredTheme = (theme) => localStorage.setItem('dev-theme', theme);
@@ -18,7 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
       themeIcon.textContent = theme === 'light' ? '🌙' : '☀️';
     }
   };
-  
+
   // Initialize theme icon (theme attribute already set inline)
   const currentTheme = document.documentElement.getAttribute('data-theme') || getStoredTheme();
   setTheme(currentTheme);
@@ -67,19 +67,19 @@ document.addEventListener('DOMContentLoaded', () => {
   // TOC active section highlighting
   const tocLinks = document.querySelectorAll('.td-toc nav a');
   const headings = document.querySelectorAll('main h1, main h2, main h3, main h4, main h5, main h6');
-  
+
   if (tocLinks.length && headings.length) {
     const highlightTocLink = () => {
       let current = '';
       const scrollPos = window.scrollY + 100; // Offset for navbar
-      
+
       headings.forEach(heading => {
         const top = heading.offsetTop;
         if (scrollPos >= top) {
           current = heading.id;
         }
       });
-      
+
       tocLinks.forEach(link => {
         link.classList.remove('active');
         if (link.getAttribute('href') === `#${current}`) {

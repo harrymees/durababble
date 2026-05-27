@@ -64,5 +64,3 @@
 
 {{ template "nav_flatten" (dict "currentDir" "" "pages" $all "scratch" $tmp) }}
 {{ .Scratch.Set "nav_ordered" ($tmp.Get "ordered") }}
-
-

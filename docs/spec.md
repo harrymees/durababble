@@ -15,6 +15,8 @@ Durababble exposes two durable primitives:
 
 Workflow and object calls compose. A workflow can call a durable object, and a durable object command can start or command workflows through their exposed RPC surface. Child durable calls inherit the caller's worker pool unless explicitly overridden.
 
+The repo includes an Alloy model under `formal/` for workflow state, leases, storage rows, waits/signals, fences, outbox, target activations, and FIFO inbox command rows for object and workflow targets. `mise exec -- bundle exec rake formal` verifies all Alloy `run`/`check` commands. `[DURABABBLE-*]` sigils between the model and Ruby implementation/tests are checked on every PR by `test/durababble/formal_sigil_drift_test.rb` in the fast `test` suite.
+
 Storage works through PostgreSQL/YSQL (`postgresql://` / `postgres://`) and MySQL/MariaDB (`mysql://` / `mysql2://`). Both adapters must provide the same public durable semantics, with backend-specific SQL hidden behind shared conformance tests and backend-specific locking/query-plan tests where query shape matters.
 
 Runtime values are serialized with Paquito into binary columns. PostgreSQL/YSQL stores runtime payloads as `bytea`; MySQL/MariaDB stores them as `LONGBLOB`. Runtime payloads include workflow inputs/results/errors, step args/results, wait contexts, inbox payloads, durable object state, command args/results/errors, idempotency fingerprints, and heartbeat cursors.
@@ -147,7 +149,7 @@ Workflow replay is driven by an append-only per-workflow command history. Latest
 
 Replay is bounded by a configurable maximum number of per-workflow `workflow_history` rows. The count includes every replay/history fact for that workflow: step schedules, starts, completions, failures, wait records, timer completions, workflow command completion/failure records, child-workflow records, and patch markers. It does not count latest-state or recovery helper rows in `steps`, `step_attempts`, `waits`, `inbox`, or `outbox`, except where those operations append a workflow-history fact. The engine checks the count before loading full replay payloads and checks projected growth before scheduling a new durable command. Durababble also has a lower warning threshold, defaulting to `8_000` events, that logs through `Durababble.logger` without stopping the run. If an open workflow exceeds the hard bound, the engine raises `Durababble::WorkflowHistoryLimitExceeded`, records that typed error on the workflow row, clears the lease and retry deadline, and returns a terminal failed run so workers do not repeatedly replay the same oversized history. Terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming the target, so an oversized terminal workflow does not leave runnable task rows behind. Terminal workflows are returned without applying the replay bound so completed results and terminal errors remain inspectable.
 
-Step scheduling, step execution starts, and step completions are distinct durable facts. A schedule record stores command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start record stores that an executor began a concrete attempt. A completion, failure, or wait record resolves the command's workflow future.
+Step scheduling, step execution starts, and terminal outcomes are distinct durable facts. A schedule record stores command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start record stores that an executor began a concrete attempt. Success, wait, cancellation, and non-retrying failure records resolve the command's workflow future. Retryable failure records are diagnostic history for the failed attempt and must not be treated as terminal replay events.
 
 Schedule record shape includes step method name, serialized args/kwargs or a stable payload digest, retry/executor attributes, and any semantic key if one is present. Replay validates the scheduled command shape even when no completion exists, so a step that started before a crash cannot disappear silently.
 
@@ -190,7 +192,7 @@ class ImportWorkflow < Durababble::Workflow
 end
 ```
 
-`schedule: [1, 5, 30]` supplies an explicit per-retry schedule. After the explicit array is exhausted, Durababble falls back to capped exponential backoff. Intervals are numeric seconds. `maximum_attempts:` counts the first execution plus retries. `non_retryable_errors:` accepts Ruby exception classes or class-name strings.
+`schedule: [1, 5, 30]` supplies an explicit per-retry schedule. After the explicit array is exhausted, Durababble falls back to capped exponential backoff. Intervals are numeric seconds. `maximum_attempts:` counts the first execution plus retries. `non_retryable_errors:` accepts Ruby exception classes or class-name strings. A retryable failure must commit the failed attempt record, diagnostic failure history, lease release, and retry due time in one transaction so replay and claiming cannot observe a half-scheduled retry.
 
 On a retryable failure, the runtime records the step attempt as failed, releases the workflow lease, stores `next_run_at`, and returns the workflow to a claimable retry state after the retry deadline. Pending or failed workflows whose `next_run_at` is in the future are not claimable. Terminal failed workflows clear `next_run_at` and are not claimable.
 
@@ -587,6 +589,7 @@ Observability requirements:
 | Transient exposed methods route to owner | `CallTransient` invokes live object/workflow owner without durable mutation. | Transient RPC specs |
 | Worker pool scopes persisted targets and relevant keys | Persisted targets and query-critical keys include `worker_pool` where routing/claiming requires it. | Worker-pool backend specs |
 | Unified inbox is the durable message model | Object commands, object wakes, and workflow commands share one inbox contract. | Inbox/mailbox specs |
+| Alloy model tracks storage/lease/concurrency invariants | `formal/workflow_storage.als` checks model obligations; `[DURABABBLE-*]` sigils tie each obligation to a Ruby implementation/test callsite. | `rake formal` (Alloy verifier) plus `FormalSigilDriftTest` in CI |
 
 ## Crash matrix
 

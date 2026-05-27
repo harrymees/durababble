@@ -178,7 +178,7 @@ module Durababble
             locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
-            status = 'pending'
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
             OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
@@ -410,7 +410,9 @@ module Durababble
     end
 
     define(:pg_ack_outbox, backend: :postgres) do |store|
-      "UPDATE #{table(store, "outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2"
+      # [DURABABBLE-WF-1] Acks require the live sender lease: an owner whose lease
+      # expired before another worker reclaimed the row cannot mark it processed.
+      "UPDATE #{table(store, "outbox")} SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2 AND locked_until >= now()"
     end
 
     define(:pg_outbox_message, backend: :postgres) do |store|
@@ -566,7 +568,7 @@ module Durababble
         SELECT id FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
           AND (
-            status = 'pending'
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
             OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
@@ -721,7 +723,9 @@ module Durababble
     end
 
     define(:mysql_ack_outbox, backend: :mysql) do |store|
-      "UPDATE #{table(store, "outbox")} SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?"
+      # [DURABABBLE-WF-1] Acks require the live sender lease: an owner whose lease
+      # expired before another worker reclaimed the row cannot mark it processed.
+      "UPDATE #{table(store, "outbox")} SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ? AND locked_until >= NOW(6)"
     end
 
     define(:mysql_outbox_message, backend: :mysql) do |store|
@@ -778,7 +782,9 @@ module Durababble
             locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
-            status IN ('pending', 'waiting', 'canceling')
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+            OR status = 'waiting'
+            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
             OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
           )
@@ -865,19 +871,22 @@ module Durababble
     end
 
     define(:pg_mark_workflow_running, backend: :postgres) do |store|
+      # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-        WHERE id = $1 AND worker_pool = $2
+        WHERE id = $1 AND worker_pool = $2 AND status = 'pending' AND locked_by IS NULL
       SQL
     end
 
     define(:pg_mark_workflow_running_with_worker, backend: :postgres) do |store|
+      # [DURABABBLE-WF-1] Terminal rows must stay terminal even when a worker holds a lease.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $1,
             locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
         WHERE id = $3 AND worker_pool = $4
+          AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
     end
 
@@ -893,11 +902,20 @@ module Durababble
     end
 
     define(:pg_complete_workflow_with_worker, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
+      # [DURABABBLE-WF-1] Workflow completion requires the running lease; live durable work
+      # is cleaned up after the UPDATE by the surrounding helper.
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() " \
+        "WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()"
     end
 
     define(:pg_complete_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
+      # [DURABABBLE-WF-1] Unfenced completion still rejects terminal rows and live durable work.
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() " \
+        "WHERE id = $1 " \
+        "AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL)) " \
+        "AND NOT EXISTS (SELECT 1 FROM #{table(store, "steps")} WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) " \
+        "AND NOT EXISTS (SELECT 1 FROM #{table(store, "step_attempts")} WHERE workflow_id = $1 AND status IN ('running', 'waiting')) " \
+        "AND NOT EXISTS (SELECT 1 FROM #{table(store, "waits")} WHERE workflow_id = $1 AND status = 'pending')"
     end
 
     define(:pg_cancel_workflow_with_worker, backend: :postgres) do |store|
@@ -905,7 +923,8 @@ module Durababble
     end
 
     define(:pg_cancel_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
+      # [DURABABBLE-WF-1] Unfenced cancel never stomps a terminal row.
+      "UPDATE #{table(store, "workflows")} SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
     end
 
     define(:pg_fail_workflow_with_worker, backend: :postgres) do |store|
@@ -913,7 +932,8 @@ module Durababble
     end
 
     define(:pg_fail_workflow, backend: :postgres) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'"
+      # [DURABABBLE-WF-1] Unfenced fail never stomps a terminal row.
+      "UPDATE #{table(store, "workflows")} SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))"
     end
 
     define(:pg_terminate_workflow_waits, backend: :postgres) do |store|
@@ -994,6 +1014,26 @@ module Durababble
       SQL
     end
 
+    define(:pg_fail_live_steps_for_workflow, backend: :postgres) do |store|
+      # Failing a workflow turns any actively-running step into a 'failed' step
+      # that carries the workflow's error. Scheduled and waiting steps stay on
+      # the cancel cleanup path — they never observed the error, so 'canceled'
+      # is the truer post-condition.
+      <<~SQL.chomp
+        UPDATE #{table(store, "steps")}
+        SET status = 'failed', error = $2, updated_at = now()
+        WHERE workflow_id = $1 AND status = 'running'
+      SQL
+    end
+
+    define(:pg_fail_live_step_attempts_for_workflow, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET status = 'failed', error = $2, completed_at = now()
+        WHERE workflow_id = $1 AND status = 'running'
+      SQL
+    end
+
     define(:pg_claim_pending_target_activation, backend: :postgres) do |store, filter_sql:|
       <<~SQL.chomp
         SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")}
@@ -1030,6 +1070,7 @@ module Durababble
         SELECT 1 FROM #{table(store, "target_activations")}
         WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
           AND status = 'running' AND locked_by = $5
+          AND locked_until >= now()
         FOR UPDATE
       SQL
     end
@@ -1286,15 +1327,18 @@ module Durababble
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql) do |store|
+      # [DURABABBLE-WF-1] Terminal rows must stay terminal even when a worker holds a lease.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
+          AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
     end
 
     define(:mysql_mark_workflow_running, backend: :mysql) do |store|
-      "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ?"
+      # [DURABABBLE-WF-1] The unfenced create path only activates a fresh, unowned pending row.
+      "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL"
     end
 
     define(:mysql_claim_workflow_for_activation_lock, backend: :mysql) do |store|
@@ -1302,7 +1346,9 @@ module Durababble
         SELECT id FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
           AND (
-            status IN ('pending', 'waiting', 'canceling')
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+            OR status = 'waiting'
+            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
             OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
           )
@@ -1462,6 +1508,8 @@ module Durababble
     end
 
     define(:mysql_complete_workflow_with_worker, backend: :mysql) do |store|
+      # [DURABABBLE-WF-1] Workflow completion requires the running lease; live durable work
+      # is cleaned up after the UPDATE by the surrounding helper.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
@@ -1470,10 +1518,15 @@ module Durababble
     end
 
     define(:mysql_complete_workflow, backend: :mysql) do |store|
+      # [DURABABBLE-WF-1] Unfenced completion still rejects terminal rows and live durable work.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ? AND status <> 'terminated'
+        WHERE id = ?
+          AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
+          AND NOT EXISTS (SELECT 1 FROM #{table(store, "steps")} WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
+          AND NOT EXISTS (SELECT 1 FROM #{table(store, "step_attempts")} WHERE workflow_id = ? AND status IN ('running', 'waiting'))
+          AND NOT EXISTS (SELECT 1 FROM #{table(store, "waits")} WHERE workflow_id = ? AND status = 'pending')
       SQL
     end
 
@@ -1487,11 +1540,12 @@ module Durababble
     end
 
     define(:mysql_cancel_workflow, backend: :mysql) do |store|
+      # [DURABABBLE-WF-1] Unfenced cancel never stomps a terminal row.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
           cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ? AND status <> 'terminated'
+        WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
     end
 
@@ -1504,10 +1558,11 @@ module Durababble
     end
 
     define(:mysql_fail_workflow, backend: :mysql) do |store|
+      # [DURABABBLE-WF-1] Unfenced fail never stomps a terminal row.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-        WHERE id = ? AND status <> 'terminated'
+        WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
     end
 
@@ -1665,6 +1720,7 @@ module Durababble
         SELECT 1 FROM #{table(store, "target_activations")}
         WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
           AND status = 'running' AND locked_by = ?
+          AND locked_until >= NOW(6)
         FOR UPDATE
       SQL
     end
@@ -1715,6 +1771,26 @@ module Durababble
         UPDATE #{table(store, "step_attempts")}
         SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
         WHERE workflow_id = ? AND status IN ('running', 'waiting')
+      SQL
+    end
+
+    define(:mysql_fail_live_steps_for_workflow, backend: :mysql) do |store|
+      # Failing a workflow turns any actively-running step into a 'failed' step
+      # that carries the workflow's error. Scheduled and waiting steps stay on
+      # the cancel cleanup path — they never observed the error, so 'canceled'
+      # is the truer post-condition.
+      <<~SQL.chomp
+        UPDATE #{table(store, "steps")}
+        SET status = 'failed', error = ?, updated_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'running'
+      SQL
+    end
+
+    define(:mysql_fail_live_step_attempts_for_workflow, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "step_attempts")}
+        SET status = 'failed', error = ?, completed_at = NOW(6)
+        WHERE workflow_id = ? AND status = 'running'
       SQL
     end
 

@@ -48,6 +48,9 @@ module Durababble
               next
             end
 
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease;
+            # mimic production where each delivery worker holds the workflow lease.
+            h.store.mark_workflow_running(workflow_id, worker_id:, lease_seconds: 20)
             messages = h.store.claim_inbox_messages(
               target_kind: "workflow",
               target_type: "counter",

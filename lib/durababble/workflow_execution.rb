@@ -112,6 +112,7 @@ module Durababble
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
       command_id, future, scheduled_from_history = allocate_command(name: step.name, shape:)
       attributes = step_attributes(instance, step:, command_id:)
+      # [DURABABBLE-STEP-1] Completed commands resolve from durable replay history instead of rerunning user step code.
       if @replay_history.terminal_recorded?(command_id)
         Observability.count("durababble.workflow.replay.steps", attributes)
       else
@@ -425,6 +426,7 @@ module Durababble
     def schedule_command!(command_id, name:, shape:, event_budget:)
       return true if @replay_history.validate_scheduled_shape!(workflow_id: @workflow_id, command_id:, shape:)
 
+      # [DURABABBLE-CONCURRENCY-1] Workflow fibers append ordered command history before side-effect execution.
       ensure_history_limit_allows!(additional_events: event_budget)
       @store.record_step_scheduled(
         workflow_id: @workflow_id,
@@ -802,6 +804,7 @@ module Durababble
     def assert_workflow_lease!
       return if synchronize_store { @store.workflow_owned?(workflow_id: @workflow_id, worker_id: @worker_id) }
 
+      # [DURABABBLE-LEASE-4] Stale workers cannot pass the final workflow/step commit fence.
       raise LeaseConflict, "workflow #{@workflow_id} lease expired or moved before state update"
     end
 
