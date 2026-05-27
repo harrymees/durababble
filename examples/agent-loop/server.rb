@@ -11,9 +11,6 @@ require_relative "agent_loop"
 module AgentLoopExample
   class Server
     TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
-    WORKFLOW_WORKER_POOL = "agent-loop-workflows"
-    OBJECT_WORKER_POOL = "agent-loop-objects"
-
     def initialize(host:, port:, database_url:, schema:)
       @host = host
       @port = port
@@ -21,13 +18,20 @@ module AgentLoopExample
       @schema = schema
       @store = Durababble::Store.connect(database_url:, schema:)
       @store.migrate!
-      AgentLoopExample.configure(database_url:, schema:, workflow_worker_pool: WORKFLOW_WORKER_POOL, object_worker_pool: OBJECT_WORKER_POOL)
+      AgentLoopExample.configure(database_url:, schema:)
+      # Everything runs in the default worker pool. WorkerRuntime requires the
+      # pool name explicitly, but because it is the default, nothing in the
+      # workflow steps, the enqueue, or the snapshot query has to name a pool.
+      # Workflows and objects are split across two runtimes (two threads) on
+      # purpose, not for pool isolation: a workflow step calls a durable-object
+      # command and blocks waiting for its result, so a separate thread must be
+      # free to drain object work. One runtime would deadlock that wait.
       @workflow_runtime = Durababble::WorkerRuntime.start(
         workflows: [AgentLoopWorkflow],
         objects: [],
         database_url:,
         schema:,
-        worker_pool: AgentLoopExample.workflow_worker_pool,
+        worker_pool: "default",
         poll_interval: 0.05,
       )
       @object_runtime = Durababble::WorkerRuntime.start(
@@ -35,7 +39,7 @@ module AgentLoopExample
         objects: [VirtualFileSystem],
         database_url:,
         schema:,
-        worker_pool: AgentLoopExample.object_worker_pool,
+        worker_pool: "default",
         poll_interval: 0.05,
       )
       @tcp_server = TCPServer.new(@host, @port)

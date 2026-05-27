@@ -182,8 +182,8 @@ module Durababble
 
     #: (Object?, Object?, ?worker_pool: String) -> Object?
     def current_object_lease(object_type, object_id, worker_pool: "default")
-      row = execute_store_query(:current_object_activation_lease, [worker_pool, object_type, object_id]).first
-      row ||= execute_store_query(:current_object_lease, [worker_pool, object_type, object_id]).first
+      row = execute_store_query(:current_object_activation_lease, [object_type, object_id]).first
+      row ||= execute_store_query(:current_object_lease, [object_type, object_id]).first
       row&.transform_values(&:itself)
     end
 
@@ -421,7 +421,7 @@ module Durababble
           candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
           next nil unless candidate
 
-          execute_store_query(:claim_selected_target_activation, [worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
+          execute_store_query(:claim_selected_target_activation, [candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
         end
       end
       typed_row = row #: as untyped
@@ -431,7 +431,7 @@ module Durababble
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
       transaction do
-        activation = execute_store_query(:lock_target_activation_for_completion, [worker_pool, target_kind, target_type, target_id, worker_id]).first
+        activation = execute_store_query(:lock_target_activation_for_completion, [target_kind, target_type, target_id, worker_id]).first
         next nil unless activation
 
         reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now:)
@@ -497,7 +497,6 @@ module Durababble
     def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
       if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(worker_pool:, workflow_id: target_id))
         dead_letter_terminal_workflow_inbox_without_transaction(
-          worker_pool:,
           target_type:,
           target_id:,
           error: terminal_error,
@@ -506,7 +505,7 @@ module Durababble
         return
       end
 
-      head = execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
+      head = execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
@@ -527,24 +526,24 @@ module Durababble
       "workflow #{workflow_id} is terminal #{status}#{suffix}"
     end
 
-    #: (worker_pool: String, target_type: String, target_id: String, error: String) -> Object?
-    def dead_letter_terminal_workflow_inbox_without_transaction(worker_pool:, target_type:, target_id:, error:)
-      execute_params(<<~SQL, [worker_pool, target_type, target_id, error])
+    #: (target_type: String, target_id: String, error: String) -> Object?
+    def dead_letter_terminal_workflow_inbox_without_transaction(target_type:, target_id:, error:)
+      execute_params(<<~SQL, [target_type, target_id, error])
         UPDATE #{table("inbox")}
         SET status = 'dead_lettered',
-            error = $4,
+            error = $3,
             locked_by = NULL,
             locked_until = NULL,
             dead_lettered_at = now(),
             updated_at = now()
-        WHERE worker_pool = $1 AND target_kind = 'workflow' AND target_type = $2 AND target_id = $3
+        WHERE target_kind = 'workflow' AND target_type = $1 AND target_id = $2
           AND status IN ('pending', 'failed', 'running')
       SQL
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:delete_target_activation, [worker_pool, target_kind, target_type, target_id])
+      execute_store_query(:delete_target_activation, [target_kind, target_type, target_id])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ready_at: Object?) -> Object?
@@ -556,17 +555,17 @@ module Durababble
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       execute_store_query(:insert_mailbox_sequence, [worker_pool, target_kind, target_type, target_id])
-      row = execute_store_query(:mailbox_sequence_for_update, [worker_pool, target_kind, target_type, target_id]).first
+      row = execute_store_query(:mailbox_sequence_for_update, [target_kind, target_type, target_id]).first
       sequence = row.fetch("last_sequence").to_i + 1
-      execute_store_query(:update_mailbox_sequence, [worker_pool, target_kind, target_type, target_id, sequence])
+      execute_store_query(:update_mailbox_sequence, [sequence, target_kind, target_type, target_id])
       sequence
     end
 
-    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
-    def existing_inbox_message_for_idempotency(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+    #: (String?, target_kind: String, target_type: String, target_id: String) -> Object?
+    def existing_inbox_message_for_idempotency(idempotency_key, target_kind:, target_type:, target_id:)
       return unless idempotency_key
 
-      idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      idempotency_hash = inbox_idempotency_hash(idempotency_key, target_kind:, target_type:, target_id:)
       execute_store_query(:existing_inbox_message_for_idempotency, [idempotency_hash]).first
     end
 
@@ -582,19 +581,19 @@ module Durababble
 
     #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
-      idempotency_hash = inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+      idempotency_hash = inbox_idempotency_hash(idempotency_key, target_kind:, target_type:, target_id:)
       serialized_payload = dump_inbox_payload(target_kind:, target_type:, target_id:, message_kind:, payload:)
       execute_store_query(:insert_inbox_message, [id, worker_pool, target_kind, target_type, target_id, sequence, message_kind, method_name, operation_id, idempotency_key, idempotency_hash, shape_hash, serialized_payload, timestamp_or_nil(ready_at), max_attempts])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, limit: Integer) -> Array[Hash[String, Object?]]
     def inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
-      execute_store_query(:inbox_claim_rows_for_update, [worker_pool, target_kind, target_type, target_id, limit])
+      execute_store_query(:inbox_claim_rows_for_update, [target_kind, target_type, target_id, limit])
     end
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
     def inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
-      execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
+      execute_store_query(:inbox_head_for_update, [target_kind, target_type, target_id]).first
     end
 
     #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?

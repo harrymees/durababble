@@ -308,7 +308,7 @@ module Durababble
       when "workflow"
         current_workflow_lease(target_id, worker_pool:)
       when "object"
-        current_object_lease(target_type, target_id, worker_pool:)
+        current_object_lease(target_type, target_id)
       end
     end
 
@@ -317,8 +317,8 @@ module Durababble
       nil
     end
 
-    #: (String, String, ?worker_pool: String) -> Hash[String, Object?]?
-    def current_object_lease(object_type, object_id, worker_pool: "default")
+    #: (String, String) -> Hash[String, Object?]?
+    def current_object_lease(object_type, object_id)
       nil
     end
 
@@ -402,10 +402,9 @@ module Durababble
       )
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, message_kind: String, method_name: String?, payload: Object?) -> String
-    def inbox_shape_hash(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+    #: (target_kind: String, target_type: String, target_id: String, message_kind: String, method_name: String?, payload: Object?) -> String
+    def inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       Digest::SHA256.hexdigest(SERIALIZER.dump({
-        "worker_pool" => worker_pool,
         "target_kind" => target_kind,
         "target_type" => target_type,
         "target_id" => target_id,
@@ -415,12 +414,11 @@ module Durababble
       }))
     end
 
-    #: (String?, worker_pool: String, target_kind: String, target_type: String, target_id: String) -> String?
-    def inbox_idempotency_hash(idempotency_key, worker_pool:, target_kind:, target_type:, target_id:)
+    #: (String?, target_kind: String, target_type: String, target_id: String) -> String?
+    def inbox_idempotency_hash(idempotency_key, target_kind:, target_type:, target_id:)
       return unless idempotency_key
 
       Digest::SHA256.hexdigest(SERIALIZER.dump({
-        "worker_pool" => worker_pool,
         "target_kind" => target_kind,
         "target_type" => target_type,
         "target_id" => target_id,

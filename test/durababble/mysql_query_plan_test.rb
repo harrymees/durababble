@@ -59,12 +59,12 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
-          params: ["default", "object", "counter", "object-1"],
+          params: ["object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "inbox mailbox head probe" => {
           sql: query_sql(:inbox_head_for_update),
-          params: ["default", "object", "counter", "object-1"],
+          params: ["object", "counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "current object activation lease probe" => {
@@ -74,7 +74,7 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
         },
         "current object inbox lease probe" => {
           sql: query_sql(:current_object_lease),
-          params: ["default", "counter", "object-1"],
+          params: ["counter", "object-1"],
           expected_key_fragment: "inbox_target",
         },
         "inbox idempotency probe" => {
@@ -206,9 +206,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     "X'#{Durababble::Store::SERIALIZER.dump(value).unpack1("H*")}'"
   end
 
-  def inbox_idempotency_hash(idempotency_key, worker_pool: "default", target_kind:, target_type:, target_id:)
+  def inbox_idempotency_hash(idempotency_key, target_kind:, target_type:, target_id:)
     Digest::SHA256.hexdigest(Durababble::Store::SERIALIZER.dump({
-      "worker_pool" => worker_pool,
       "target_kind" => target_kind,
       "target_type" => target_type,
       "target_id" => target_id,
