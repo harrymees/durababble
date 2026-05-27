@@ -258,6 +258,8 @@ module Durababble
       create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
       create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
       create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
+      create_postgres_index("durable_objects_worker_lease_idx", "ON #{table("durable_objects")} (locked_by) WHERE locked_by IS NOT NULL")
+      create_postgres_index("durable_objects_expired_lease_idx", "ON #{table("durable_objects")} (locked_until) WHERE locked_by IS NOT NULL")
     end
 
     #: (untyped, untyped, ?unique: bool) -> untyped

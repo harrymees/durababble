@@ -213,6 +213,17 @@ module Durababble
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
+        # Gate object inbox claims on ownership of the unified per-object lease so
+        # commands are only processed by the single, exclusive object owner.
+        # Lease acquisition happens AFTER the row scan: an empty row set means no
+        # work in this pool, so we must not side-effect a free lease into a held
+        # one (that would block the real owner in another pool from ever
+        # progressing). Workflow inbox claims keep the existing
+        # workflows.locked_by fence and are unaffected.
+        if target_kind == "object" && !rows.empty?
+          holder = claim_object_lease(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_seconds:)
+          next [] unless holder
+        end
         contiguous_claimable_inbox_rows(rows, now:).map do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
           claimed_inbox_row(row, worker_id:, lease_seconds:, now:)

@@ -435,8 +435,12 @@ module Durababble
       "SELECT COUNT(*) AS count FROM #{table(store, "step_attempts")} WHERE workflow_id = $1 AND position = $2"
     end
 
+    # Lease-only rows (`claim_object_lease` inserts a row before state has been written)
+    # carry a NULL `state`; the IS NOT NULL filter makes the read return zero rows in
+    # that case so `object_state_entry` reports `NO_OBJECT_STATE` and the caller treats
+    # the object as uninitialized.
     define(:pg_object_state, backend: :postgres) do |store|
-      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = $1 AND object_id = $2"
+      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = $1 AND object_id = $2 AND state IS NOT NULL"
     end
 
     # worker_pool is routing metadata, not identity — on conflict the clause leaves it at the first
@@ -759,8 +763,10 @@ module Durababble
       "SELECT COUNT(*) AS count FROM #{table(store, "step_attempts")} WHERE workflow_id = ? AND position = ?"
     end
 
+    # See pg_object_state — the IS NOT NULL filter hides lease-only rows so reads
+    # of an uninitialized object return zero rows.
     define(:mysql_object_state, backend: :mysql) do |store|
-      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = ? AND object_id = ?"
+      "SELECT state FROM #{table(store, "durable_objects")} WHERE object_type = ? AND object_id = ? AND state IS NOT NULL"
     end
 
     define(:pg_drop_schema, backend: :postgres) do |store|
@@ -859,14 +865,79 @@ module Durababble
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = $1 AND position = $2"
     end
 
+    # Live ownership of the unified object lease: the row exists on the durable_objects
+    # table (locked_by / locked_until columns), filled by claim_object_lease and cleared on
+    # release / expiry. Routes both stream and command lanes to the holder.
     define(:pg_current_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
+        SELECT worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = $1 AND object_id = $2
           AND locked_by IS NOT NULL AND locked_until >= now()
-        ORDER BY sequence
         LIMIT 1
+      SQL
+    end
+
+    # Atomic object-lease claim. Inserts the durable_objects row if missing; takes
+    # ownership only when no live lease exists OR the caller is already the holder.
+    # `RETURNING` emits a row only when the INSERT/UPDATE actually fires — on
+    # rejection the result is empty, and `Postgres#claim_object_lease` translates
+    # that to `nil`. Callers compare against nil to detect a lost claim; we
+    # deliberately do not surface the competing holder's identity here.
+    define(:pg_claim_object_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "durable_objects")}
+          (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 second'), now(), now())
+        ON CONFLICT (object_type, object_id) DO UPDATE
+        SET locked_by = EXCLUDED.locked_by,
+            locked_until = EXCLUDED.locked_until,
+            updated_at = now()
+        WHERE #{table(store, "durable_objects")}.locked_by IS NULL
+           OR #{table(store, "durable_objects")}.locked_until < now()
+           OR #{table(store, "durable_objects")}.locked_by = EXCLUDED.locked_by
+        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+      SQL
+    end
+
+    # Conditional renew: only succeeds while the caller still holds a live lease.
+    # Returning row lets the host detect lost ownership (no row = lost).
+    define(:pg_renew_object_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_until = now() + ($4::int * interval '1 second'), updated_at = now()
+        WHERE object_type = $1 AND object_id = $2
+          AND locked_by = $3 AND locked_until >= now()
+        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+      SQL
+    end
+
+    # Idempotent release; non-owner workers cannot release someone else's lease.
+    define(:pg_release_object_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE object_type = $1 AND object_id = $2 AND locked_by = $3
+      SQL
+    end
+
+    # Reclaim object leases past their locked_until deadline. Paired with the
+    # workflow-side steal sweep on the same expiry timer.
+    define(:pg_steal_expired_object_leases, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE locked_by IS NOT NULL AND locked_until < $1::timestamptz
+      SQL
+    end
+
+    # Graceful release of every object lease this worker still owns. Called from
+    # release_worker_leases! on shutdown.
+    define(:pg_release_worker_object_leases, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE locked_by = $1
       SQL
     end
 
@@ -1455,14 +1526,84 @@ module Durababble
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = ? AND position = ?"
     end
 
+    # MySQL mirror of pg_current_object_lease — see notes on the PG variant.
     define(:mysql_current_object_lease, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+        SELECT worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = ? AND object_id = ?
           AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-        ORDER BY sequence
         LIMIT 1
+      SQL
+    end
+
+    # MySQL mirror of pg_claim_object_lease, split in two so we can read win/loss
+    # off the UPDATE's affected_rows alone. A single-statement
+    # `INSERT ... ON DUPLICATE KEY UPDATE` would not work here: the trilogy
+    # adapter forces `CLIENT_FOUND_ROWS` on every connection, which makes a
+    # no-op "row matched but unchanged" UPDATE report `affected_rows = 1`
+    # — indistinguishable from a fresh insert and so unable to tell a winning
+    # claim from a rejected one without a follow-up SELECT. Splitting it lets
+    # the conditional WHERE on the UPDATE step do the gating: a matching row
+    # means we won (insert or takeover or refresh-self); no match means we
+    # lost. `mysql_ensure_object_row` just guarantees the PK exists so the
+    # UPDATE has something to match.
+    define(:mysql_ensure_object_row, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT IGNORE INTO #{table(store, "durable_objects")}
+          (worker_pool, object_type, object_id, created_at, updated_at)
+        VALUES (?, ?, ?, NOW(6), NOW(6))
+      SQL
+    end
+
+    # Conditional claim against the guaranteed-present row. The WHERE only
+    # matches when the lease is free, expired, or already ours; on a match the
+    # UPDATE writes new values and `affected_rows = 1` (under CLIENT_FOUND_ROWS,
+    # a matched-but-unchanged row also reports 1, but every matching branch of
+    # this WHERE legitimately means we won, so the count is still unambiguous).
+    define(:mysql_claim_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+      SQL
+    end
+
+    # MySQL mirror of pg_renew_object_lease.
+    define(:mysql_renew_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ?
+          AND locked_by = ? AND locked_until >= NOW(6)
+      SQL
+    end
+
+    # MySQL mirror of pg_release_object_lease.
+    define(:mysql_release_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ? AND locked_by = ?
+      SQL
+    end
+
+    # MySQL mirror of pg_steal_expired_object_leases.
+    define(:mysql_steal_expired_object_leases, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE locked_by IS NOT NULL AND locked_until < ?
+      SQL
+    end
+
+    # MySQL mirror of pg_release_worker_object_leases.
+    define(:mysql_release_worker_object_leases, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE locked_by = ?
       SQL
     end
 
@@ -2112,5 +2253,13 @@ module Durababble
         )
       SQL
     end
+
+    # No :sqlite_claim_object_lease override: the two-step
+    # :mysql_ensure_object_row + :mysql_claim_object_lease pair translates
+    # cleanly through #translate_to_sqlite (INSERT IGNORE → INSERT OR IGNORE,
+    # DATE_ADD(NOW(6), INTERVAL n SECOND) → dura_now() + n * seconds_scale).
+    # SQLite needs no CLIENT_FOUND_ROWS workaround — `db.changes` reports the
+    # actual matched-and-updated count, so the same UPDATE-WHERE win/loss
+    # signal applies.
   end
 end

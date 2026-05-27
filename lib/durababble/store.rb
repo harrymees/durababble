@@ -79,6 +79,17 @@ module Durababble
         raise ArgumentError, "unsupported ActiveRecord adapter for Durababble store: #{adapter}"
       end
 
+      # Shared guard for the public lease API. Negative or zero values would
+      # produce a lease that is already expired, which only confuses the takeover
+      # path (a "claim" that the next steal sweep can clear). Reject at the
+      # boundary so backends never see one.
+      #: (Numeric) -> void
+      def validate_positive_lease_seconds!(lease_seconds)
+        return if lease_seconds > 0
+
+        raise ArgumentError, "lease_seconds must be a positive Numeric, got #{lease_seconds.inspect}"
+      end
+
       private
 
       #: (String) -> Class
@@ -495,6 +506,13 @@ module Durababble
       result #: as String
     end
 
+    # `private` runs ~50 lines up to keep the helper section tidy, but the lease
+    # contract below (current_*, claim/renew/release) is part of the public Store
+    # surface — backends override it and out-of-class callers (durable_object,
+    # workflow_rpc, rpc_transport) dispatch through it. Restore visibility here
+    # so Sorbet doesn't flag the call sites.
+    public
+
     #: (target_kind: String, target_type: String, target_id: String, worker_pool: String) -> Hash[String, Object?]?
     def current_target_lease(target_kind:, target_type:, target_id:, worker_pool:)
       case target_kind
@@ -514,6 +532,23 @@ module Durababble
     def current_object_lease(object_type, object_id, worker_pool: nil)
       nil
     end
+
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+      nil
+    end
+
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
+    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      false
+    end
+
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def release_object_lease(object_type:, object_id:, worker_id:)
+      false
+    end
+
+    private
 
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
     def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
