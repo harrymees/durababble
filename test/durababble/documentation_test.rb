@@ -46,6 +46,16 @@ class DurababbleDocumentationTest < DurababbleTestCase
         ["release_seat", "completed"],
       ],
     },
+    "patterns-cancellation-ensure" => {
+      "status" => "canceled",
+      "result" => nil,
+      "deleted" => ["tmp_proj_123"],
+      "steps" => [
+        ["create_workspace", "completed"],
+        ["copy_rows", "completed"],
+        ["delete_workspace", "completed"],
+      ],
+    },
   }.freeze
 
   def read(path)
