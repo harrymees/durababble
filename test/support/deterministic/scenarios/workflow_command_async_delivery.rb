@@ -33,6 +33,10 @@ module Durababble
 
           delivered = []
           h.scheduler.schedule(actor: "command-worker", delay: 5, name: "drain_commands") do
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease;
+            # mimic production where the workflow worker holds the lease while
+            # draining its inbox.
+            h.store.mark_workflow_running(workflow_id, worker_id: "command-worker", lease_seconds: 30)
             # Bounded so a buggy re-arm (activation never retired) fails the
             # exactly-once check rather than spinning the virtual clock forever.
             (command_count + 3).times do

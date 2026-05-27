@@ -276,12 +276,15 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow completion") do
-        if worker_id
+      transaction do
+        update = if worker_id
           execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
         else
-          execute_store_query(:complete_workflow, [serialized_result, workflow_id])
+          execute_store_query(:complete_workflow, [serialized_result, workflow_id, workflow_id, workflow_id, workflow_id])
         end
+        require_workflow_completion_update!(update, workflow_id:, worker_id:)
+        cancel_live_workflow_dependents(workflow_id)
+        update
       end
     end
 
@@ -299,13 +302,23 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure", failure_error: error) do
         if worker_id
           execute_store_query(:fail_workflow_with_worker, [error, workflow_id, worker_id])
         else
           execute_store_query(:fail_workflow, [error, workflow_id])
         end
       end
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_steps_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_steps_for_workflow, [error, workflow_id])
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_step_attempts_for_workflow, [error, workflow_id])
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
@@ -319,11 +332,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       execute_store_query(:fail_step, [error, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      payload = step_failure_payload(terminal:, error_class:, error_message:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:, retrying:)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 

@@ -51,7 +51,7 @@ module Durababble
         )
       end
 
-      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) ?{ (?) -> untyped } -> String
+      #: (Object?, Symbol | String, *Object?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, **Object?) ?{ (Object?) -> Object? } -> String
       def tell(durable_id, method_name, *args, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, **kwargs, &block)
         raise ArgumentError, "blocks cannot be passed to durable object command `#{method_name}`: command arguments are serialized across nodes and blocks cannot be" if block
 
@@ -63,7 +63,7 @@ module Durababble
         raise NoMethodError, "undefined durable object command `#{method_name}` for #{self}" unless retry_policy
 
         if (execution = WorkflowExecutionContext.current)
-          return execution.call_handle_rpc(
+          rpc_result = execution.call_handle_rpc(
             target_kind: "object",
             target_type: object_type,
             target_id: String(durable_id),
@@ -73,17 +73,20 @@ module Durababble
             kwargs: kwargs.merge(idempotency_key:),
             retry_policy:,
           ) do |idempotency_key:, args:, kwargs:|
+            rpc_args = args #: as Array[Object?]
+            rpc_kwargs = kwargs #: as Hash[Symbol, Object?]
             enqueue_tell(
               store:,
               worker_pool:,
               object_id: String(durable_id),
               method_name:,
-              args:,
-              kwargs:,
+              args: rpc_args,
+              kwargs: rpc_kwargs,
               idempotency_key:,
               retry_policy:,
             )
           end
+          return rpc_result #: as String
         end
 
         enqueue_tell(
@@ -173,7 +176,7 @@ module Durababble
     def initialize(durable_id: nil, state: UNINITIALIZED, store: nil, command_context: nil, worker_pool: "default")
       @durable_id = durable_id
       @current_state = state
-      @store = store #: as untyped
+      @store = store
       @command_context = command_context
       @worker_pool = worker_pool
       @state_dirty = false
@@ -199,7 +202,10 @@ module Durababble
 
       @current_state = new_state
       @state_dirty = true
-      @store&.save_object_state(worker_pool: @worker_pool, object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
+      if @store && !command_context
+        object_id = durable_id || raise(Error, "durable object state cannot be saved without a durable id")
+        @store.save_object_state(worker_pool: @worker_pool, object_type: self.class.object_type, object_id:, state: new_state)
+      end
       new_state
     end
 
@@ -284,7 +290,7 @@ module Durababble
     def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
       @object_class = object_class #: as untyped
       @durable_id = durable_id
-      @store = store #: as untyped
+      @store = store
       @worker_pool = worker_pool || "default"
       @idempotency_key = idempotency_key
     end
@@ -305,7 +311,9 @@ module Durababble
             args:,
             kwargs:,
           ) do |args:, kwargs:, **|
-            invoke_query(method_name, args:, kwargs:, block:)
+            rpc_args = args #: as Array[Object?]
+            rpc_kwargs = kwargs #: as Hash[Symbol, Object?]
+            invoke_query(method_name, args: rpc_args, kwargs: rpc_kwargs, block:)
           end
         end
 
@@ -324,7 +332,9 @@ module Durababble
             kwargs:,
             retry_policy:,
           ) do |idempotency_key:, args:, kwargs:|
-            invoke_command(method_name, retry_policy:, args:, kwargs:, idempotency_key:)
+            rpc_args = args #: as Array[Object?]
+            rpc_kwargs = kwargs #: as Hash[Symbol, Object?]
+            invoke_command(method_name, retry_policy:, args: rpc_args, kwargs: rpc_kwargs, idempotency_key:)
           end
         end
 
@@ -427,7 +437,7 @@ module Durababble
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
         command_kwargs = kwargs.dup
-        command_idempotency_key = idempotency_key || (command_kwargs.key?(:idempotency_key) ? command_kwargs.delete(:idempotency_key) : @idempotency_key)
+        command_idempotency_key = string_idempotency_key(idempotency_key) || (command_kwargs.key?(:idempotency_key) ? string_idempotency_key(command_kwargs.delete(:idempotency_key)) : @idempotency_key)
         command_id = @store.enqueue_object_command(
           worker_pool: @worker_pool,
           object_type: @object_class.object_type,
@@ -447,6 +457,11 @@ module Durababble
         )
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
+    end
+
+    #: (Object?) -> String?
+    def string_idempotency_key(value)
+      value&.to_s
     end
 
     #: (String) -> String
@@ -573,7 +588,7 @@ module Durababble
   end
 
   class DurableObjectExecutor
-    #: (store: untyped, objects: untyped, worker_id: untyped, lease_seconds: untyped, ?worker_pool: String) -> void
+    #: (store: Store, objects: Object, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def initialize(store:, objects:, worker_id:, lease_seconds:, worker_pool: "default")
       @store = store
       @objects = normalize_objects(objects)
@@ -582,7 +597,7 @@ module Durababble
       @worker_pool = worker_pool
     end
 
-    #: (untyped, object_id: untyped, ?limit: untyped) -> untyped
+    #: (String, object_id: String, ?limit: Integer) -> Integer
     def drain_object_inbox(object_type, object_id:, limit: 10)
       object_class = @objects.fetch(object_type)
       drained = 0

@@ -140,11 +140,12 @@ module Durababble
       class << self
         # Accepts any value that ducks `Messages::TransientResponse` (the test
         # suite passes a Struct with the same `result`/`ok`/`err`/`moved`
-        # surface), so the parameter is `untyped` rather than the concrete
-        # class. The `result` accessor returns one of `:ok`/`:err`/`:not_running`/
+        # surface), so the parameter is a duck-typed `Object` rather than the
+        # concrete class. The `result` accessor returns one of `:ok`/`:err`/`:not_running`/
         # `:moved` matching the populated field, and `nil` for an empty response.
-        #: (untyped) -> Object?
+        #: (Object) -> Object?
         def decode_transient_response(response)
+          response = response #: as untyped
           case response.result
           when :ok
             Rpc.load(response.ok)
@@ -162,8 +163,9 @@ module Durababble
 
         # Same duck-typed contract as `decode_transient_response`; accepts the
         # concrete `Messages::RemoteError` or the test's lookalike Struct.
-        #: (untyped) -> bot
+        #: (Object) -> bot
         def raise_remote_error(error)
+          error = error #: as untyped
           typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
           raise typed if typed
           raise ObjectReadBlocked, error.message if error.klass == "Durababble::ObjectReadBlocked"
@@ -273,8 +275,9 @@ module Durababble
       # unexpected 500 from a peer signals a bug, not a healthy-but-busy node, so
       # retrying it would just amplify the failure. See the "Retry Semantics"
       # section in docs/content/cluster-rpc.md.
-      #: (untyped) -> Object?
+      #: (Object) -> Object?
       def handle_response(response)
+        response = response #: as untyped
         status = response.status
         body = response.read
         case status
@@ -467,14 +470,15 @@ module Durababble
       # unavailability (timeouts, connection failures — produced by `with_rpc_errors`,
       # not by `route`) which IS retried via `WorkflowRpc::NodeUnavailable`.
       #
-      # The case/when below is the one place where wire bytes (untyped `Object`
+      # The case/when below is the one place where decoded wire bytes (`Object`
       # from `Rpc.load`) cross into the typed `Service` API — each branch's
       # `#: as` cast is the single boundary between "we trust the bytes match
       # the path we routed" and the concrete `Messages::*` shape. Service
       # methods are typed in terms of those `Messages::*` classes downstream and
       # need no per-method casts.
-      #: (Service, untyped) -> untyped
+      #: (Service, Object) -> Object
       def route(service, request)
+        request = request #: as untyped
         method = ROUTES[request.path]
         return Protocol::HTTP::Response[404, OCTET_HEADERS, []] unless method
 
@@ -529,7 +533,7 @@ module Durababble
         @verify_deliver_message_owner = verify_deliver_message_owner
       end
 
-      #: (Messages::AwakenBatchRequest, untyped) -> Messages::AwakenBatchResponse
+      #: (Messages::AwakenBatchRequest, Object) -> Messages::AwakenBatchResponse
       def awaken_batch(request, call)
         Observability.trace("durababble.rpc.server.awaken_batch", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id) do
           authorize!(call)
@@ -538,7 +542,7 @@ module Durababble
         end
       end
 
-      #: (Messages::EvictLeaseRequest, untyped) -> Messages::EvictLeaseResponse
+      #: (Messages::EvictLeaseRequest, Object) -> Messages::EvictLeaseResponse
       def evict_lease(request, call)
         Observability.trace("durababble.rpc.server.evict_lease", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
@@ -554,7 +558,7 @@ module Durababble
         end
       end
 
-      #: (Messages::DeliverMessageRequest, untyped) -> Messages::DeliverMessageResponse
+      #: (Messages::DeliverMessageRequest, Object) -> Messages::DeliverMessageResponse
       def deliver_message(request, call)
         Observability.trace("durababble.rpc.server.deliver_message", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.target_kind" => request.target_kind, "durababble.rpc.target_class" => request.target_class) do
           authorize!(call)
@@ -570,7 +574,7 @@ module Durababble
         end
       end
 
-      #: (Messages::TransientRequest, untyped) -> Messages::TransientResponse
+      #: (Messages::TransientRequest, Object) -> Messages::TransientResponse
       def call_transient(request, call)
         Observability.trace("durababble.rpc.server.call_transient", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => request.durable_object_id) do
           authorize!(call)
@@ -618,7 +622,7 @@ module Durababble
         )
       end
 
-      #: (untyped) -> void
+      #: (Object) -> void
       def authorize!(call)
         return unless @authorize
         return if @authorize.call(call)
@@ -644,7 +648,7 @@ module Durababble
         end
       end
 
-      #: () { (untyped) -> untyped } -> untyped
+      #: () { (Store) -> Object? } -> Object?
       def with_store(&block)
         if @store.respond_to?(:with_dedicated_connection)
           @store.with_dedicated_connection(&block)

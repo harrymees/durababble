@@ -52,6 +52,13 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
     end
   end
 
+  test "default database url requires explicit environment" do
+    with_env("DURABABBLE_DATABASE_URL" => nil) do
+      error = assert_raises(KeyError) { Durababble.default_database_url }
+      assert_match(/DURABABBLE_DATABASE_URL/, error.message)
+    end
+  end
+
   test "derives the default schema from a sanitized workspace root" do
     with_env("DURABABBLE_SCHEMA" => nil, "DURABABBLE_WORKSPACE_ROOT" => "/tmp/Workspace With Caps") do
       assert_match(/\Adurababble_/, Durababble.workspace_schema)
@@ -59,14 +66,15 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
   end
 
   test "configure and store connection use the selected default schema" do
+    database_url = durababble_default_database_url
     with_env("DURABABBLE_SCHEMA" => "selected_workspace_schema") do
-      configured = Durababble.configure(database_url: Durababble.default_database_url)
+      configured = Durababble.configure(database_url:)
 
       assert_equal("selected_workspace_schema", configured.schema)
       assert_same(configured, Durababble.store)
     end
   rescue StandardError => e
-    skip("Durababble configure smoke requires a reachable SQL database at #{Durababble.default_database_url}: #{e.class}: #{e.message}")
+    skip("Durababble configure smoke requires a reachable SQL database at #{database_url}: #{e.class}: #{e.message}")
   ensure
     Durababble.default_store&.close
     Durababble.default_store = nil
@@ -98,10 +106,11 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
   end
 
   test "worker runtime threads the selected default schema to owned stores" do
+    database_url = durababble_default_database_url
     runtime = nil
     with_env("DURABABBLE_SCHEMA" => "runtime_workspace_schema") do
       runtime = Durababble::WorkerRuntime.new(
-        database_url: Durababble.default_database_url,
+        database_url:,
         workflows: {},
         worker_pool: "namespace-test",
         migrate: false,
@@ -110,7 +119,7 @@ class DurababbleWorkspaceNamespaceTest < DurababbleTestCase
       assert_equal("runtime_workspace_schema", runtime.store.schema)
     end
   rescue StandardError => e
-    skip("Durababble worker runtime schema smoke requires a reachable SQL database at #{Durababble.default_database_url}: #{e.class}: #{e.message}")
+    skip("Durababble worker runtime schema smoke requires a reachable SQL database at #{database_url}: #{e.class}: #{e.message}")
   ensure
     runtime&.close
   end

@@ -1,5 +1,5 @@
 -- pg_ack_outbox
-UPDATE "durababble_pg_snapshot"."outbox" SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2
+UPDATE "durababble_pg_snapshot"."outbox" SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2 AND locked_until >= now()
 
 -- pg_cancel_live_step_attempts_for_workflow
 UPDATE "durababble_pg_snapshot"."step_attempts"
@@ -30,7 +30,7 @@ SET status = 'canceled', error = 'workflow cancellation requested', updated_at =
 WHERE workflow_id = $1 AND status = 'waiting'
 
 -- pg_cancel_workflow
-UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- pg_cancel_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()
@@ -159,7 +159,9 @@ SET status = 'running', error = NULL, locked_by = $3,
     locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
 WHERE id = $1 AND worker_pool = $2
   AND (
-    status IN ('pending', 'waiting', 'canceling')
+    (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+    OR status = 'waiting'
+    OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
     OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
     OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
   )
@@ -171,7 +173,7 @@ SET status = 'running', error = NULL, locked_by = $3,
     locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
 WHERE id = $1 AND worker_pool = $2
   AND (
-    status = 'pending'
+    (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
     OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
     OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
     OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
@@ -206,7 +208,7 @@ WHERE id IN (
 RETURNING *
 
 -- pg_complete_workflow
-UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM "durababble_pg_snapshot"."steps" WHERE workflow_id = $1 AND status IN ('scheduled', 'running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM "durababble_pg_snapshot"."step_attempts" WHERE workflow_id = $1 AND status IN ('running', 'waiting')) AND NOT EXISTS (SELECT 1 FROM "durababble_pg_snapshot"."waits" WHERE workflow_id = $1 AND status = 'pending')
 
 -- pg_complete_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
@@ -276,11 +278,21 @@ SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THE
   updated_at = now()
 WHERE id = $1
 
+-- pg_fail_live_step_attempts_for_workflow
+UPDATE "durababble_pg_snapshot"."step_attempts"
+SET status = 'failed', error = $2, completed_at = now()
+WHERE workflow_id = $1 AND status = 'running'
+
+-- pg_fail_live_steps_for_workflow
+UPDATE "durababble_pg_snapshot"."steps"
+SET status = 'failed', error = $2, updated_at = now()
+WHERE workflow_id = $1 AND status = 'running'
+
 -- pg_fail_step
 UPDATE "durababble_pg_snapshot"."steps" SET status = 'failed', error = $3, updated_at = now() WHERE workflow_id = $1 AND position = $2
 
 -- pg_fail_workflow
-UPDATE "durababble_pg_snapshot"."workflows" SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status <> 'terminated'
+UPDATE "durababble_pg_snapshot"."workflows" SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- pg_fail_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'failed', error = $2, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
@@ -406,6 +418,7 @@ FOR UPDATE
 SELECT 1 FROM "durababble_pg_snapshot"."target_activations"
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
   AND status = 'running' AND locked_by = $5
+  AND locked_until >= now()
 FOR UPDATE
 
 -- pg_lock_workflow_for_termination
@@ -447,13 +460,14 @@ WHERE id = $1 AND cancel_requested_at IS NOT NULL
 -- pg_mark_workflow_running
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now()
-WHERE id = $1 AND worker_pool = $2
+WHERE id = $1 AND worker_pool = $2 AND status = 'pending' AND locked_by IS NULL
 
 -- pg_mark_workflow_running_with_worker
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, locked_by = $1,
     locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, runnable_immediately = true, updated_at = now()
 WHERE id = $3 AND worker_pool = $4
+  AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- pg_next_workflow_history_event_index
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1

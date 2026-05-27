@@ -77,14 +77,14 @@
 
   {{/* Create unified list of pages and directories sorted by weight */}}
   {{ $allItems := slice }}
-  
+
   {{/* Add individual pages */}}
   {{ range $currentPages }}
     {{ if ne .File.BaseFileName "_index" }}
       {{ $allItems = $allItems | append (dict "type" "page" "weight" (.Params.weight | default 999) "page" .) }}
     {{ end }}
   {{ end }}
-  
+
   {{/* Add subdirectories */}}
   {{ range $subdir, $_ := $subdirs }}
     {{ $subdirPages := slice }}
@@ -105,7 +105,7 @@
       {{ $allItems = $allItems | append (dict "type" "directory" "weight" $weight "name" $subdir "pages" $subdirPages "index" $subdirIndex) }}
     {{ end }}
   {{ end }}
-  
+
   {{/* Render all items sorted by weight */}}
   {{ range sort $allItems "weight" }}
     {{ if eq .type "page" }}

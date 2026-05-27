@@ -9,18 +9,26 @@ module Durababble
     DEFAULT_POLL_INTERVAL = 0.1
     DEFAULT_SHUTDOWN_TIMEOUT = 10
 
-    #: untyped
-    attr_reader :store, :workflows, :objects, :worker_pool, :worker_id, :last_error, :rpc_address
+    #: Store
+    attr_reader :store
+    #: Object
+    attr_reader :workflows, :objects
+    #: String
+    attr_reader :worker_pool, :worker_id
+    #: StandardError?
+    attr_reader :last_error
+    #: String?
+    attr_reader :rpc_address
 
     class << self
-      #: (**untyped) -> untyped
+      #: (**Object?) -> WorkerRuntime
       def start(**kwargs)
         runtime = self #: as untyped
         runtime.new(**kwargs).tap(&:start)
       end
     end
 
-    #: (workflows: untyped, worker_pool: untyped, ?objects: untyped, ?store: untyped, ?database_url: untyped, ?schema: untyped, ?worker_id: untyped, ?lease_seconds: untyped, ?poll_interval: untyped, ?migrate: untyped, ?rpc_host: untyped, ?rpc_port: untyped, ?rpc_credentials: untyped, ?rpc_pool_size: untyped) -> void
+    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
     def initialize(
       workflows:,
       worker_pool:,
@@ -39,10 +47,13 @@ module Durababble
     )
       schema ||= Durababble.default_schema unless store
       raise ArgumentError, "provide either store: or database_url:" unless store || database_url
-      raise ArgumentError, "rpc_host is required" unless rpc_host
-      raise ArgumentError, "rpc_port is required" if rpc_port.nil?
 
-      @store = store || Store.connect(database_url:, schema:)
+      @rpc_host = rpc_host || raise(ArgumentError, "rpc_host is required")
+      @rpc_port = rpc_port.nil? ? raise(ArgumentError, "rpc_port is required") : rpc_port
+
+      database_url = database_url #: as untyped
+      schema = schema #: as untyped
+      @store = store || Store.connect(database_url:, schema:) #: as untyped
       @owns_store = store.nil?
       @workflows = workflows
       @objects = objects
@@ -52,8 +63,6 @@ module Durababble
       @lease_seconds = lease_seconds
       @poll_interval = poll_interval
       @migrate = migrate
-      @rpc_host = rpc_host
-      @rpc_port = rpc_port
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
       # @mutex guards the lifecycle state shared between the control thread and
@@ -75,7 +84,7 @@ module Durababble
       @workflow_rpc_handlers = workflow_rpc_handlers
     end
 
-    #: () -> untyped
+    #: () -> WorkerRuntime
     def start
       @mutex.synchronize do
         return self if running?
@@ -116,7 +125,7 @@ module Durababble
       self
     end
 
-    #: (?timeout: untyped) -> untyped
+    #: (?timeout: Numeric) -> Symbol
     def shutdown(timeout: DEFAULT_SHUTDOWN_TIMEOUT)
       thread = @mutex.synchronize do
         @stopping = true
@@ -147,18 +156,18 @@ module Durababble
 
     alias_method :stop, :shutdown
 
-    #: (?timeout: untyped) -> untyped
+    #: (?timeout: Numeric?) -> Thread?
     def wait(timeout: nil)
       thread = @mutex.synchronize { @thread }
       timeout ? thread&.join(timeout) : thread&.join
     end
 
-    #: () -> untyped
+    #: () -> bool
     def running?
       @thread&.alive? || false
     end
 
-    #: () -> untyped
+    #: () -> void
     def close
       shutdown
       @store.close if @owns_store

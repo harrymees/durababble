@@ -172,6 +172,47 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "atomically records failed retry attempts with retry backoff with #{backend.name}" do
+      with_durababble_store(backend, "step_retry_atomicity") do |store|
+        workflow_id = store.enqueue_workflow(name: "atomic-retry", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 30)
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+        store.record_step_started(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+
+        assert_raises(Durababble::LeaseConflict) do
+          store.record_step_failed_and_schedule_retry(
+            workflow_id:,
+            command_id: 0,
+            error: "RuntimeError: wrong owner",
+            worker_id: "worker-b",
+            run_at: Time.now + 60,
+          )
+        end
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "running"
+        assert_equal ["step_scheduled", "step_started"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+
+        run_at = Time.now + 60
+        store.record_step_failed_and_schedule_retry(
+          workflow_id:,
+          command_id: 0,
+          error: "RuntimeError: retry me",
+          worker_id: "worker-a",
+          run_at:,
+        )
+
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "failed", "error" => "RuntimeError: retry me"
+        retry_row = store.workflow(workflow_id)
+        assert_hash_includes retry_row, "status" => "pending", "locked_by" => nil
+        refute_nil retry_row.fetch("next_run_at")
+        retry_history = store.workflow_history_for(workflow_id)
+        assert_equal ["step_scheduled", "step_started", "step_failed"], retry_history.map { |event| event.fetch("kind") }
+        assert_equal({ "retrying" => true }, retry_history.last.fetch("payload"))
+        assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30)
+        store.make_workflow_due!(workflow_id, now: Time.now)
+        assert_hash_includes store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30), "id" => workflow_id, "locked_by" => "worker-b"
+      end
+    end
+
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
@@ -495,15 +536,102 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
         assert_nil store.claim_target_activation(worker_id: "other", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
 
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker",
+        )
         claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
         assert_equal [first], claimed.map { |message| message.fetch("id") }
         store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
-        store.complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker")
+        assert store.suspend_workflow(workflow_id:, worker_id: "activation-worker")
+        store.complete_target_activation(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          worker_id: "activation-worker",
+        )
 
         rearmed = store.claim_target_activation(worker_id: "activation-worker-2", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
         assert_hash_includes rearmed, "target_id" => workflow_id, "locked_by" => "activation-worker-2"
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker-2", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker-2",
+        )
         remaining = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker-2", lease_seconds: 30, limit: 1)
         assert_equal [second], remaining.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "workflow inbox command writes require a live workflow lease with #{backend.name}" do
+      with_durababble_store(backend, "workflow_inbox_lease_fence") do |store|
+        store.migrate!
+
+        [
+          [
+            "completion",
+            lambda do |workflow_id, message_id|
+              store.complete_workflow_command(
+                message_id:,
+                workflow_id:,
+                result: { "ok" => true },
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+          [
+            "failure",
+            lambda do |workflow_id, message_id|
+              store.fail_workflow_command(
+                message_id:,
+                workflow_id:,
+                error: "boom",
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+        ].each do |operation, write_command|
+          workflow_id = store.enqueue_workflow(name: "approval", input: { "operation" => operation })
+          message_id = store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: operation } },
+          )
+
+          assert_hash_includes(
+            store.claim_target_activation(
+              worker_id: "workflow-owner",
+              lease_seconds: 300,
+              target_kinds: ["workflow"],
+              target_types: ["approval"],
+            ),
+            "target_id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          assert_hash_includes(
+            store.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed_messages = store.claim_inbox_messages(
+            target_kind: "workflow",
+            target_type: "approval",
+            target_id: workflow_id,
+            worker_id: "workflow-owner",
+            lease_seconds: 300,
+          )
+          assert_equal(
+            [message_id],
+            claimed_messages.map { |message| message.fetch("id") },
+          )
+
+          assert_equal 1, store.steal_expired_leases!(now: Time.now + 31)
+          assert_raises(Durababble::LeaseConflict) { write_command.call(workflow_id, message_id) }
+          assert_equal [], store.workflow_history_for(workflow_id)
+          assert_hash_includes store.inbox_message(message_id), "status" => "running", "locked_by" => "workflow-owner"
+        end
       end
     end
 
@@ -820,6 +948,59 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "expired target activation owners cannot complete activations with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_completion_lease") do |store|
+        store.migrate!
+        store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "stale-activation",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-owner",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-owner",
+        )
+        expire_target_activation!(
+          store,
+          backend,
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+        )
+
+        assert_nil store.complete_target_activation(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+          worker_id: "activation-owner",
+        )
+        assert_hash_includes(
+          store.target_activation(target_kind: "object", target_type: "counter", target_id: "stale-activation"),
+          "status" => "running",
+          "locked_by" => "activation-owner",
+        )
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-reclaimer",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-reclaimer",
+        )
+      end
+    end
+
     test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
       with_durababble_store(backend, "inbox_idempotency") do |store|
         store.migrate!
@@ -1012,10 +1193,11 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
       with_durababble_store(backend, "inbox_crash_after_commit") do |store|
         store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
         message_id = store.enqueue_inbox_message(
           target_kind: "workflow",
           target_type: "approval",
-          target_id: "wf-2",
+          target_id: workflow_id,
           message_kind: "workflow_command",
           method_name: "approve",
           payload: { "reason" => "ok" },
@@ -1025,7 +1207,12 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         begin
           assert_hash_includes(recovered.inbox_message(message_id), "status" => "pending")
           assert_equal(1, recovered.inbox_message(message_id).fetch("sequence").to_i)
-          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-2", worker_id: "workflow-owner", lease_seconds: 30)
+          assert_hash_includes(
+            recovered.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "workflow-owner", lease_seconds: 30)
           assert_equal([message_id], claimed.map { |message| message.fetch("id") })
         ensure
           recovered.close
@@ -1223,6 +1410,103 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "unfenced workflow status writes do not mutate terminal rows with #{backend.name}" do
+      with_durababble_store(backend, "terminal_immutability") do |store|
+        completed_id = store.enqueue_workflow(name: "terminal-completed", input: {})
+        store.complete_workflow(completed_id, result: { "done" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completed_id, result: { "done" => false })
+        end
+        store.cancel_workflow(completed_id, reason: "too late")
+        store.fail_workflow(completed_id, error: "too late")
+        store.mark_workflow_running(completed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(completed_id),
+          "status" => "completed",
+          "result" => { "done" => true },
+          "error" => nil,
+          "locked_by" => nil,
+        )
+
+        canceled_id = store.enqueue_workflow(name: "terminal-canceled", input: {})
+        store.cancel_workflow(canceled_id, reason: "operator stop", result: { "cleanup" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(canceled_id, result: { "done" => true })
+        end
+        store.cancel_workflow(canceled_id, reason: "second cancel")
+        store.fail_workflow(canceled_id, error: "too late")
+        store.mark_workflow_running(canceled_id)
+        assert_hash_includes(
+          store.workflow(canceled_id),
+          "status" => "canceled",
+          "result" => { "cleanup" => true },
+          "error" => "operator stop",
+          "locked_by" => nil,
+        )
+
+        failed_id = store.enqueue_workflow(name: "terminal-failed", input: {})
+        store.fail_workflow(failed_id, error: "fatal")
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(failed_id, result: { "done" => true })
+        end
+        store.cancel_workflow(failed_id, reason: "too late")
+        store.fail_workflow(failed_id, error: "different")
+        store.mark_workflow_running(failed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(failed_id),
+          "status" => "failed",
+          "error" => "fatal",
+          "next_run_at" => nil,
+          "locked_by" => nil,
+        )
+      end
+    end
+
+    test "terminal workflow writes do not leave incomplete durable work with #{backend.name}" do
+      with_durababble_store(backend, "terminal_work_cleanup") do |store|
+        completion_id = store.create_workflow(name: "reject-incomplete-complete", input: {})
+        store.record_step_scheduled(workflow_id: completion_id, command_id: 0, name: "not_done")
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completion_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(completion_id), "status" => "running", "result" => nil
+        assert_equal ["scheduled"], store.steps_for(completion_id).map { |step| step.fetch("status") }
+
+        pending_wait_id = store.create_workflow(name: "reject-pending-wait-complete", input: {})
+        store.record_wait(
+          workflow_id: pending_wait_id,
+          command_id: 0,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+        store.record_step_completed(workflow_id: pending_wait_id, command_id: 0, result: { "finished" => true })
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(pending_wait_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(pending_wait_id), "status" => "waiting", "result" => nil
+        assert_equal ["pending"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
+
+        cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
+        store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
+        store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running")
+        store.record_wait(
+          workflow_id: cancel_id,
+          command_id: 2,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+
+        store.cancel_workflow(cancel_id, reason: "operator stop")
+        assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "error" => "operator stop"
+        assert_equal ["canceled", "canceled", "canceled"], store.steps_for(cancel_id).map { |step| step.fetch("status") }
+        assert_equal ["canceled"], store.step_attempts_for(cancel_id).map { |attempt| attempt.fetch("status") }
+        assert_equal ["canceled"], store.waits_for(cancel_id).map { |wait| wait.fetch("status") }
+      end
+    end
+
     test "reclaims expired durable object command leases with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(
@@ -1316,6 +1600,45 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_nil store.claim_object_command(command_id:, worker_id: "other-object-worker", lease_seconds: 30)
         assert_equal 0, mysql_transaction_depth
       end
+    end
+  end
+
+  def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)
+    table = store.send(:table, "target_activations")
+    if backend.sqlite?
+      # SqliteStore stores locked_until as an integer microsecond clock; subtract
+      # 1 hour worth of integer ticks from dura_now() so the comparison matches
+      # the integer clock the translated NOW(6) reads.
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = dura_now() - (3600 * #{store.send(:seconds_scale)})
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [target_kind, target_type, target_id],
+      )
+    elsif backend.mysql?
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = ?
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [expired_at, target_kind, target_type, target_id],
+      )
+    else
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = now() - interval '1 hour'
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SQL
+        [target_kind, target_type, target_id],
+      )
     end
   end
 

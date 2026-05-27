@@ -185,6 +185,16 @@ module Durababble
     #: () -> Time
     def current_time = Time.now
 
+    #: () -> Store
+    def migrate!
+      raise NotImplementedError
+    end
+
+    #: () -> void
+    def drop_schema!
+      raise NotImplementedError
+    end
+
     #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String, ?client_factory: Object?) -> bool
     def deliver_target_message(target_kind:, target_type:, target_id:, worker_pool: "default", client_factory: nil)
       lease = current_target_lease(target_kind:, target_type:, target_id:, worker_pool:)
@@ -224,8 +234,150 @@ module Durababble
       raise NotImplementedError
     end
 
+    #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
+    def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (String) -> Hash[String, Object?]
+    def workflow(workflow_id)
+      raise NotImplementedError
+    end
+
+    #: (String) -> Array[Hash[String, Object?]]
+    def workflow_history_for(workflow_id)
+      raise NotImplementedError
+    end
+
+    #: (String) -> Integer
+    def workflow_history_count_for(workflow_id)
+      raise NotImplementedError
+    end
+
+    #: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]?, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
+    def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (String, result: Object?, ?worker_id: String?) -> Object
+    def complete_workflow(workflow_id, result:, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (String, reason: String?, ?result: Object?, ?worker_id: String?) -> Object
+    def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (String, error: String, ?worker_id: String?) -> Object
+    def fail_workflow(workflow_id, error:, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?worker_id: String?) -> bool
+    def suspend_workflow(workflow_id:, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, reason: Object?) -> Hash[String, Object?]
+    def request_workflow_cancellation(workflow_id:, reason:)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?reason: Object?) -> Hash[String, Object?]
+    def request_workflow_termination(workflow_id:, reason: nil)
+      raise NotImplementedError
+    end
+
+    #: (String) -> Hash[String, Object?]?
+    def workflow_cancellation(workflow_id)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String) -> Object?
+    def mark_workflow_cancellation_delivered(workflow_id:)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, worker_id: String) -> bool
+    def workflow_owned?(workflow_id:, worker_id:)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, result: Object?, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, error: String, worker_id: String, run_at: Time, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: Object?, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?) -> Integer
+    def step_attempt_count_for(workflow_id:, command_id: nil, position: nil)
+      raise NotImplementedError
+    end
+
     #: (object_type: String, object_id: String, method_name: Symbol | String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?, ?worker_pool: String) -> String
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil, worker_pool: "default")
+      # [DURABABBLE-OBJ-1] Inbox commands serialize by target identity: the durable row is
+      # persisted before execution so concurrent enqueues line up behind one lease.
       enqueue_inbox_message(
         worker_pool:,
         target_kind: "object",
@@ -237,6 +389,51 @@ module Durababble
         idempotency_key:,
         max_attempts:,
       )
+    end
+
+    #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time, ?worker_pool: String) -> Array[Hash[String, Object?]]
+    def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (worker_pool: String, workflow_name: String, workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
+      raise NotImplementedError
+    end
+
+    #: (workflow_id: String, workflow_name: String, method_name: String, payload: Object?, ?idempotency_key: String?) -> String
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
+      raise NotImplementedError
+    end
+
+    #: (object_type: String, object_id: String, state: Object?, ?worker_pool: String) -> Object?
+    def save_object_state(object_type:, object_id:, state:, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    #: (command_id: String, result: Object?, ?object_type: String?, ?object_id: String?, ?state: Object?, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> ActiveRecord::Result?
+    def complete_object_command(command_id:, result:, object_type: nil, object_id: nil, state: Store::NO_OBJECT_STATE, wakeup_changes: [], worker_id: nil)
+      raise NotImplementedError
+    end
+
+    #: (command_id: String, error: String, ?worker_id: String?, ?terminal: bool) -> Object?
+    def fail_object_command(command_id:, error:, worker_id: nil, terminal: false)
+      raise NotImplementedError
+    end
+
+    #: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
+    def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+      raise NotImplementedError
+    end
+
+    #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+      raise NotImplementedError
+    end
+
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+      raise NotImplementedError
     end
 
     #: (target_kind: String, target_type: String, target_id: String, ?now: Time, ?worker_pool: String) -> Object?
