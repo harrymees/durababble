@@ -216,18 +216,14 @@ module Durababble
 
     #: (String, ?worker_pool: String?) -> Object?
     def current_workflow_lease(workflow_id, worker_pool: nil)
-      worker_pool_sql = worker_pool ? "AND worker_pool = ?" : ""
-      params = worker_pool ? [workflow_id, worker_pool] : [workflow_id]
-      execute_store_query(:current_workflow_lease, params, worker_pool_sql:).first
+      _ = worker_pool
+      execute_store_query(:current_workflow_lease, [workflow_id]).first
     end
 
     #: (Object?, Object?, ?worker_pool: String?) -> Object?
     def current_object_lease(object_type, object_id, worker_pool: nil)
-      if worker_pool
-        execute_store_query(:current_object_lease_for_worker_pool, [object_type, object_id, worker_pool]).first
-      else
-        execute_store_query(:current_object_lease, [object_type, object_id]).first
-      end
+      _ = worker_pool
+      execute_store_query(:current_object_lease, [object_type, object_id]).first
     end
 
     #: (?now: Time) -> Integer

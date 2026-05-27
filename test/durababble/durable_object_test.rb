@@ -134,6 +134,17 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  class MaterializedMailboxPoolStore < AskWaitStore
+    def initialize(worker_pool)
+      super()
+      @worker_pool = worker_pool
+    end
+
+    def inbox_message(_message_id)
+      { "worker_pool" => @worker_pool }
+    end
+  end
+
   class CleanCommandObject < Durababble::DurableObject
     expose_command def read_only
       "unchanged"
@@ -728,6 +739,16 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal "waited:cmd-2", handle.read_only(idempotency_key: "override-key")
     assert_equal "override-key", store.enqueued.last.fetch(:idempotency_key)
     assert_equal "priority", store.deliveries.last.fetch(:worker_pool)
+  end
+
+  test "durable object commands deliver through the persisted mailbox worker pool" do
+    store = MaterializedMailboxPoolStore.new("materialized")
+    handle = CleanCommandObject.handle("object-1", store:, worker_pool: "requested")
+
+    assert_equal "waited:cmd-1", handle.read_only
+    assert_equal "cmd-2", CleanCommandObject.tell("object-1", :read_only, store:, worker_pool: "requested")
+    assert_equal ["requested", "requested"], store.enqueued.map { |command| command.fetch(:worker_pool) }
+    assert_equal ["materialized", "materialized"], store.deliveries.map { |delivery| delivery.fetch(:worker_pool) }
   end
 
   durababble_store_backends.each do |backend|

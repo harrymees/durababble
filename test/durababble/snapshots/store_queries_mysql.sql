@@ -234,18 +234,10 @@ WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 
 ORDER BY sequence
 LIMIT 1
 
--- mysql_current_object_lease_for_worker_pool
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND worker_pool = ? AND status = 'running'
-  AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-ORDER BY sequence
-LIMIT 1
-
 -- mysql_current_workflow_lease
 SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
 FROM `durababble_mysql_snapshot_workflows`
-WHERE id = ? <worker_pool_sql> AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
 
 -- mysql_dead_letter_inbox_message
 UPDATE `durababble_mysql_snapshot_inbox` SET status = 'dead_lettered', error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = NOW(6), updated_at = NOW(6) WHERE id = ?

@@ -219,18 +219,10 @@ WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status 
 ORDER BY sequence
 LIMIT 1
 
--- pg_current_object_lease_for_worker_pool
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM "durababble_pg_snapshot"."inbox"
-WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND worker_pool = $3 AND status = 'running'
-  AND locked_by IS NOT NULL AND locked_until >= now()
-ORDER BY sequence
-LIMIT 1
-
 -- pg_current_workflow_lease
 SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
 FROM "durababble_pg_snapshot"."workflows"
-WHERE id = $1 <worker_pool_sql> AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
 
 -- pg_dead_letter_inbox_message
 UPDATE "durababble_pg_snapshot"."inbox"

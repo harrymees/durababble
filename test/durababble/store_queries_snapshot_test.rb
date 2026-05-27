@@ -21,7 +21,6 @@ class StoreQueriesSnapshotTest < DurababbleTestCase
     name_sql: "<name_sql>",
     filter_sql: "<filter_sql>",
     name_filter: "<name_filter>",
-    worker_pool_sql: "<worker_pool_sql>",
     placeholders: "<placeholders>",
     limit: 100,
     table_name: "workflows",

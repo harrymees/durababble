@@ -270,11 +270,11 @@ module Durababble
       SQL
     end
 
-    define(:pg_current_workflow_lease, backend: :postgres) do |store, worker_pool_sql: ""|
+    define(:pg_current_workflow_lease, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
         FROM #{table(store, "workflows")}
-        WHERE id = $1 #{worker_pool_sql} AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
+        WHERE id = $1 AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= now()
       SQL
     end
 
@@ -633,11 +633,11 @@ module Durababble
       "SELECT locked_until FROM #{table(store, "workflows")} WHERE id = ?"
     end
 
-    define(:mysql_current_workflow_lease, backend: :mysql) do |store, worker_pool_sql: ""|
+    define(:mysql_current_workflow_lease, backend: :mysql) do |store|
       <<~SQL.chomp
         SELECT id AS workflow_id, worker_pool, locked_by AS worker_id, locked_until
         FROM #{table(store, "workflows")}
-        WHERE id = ? #{worker_pool_sql} AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        WHERE id = ? AND status = 'running' AND locked_by IS NOT NULL AND locked_until >= NOW(6)
       SQL
     end
 
@@ -858,17 +858,6 @@ module Durababble
         SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
         FROM #{table(store, "inbox")}
         WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= now()
-        ORDER BY sequence
-        LIMIT 1
-      SQL
-    end
-
-    define(:pg_current_object_lease_for_worker_pool, backend: :postgres) do |store|
-      <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = $1 AND target_id = $2 AND worker_pool = $3 AND status = 'running'
           AND locked_by IS NOT NULL AND locked_until >= now()
         ORDER BY sequence
         LIMIT 1
@@ -1416,17 +1405,6 @@ module Durababble
         SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
         FROM #{table(store, "inbox")}
         WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-        ORDER BY sequence
-        LIMIT 1
-      SQL
-    end
-
-    define(:mysql_current_object_lease_for_worker_pool, backend: :mysql) do |store|
-      <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND worker_pool = ? AND status = 'running'
           AND locked_by IS NOT NULL AND locked_until >= NOW(6)
         ORDER BY sequence
         LIMIT 1

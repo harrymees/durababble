@@ -956,7 +956,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "does not advisory-deliver object messages across worker pools with #{backend.name}" do
+    test "advisory-delivers object messages through the active lease worker pool with #{backend.name}" do
       with_durababble_store(backend, "object_advisory_delivery_worker_pool") do |store|
         message_id = store.enqueue_inbox_message(
           worker_pool: "pool-a",
@@ -981,29 +981,17 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal [message_id], claimed.map { |message| message.fetch("id") }
 
         wrong_client = AdvisoryDeliveryClient.new
-        wrong_delivered = store.deliver_target_message(
+        delivered = store.deliver_target_message(
           worker_pool: "pool-b",
-          target_kind: "object",
-          target_type: "counter",
-          target_id: "same",
-          client_factory: ->(_address) { wrong_client },
-        )
-        assert_equal false, wrong_delivered
-        assert_empty wrong_client.deliveries
-
-        right_client = AdvisoryDeliveryClient.new
-        right_delivered = store.deliver_target_message(
-          worker_pool: "pool-a",
           target_kind: "object",
           target_type: "counter",
           target_id: "same",
           client_factory: lambda do |address|
             assert_equal("127.0.0.1:34567", address)
-            right_client
+            wrong_client
           end,
         )
-
-        assert_equal true, right_delivered
+        assert_equal true, delivered
         assert_equal(
           [
             {
@@ -1014,7 +1002,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
               expected_worker_id: worker_id,
             },
           ],
-          right_client.deliveries,
+          wrong_client.deliveries,
         )
       end
     end

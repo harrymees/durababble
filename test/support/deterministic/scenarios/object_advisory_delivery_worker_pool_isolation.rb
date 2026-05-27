@@ -36,15 +36,8 @@ module Durababble
           end
           factory = ->(_address) { client }
 
-          wrong_pool_delivered = h.store.deliver_target_message(
+          delivered = h.store.deliver_target_message(
             worker_pool: "pool-b",
-            target_kind: "object",
-            target_type: "counter",
-            target_id: "shared-object",
-            client_factory: factory,
-          )
-          right_pool_delivered = h.store.deliver_target_message(
-            worker_pool: "pool-a",
             target_kind: "object",
             target_type: "counter",
             target_id: "shared-object",
@@ -56,16 +49,12 @@ module Durababble
             "mailbox",
             "object_delivery_pool_scope",
             claimed: claimed.map { |row| row.fetch("id") },
-            wrong_pool_delivered:,
-            right_pool_delivered:,
+            delivered:,
             deliveries: deliveries.map { |delivery| delivery.fetch(:worker_pool) },
           )
 
-          h.check("object advisory delivery ignores a lease from another worker pool") do
-            !wrong_pool_delivered && deliveries.none? { |delivery| delivery.fetch(:worker_pool) == "pool-b" }
-          end
-          h.check("object advisory delivery still reaches the active pool lease") do
-            right_pool_delivered && deliveries.map { |delivery| delivery.fetch(:worker_pool) } == ["pool-a"]
+          h.check("object advisory delivery uses the active lease worker pool") do
+            delivered && deliveries.map { |delivery| delivery.fetch(:worker_pool) } == ["pool-a"]
           end
           h.check("object delivery used the claimed inbox lease") do
             claimed.map { |row| row.fetch("id") } == [message_id]

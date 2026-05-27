@@ -682,12 +682,12 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_includes result.trace, "right_pool_claim"
   end
 
-  test "keeps object advisory delivery scoped to worker pool" do
+  test "routes object advisory delivery through the active worker pool" do
     result = Durababble::Deterministic.prove("object_advisory_delivery_worker_pool_isolation", seed: 1)
 
     assert_empty result.violations
     assert_includes result.trace, "object_delivery_pool_scope"
-    assert_includes result.trace, "wrong_pool_delivered=false"
+    assert_includes result.trace, "delivered=true"
     assert_includes result.trace, 'deliveries=["pool-a"]'
   end
 

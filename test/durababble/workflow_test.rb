@@ -487,6 +487,26 @@ class DurababbleWorkflowTest < DurababbleTestCase
       end
     end
 
+    test "exposed workflow queries route RPC clients with the active lease worker pool for #{backend.name}" do
+      with_durababble_store(backend, "workflow_query_lease_pool") do |store|
+        store.migrate!
+        workflow_id = store.enqueue_workflow(
+          name: ApiTestQueryableWorkflow.workflow_name,
+          input: { "state" => "pool" },
+          worker_pool: "priority",
+        )
+        store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 60, worker_pool: "priority")
+        pools = []
+        store.workflow_rpc_client_factory = lambda do |_address, worker_pool:|
+          pools << worker_pool
+          WorkflowQueryFakeClient.new { |_command, _payload| { "pool" => worker_pool } }
+        end
+
+        assert_equal({ "pool" => "priority" }, ApiTestQueryableWorkflow.handle(workflow_id, store:, worker_pool: "stale").snapshot(prefix: "pool"))
+        assert_equal ["priority"], pools
+      end
+    end
+
     test "exposed workflow query bodies cannot schedule workflow steps or waits with #{backend.name}" do
       with_durababble_store(backend, "workflow_query_durable_boundary_guard") do |store|
         store.migrate!

@@ -77,7 +77,7 @@ module Durababble
   end
 
   interface _WorkflowRpcRouteClientFactory
-    def call: (String worker_id) -> _RpcRequester
+    def call: (String worker_id, worker_pool: String) -> _RpcRequester
   end
 
   interface _LeaseStarter
