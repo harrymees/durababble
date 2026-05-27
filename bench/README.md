@@ -1,6 +1,6 @@
 # Durababble benchmark suite
 
-Durababble uses a purpose-built macro benchmark harness for storage and coordination performance, plus notes from the Ruby benchmarking ecosystem:
+Durababble uses a purpose-built macrobenchmark harness for storage and coordination performance, plus notes from the Ruby benchmarking ecosystem:
 
 - `benchmark-ips` is excellent for microbenchmarks because it automatically chooses iteration counts and reports variance.
 - `benchmark-driver` is the modern low-overhead Ruby benchmarking driver; it can run generated benchmark scripts, repeat runs, and emit machine-readable records.

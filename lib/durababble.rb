@@ -5,12 +5,12 @@ require "digest"
 require "logger"
 
 require_relative "durababble/version"
+require_relative "durababble/defaults"
 require_relative "durababble/statuses"
 require_relative "durababble/observability"
 require_relative "durababble/backoff"
 
 module Durababble
-  DEFAULT_DATABASE_URL = "mysql://root@127.0.0.1:3306/sidekick_server_development"
   DEFAULT_SCHEMA_PREFIX = "durababble"
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
   DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000
@@ -49,14 +49,19 @@ module Durababble
   class ConfigurationError < Error; end
   class InjectedCrash < Error; end
   class LeaseConflict < Error; end
+
+  # DeterminismError rejects unsafe host APIs during the current workflow run;
+  # NonDeterminismError rejects replay divergence from already persisted history.
   class DeterminismError < Error; end
   class NonDeterminismError < DeterminismError; end
 
   class WorkflowHistoryLimitExceeded < Error
-    #: untyped
-    attr_reader :workflow_id, :history_events, :max_history_events
+    #: String
+    attr_reader :workflow_id
+    #: Integer
+    attr_reader :history_events, :max_history_events
 
-    #: (untyped, history_events: Integer, max_history_events: Integer) -> void
+    #: (String, history_events: Integer, max_history_events: Integer) -> void
     def initialize(workflow_id, history_events:, max_history_events:)
       @workflow_id = workflow_id
       @history_events = history_events
@@ -80,7 +85,7 @@ module Durababble
     #: Integer
     attr_reader :max_bytes
 
-    #: (Symbol | String surface, bytesize: Integer, max_bytes: Integer, ?context: String?) -> void
+    #: (Symbol | String, bytesize: Integer, max_bytes: Integer, ?context: String?) -> void
     def initialize(surface, bytesize:, max_bytes:, context: nil)
       @surface = surface.to_sym
       @context = context
@@ -125,22 +130,22 @@ module Durababble
     #: untyped
     attr_writer :workflow_history_warning_events
 
-    #: (Store?) -> Engine?
+    #: (Store?) -> Store?
     def default_store=(store)
-      @default_store = store
       @default_engine = store ? Engine.new(store:) : nil
+      @default_store = store
     end
 
-    #: (Engine?) -> Store?
+    #: (Engine?) -> Engine?
     def default_engine=(engine)
+      typed_engine = engine #: as untyped
+      @default_store = typed_engine&.store
       @default_engine = engine
-      engine = engine #: as untyped
-      @default_store = engine&.store
     end
 
     #: () -> String
     def default_database_url
-      ENV.fetch("DURABABBLE_DATABASE_URL", DEFAULT_DATABASE_URL)
+      ENV.fetch("DURABABBLE_DATABASE_URL", Defaults::DATABASE_URL)
     end
 
     #: () -> String
@@ -203,7 +208,7 @@ module Durababble
       @logger = Logger.new($stderr).tap { |logger| logger.level = Logger::WARN }
     end
 
-    #: (workflow_id: untyped, history_events: Integer, max_history_events: Integer) -> bool
+    #: (workflow_id: String, history_events: Integer, max_history_events: Integer) -> bool
     def warn_workflow_history_events(workflow_id:, history_events:, max_history_events:)
       warning_events = workflow_history_warning_events
       return false if history_events < warning_events
