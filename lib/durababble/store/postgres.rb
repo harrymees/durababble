@@ -205,67 +205,35 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      transaction do
-        update = if worker_id
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow completion") do
+        if worker_id
           execute_store_query(:complete_workflow_with_worker, [workflow_id, serialized_result, worker_id])
         else
           execute_store_query(:complete_workflow, [workflow_id, serialized_result])
         end
-        require_fenced_workflow_update!(update, workflow_id:, worker_id:, operation: "workflow completion")
-        # A control-flow wait_condition / wait_until satisfied by a delivered
-        # workflow command (rather than by its timer firing) returns control to
-        # execute while its recorded timer wait + waiting step are left behind:
-        # the command supersedes the wait, so nothing ever completes it. If the
-        # workflow then runs to completion, that live wait/step would strand on a
-        # terminal workflow. Terminalize it in the same transaction, exactly as
-        # cancellation/failure/termination do (the timer-firing path instead
-        # completes the wait+step before the workflow finishes, so this is a no-op
-        # there).
-        cancel_live_workflow_dependents(workflow_id)
-        update
       end
     end
 
     #: (String, reason: String, ?result: Object?, ?worker_id: String?) -> Object
     def cancel_workflow(workflow_id, reason:, result: nil, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:, context: "cancellation result")
-      transaction do
-        result_set = if worker_id
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow cancellation") do
+        if worker_id
           execute_store_query(:cancel_workflow_with_worker, [workflow_id, serialized_result, reason, worker_id])
         else
           execute_store_query(:cancel_workflow, [workflow_id, serialized_result, reason])
         end
-        require_fenced_workflow_update!(result_set, workflow_id:, worker_id:, operation: "workflow cancellation")
-        # Terminalize any live wait/step/attempt the workflow still carries. When a
-        # cancellation was requested while the workflow was still running -- before
-        # its step suspended -- the request-time cleanup found nothing to cancel
-        # (the wait/step/attempt did not exist yet), and the step then recorded its
-        # wait and suspended into 'canceling'. Finalization here is the one place
-        # guaranteed to leave a clean terminal, so it repeats the idempotent,
-        # status-gated cleanup that the cancellation request runs.
-        cancel_live_workflow_dependents(workflow_id)
-        result_set
       end
     end
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      transaction do
-        result_set = if worker_id
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+        if worker_id
           execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
         else
           execute_store_query(:fail_workflow, [workflow_id, error])
         end
-        require_fenced_workflow_update!(result_set, workflow_id:, worker_id:, operation: "workflow failure")
-        # fail_workflow is the final-failure path (it clears next_run_at, so the row
-        # is terminal and is never resumed). A parallel branch may still be parked on
-        # a wait at this point -- a live wait/step/attempt that the workflow will now
-        # never drive to completion. Terminalize it in the same transaction so the
-        # failed workflow lands clean, exactly as cancellation and termination do
-        # (an abandoned parked branch is terminalized as 'canceled'; the real failure
-        # lives on the workflow's own error column).
-        cancel_live_workflow_dependents(workflow_id)
-        result_set
       end
     end
 
@@ -483,20 +451,6 @@ module Durababble
       workflow_id
     rescue ActiveRecord::RecordNotUnique
       raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
-    end
-
-    #: (String) -> Object?
-    def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
-      execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
-    end
-
-    #: (String) -> Object?
-    def cancel_live_workflow_dependents(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
-      execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
-      execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
     end
 
     #: (String, error: String) -> void

@@ -429,6 +429,33 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
     end
 
+    # Terminal workflow writes have one shared postcondition: if the update was
+    # made by a leased worker it must still own the row, and the workflow must
+    # not strand live waits, steps, or attempts after becoming terminal.
+    #: (workflow_id: String, worker_id: String?, operation: String) { () -> Object? } -> Object?
+    def finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation:)
+      transaction do
+        result = yield
+        require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)
+        cancel_live_workflow_dependents(workflow_id)
+        result
+      end
+    end
+
+    #: (String) -> Object?
+    def cancel_pending_waits_for_workflow(workflow_id)
+      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
+      execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
+      execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
+    end
+
+    #: (String) -> Object?
+    def cancel_live_workflow_dependents(workflow_id)
+      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
+      execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
+      execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
+    end
+
     #: (terminal: bool, error_class: String?, error_message: String?) -> Hash[String, Object?]?
     def step_failure_payload(terminal:, error_class:, error_message:)
       return unless terminal
