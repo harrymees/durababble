@@ -468,17 +468,17 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def grpc_workflow_rpc_response_matrix(seed)
-        run(seed, "grpc_workflow_rpc_response_matrix") do |h|
+      def rpc_workflow_rpc_response_matrix(seed)
+        run(seed, "rpc_workflow_rpc_response_matrix") do |h|
           moved_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.claim_workflow(workflow_id: moved_id, worker_id: "worker-a", lease_seconds: 10)
-          worker_a = grpc_workflow_rpc_client(h, "worker-a") do |payload|
+          worker_a = rpc_workflow_rpc_client(h, "worker-a") do |payload|
             h.store.steal_expired_leases!(now: 11)
             h.store.claim_workflow(workflow_id: moved_id, worker_id: "worker-b", lease_seconds: 60)
             workflow_rpc_handler(h, "worker-a").call(payload)
           end
-          worker_b = grpc_workflow_rpc_client(h, "worker-b") do |payload|
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.retry_success", target: "worker-b")
+          worker_b = rpc_workflow_rpc_client(h, "worker-b") do |payload|
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.retry_success", target: "worker-b")
             workflow_rpc_handler(h, "worker-b").call(payload)
           end
           moved_router = Durababble::WorkflowRpc::Router.new(
@@ -486,7 +486,7 @@ module Durababble
             rpc_clients: { "worker-a" => worker_a, "worker-b" => worker_b },
             retry_on_stale: true,
           )
-          h.scheduler.schedule(actor: "caller", delay: 5, name: "grpc_workflow_rpc") do
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "rpc_workflow_rpc") do
             moved_router.request(workflow_id: moved_id, command: "status", payload: { "request" => seed })
           end
 
@@ -496,7 +496,7 @@ module Durababble
           unavailable_client.define_singleton_method(:request) do |command, _payload|
             raise Durababble::WorkflowRpc::UnknownCommand, command unless command == "workflow_rpc"
 
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.unavailable", target: "worker-a")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.unavailable", target: "worker-a")
             raise Durababble::WorkflowRpc::NodeUnavailable, "worker-a unavailable"
           end
           unavailable_router = Durababble::WorkflowRpc::Router.new(
@@ -504,39 +504,39 @@ module Durababble
             rpc_clients: { "worker-a" => unavailable_client },
             retry_on_stale: false,
           )
-          h.scheduler.schedule(actor: "caller", delay: 1, name: "grpc_unavailable") do
+          h.scheduler.schedule(actor: "caller", delay: 1, name: "rpc_unavailable") do
             unavailable_router.request(workflow_id: unavailable_id, command: "status", payload: {})
           rescue Durababble::WorkflowRpc::NodeUnavailable
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.node_unavailable_observed")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.node_unavailable_observed")
           end
 
           not_running_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed + 2 })
-          worker_b = grpc_workflow_rpc_client(h, "worker-b")
-          h.scheduler.schedule(actor: "caller", delay: 15, name: "grpc_not_running") do
+          worker_b = rpc_workflow_rpc_client(h, "worker-b")
+          h.scheduler.schedule(actor: "caller", delay: 15, name: "rpc_not_running") do
             worker_b.request("workflow_rpc", {
               "workflow_id" => not_running_id,
               "command" => "status",
               "payload" => {},
             })
           rescue Durababble::WorkflowRpc::NoActiveLease
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.not_running_observed")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.not_running_observed")
           end
-          h.check("gRPC CallTransient was used") { h.scheduler.trace.to_s.include?("grpc.call_transient") }
-          h.check("gRPC moved response was emitted") { h.scheduler.trace.to_s.include?("grpc.lease_moved") }
-          h.check("gRPC moved response decoded as stale lease") { h.scheduler.trace.to_s.include?("grpc.decode_moved") }
-          h.check("gRPC retry reached the new owner") { h.scheduler.trace.to_s.include?("grpc.retry_success") }
-          h.check("gRPC unavailable surfaced as node unavailable") do
-            h.scheduler.trace.to_s.include?("grpc.node_unavailable_observed")
+          h.check("RPC CallTransient was used") { h.scheduler.trace.to_s.include?("rpc.call_transient") }
+          h.check("RPC moved response was emitted") { h.scheduler.trace.to_s.include?("rpc.lease_moved") }
+          h.check("RPC moved response decoded as stale lease") { h.scheduler.trace.to_s.include?("rpc.decode_moved") }
+          h.check("RPC retry reached the new owner") { h.scheduler.trace.to_s.include?("rpc.retry_success") }
+          h.check("RPC unavailable surfaced as node unavailable") do
+            h.scheduler.trace.to_s.include?("rpc.node_unavailable_observed")
           end
-          h.check("gRPC not_running response decoded as no active lease") do
-            h.scheduler.trace.to_s.include?("grpc.not_running_observed")
+          h.check("RPC not_running response decoded as no active lease") do
+            h.scheduler.trace.to_s.include?("rpc.not_running_observed")
           end
         end
       end
 
       #: (untyped) -> untyped
-      def grpc_workflow_rpc_transport_fault_matrix(seed)
-        run(seed, "grpc_workflow_rpc_transport_fault_matrix") do |h|
+      def rpc_workflow_rpc_transport_fault_matrix(seed)
+        run(seed, "rpc_workflow_rpc_transport_fault_matrix") do |h|
           faults = [
             "timeout",
             "deadline_exceeded",
@@ -552,9 +552,9 @@ module Durababble
             id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed + index })
             node_id = "worker-#{index}"
             h.store.claim_workflow(workflow_id: id, worker_id: node_id, lease_seconds: 60)
-            client = grpc_workflow_rpc_client(h, node_id, faults: [fault]) do |payload|
+            client = rpc_workflow_rpc_client(h, node_id, faults: [fault]) do |payload|
               handler_calls[fault] += 1
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.handler", fault:, target: node_id)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.handler", fault:, target: node_id)
               workflow_rpc_handler(h, node_id).call(payload)
             end
             router = Durababble::WorkflowRpc::Router.new(
@@ -562,23 +562,23 @@ module Durababble
               rpc_clients: { node_id => client },
               retry_on_stale: true,
             )
-            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "grpc_fault:#{fault}") do
+            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "rpc_fault:#{fault}") do
               router.request(workflow_id: id, command: "status", payload: { "fault" => fault })
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.transport_retry_success", fault:)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.transport_retry_success", fault:)
             end
           end
 
-          h.check("timeout transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.timeout") }
-          h.check("deadline transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.deadline_exceeded") }
-          h.check("RST transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.rst") }
-          h.check("EOF transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.eof") }
-          h.check("unavailable transport fault was injected") { h.scheduler.trace.to_s.include?("grpc.unavailable") }
+          h.check("timeout transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.timeout") }
+          h.check("deadline transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.deadline_exceeded") }
+          h.check("RST transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.rst") }
+          h.check("EOF transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.eof") }
+          h.check("unavailable transport fault was injected") { h.scheduler.trace.to_s.include?("rpc.unavailable") }
           h.check("response-timeout fault was injected after handler execution") do
-            h.scheduler.trace.to_s.include?("grpc.response_timeout")
+            h.scheduler.trace.to_s.include?("rpc.response_timeout")
           end
-          h.check("duplicate response delivery was modeled") { h.scheduler.trace.to_s.include?("grpc.duplicate_response") }
+          h.check("duplicate response delivery was modeled") { h.scheduler.trace.to_s.include?("rpc.duplicate_response") }
           h.check("each transport fault retried to success") do
-            h.scheduler.trace.to_s.scan("grpc.transport_retry_success").length == faults.length
+            h.scheduler.trace.to_s.scan("rpc.transport_retry_success").length == faults.length
           end
           h.check("lost response can duplicate a transient handler invocation") do
             handler_calls["response_timeout"] == 2
@@ -590,8 +590,8 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def grpc_workflow_rpc_transport_fault_reroute(seed)
-        run(seed, "grpc_workflow_rpc_transport_fault_reroute") do |h|
+      def rpc_workflow_rpc_transport_fault_reroute(seed)
+        run(seed, "rpc_workflow_rpc_transport_fault_reroute") do |h|
           faults = ["timeout", "deadline_exceeded", "connection_reset", "eof", "unavailable"]
 
           faults.each_with_index do |fault, index|
@@ -600,15 +600,15 @@ module Durababble
             new_owner = "new-owner-#{index}"
             h.store.claim_workflow(workflow_id: id, worker_id: old_owner, lease_seconds: 10)
             old_client = Object.new
-            transport_fault = method(:grpc_transport_fault!)
+            transport_fault = method(:rpc_transport_fault!)
             old_client.define_singleton_method(:request) do |command, _payload|
               raise Durababble::WorkflowRpc::UnknownCommand, command unless command == "workflow_rpc"
 
               h.store.mark_workflow_running(id, worker_id: new_owner, lease_seconds: 60)
               transport_fault.call(h, fault, target: old_owner)
             end
-            new_client = grpc_workflow_rpc_client(h, new_owner) do |payload|
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.transport_reroute_success", fault:)
+            new_client = rpc_workflow_rpc_client(h, new_owner) do |payload|
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.transport_reroute_success", fault:)
               workflow_rpc_handler(h, new_owner).call(payload)
             end
             router = Durababble::WorkflowRpc::Router.new(
@@ -616,13 +616,13 @@ module Durababble
               rpc_clients: { old_owner => old_client, new_owner => new_client },
               retry_on_stale: true,
             )
-            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "grpc_reroute:#{fault}") do
+            h.scheduler.schedule(actor: "caller", delay: index * 4, name: "rpc_reroute:#{fault}") do
               router.request(workflow_id: id, command: "status", payload: { "fault" => fault })
             end
           end
 
           h.check("transport failures caused fresh lease lookups and reroutes") do
-            h.scheduler.trace.to_s.scan("grpc.transport_reroute_success").length == faults.length
+            h.scheduler.trace.to_s.scan("rpc.transport_reroute_success").length == faults.length
           end
           h.check("reroute matrix included timeout") { h.scheduler.trace.to_s.include?("fault=\"timeout\"") }
           h.check("reroute matrix included RST") { h.scheduler.trace.to_s.include?("fault=\"connection_reset\"") }
@@ -631,8 +631,8 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def grpc_wakeup_fault_matrix(seed)
-        run(seed, "grpc_wakeup_fault_matrix") do |h|
+      def rpc_wakeup_fault_matrix(seed)
+        run(seed, "rpc_wakeup_fault_matrix") do |h|
           h.workflows["counter"] = counter_workflow
           active_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           recovery_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed + 1 })
@@ -661,12 +661,12 @@ module Durababble
           ].rotate(h.scheduler.rng.int(7))
 
           operations.each_with_index do |(method_name, fault), index|
-            h.scheduler.schedule(actor: "caller", delay: index * 3, name: "grpc_wakeup:#{method_name}:#{fault}") do
-              grpc_faulty_unary(h, method_name, target: "worker-a", fault:) do
-                call_grpc_service_method(service, method_name, workflow_id: active_id)
+            h.scheduler.schedule(actor: "caller", delay: index * 3, name: "rpc_wakeup:#{method_name}:#{fault}") do
+              rpc_faulty_unary(h, method_name, target: "worker-a", fault:) do
+                call_rpc_service_method(service, method_name, workflow_id: active_id)
               end
             rescue Durababble::WorkflowRpc::NodeUnavailable
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.wakeup_fault_observed", method: method_name, fault:)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.wakeup_fault_observed", method: method_name, fault:)
             end
           end
 
@@ -674,9 +674,9 @@ module Durababble
           h.scheduler.schedule(actor: "reaper", delay: 80, name: "release_active_for_recovery") do
             h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
           end
-          h.check("wakeup drop was injected") { h.scheduler.trace.to_s.include?("grpc.drop") }
-          h.check("wakeup duplicate was injected") { h.scheduler.trace.to_s.include?("grpc.duplicate") }
-          h.check("wakeup timeout was observed") { h.scheduler.trace.to_s.include?("grpc.wakeup_fault_observed") }
+          h.check("wakeup drop was injected") { h.scheduler.trace.to_s.include?("rpc.drop") }
+          h.check("wakeup duplicate was injected") { h.scheduler.trace.to_s.include?("rpc.duplicate") }
+          h.check("wakeup timeout was observed") { h.scheduler.trace.to_s.include?("rpc.wakeup_fault_observed") }
           h.check("polling completed workflow despite wakeup transport faults") do
             h.store.workflow(recovery_id).fetch("status") == "completed"
           end
@@ -688,8 +688,8 @@ module Durababble
       end
 
       #: (untyped) -> untyped
-      def grpc_service_contract(seed)
-        run(seed, "grpc_service_contract") do |h|
+      def rpc_service_contract(seed)
+        run(seed, "rpc_service_contract") do |h|
           id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.claim_workflow(workflow_id: id, worker_id: "worker-a", lease_seconds: 10)
           events = []
@@ -706,38 +706,38 @@ module Durababble
             deliver_message: ->(**event) { events << [:deliver_message, event] },
           )
 
-          h.scheduler.schedule(actor: "caller", delay: 1, name: "grpc_awaken_batch") do
+          h.scheduler.schedule(actor: "caller", delay: 1, name: "rpc_awaken_batch") do
             service.awaken_batch(
-              Durababble::Rpc::Proto::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: [id]),
+              Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: [id]),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.awaken_batch")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.awaken_batch")
           end
-          h.scheduler.schedule(actor: "caller", delay: 2, name: "grpc_evict_lease") do
+          h.scheduler.schedule(actor: "caller", delay: 2, name: "rpc_evict_lease") do
             service.evict_lease(
-              Durababble::Rpc::Proto::EvictLeaseRequest.new(
+              Durababble::Rpc::Messages::EvictLeaseRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
               ),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.evict_lease")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.evict_lease")
           end
-          h.scheduler.schedule(actor: "caller", delay: 3, name: "grpc_deliver_message") do
+          h.scheduler.schedule(actor: "caller", delay: 3, name: "rpc_deliver_message") do
             service.deliver_message(
-              Durababble::Rpc::Proto::DeliverMessageRequest.new(
+              Durababble::Rpc::Messages::DeliverMessageRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
               ),
               nil,
             )
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.deliver_message")
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.deliver_message")
           end
-          h.scheduler.schedule(actor: "caller", delay: 4, name: "grpc_call_transient") do
+          h.scheduler.schedule(actor: "caller", delay: 4, name: "rpc_call_transient") do
             response = service.call_transient(
-              Durababble::Rpc::Proto::TransientRequest.new(
+              Durababble::Rpc::Messages::TransientRequest.new(
                 worker_pool: "default",
                 workflow_id: id,
                 method: "status",
@@ -746,28 +746,28 @@ module Durababble
               nil,
             )
             decoded = Durababble::Rpc::Client.decode_transient_response(response)
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.call_transient_ok", decoded:)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.call_transient_ok", decoded:)
           end
-          h.scheduler.schedule(actor: "caller", delay: 5, name: "grpc_call_object_transient") do
+          h.scheduler.schedule(actor: "caller", delay: 5, name: "rpc_call_object_transient") do
             response = service.call_transient(
-              Durababble::Rpc::Proto::TransientRequest.new(
+              Durababble::Rpc::Messages::TransientRequest.new(
                 worker_pool: "default",
                 class_name: "Counter",
-                object_id: "counter-1",
+                durable_object_id: "counter-1",
                 method: "balance",
                 args: Durababble::Rpc.dump({ "seed" => seed }),
               ),
               nil,
             )
             decoded = Durababble::Rpc::Client.decode_transient_response(response)
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.call_object_transient_ok", decoded:)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.call_object_transient_ok", decoded:)
           end
-          h.scheduler.schedule(actor: "caller", delay: 6, name: "grpc_stale_deliver_message") do
+          h.scheduler.schedule(actor: "caller", delay: 6, name: "rpc_stale_deliver_message") do
             before = events.length
             h.store.steal_expired_leases!(now: 11)
             h.store.claim_workflow(workflow_id: id, worker_id: "worker-b", lease_seconds: 60)
             service.deliver_message(
-              Durababble::Rpc::Proto::DeliverMessageRequest.new(
+              Durababble::Rpc::Messages::DeliverMessageRequest.new(
                 worker_pool: "default",
                 target_kind: "workflow",
                 target_id: id,
@@ -776,19 +776,19 @@ module Durababble
             )
             h.scheduler.trace.event(
               h.scheduler.time,
-              "grpc",
-              events.length == before ? "grpc.deliver_message_stale_ack" : "grpc.deliver_message_stale_work",
+              "rpc",
+              events.length == before ? "rpc.deliver_message_stale_ack" : "rpc.deliver_message_stale_work",
             )
           end
-          h.check("AwakenBatch was served") { h.scheduler.trace.to_s.include?("grpc.awaken_batch") }
-          h.check("EvictLease was served") { h.scheduler.trace.to_s.include?("grpc.evict_lease") }
-          h.check("DeliverMessage was served for the active owner") { h.scheduler.trace.to_s.include?("grpc.deliver_message") }
-          h.check("CallTransient decoded a workflow response") { h.scheduler.trace.to_s.include?("grpc.call_transient_ok") }
+          h.check("AwakenBatch was served") { h.scheduler.trace.to_s.include?("rpc.awaken_batch") }
+          h.check("EvictLease was served") { h.scheduler.trace.to_s.include?("rpc.evict_lease") }
+          h.check("DeliverMessage was served for the active owner") { h.scheduler.trace.to_s.include?("rpc.deliver_message") }
+          h.check("CallTransient decoded a workflow response") { h.scheduler.trace.to_s.include?("rpc.call_transient_ok") }
           h.check("CallTransient decoded an object response") do
-            h.scheduler.trace.to_s.include?("grpc.call_object_transient_ok")
+            h.scheduler.trace.to_s.include?("rpc.call_object_transient_ok")
           end
           h.check("stale DeliverMessage returned without doing work") do
-            h.scheduler.trace.to_s.include?("grpc.deliver_message_stale_ack")
+            h.scheduler.trace.to_s.include?("rpc.deliver_message_stale_ack")
           end
         end
       end
@@ -805,17 +805,17 @@ module Durababble
       end
 
       #: (untyped, untyped, ?faults: untyped) { (?) -> untyped } -> untyped
-      def grpc_workflow_rpc_client(h, node_id, faults: [], &block)
+      def rpc_workflow_rpc_client(h, node_id, faults: [], &block)
         fault_queue = faults.dup
-        transport_fault = method(:grpc_transport_fault!)
-        workflow_response = method(:grpc_workflow_rpc_response)
-        remote_error_response = method(:grpc_remote_error_response)
+        transport_fault = method(:rpc_transport_fault!)
+        workflow_response = method(:rpc_workflow_rpc_response)
+        remote_error_response = method(:rpc_remote_error_response)
         handler_for = method(:workflow_rpc_handler)
         Object.new.tap do |client|
           client.define_singleton_method(:request) do |command, payload|
             raise Durababble::WorkflowRpc::UnknownCommand, command unless command == "workflow_rpc"
 
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.call_transient", target: node_id)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.call_transient", target: node_id)
             server_payload = {
               "workflow_id" => payload.fetch("workflow_id"),
               "expected_worker_id" => node_id,
@@ -834,27 +834,27 @@ module Durababble
             }
             response = workflow_response.call(response_context, server_payload)
             if fault == "duplicate_response"
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.duplicate_response", target: node_id)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.duplicate_response", target: node_id)
               workflow_response.call(response_context, server_payload)
             end
             if fault == "response_timeout"
-              h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.response_timeout", target: node_id)
+              h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.response_timeout", target: node_id)
               raise Durababble::WorkflowRpc::NodeUnavailable, "#{node_id} response timed out"
             end
 
             Durababble::Rpc::Client.decode_transient_response(response)
           rescue Durababble::WorkflowRpc::StaleLease
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.decode_moved", target: node_id)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.decode_moved", target: node_id)
             raise
           rescue Durababble::WorkflowRpc::NoActiveLease
-            h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.decode_not_running", target: node_id)
+            h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.decode_not_running", target: node_id)
             raise
           end
         end
       end
 
       #: (untyped, untyped) -> untyped
-      def grpc_workflow_rpc_response(context, payload)
+      def rpc_workflow_rpc_response(context, payload)
         h = context.fetch(:h)
         node_id = context.fetch(:node_id)
         workflow_id = context.fetch(:workflow_id)
@@ -863,22 +863,22 @@ module Durababble
         remote_error_response = context.fetch(:remote_error_response)
 
         result = handler_block ? handler_block.call(payload) : handler_for.call(h, node_id).call(payload)
-        Durababble::Rpc::Proto::TransientResponse.new(ok: Durababble::Rpc.dump(result))
+        Durababble::Rpc::Messages::TransientResponse.new(ok: Durababble::Rpc.dump(result))
       rescue Durababble::WorkflowRpc::NoActiveLease
-        h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.not_running", target: node_id)
-        Durababble::Rpc::Proto::TransientResponse.new(not_running: true)
+        h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.not_running", target: node_id)
+        Durababble::Rpc::Messages::TransientResponse.new(not_running: true)
       rescue Durababble::WorkflowRpc::StaleLease => e
         lease = h.store.current_workflow_lease(workflow_id)
         if lease && lease.fetch("worker_id") != node_id
           h.scheduler.trace.event(
             h.scheduler.time,
-            "grpc",
-            "grpc.lease_moved",
+            "rpc",
+            "rpc.lease_moved",
             from: node_id,
             to: lease.fetch("worker_id"),
           )
-          Durababble::Rpc::Proto::TransientResponse.new(
-            moved: Durababble::Rpc::Proto::LeaseMoved.new(
+          Durababble::Rpc::Messages::TransientResponse.new(
+            moved: Durababble::Rpc::Messages::LeaseMoved.new(
               new_node_id: lease.fetch("worker_id"),
               new_rpc_address: "virtual://#{lease.fetch("worker_id")}",
             ),
@@ -891,55 +891,55 @@ module Durababble
       end
 
       #: (untyped, untyped, target: untyped) -> untyped
-      def grpc_transport_fault!(h, fault, target:)
+      def rpc_transport_fault!(h, fault, target:)
         case fault
         when nil, "success", "response_timeout", "duplicate_response"
           nil
         when "timeout"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.timeout", target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.timeout", target:)
           raise Durababble::WorkflowRpc::NodeUnavailable, "#{target} timed out"
         when "deadline_exceeded"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.deadline_exceeded", target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.deadline_exceeded", target:)
           raise Durababble::WorkflowRpc::NodeUnavailable, "#{target} deadline exceeded"
         when "connection_reset"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.rst", target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.rst", target:)
           raise Durababble::WorkflowRpc::NodeUnavailable, "#{target} reset the stream"
         when "eof"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.eof", target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.eof", target:)
           raise Durababble::WorkflowRpc::NodeUnavailable, "#{target} closed the stream"
         when "unavailable"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.unavailable", target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.unavailable", target:)
           raise Durababble::WorkflowRpc::NodeUnavailable, "#{target} unavailable"
         else
-          raise ArgumentError, "unknown gRPC fault #{fault}"
+          raise ArgumentError, "unknown RPC fault #{fault}"
         end
       end
 
       #: (untyped, untyped, target: untyped, fault: untyped) { (?) -> untyped } -> untyped
-      def grpc_faulty_unary(h, method_name, target:, fault:, &block)
-        h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.#{method_name}.request", target:, fault:)
+      def rpc_faulty_unary(h, method_name, target:, fault:, &block)
+        h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.#{method_name}.request", target:, fault:)
         case fault
         when "drop"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.drop", method: method_name, target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.drop", method: method_name, target:)
           :dropped
         when "duplicate"
-          h.scheduler.trace.event(h.scheduler.time, "grpc", "grpc.duplicate", method: method_name, target:)
+          h.scheduler.trace.event(h.scheduler.time, "rpc", "rpc.duplicate", method: method_name, target:)
           block.call
           block.call
           :ok
         else
-          grpc_transport_fault!(h, fault, target:)
+          rpc_transport_fault!(h, fault, target:)
           block.call
           :ok
         end
       end
 
       #: (untyped, untyped, workflow_id: untyped) -> untyped
-      def call_grpc_service_method(service, method_name, workflow_id:)
+      def call_rpc_service_method(service, method_name, workflow_id:)
         case method_name
         when "awaken_batch"
           service.awaken_batch(
-            Durababble::Rpc::Proto::AwakenBatchRequest.new(
+            Durababble::Rpc::Messages::AwakenBatchRequest.new(
               worker_pool: "default",
               workflow_ids: [workflow_id],
             ),
@@ -947,7 +947,7 @@ module Durababble
           )
         when "deliver_message"
           service.deliver_message(
-            Durababble::Rpc::Proto::DeliverMessageRequest.new(
+            Durababble::Rpc::Messages::DeliverMessageRequest.new(
               worker_pool: "default",
               target_kind: "workflow",
               target_id: workflow_id,
@@ -956,7 +956,7 @@ module Durababble
           )
         when "evict_lease"
           service.evict_lease(
-            Durababble::Rpc::Proto::EvictLeaseRequest.new(
+            Durababble::Rpc::Messages::EvictLeaseRequest.new(
               worker_pool: "default",
               target_kind: "workflow",
               target_id: workflow_id,
@@ -964,14 +964,14 @@ module Durababble
             nil,
           )
         else
-          raise ArgumentError, "unknown gRPC service method #{method_name}"
+          raise ArgumentError, "unknown RPC service method #{method_name}"
         end
       end
 
       #: (untyped) -> untyped
-      def grpc_remote_error_response(error)
-        Durababble::Rpc::Proto::TransientResponse.new(
-          err: Durababble::Rpc::Proto::RemoteError.new(
+      def rpc_remote_error_response(error)
+        Durababble::Rpc::Messages::TransientResponse.new(
+          err: Durababble::Rpc::Messages::RemoteError.new(
             klass: error.class.name,
             message: error.message,
             backtrace: error.backtrace || [],
