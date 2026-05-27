@@ -196,7 +196,7 @@ module Durababble
     #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
       if worker_id
-        claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool:)
+        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_seconds, workflow_id, worker_pool])
       else
         execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
       end
