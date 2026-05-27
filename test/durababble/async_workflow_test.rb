@@ -223,7 +223,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         run = Durababble::Engine.new(store:, worker_id: "failure-history-seeder").resume(workflow, workflow_id:)
 
         assert_equal "completed", run.status
-        assert_equal({ "handled" => "Durababble::Error" }, run.result)
+        assert_equal({ "handled" => "RuntimeError" }, run.result)
         assert_equal 0, failed_runs
         assert_equal 1, cleanup_runs
       end

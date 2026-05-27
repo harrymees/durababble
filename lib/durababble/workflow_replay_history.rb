@@ -156,9 +156,11 @@ module Durababble
       case event.fetch("kind")
       when "step_scheduled"
         @scheduled[command_id] = event
-      when "step_failed"
-        @terminal[command_id] = event if terminal_step_failure?(event)
       when *TERMINAL_KINDS
+        # A step_failed event is terminal unless it explicitly carries a
+        # "retrying" payload. Replay must not re-run the side effect of a
+        # non-retrying failure; the workflow code is expected to observe it via
+        # the exception path.
         return if retrying_step_failure?(event)
 
         @terminal[command_id] = event
@@ -210,12 +212,6 @@ module Durababble
     def consume_event!(event)
       event_index = event["event_index"]
       @consumed_event_indexes[event_index.to_s.to_i] = true if event_index
-    end
-
-    #: (Hash[String, Object?]) -> bool
-    def terminal_step_failure?(event)
-      payload = event["payload"]
-      payload.is_a?(Hash) && payload["terminal"] == true
     end
   end
 end

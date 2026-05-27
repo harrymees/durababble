@@ -231,13 +231,23 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure", failure_error: error) do
         if worker_id
           execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
         else
           execute_store_query(:fail_workflow, [workflow_id, error])
         end
       end
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_steps_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_steps_for_workflow, [workflow_id, error])
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_step_attempts_for_workflow, [workflow_id, error])
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?

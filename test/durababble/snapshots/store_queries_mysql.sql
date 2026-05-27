@@ -1,5 +1,5 @@
 -- mysql_ack_outbox
-UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?
+UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ? AND locked_until >= NOW(6)
 
 -- mysql_cancel_live_step_attempts_for_workflow
 UPDATE `durababble_mysql_snapshot_step_attempts`
@@ -35,7 +35,7 @@ WHERE workflow_id = ? AND status = 'waiting'
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
   cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-WHERE id = ? AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
+WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_cancel_workflow_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -207,7 +207,7 @@ UPDATE `durababble_mysql_snapshot_waits` SET status = 'completed', payload = ?, 
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ?
-  AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
+  AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
   AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_steps` WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
   AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_step_attempts` WHERE workflow_id = ? AND status IN ('running', 'waiting'))
   AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_waits` WHERE workflow_id = ? AND status = 'pending')
@@ -216,9 +216,6 @@ WHERE id = ?
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
-  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_steps` WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
-  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_step_attempts` WHERE workflow_id = ? AND status IN ('running', 'waiting'))
-  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_waits` WHERE workflow_id = ? AND status = 'pending')
 
 -- mysql_count_expired_workflow_leases
 SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflows` WHERE status = 'running' AND locked_until < ?
@@ -285,6 +282,16 @@ WHERE workflow_id = ? AND `key` = ? AND locked_by = ?
 -- mysql_fail_inbox_message
 UPDATE `durababble_mysql_snapshot_inbox` SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?
 
+-- mysql_fail_live_step_attempts_for_workflow
+UPDATE `durababble_mysql_snapshot_step_attempts`
+SET status = 'failed', error = ?, completed_at = NOW(6)
+WHERE workflow_id = ? AND status = 'running'
+
+-- mysql_fail_live_steps_for_workflow
+UPDATE `durababble_mysql_snapshot_steps`
+SET status = 'failed', error = ?, updated_at = NOW(6)
+WHERE workflow_id = ? AND status = 'running'
+
 -- mysql_fail_step
 UPDATE `durababble_mysql_snapshot_steps`
 SET status = 'failed', error = ?, updated_at = NOW(6)
@@ -293,7 +300,7 @@ WHERE workflow_id = ? AND position = ?
 -- mysql_fail_workflow
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-WHERE id = ? AND NOT (status IN ('completed', 'canceled') OR (status = 'failed' AND next_run_at IS NULL))
+WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_fail_workflow_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
