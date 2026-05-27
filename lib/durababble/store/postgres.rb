@@ -24,6 +24,8 @@ module Durababble
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
       return if workflow_names&.empty?
 
+      # [DURABABBLE-LEASE-1] Queue selection and lease assignment commit as one locked update
+      # so two pollers can never both hold a live workflow lease.
       name_filter, name_params = workflow_name_filter(workflow_names, offset: 4)
       row = retry_serialization_failures do
         execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params, name_filter:).first
@@ -53,6 +55,7 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
+      # [DURABABBLE-LEASE-2] Heartbeats only extend an unexpired lease held by this worker.
       result = execute_store_query(:heartbeat_workflow, [workflow_id, worker_id, lease_seconds])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
@@ -64,6 +67,8 @@ module Durababble
 
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
+      # [DURABABBLE-LEASE-3] Shutdown releases owned workflow / outbox / inbox / activation
+      # leases back to pending so another worker can resume the work.
       transaction do
         workflows = execute_store_query(:release_workflow_leases, [worker_id]).affected_rows
         outbox = execute_store_query(:release_outbox_leases, [worker_id]).affected_rows
@@ -320,6 +325,8 @@ module Durababble
 
     #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
+      # [DURABABBLE-FENCE-1] The fence row is persisted before yielding to the side effect,
+      # so a duplicate caller observes the running fence rather than re-running the work.
       token = SecureRandom.uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
       claimed = inserted.affected_rows == 1
@@ -361,6 +368,8 @@ module Durababble
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
+      # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row;
+      # subsequent enqueues resolve to the same row and never deliver twice.
       existing = execute_store_query(:outbox_by_key, [key]).first
       return existing.fetch("id") if existing
 
@@ -653,6 +662,8 @@ module Durababble
 
     #: (Time, Integer) -> Integer
     def complete_timer_waits(now, batch_size)
+      # [DURABABBLE-WAIT-1] Locked wait completion ensures concurrent wakeups observe one winner,
+      # so each due wait produces at most one durable wake event.
       completed = transaction do
         returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
         finish_completed_waits(returning, {})

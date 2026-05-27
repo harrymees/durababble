@@ -222,6 +222,8 @@ module Durababble
 
     #: (object_type: String, object_id: String, method_name: Symbol | String, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?message_kind: String, ?idempotency_key: String?, ?max_attempts: Integer?, ?worker_pool: String) -> String
     def enqueue_object_command(object_type:, object_id:, method_name:, args:, kwargs:, message_kind: "ask", idempotency_key: nil, max_attempts: nil, worker_pool: "default")
+      # [DURABABBLE-OBJ-1] Inbox commands serialize by target identity: the durable row is
+      # persisted before execution so concurrent enqueues line up behind one lease.
       enqueue_inbox_message(
         worker_pool:,
         target_kind: "object",
