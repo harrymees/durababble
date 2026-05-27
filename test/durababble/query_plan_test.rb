@@ -402,8 +402,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     refute_empty Durababble::StoreQueries::QUERIES
 
     Durababble::StoreQueries::QUERIES.each do |id, query|
-      assert_kind_of Symbol, id
-      assert_includes [:postgres, :mysql], query.backend
+      assert_equal id, query.id
+      assert_includes [:postgres, :mysql, :sqlite], query.backend
       assert_respond_to query.builder, :call
     end
   end

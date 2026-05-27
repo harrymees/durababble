@@ -4,12 +4,16 @@
 require "uri"
 
 DurababbleStoreBackend = Data.define(:name, :database_url, :default_schema_prefix) do
+  def sqlite?
+    database_url.start_with?("sqlite://")
+  end
+
   def mysql?
     database_url.start_with?("mysql://", "mysql2://", "trilogy://")
   end
 
   def postgres?
-    !mysql?
+    !sqlite? && !mysql?
   end
 end
 
@@ -57,6 +61,23 @@ def durababble_store_backends
   end
 
   backends
+end
+
+# The in-memory SQLite store is test-only and single-serialized-connection. It
+# is exercised by the backend conformance suite (proving it runs the same SQL
+# contract as the production adapters) but is deliberately kept out of the
+# broader integration suites, which assume real multi-connection backends. DST
+# exercises it separately under simulation.
+def durababble_sqlite_backend
+  DurababbleStoreBackend.new(
+    name: "sqlite",
+    database_url: "sqlite://memory",
+    default_schema_prefix: "durababble_sqlite",
+  )
+end
+
+def durababble_conformance_store_backends
+  [durababble_sqlite_backend, *durababble_store_backends]
 end
 
 def skip_without_yugabyte!

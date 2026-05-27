@@ -887,31 +887,31 @@ class DurababbleStoreTest < DurababbleTestCase
   end
 
   test "terminal workflow updates choose fenced and unfenced SQL paths" do
-    pg_fenced_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-    ])
+    # complete_workflow / cancel_workflow / fail_workflow each also issue the idempotent
+    # wait/step/attempt cleanup cascade (three extra queries per terminal transition), so
+    # each terminal call emits four queries; scope the fence assertions to the terminal
+    # workflow-row updates (the only queries that touch runnable_immediately). Provide one
+    # affected_rows:1 result per emitted query so every fenced workflow-row update sees a
+    # live lease rather than falling onto a default empty result and raising LeaseConflict.
+    pg_fenced_connection = ScriptedPgConnection.new(params_results: Array.new(12) { sql_result([], affected_rows: 1) })
     pg_fenced_store = pg_store(pg_fenced_connection)
     pg_fenced_store.complete_workflow("wf", result: { "ok" => true }, worker_id: "worker-1")
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 3, pg_fenced_connection.exec_params_calls.length
-    assert pg_fenced_connection.exec_params_calls.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
+    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    assert_equal 3, pg_fenced_workflow_updates.length
+    assert pg_fenced_workflow_updates.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
 
-    pg_unfenced_connection = ScriptedPgConnection.new(params_results: [
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-      sql_result([], affected_rows: 1),
-    ])
+    pg_unfenced_connection = ScriptedPgConnection.new(params_results: Array.new(6) { sql_result([], affected_rows: 1) })
     pg_unfenced_store = pg_store(pg_unfenced_connection)
     pg_unfenced_store.complete_workflow("wf", result: { "ok" => true })
     pg_unfenced_store.cancel_workflow("wf", reason: "stop")
     pg_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 3, pg_unfenced_connection.exec_params_calls.length
-    assert pg_unfenced_connection.exec_params_calls.none? { |sql, _params| sql.include?("AND locked_by =") }
+    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    assert_equal 3, pg_unfenced_workflow_updates.length
+    assert pg_unfenced_workflow_updates.none? { |sql, _params| sql.include?("AND locked_by =") }
 
     mysql_fenced_connection = ScriptedMysqlConnection.new { sql_result([], affected_rows: 1) }
     mysql_fenced_store = mysql_store(mysql_fenced_connection)
@@ -919,8 +919,9 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    assert_equal 3, mysql_fenced_connection.queries.length
-    assert mysql_fenced_connection.queries.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
+    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    assert_equal 3, mysql_fenced_workflow_updates.length
+    assert mysql_fenced_workflow_updates.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
 
     mysql_unfenced_connection = ScriptedMysqlConnection.new
     mysql_unfenced_store = mysql_store(mysql_unfenced_connection)
@@ -928,8 +929,9 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
     mysql_unfenced_store.fail_workflow("wf", error: "boom")
 
-    assert_equal 3, mysql_unfenced_connection.queries.length
-    assert mysql_unfenced_connection.queries.none? { |sql| sql.include?("AND locked_by =") }
+    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    assert_equal 3, mysql_unfenced_workflow_updates.length
+    assert mysql_unfenced_workflow_updates.none? { |sql| sql.include?("AND locked_by =") }
 
     stale_pg_store = pg_store(ScriptedPgConnection.new(params_results: [sql_result([], affected_rows: 0)]))
     assert_raises(Durababble::LeaseConflict) do
