@@ -378,8 +378,18 @@ module Durababble
   end
 
   class Worker
+    class WorkItem
+      attr_reader kind: Symbol
+      attr_reader target_key: Array[String]
+      attr_reader payload: Object?
+    end
+
     def initialize: (store: Store, workflows: workflow_registry, worker_id: String, ?objects: object_registry, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def tick: () -> Symbol
+    def claim_work: () -> WorkItem?
+    def delivery_work: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> WorkItem?
+    def perform_work: (WorkItem work_item) -> Object?
+    def defer_claimed_work: (WorkItem work_item, ready_at: Time) -> Object?
     def deliver_target: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Symbol
     def run_until_idle: (?max_ticks: Integer) -> Integer
   end
@@ -397,12 +407,13 @@ module Durababble
     attr_reader objects: object_registry
     attr_reader worker_pool: String
     attr_reader worker_id: String
+    attr_reader concurrency: Integer
     attr_reader last_error: StandardError?
     attr_reader rpc_address: String?
 
-    def self.start: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> WorkerRuntime
+    def self.start: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> WorkerRuntime
 
-    def initialize: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
+    def initialize: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
     def start: () -> self
     def shutdown: (?timeout: Numeric) -> (:stopped | :timeout)
     def stop: (?timeout: Numeric) -> (:stopped | :timeout)

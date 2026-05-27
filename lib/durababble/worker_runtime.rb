@@ -8,6 +8,7 @@ module Durababble
   class WorkerRuntime
     DEFAULT_POLL_INTERVAL = 0.1
     DEFAULT_SHUTDOWN_TIMEOUT = 10
+    DUPLICATE_TARGET_RETRY_SECONDS = 0.1
 
     #: Store
     attr_reader :store
@@ -15,6 +16,8 @@ module Durababble
     attr_reader :workflows, :objects
     #: String
     attr_reader :worker_pool, :worker_id
+    #: Integer
+    attr_reader :concurrency
     #: StandardError?
     attr_reader :last_error
     #: String?
@@ -28,7 +31,7 @@ module Durababble
       end
     end
 
-    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
+    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Object, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
     def initialize(
       workflows:,
       worker_pool:,
@@ -39,6 +42,7 @@ module Durababble
       worker_id: nil,
       lease_seconds: Engine::DEFAULT_LEASE_SECONDS,
       poll_interval: DEFAULT_POLL_INTERVAL,
+      concurrency: 1,
       migrate: true,
       rpc_host: "127.0.0.1",
       rpc_port: 0,
@@ -51,6 +55,13 @@ module Durababble
       @rpc_host = rpc_host || raise(ArgumentError, "rpc_host is required")
       @rpc_port = rpc_port.nil? ? raise(ArgumentError, "rpc_port is required") : rpc_port
 
+      concurrency = begin
+        Integer(concurrency)
+      rescue ArgumentError, TypeError
+        raise ArgumentError, "concurrency must be a positive integer"
+      end
+      raise ArgumentError, "concurrency must be a positive integer" unless concurrency.positive?
+
       database_url = database_url #: as untyped
       schema = schema #: as untyped
       @store = store || Store.connect(database_url:, schema:) #: as untyped
@@ -62,6 +73,7 @@ module Durababble
       @worker_id = @worker_identity_id
       @lease_seconds = lease_seconds
       @poll_interval = poll_interval
+      @concurrency = concurrency
       @migrate = migrate
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
@@ -115,11 +127,10 @@ module Durababble
           stop_rpc_server
           raise
         end
-        # The poll loop runs as a fiber inside an async reactor. A non-blocking
+        # The scheduler runs as fibers inside one async reactor. A non-blocking
         # background service still needs one host thread to drive the reactor,
-        # but the worker logic itself is fiber-based: it yields to the reactor
-        # while idle and is woken cooperatively rather than hand-rolling a
-        # Mutex/ConditionVariable loop on a bare thread.
+        # but the worker logic fans out cooperatively up to @concurrency and is
+        # woken by hints rather than hand-rolling worker threads.
         @thread = Thread.new { Async { |task| run_loop(task, worker) } }
       end
       self
@@ -269,37 +280,89 @@ module Durababble
 
     #: (untyped, untyped) -> untyped
     def run_loop(task, worker)
+      active_targets = {}
       loop do
-        break if stopping?
+        if stopping?
+          break if active_targets.empty?
+
+          await_active_work(task)
+          next
+        end
 
         begin
-          delivery = next_delivery
-          result = if delivery
-            worker.deliver_target(
-              worker_pool: delivery.fetch(:worker_pool),
-              target_kind: delivery.fetch(:target_kind),
-              target_type: delivery.fetch(:target_type),
-              target_id: delivery.fetch(:target_id),
-            )
-          else
-            worker.tick
-          end
-          @consecutive_errors = 0
-          await_work(task) if result == :idle && !stopping?
+          scheduled = schedule_available_work(task, worker, active_targets)
+          await_work(task) unless scheduled
         rescue LeaseConflict => e
-          @last_error = e
-          break if stopping?
+          record_worker_error(e)
         rescue StandardError => e
-          @last_error = e
-          @consecutive_errors += 1
-          break if stopping?
-
-          log_loop_error(e)
+          record_worker_error(e)
           await_work(task)
         end
       end
     ensure
       @mutex.synchronize { @thread = nil if Thread.current == @thread }
+    end
+
+    #: (untyped, untyped, Hash[Array[String], untyped]) -> bool
+    def schedule_available_work(task, worker, active_targets)
+      scheduled_count = 0
+      while active_targets.length < @concurrency && !stopping?
+        work_item = next_delivery_work(worker) || worker.claim_work
+        break unless work_item
+
+        if active_targets.key?(work_item.target_key)
+          defer_duplicate_work(worker, work_item)
+          next
+        end
+
+        active_targets[work_item.target_key] = true
+        scheduled_item = work_item
+        scheduled_count += 1
+        task.async do
+          worker.perform_work(scheduled_item)
+          @consecutive_errors = 0
+        rescue LeaseConflict => e
+          record_worker_error(e)
+        rescue StandardError => e
+          record_worker_error(e)
+        ensure
+          active_targets.delete(scheduled_item.target_key)
+          @wakeups.push(:finished)
+        end
+      end
+      scheduled_count.positive?
+    end
+
+    #: (untyped) -> untyped
+    def next_delivery_work(worker)
+      delivery = next_delivery
+      return unless delivery
+
+      worker.delivery_work(
+        worker_pool: delivery.fetch(:worker_pool),
+        target_kind: delivery.fetch(:target_kind),
+        target_type: delivery.fetch(:target_type),
+        target_id: delivery.fetch(:target_id),
+      )
+    end
+
+    #: (untyped, untyped) -> void
+    def defer_duplicate_work(worker, work_item)
+      return unless work_item.kind == :target_activation
+
+      worker.defer_claimed_work(
+        work_item,
+        ready_at: Time.now + Backoff.jittered(DUPLICATE_TARGET_RETRY_SECONDS),
+      )
+    end
+
+    #: (StandardError) -> void
+    def record_worker_error(error)
+      @last_error = error
+      return if error.is_a?(LeaseConflict)
+
+      @consecutive_errors += 1
+      log_loop_error(error)
     end
 
     #: () -> untyped
@@ -328,6 +391,15 @@ module Durababble
     def await_work(task)
       return if stopping? || !deliveries_empty?
 
+      task.with_timeout(@poll_interval) { @wakeups.pop }
+    rescue Async::TimeoutError
+      nil
+    ensure
+      @wakeups.clear
+    end
+
+    #: (untyped) -> void
+    def await_active_work(task)
       task.with_timeout(@poll_interval) { @wakeups.pop }
     rescue Async::TimeoutError
       nil

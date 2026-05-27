@@ -77,6 +77,20 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   end
 
+  test "requires positive concurrency" do
+    store = RuntimeBranchStore.new
+
+    assert_raises_matching(ArgumentError, /concurrency/) do
+      Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: 0)
+    end
+    assert_raises_matching(ArgumentError, /concurrency/) do
+      Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: "many")
+    end
+
+    runtime = Durababble::WorkerRuntime.new(store:, workflows: {}, worker_pool: "default", concurrency: 3)
+    assert_equal 3, runtime.concurrency
+  end
+
   test "is idempotent when started more than once and stopped more than once" do
     store = RuntimeBranchStore.new
     runtime = Durababble::WorkerRuntime.new(
@@ -213,6 +227,254 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       "locked_until" => nil,
     )
     assert_equal ["completed"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
+  end
+
+  test "runs multiple workflow tasks concurrently inside one runtime" do
+    active = 0
+    max_active = 0
+    release = false
+    started = Queue.new
+    workflow = durababble_test_workflow("runtime-concurrent-workflows") do
+      test_step("hold") do |ctx|
+        active += 1
+        max_active = [max_active, active].max
+        started << ctx.fetch("id")
+        sleep(0.01) until release
+        ctx.merge("done" => true)
+      ensure
+        active -= 1
+      end
+    end
+    workflow_ids = [
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "a" }),
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "b" }),
+    ]
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-concurrent",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+
+    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+    assert_operator(max_active, :>=, 2)
+    release = true
+    eventually(timeout: 3) do
+      assert_equal(["completed", "completed"], workflow_ids.map { |workflow_id| store.workflow(workflow_id).fetch("status") })
+    end
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "a single concurrent runtime can make workflow-to-object progress without another process" do
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_concurrent_object"
+
+      define_method(:record) do |value|
+        update_state({ "value" => value })
+        { "recorded" => value }
+      end
+      expose_command :record
+    end
+    caller_store = Durababble::Store.connect(database_url:, schema:)
+    def caller_store.wait_for_inbox_message(message_id, poll_interval: 0.005, timeout: 2)
+      super(message_id, poll_interval:, timeout:)
+    end
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "runtime-concurrent-object-call"
+
+      define_method(:execute) do |input|
+        persist_to_object(input.fetch("object_id"))
+      end
+
+      define_method(:persist_to_object) do |object_id|
+        object.handle(object_id, store: caller_store).record("ok")
+      end
+      step :persist_to_object
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "object_id" => "object-1" })
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.workflow_name => workflow },
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+      rpc_host: "127.0.0.1",
+      rpc_port: 0,
+    )
+    runtime.start
+
+    eventually(timeout: 3) do
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "recorded" => "ok" })
+    end
+    assert_equal({ "value" => "ok" }, store.object_state(object_type: object.object_type, object_id: "object-1"))
+  ensure
+    runtime&.shutdown(timeout: 1)
+    caller_store&.close
+  end
+
+  test "does not re-enter an in-flight workflow when a duplicate activation is claimed by the same runtime" do
+    release = false
+    started = Queue.new
+    workflow = Class.new(Durababble::Workflow) do
+      workflow_name "runtime-duplicate-activation"
+
+      define_method(:execute) do |input|
+        hold(input)
+      end
+
+      define_method(:hold) do |input|
+        started << input.fetch("id")
+        sleep(0.01) until release
+        { "done" => true }
+      end
+      step :hold
+
+      expose_command def approve
+        { "approved" => true }
+      end
+    end
+    workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wf" })
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.workflow_name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-duplicate",
+      concurrency: 2,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+    assert_equal("wf", started.pop)
+    message_id = store.enqueue_workflow_command(
+      workflow_id:,
+      workflow_name: workflow.workflow_name,
+      method_name: "approve",
+      payload: { "method" => "approve", "args" => [], "kwargs" => {} },
+    )
+
+    sleep(0.25)
+    assert_equal(0, started.length)
+    assert_equal(1, store.step_attempts_for(workflow_id).length)
+
+    release = true
+    eventually(timeout: 3) do
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "done" => true })
+      assert_hash_includes(store.inbox_message(message_id), "status" => "completed", "result" => { "approved" => true })
+    end
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "keeps commands for one object id serialized while other runtime slots are available" do
+    active = 0
+    max_active = 0
+    entered = Queue.new
+    object = Class.new(Durababble::DurableObject) do
+      object_type "runtime_serial_object"
+
+      define_method(:append) do |value|
+        active += 1
+        max_active = [max_active, active].max
+        entered << value
+        sleep(0.02)
+        values = current_state || []
+        update_state(values + [value])
+        values + [value]
+      ensure
+        active -= 1
+      end
+      expose_command :append
+    end
+    first_id = object.tell("shared", :append, 1, store:)
+    second_id = object.tell("shared", :append, 2, store:)
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: {},
+      objects: [object],
+      worker_pool: "default",
+      concurrency: 4,
+      poll_interval: 0.01,
+      migrate: false,
+    )
+    runtime.start
+
+    eventually(timeout: 3) do
+      assert_hash_includes(store.inbox_message(first_id), "status" => "completed")
+      assert_hash_includes(store.inbox_message(second_id), "status" => "completed")
+    end
+    assert_equal([1, 2], queue_values(entered, 2))
+    assert_equal(1, max_active)
+    assert_equal([1, 2], store.object_state(object_type: object.object_type, object_id: "shared"))
+  ensure
+    runtime&.shutdown(timeout: 1)
+  end
+
+  test "shutdown timeout releases every in-flight workflow lease from a concurrent runtime" do
+    release = false
+    started = Queue.new
+    attempts = Hash.new(0)
+    workflow = durababble_test_workflow("runtime-concurrent-timeout") do
+      test_step("hold") do |ctx|
+        attempts[ctx.fetch("id")] += 1
+        started << ctx.fetch("id")
+        sleep(0.01) until release
+        ctx.merge("attempt" => attempts.fetch(ctx.fetch("id")))
+      end
+    end
+    workflow_ids = [
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "a" }),
+      store.enqueue_workflow(name: workflow.name, input: { "id" => "b" }),
+    ]
+
+    runtime = Durababble::WorkerRuntime.new(
+      store: runtime_store,
+      workflows: { workflow.name => workflow },
+      worker_pool: "default",
+      worker_id: "runtime-concurrent-timeout",
+      concurrency: 2,
+      poll_interval: 0.01,
+      lease_seconds: 60,
+      migrate: false,
+    )
+    runtime.start
+    eventually(timeout: 3) { assert_equal(["a", "b"], queue_values(started, 2).sort) }
+
+    assert_equal(:timeout, runtime.shutdown(timeout: 0.05))
+    workflow_ids.each do |workflow_id|
+      assert_hash_includes(store.workflow(workflow_id), "status" => "pending", "locked_by" => nil, "locked_until" => nil)
+      assert_equal(["running"], store.steps_for(workflow_id).map { |step| step.fetch("status") })
+    end
+
+    release = true
+    runtime.wait(timeout: 1)
+    recovery = Durababble::Worker.new(
+      store:,
+      workflows: { workflow.name => workflow },
+      worker_id: "concurrent-recovery",
+      lease_seconds: 60,
+      migrate: false,
+    )
+    assert_equal(2, recovery.run_until_idle(max_ticks: 4))
+    workflow_ids.each do |workflow_id|
+      assert_hash_includes(store.workflow(workflow_id), "status" => "completed", "result" => { "id" => store.workflow(workflow_id).fetch("input").fetch("id"), "attempt" => 2 })
+      assert_equal(["failed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") })
+    end
+  ensure
+    release = true
+    runtime&.shutdown(timeout: 1)
   end
 
   test "stops claiming work on shutdown timeout, revokes owned leases, and lets another worker retry incomplete steps" do
@@ -549,5 +811,11 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
 
       sleep(0.01)
     end
+  end
+
+  def queue_values(queue, count)
+    return [] if queue.length < count
+
+    count.times.map { queue.pop(true) }
   end
 end

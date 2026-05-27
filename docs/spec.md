@@ -422,11 +422,11 @@ All public durable semantics must work on PostgreSQL/YSQL and MySQL/MariaDB. Sch
 
 ### Worker lifecycle and recovery
 
-A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`. Each tick claims runnable work whose workflow or object class is present in the worker registry, including workflow rows and coalesced target activations, then resumes it through the deterministic workflow executor or durable object mailbox executor.
+A worker pool is served by processes repeatedly calling `Durababble::Worker#tick` or `#run_until_idle`, or by an embedded `Durababble::WorkerRuntime`. Each raw worker tick claims one runnable work item whose workflow or object class is present in the worker registry, including workflow rows and coalesced target activations, then resumes it through the deterministic workflow executor or durable object mailbox executor.
 
 Runnable workflows are pending rows, retryable failed rows whose non-null `next_run_at` is due, canceling rows with no live lease whose `next_run_at` is null or due, and expired running leases that are recoverable. Terminal failed rows with no retry deadline are not claimable.
 
-`Durababble::WorkerRuntime` is the preferred app/process lifecycle entrypoint. It loops `Worker#tick` for one worker pool, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and releases still-held workflow/outbox leases if the timeout is exceeded.
+`Durababble::WorkerRuntime` is the preferred app/process lifecycle entrypoint. It runs one worker pool with configurable `concurrency:`, schedules up to that many worker work items concurrently with `async` fibers, avoids running the same durable target identity twice inside the process, stops taking new claims on shutdown, waits for in-flight work up to a timeout, and releases still-held workflow, inbox, target-activation, and outbox leases if the timeout is exceeded.
 
 `Engine#resume` refuses to execute work owned by another live worker. Lease holders must re-check ownership before mutating durable state.
 
