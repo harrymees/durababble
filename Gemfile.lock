@@ -153,6 +153,7 @@ GEM
     sqlite3 (2.9.4-aarch64-linux-gnu)
     sqlite3 (2.9.4-arm64-darwin)
     sqlite3 (2.9.4-x86_64-linux-gnu)
+    stackprof (0.2.28)
     timeout (0.6.1)
     traces (0.18.2)
     trilogy (2.9.0)
@@ -183,6 +184,7 @@ DEPENDENCIES
   simplecov (~> 0.22)
   sorbet (~> 0.5)
   sqlite3 (~> 2.1)
+  stackprof (~> 0.2)
 
 BUNDLED WITH
    2.6.7
