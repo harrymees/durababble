@@ -389,6 +389,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         store.complete_object_command(command_id:, result: { "count" => 3 })
         assert_hash_includes store.inbox_message(command_id), "status" => "completed", "result" => { "count" => 3 }
         assert_nil store.claim_object_command(command_id:, worker_id: "object-worker", lease_seconds: 30)
+        store.release_object_lease(object_type: "counter", object_id: "abc", worker_id: "object-worker")
 
         fenced_command_id = store.enqueue_object_command(
           object_type: "counter",
@@ -496,6 +497,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal [], store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2)
         assert_hash_includes store.inbox_message(blocked), "status" => "pending"
         assert_hash_includes store.inbox_message(ready), "status" => "pending"
+        assert_nil store.current_object_lease("counter", "blocked")
 
         future = Time.now + 120
         due = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "blocked", worker_id: "worker-a", lease_seconds: 30, limit: 2, now: future)
@@ -1545,9 +1547,11 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
 
         assert_hash_includes(
-          store.claim_object_command(command_id:, worker_id: "crashed-object-worker", lease_seconds: -1),
+          store.claim_object_command(command_id:, worker_id: "crashed-object-worker", lease_seconds: 30),
           "locked_by" => "crashed-object-worker",
         )
+        expire_inbox_message_lease!(store, backend, command_id)
+        expire_object_lease!(store, backend, "counter", "abc")
         assert_hash_includes(
           store.claim_object_command(command_id:, worker_id: "recovery-object-worker", lease_seconds: 30),
           "id" => command_id,
@@ -1567,12 +1571,15 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           kwargs: {},
         )
         assert_hash_includes(
-          store.claim_object_command(command_id: stale_failure, worker_id: "expired-object-worker", lease_seconds: -1),
+          store.claim_object_command(command_id: stale_failure, worker_id: "expired-object-worker", lease_seconds: 30),
           "locked_by" => "expired-object-worker",
         )
-        failed = store.fail_object_command(command_id: stale_failure, error: "stale failure", worker_id: "expired-object-worker", terminal: true)
-        assert(failed.nil? || failed.affected_rows.to_i.zero?)
+        expire_object_lease!(store, backend, "counter", "abc")
+        assert_raises(Durababble::LeaseConflict) do
+          store.fail_object_command(command_id: stale_failure, error: "stale failure", worker_id: "expired-object-worker", terminal: true)
+        end
         assert_hash_includes store.inbox_message(stale_failure), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        expire_inbox_message_lease!(store, backend, stale_failure)
         assert_hash_includes(
           store.claim_object_command(command_id: stale_failure, worker_id: "recovery-object-worker", lease_seconds: 30),
           "locked_by" => "recovery-object-worker",
@@ -1586,14 +1593,53 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           kwargs: {},
         )
         assert_hash_includes(
-          store.claim_object_command(command_id: stale_retry, worker_id: "expired-object-worker", lease_seconds: -1),
+          store.claim_object_command(command_id: stale_retry, worker_id: "expired-object-worker", lease_seconds: 30),
           "locked_by" => "expired-object-worker",
         )
-        retried = store.retry_object_command(command_id: stale_retry, error: "stale retry", worker_id: "expired-object-worker", ready_at: Time.now + 60)
-        assert(retried.nil? || retried.affected_rows.to_i.zero?)
+        expire_object_lease!(store, backend, "counter", "abc-retry")
+        assert_raises(Durababble::LeaseConflict) do
+          store.retry_object_command(command_id: stale_retry, error: "stale retry", worker_id: "expired-object-worker", ready_at: Time.now + 60)
+        end
         assert_hash_includes store.inbox_message(stale_retry), "status" => "running", "locked_by" => "expired-object-worker", "error" => nil
+        expire_inbox_message_lease!(store, backend, stale_retry)
         assert_hash_includes(
           store.claim_object_command(command_id: stale_retry, worker_id: "recovery-object-worker", lease_seconds: 30),
+          "locked_by" => "recovery-object-worker",
+        )
+      end
+    end
+
+    test "fences stale durable object command completion writes with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "stale-complete",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "expired-object-worker", lease_seconds: 30),
+          "locked_by" => "expired-object-worker",
+        )
+
+        expire_object_lease!(store, backend, "counter", "stale-complete")
+        assert_raises(Durababble::LeaseConflict) do
+          store.complete_object_command(
+            command_id:,
+            result: { "count" => 1 },
+            object_type: "counter",
+            object_id: "stale-complete",
+            state: { "count" => 1 },
+            worker_id: "expired-object-worker",
+          )
+        end
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "expired-object-worker", "result" => nil
+        assert_nil store.object_state(object_type: "counter", object_id: "stale-complete")
+
+        expire_inbox_message_lease!(store, backend, command_id)
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "recovery-object-worker", lease_seconds: 30),
           "locked_by" => "recovery-object-worker",
         )
       end
@@ -1850,6 +1896,31 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         # And A's release remains idempotent on the now-empty row.
         assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
       end
+    end
+  end
+
+  def expire_inbox_message_lease!(store, backend, message_id)
+    table = store.send(:table, "inbox")
+    if backend.postgres?
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = now() - interval '1 hour' WHERE id = $1",
+        [message_id],
+      )
+    elsif backend.sqlite?
+      expired_at = ((Time.now.to_r - 3600) * 1_000_000).to_i
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE id = ?",
+        [expired_at, message_id],
+      )
+    else
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE id = ?",
+        [expired_at, message_id],
+      )
     end
   end
 

@@ -390,6 +390,13 @@ SELECT * FROM `durababble_mysql_snapshot_inbox`
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 FOR UPDATE
 
+-- mysql_lock_owned_object_for_update
+SELECT 1
+FROM `durababble_mysql_snapshot_durable_objects`
+WHERE object_type = ? AND object_id = ?
+  AND locked_by = ? AND locked_until >= NOW(6)
+FOR UPDATE
+
 -- mysql_lock_owned_workflow_for_update
 SELECT 1
 FROM `durababble_mysql_snapshot_workflows`

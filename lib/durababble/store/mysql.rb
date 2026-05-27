@@ -541,6 +541,11 @@ module Durababble
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
     end
 
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def lock_owned_object_for_update(object_type:, object_id:, worker_id:)
+      execute_store_query(:lock_owned_object_for_update, [object_type, object_id, worker_id]).first
+    end
+
     #: (String, error: String) -> void
     def terminate_workflow_dependents(workflow_id, error:)
       # Called only while request_workflow_termination holds the workflow row lock inside a transaction.

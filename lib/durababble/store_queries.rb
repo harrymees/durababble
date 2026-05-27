@@ -839,6 +839,19 @@ module Durababble
       SQL
     end
 
+    # Command outcome commits must still own the unified object lease. This
+    # mirrors workflow commit fencing: the inbox row lease alone is not enough once
+    # reads and streams route to durable_objects.locked_by as the active owner.
+    define(:pg_lock_owned_object_for_update, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT 1
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = $1 AND object_id = $2
+          AND locked_by = $3 AND locked_until >= now()
+        FOR UPDATE
+      SQL
+    end
+
     # Idempotent release; non-owner workers cannot release someone else's lease.
     define(:pg_release_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
@@ -1504,6 +1517,17 @@ module Durababble
         SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
         WHERE object_type = ? AND object_id = ?
           AND locked_by = ? AND locked_until >= NOW(6)
+      SQL
+    end
+
+    # MySQL mirror of pg_lock_owned_object_for_update.
+    define(:mysql_lock_owned_object_for_update, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT 1
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = ? AND object_id = ?
+          AND locked_by = ? AND locked_until >= NOW(6)
+        FOR UPDATE
       SQL
     end
 
