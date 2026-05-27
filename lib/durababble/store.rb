@@ -31,13 +31,13 @@ module Durababble
     #: Object
     attr_accessor :rpc_client_factory
     #: Object
-    attr_accessor :local_worker_id, :local_transient_handler
-    #: Object
     attr_accessor :workflow_rpc_client_factory
     #: String?
     attr_accessor :local_workflow_rpc_node_id
     #: Hash[String, Object]?
     attr_accessor :local_workflow_rpc_handlers
+    #: Object
+    attr_accessor :local_worker_id, :local_transient_handler
 
     class << self
       #: (*Object?, **Object?) ?{ (Object?) -> Object? } -> Store
@@ -160,11 +160,11 @@ module Durababble
       @owner = owner
       @migrated = false
       @rpc_client_factory = ->(address) { Durababble::Rpc::Client.new(address:) }
-      @local_worker_id = nil
-      @local_transient_handler = nil
       @workflow_rpc_client_factory = ->(address, worker_pool:) { Durababble::Rpc::WorkflowClient.new(address:, worker_pool:) }
       @local_workflow_rpc_node_id = nil
       @local_workflow_rpc_handlers = nil
+      @local_worker_id = nil
+      @local_transient_handler = nil
     end
 
     #: () -> void

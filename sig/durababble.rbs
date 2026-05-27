@@ -210,11 +210,11 @@ module Durababble
     attr_reader schema: String
     attr_reader connection_pool: _ActiveRecordConnectionPool
     attr_accessor rpc_client_factory: _RpcClientFactory
-    attr_accessor local_worker_id: (String | _WorkerIdProvider)?
-    attr_accessor local_transient_handler: _TransientHandler?
     attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
     attr_accessor local_workflow_rpc_node_id: String?
     attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
+    attr_accessor local_worker_id: (String | _WorkerIdProvider)?
+    attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
     def self.from_active_record: (connection_pool: _ActiveRecordConnectionPool, ?schema: String, ?owner: _ActiveRecordOwner?) -> Store
