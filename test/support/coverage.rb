@@ -15,6 +15,7 @@ SimpleCov.start do
   add_filter("/bench/")
   add_filter("/docs/")
   add_filter("/examples/")
+  add_filter("/scripts/")
   add_filter("/sig/")
   add_filter("/sorbet/")
   add_filter("lib/durababble/version.rb")
