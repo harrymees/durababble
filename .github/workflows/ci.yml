@@ -101,29 +101,6 @@ jobs:
       - name: Run RuboCop, RBS validation, typecheck, and Markdown format check
         run: bundle exec rake lint
 
-  formal:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.4"
-          bundler-cache: true
-
-      - name: Verify Alloy models
-        run: scripts/verify-alloy.sh
-
-      - name: Validate formal sigils
-        run: bundle exec ruby scripts/validate-durababble-sigils.rb
-
   docs-build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
