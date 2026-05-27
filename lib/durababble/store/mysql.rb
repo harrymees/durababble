@@ -368,10 +368,7 @@ module Durababble
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox_unchecked(worker_id:, lease_seconds:)
       transaction do
-        candidates = []
-        candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
-        candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
-        candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
+        candidate = execute_store_query(:claim_outbox).first
         next unless candidate
 
         execute_store_query(:claim_selected_outbox, [worker_id, lease_seconds, candidate.fetch("id")])

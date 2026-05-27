@@ -57,23 +57,15 @@ UPDATE `durababble_mysql_snapshot_fences`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), result = NULL, error = NULL, completed_at = NULL
 WHERE workflow_id = ? AND `key` = ? AND status = 'running' AND locked_until < NOW(6)
 
--- mysql_claim_expired_outbox
-SELECT id, created_at FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_expired_lease_idx)
-WHERE status = 'processing' AND locked_until < NOW(6)
-ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
 -- mysql_claim_object_lease
 UPDATE `durababble_mysql_snapshot_durable_objects`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
 WHERE object_type = ? AND object_id = ?
   AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
 
--- mysql_claim_pending_outbox
-SELECT id, created_at FROM `durababble_mysql_snapshot_outbox`
-WHERE status = 'pending'
-ORDER BY created_at
+-- mysql_claim_outbox
+SELECT id, created_at FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_claim_idx)
+WHERE queue_available_at <= NOW(6)
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 

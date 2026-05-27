@@ -49,13 +49,6 @@ UPDATE "durababble_pg_snapshot"."fences"
 SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), result = NULL, error = NULL, completed_at = NULL
 WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < now()
 
--- pg_claim_expired_outbox
-SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
-WHERE status = 'processing' AND locked_until < now()
-ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
 -- pg_claim_object_lease
 INSERT INTO "durababble_pg_snapshot"."durable_objects"
   (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
@@ -69,12 +62,22 @@ WHERE "durababble_pg_snapshot"."durable_objects".locked_by IS NULL
    OR "durababble_pg_snapshot"."durable_objects".locked_by = EXCLUDED.locked_by
 RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
 
--- pg_claim_pending_outbox
-SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
-WHERE status = 'pending'
-ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
+-- pg_claim_outbox
+WITH candidate AS (
+  SELECT id FROM "durababble_pg_snapshot"."outbox"
+  WHERE (CASE
+  WHEN status = 'pending' THEN created_at
+  WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END) <= now()
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE "durababble_pg_snapshot"."outbox" AS outbox
+SET status = 'processing', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+FROM candidate
+WHERE outbox.id = candidate.id
+RETURNING outbox.*
 
 -- pg_claim_runnable_workflow
 WITH candidate AS (
@@ -95,12 +98,6 @@ SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interv
 FROM candidate
 WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
 RETURNING workflows.*
-
--- pg_claim_selected_outbox
-UPDATE "durababble_pg_snapshot"."outbox"
-SET status = 'processing', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
-WHERE id = $1
-RETURNING *
 
 -- pg_claim_selected_target_activation
 UPDATE "durababble_pg_snapshot"."target_activations"

@@ -122,8 +122,14 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           processed_at DATETIME(6),
-          INDEX #{quote_column_name(index_name("outbox", "queue"))} (status, created_at),
-          INDEX #{quote_column_name(index_name("outbox", "expired_lease"))} (status, locked_until, created_at),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN created_at
+              WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
+          INDEX #{quote_column_name(index_name("outbox", "claim"))} (queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )

@@ -24,10 +24,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_access_types: ["range"],
           max_rows_examined_per_scan: 4_000,
         },
-        "pending outbox claim probe" => {
-          sql: query_sql(:claim_pending_outbox),
-          expected_key_fragment: "outbox_queue",
-        },
         "expired workflow lease count probe" => {
           sql: query_sql(:count_expired_workflow_leases),
           params: [now],
@@ -40,11 +36,10 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_key_fragment: "workflows_expired_lease",
           expected_access_types: ["range"],
         },
-        "expired outbox claim probe" => {
-          sql: query_sql(:claim_expired_outbox),
-          expected_key_fragment: "outbox_expired_lease",
+        "outbox claim probe" => {
+          sql: query_sql(:claim_outbox),
+          expected_key_fragment: "outbox_claim",
           expected_access_types: ["range"],
-          allow_filesort: true,
         },
         "timer wait wake probe" => {
           sql: query_sql(:complete_timer_waits, limit: 100),
@@ -225,10 +220,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       ["worker_pool", "queue_available_at"]
     when "workflows_expired_lease"
       ["status", "locked_until"]
-    when "outbox_queue"
-      ["status"]
-    when "outbox_expired_lease"
-      ["status", "locked_until"]
+    when "outbox_claim"
+      ["queue_available_at"]
     when "waits_timer_pending"
       ["status", "kind", "wake_at"]
     when "waits_workflow_status"

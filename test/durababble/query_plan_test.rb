@@ -78,8 +78,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_child_workflow_by_child_id_for_update,
     :mysql_child_workflow_rows_for_object,
     :mysql_child_workflow_rows_for_parent,
-    :mysql_claim_expired_outbox,
-    :mysql_claim_pending_outbox,
+    :mysql_claim_outbox,
     :mysql_claim_runnable_workflow,
     :mysql_claim_selected_outbox,
     :mysql_claim_selected_target_activation,
@@ -601,8 +600,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "claim_outbox" => {
         call: -> { store.claim_outbox(worker_id: "plan-worker", lease_seconds: 60) },
-        allowed_indexes: ["outbox_pkey", "outbox_queue_idx", "outbox_expired_lease_idx"],
-        allow_post_filter_indexes: ["outbox_queue_idx"],
+        allowed_indexes: ["outbox_claim_idx"],
       },
       "ack_outbox" => {
         call: -> { store.ack_outbox("processing-outbox", worker_id: "owner") },

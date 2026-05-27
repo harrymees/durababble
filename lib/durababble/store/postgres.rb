@@ -402,16 +402,7 @@ module Durababble
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox_unchecked(worker_id:, lease_seconds:)
       row = retry_serialization_failures do
-        transaction do
-          candidates = []
-          candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
-          candidates.concat(execute_store_query(:claim_expired_outbox).to_a)
-
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
-          next nil unless candidate
-
-          execute_store_query(:claim_selected_outbox, [candidate.fetch("id"), worker_id, lease_seconds]).first
-        end
+        execute_store_query(:claim_outbox, [worker_id, lease_seconds]).first
       end
       typed_row = row #: as untyped
       observe_claim_latency(typed_row, "outbox") if typed_row

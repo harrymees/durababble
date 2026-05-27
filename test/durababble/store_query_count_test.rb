@@ -116,7 +116,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         claim_outbox_workflow = store.enqueue_workflow(name: "query-count-claim-outbox", input: {})
         claim_outbox_id = store.enqueue_outbox(workflow_id: claim_outbox_workflow, topic: "events", payload: { "ok" => true }, key: "query-count-claim-outbox")
-        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 4, postgres: 3) do
+        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 3, postgres: 1) do
           store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed_outbox, "id" => claim_outbox_id, "status" => "processing"

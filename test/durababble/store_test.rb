@@ -531,8 +531,7 @@ class DurababbleStoreTest < DurababbleTestCase
       assert_includes indexes, "waits_workflow_created_idx"
       assert_includes indexes, "step_attempts_workflow_started_position_idx"
       assert_includes indexes, "step_attempts_workflow_position_status_started_idx"
-      assert_includes indexes, "outbox_queue_idx"
-      assert_includes indexes, "outbox_expired_lease_idx"
+      assert_includes indexes, "outbox_claim_idx"
     end
   end
 
@@ -586,8 +585,6 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
       sql_result([], affected_rows: 0),
       sql_result([{ "id" => "outbox-old" }]),
-      sql_result([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
-      sql_result,
       sql_result([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
       sql_result,
@@ -1212,7 +1209,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "new-outbox", pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "new-outbox" }]),
     ])).enqueue_outbox(workflow_id: "wf", topic: "email", payload: {}, key: "new")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .claim_outbox(worker_id: "w", lease_seconds: 5)
     assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .claim_object_command(command_id: "cmd", worker_id: "w")

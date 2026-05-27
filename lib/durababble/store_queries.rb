@@ -21,6 +21,13 @@ module Durababble
         ELSE NULL
       END
     SQL
+    POSTGRES_OUTBOX_CLAIM_EXPRESSION = <<~SQL.chomp.freeze
+      CASE
+        WHEN status = 'pending' THEN created_at
+        WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+        ELSE NULL
+      END
+    SQL
 
     class << self
       #: (untyped, backend: untyped, ?description: String?) { (untyped) -> untyped } -> void
@@ -108,8 +115,8 @@ module Durababble
       },
       "outbox delivery" => {
         methods: ["Store.enqueue_outbox", "Store.claim_outbox", "Store.ack_outbox", "Store.release_worker_leases!"],
-        indexes: ["outbox_key_key", "outbox_queue_idx", "outbox_expired_lease_idx", "outbox_worker_lease_idx"],
-        assertions: ["unique key lookup", "queue/expired indexes", "worker release index"],
+        indexes: ["outbox_key_key", "outbox_claim_idx", "outbox_worker_lease_idx"],
+        assertions: ["unique key lookup", "unified claim index", "worker release index"],
         benchmarks: ["outbox_claim_ack", "outbox_expired_reclaim"],
       },
       "durable object mailbox" => {
@@ -356,32 +363,20 @@ module Durababble
       SQL
     end
 
-    define(:pg_claim_pending_outbox, backend: :postgres) do |store|
+    define(:pg_claim_outbox, backend: :postgres, description: "Probe the unified outbox queue and attach this sender lease to one available message.") do |store|
+      outbox = table(store, "outbox")
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")}
-        WHERE status = 'pending'
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:pg_claim_expired_outbox, backend: :postgres) do |store|
-      <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")}
-        WHERE status = 'processing' AND locked_until < now()
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:pg_claim_selected_outbox, backend: :postgres) do |store|
-      <<~SQL.chomp
-        UPDATE #{table(store, "outbox")}
-        SET status = 'processing', locked_by = $2, locked_until = now() + ($3::int * interval '1 second')
-        WHERE id = $1
-        RETURNING *
+        WITH candidate AS (
+          SELECT id FROM #{outbox}
+          WHERE (#{POSTGRES_OUTBOX_CLAIM_EXPRESSION}) <= now()
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE #{outbox} AS outbox
+        SET status = 'processing', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+        FROM candidate
+        WHERE outbox.id = candidate.id
+        RETURNING outbox.*
       SQL
     end
 
@@ -654,21 +649,10 @@ module Durababble
       "SELECT COUNT(*) AS count FROM #{table(store, "outbox")} FORCE INDEX (#{index}) WHERE status = 'processing' AND locked_by = ?"
     end
 
-    define(:mysql_claim_pending_outbox, backend: :mysql) do |store|
+    define(:mysql_claim_outbox, backend: :mysql, description: "Probe the unified outbox queue for one available message.") do |store|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")}
-        WHERE status = 'pending'
-        ORDER BY created_at
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-      SQL
-    end
-
-    define(:mysql_claim_expired_outbox, backend: :mysql) do |store|
-      <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")} FORCE INDEX (#{index_name(store, "outbox", "expired_lease")})
-        WHERE status = 'processing' AND locked_until < NOW(6)
-        ORDER BY created_at
+        SELECT id, created_at FROM #{table(store, "outbox")} FORCE INDEX (#{index_name(store, "outbox", "claim")})
+        WHERE queue_available_at <= NOW(6)
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL

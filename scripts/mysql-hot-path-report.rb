@@ -28,6 +28,7 @@ module DurababbleMysqlHotPathReport
     "enqueue_workflow" => "Trace the single durable write that enqueues a pending workflow.",
     "claim_runnable_workflow" => "Trace the MySQL queue probes and lease update used when a worker claims runnable workflow work.",
     "claim_target_activation" => "Trace the target activation queue probes and lease update used when a worker claims mailbox wakeup work.",
+    "claim_outbox" => "Trace the unified outbox queue probe and lease update used when a sender claims a message.",
     "worker_poll_idle" => "Trace one Worker#tick poll when no workflow work is available.",
     "worker_tick_claim" => "Trace one Worker#tick that polls, claims a workflow, and runs it to completion.",
   }.freeze
@@ -218,6 +219,35 @@ module DurababbleMysqlHotPathReport
           ready_at: Time.now - 1,
           worker_pool:,
         )
+      end
+    end
+
+    def seed_outbox_messages(
+      count = fixture_size,
+      workflow_name: "outbox-analysis-owner",
+      topic: "events",
+      id_prefix: "outbox-analysis-owner"
+    )
+      count.times do |index|
+        workflow_id = store.enqueue_workflow(
+          name: workflow_name,
+          input: { "n" => index },
+          id: "#{id_prefix}-#{index}",
+        )
+        store.enqueue_outbox(
+          workflow_id:,
+          topic:,
+          payload: { "n" => index },
+          key: "outbox-analysis-pending-#{index}",
+        )
+        claimed = store.claim_outbox(worker_id: "stale-outbox-worker", lease_seconds: -1)
+        store.enqueue_outbox(
+          workflow_id:,
+          topic:,
+          payload: { "ready" => index },
+          key: "outbox-analysis-ready-#{index}",
+        )
+        store.ack_outbox(claimed.fetch("id"), worker_id: "cleanup") if claimed && index.odd?
       end
     end
   end
@@ -1131,6 +1161,16 @@ module DurababbleMysqlHotPathReport
       target_types: [DEFAULT_WORKFLOW_NAME],
       worker_pool: DEFAULT_WORKER_POOL,
     )
+  end
+
+  register_scenario(
+    "claim_outbox",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("claim_outbox"),
+    setup: lambda do |context|
+      context.seed_outbox_messages
+    end,
+  ) do |context|
+    context.store.claim_outbox(worker_id: "analysis-worker", lease_seconds: 60)
   end
 
   register_scenario(

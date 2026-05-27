@@ -129,6 +129,13 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           processed_at INTEGER,
+          queue_available_at INTEGER GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN created_at
+              WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL
