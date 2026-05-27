@@ -851,23 +851,21 @@ module Durababble
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = $1 AND position = $2"
     end
 
-    define(:pg_current_object_activation_lease, backend: :postgres) do |store|
-      <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "target_activations")}
-        WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= now()
-        LIMIT 1
-      SQL
-    end
-
     define(:pg_current_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= now()
-        ORDER BY sequence
+        SELECT worker_pool, object_id, worker_id, locked_until
+        FROM (
+          SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 0 AS source_priority, NULL::bigint AS inbox_sequence
+          FROM #{table(store, "target_activations")}
+          WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+            AND locked_by IS NOT NULL AND locked_until >= now()
+          UNION ALL
+          SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 1 AS source_priority, sequence AS inbox_sequence
+          FROM #{table(store, "inbox")}
+          WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+            AND locked_by IS NOT NULL AND locked_until >= now()
+        ) AS leases
+        ORDER BY source_priority, inbox_sequence
         LIMIT 1
       SQL
     end
@@ -1393,23 +1391,21 @@ module Durababble
       "SELECT heartbeat_cursor FROM #{table(store, "steps")} WHERE workflow_id = ? AND position = ?"
     end
 
-    define(:mysql_current_object_activation_lease, backend: :mysql) do |store|
-      <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "target_activations")}
-        WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-        LIMIT 1
-      SQL
-    end
-
     define(:mysql_current_object_lease, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-        FROM #{table(store, "inbox")}
-        WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
-          AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-        ORDER BY sequence
+        SELECT worker_pool, object_id, worker_id, locked_until
+        FROM (
+          SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 0 AS source_priority, CAST(NULL AS SIGNED) AS inbox_sequence
+          FROM #{table(store, "target_activations")}
+          WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+            AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+          UNION ALL
+          SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 1 AS source_priority, sequence AS inbox_sequence
+          FROM #{table(store, "inbox")}
+          WHERE worker_pool = ? AND target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+            AND locked_by IS NOT NULL AND locked_until >= NOW(6)
+        ) AS leases
+        ORDER BY source_priority, inbox_sequence
         LIMIT 1
       SQL
     end

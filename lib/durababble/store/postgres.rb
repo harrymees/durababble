@@ -182,8 +182,7 @@ module Durababble
 
     #: (Object?, Object?, ?worker_pool: String) -> Object?
     def current_object_lease(object_type, object_id, worker_pool: "default")
-      row = execute_store_query(:current_object_activation_lease, [worker_pool, object_type, object_id]).first
-      row ||= execute_store_query(:current_object_lease, [worker_pool, object_type, object_id]).first
+      row = execute_store_query(:current_object_lease, [worker_pool, object_type, object_id]).first
       row&.transform_values(&:itself)
     end
 

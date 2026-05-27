@@ -23,6 +23,6 @@ The published site content lives in `docs/content/`. Existing design and review 
 devx zeitung              # Preview locally on port 1313
 devx zeitung --port 8080  # Preview locally on another port
 devx zeitung build        # Build static output into docs/build
-pnpm run format:markdown  # Format Markdown docs and repository README files
-pnpm run check:markdown   # Check Markdown formatting; also runs through rake lint
+bundle exec rake format:markdown  # Format Markdown docs and repository README files
+bundle exec rake check:markdown   # Check Markdown formatting; also runs through rake lint
 ```

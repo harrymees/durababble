@@ -223,8 +223,7 @@ module Durababble
 
     #: (Object?, Object?, ?worker_pool: String) -> Object?
     def current_object_lease(object_type, object_id, worker_pool: "default")
-      execute_store_query(:current_object_activation_lease, [worker_pool, object_type, object_id]).first ||
-        execute_store_query(:current_object_lease, [worker_pool, object_type, object_id]).first
+      execute_store_query(:current_object_lease, [worker_pool, object_type, object_id, worker_pool, object_type, object_id]).first
     end
 
     #: (?now: Time) -> Integer

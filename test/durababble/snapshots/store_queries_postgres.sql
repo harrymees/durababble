@@ -211,19 +211,20 @@ UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $
 -- pg_complete_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, runnable_immediately = true, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $3 AND locked_until >= now()
 
--- pg_current_object_activation_lease
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM "durababble_pg_snapshot"."target_activations"
-WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
-  AND locked_by IS NOT NULL AND locked_until >= now()
-LIMIT 1
-
 -- pg_current_object_lease
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM "durababble_pg_snapshot"."inbox"
-WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
-  AND locked_by IS NOT NULL AND locked_until >= now()
-ORDER BY sequence
+SELECT worker_pool, object_id, worker_id, locked_until
+FROM (
+  SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 0 AS source_priority, NULL::bigint AS inbox_sequence
+  FROM "durababble_pg_snapshot"."target_activations"
+  WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+    AND locked_by IS NOT NULL AND locked_until >= now()
+  UNION ALL
+  SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until, 1 AS source_priority, sequence AS inbox_sequence
+  FROM "durababble_pg_snapshot"."inbox"
+  WHERE worker_pool = $1 AND target_kind = 'object' AND target_type = $2 AND target_id = $3 AND status = 'running'
+    AND locked_by IS NOT NULL AND locked_until >= now()
+) AS leases
+ORDER BY source_priority, inbox_sequence
 LIMIT 1
 
 -- pg_current_workflow_lease
