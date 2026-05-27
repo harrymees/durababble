@@ -70,6 +70,16 @@ class Fiber
   def self.scheduler; end
 end
 
+module ActiveSupport
+  module IsolatedExecutionState
+    sig { returns(Symbol) }
+    def self.isolation_level; end
+
+    sig { params(value: Symbol).returns(Symbol) }
+    def self.isolation_level=(value); end
+  end
+end
+
 module ActiveRecord
   class ActiveRecordError < StandardError; end
   class Deadlocked < ActiveRecordError; end

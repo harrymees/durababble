@@ -4,6 +4,7 @@
 require "securerandom"
 
 require_relative "durable_method_dsl"
+require_relative "execution_context"
 
 module Durababble
   Step = Data.define(:name, :retry_policy)
@@ -199,27 +200,91 @@ module Durababble
 
     #: () -> untyped
     def status
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_handle_rpc(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          method_name: :status,
+          rpc_kind: "workflow_status",
+          args: [],
+          kwargs: {},
+        ) { @store.workflow(@workflow_id).fetch("status") }
+      end
+
       @store.workflow(@workflow_id).fetch("status")
     end
 
     #: () -> untyped
     def result
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_handle_rpc(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          method_name: :result,
+          rpc_kind: "workflow_result",
+          args: [],
+          kwargs: {},
+        ) { @store.workflow(@workflow_id)["result"] }
+      end
+
       @store.workflow(@workflow_id)["result"]
     end
 
     #: () -> untyped
     def error
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_handle_rpc(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          method_name: :error,
+          rpc_kind: "workflow_error",
+          args: [],
+          kwargs: {},
+        ) { @store.workflow(@workflow_id)["error"] }
+      end
+
       @store.workflow(@workflow_id)["error"]
     end
 
     #: (?reason: untyped) -> untyped
     def cancel(reason: nil)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_handle_rpc(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          method_name: :cancel,
+          rpc_kind: "workflow_cancel",
+          args: [],
+          kwargs: { reason: },
+        ) do
+          cancel(reason:)
+        end
+      end
+
       row = @store.request_workflow_cancellation(workflow_id: @workflow_id, reason:)
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
     end
 
     #: (?reason: untyped) -> untyped
     def terminate(reason: nil)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_handle_rpc(
+          target_kind: "workflow",
+          target_type: @workflow_class.workflow_name,
+          target_id: @workflow_id,
+          method_name: :terminate,
+          rpc_kind: "workflow_terminate",
+          args: [],
+          kwargs: { reason: },
+        ) do
+          terminate(reason:)
+        end
+      end
+
       row = @store.request_workflow_termination(workflow_id: @workflow_id, reason:)
       Run.new(id: row.fetch("id"), status: row.fetch("status"), result: row["result"], error: row["error"])
     end
@@ -230,24 +295,40 @@ module Durababble
         raise ArgumentError, "workflow query #{method_name} does not accept idempotency_key:" if kwargs.key?(:idempotency_key)
         raise ArgumentError, "workflow query #{method_name} does not accept blocks" if block
 
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "workflow",
+            target_type: @workflow_class.workflow_name,
+            target_id: @workflow_id,
+            method_name:,
+            rpc_kind: "workflow_query",
+            args:,
+            kwargs:,
+          ) do |args:, kwargs:, **|
+            route_query(method_name, args:, kwargs:)
+          end
+        end
+
         route_query(method_name, args:, kwargs:)
       elsif @workflow_class.exposed_commands.key?(method_name)
-        idempotency_key = kwargs.delete(:idempotency_key)
-        payload = { "method" => method_name.to_s, "args" => args, "kwargs" => kwargs }
-        message_id = @store.enqueue_workflow_command(
-          workflow_id: @workflow_id,
-          workflow_name: @workflow_class.workflow_name,
-          method_name: method_name.to_s,
-          payload:,
-          idempotency_key:,
-        )
-        @store.deliver_target_message(
-          worker_pool: inbox_worker_pool(message_id),
-          target_kind: "workflow",
-          target_type: @workflow_class.workflow_name,
-          target_id: @workflow_id,
-        )
-        @store.wait_for_inbox_message(message_id)
+        raise ArgumentError, "blocks cannot be passed to workflow command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
+
+        if (execution = WorkflowExecutionContext.current)
+          return execution.call_handle_rpc(
+            target_kind: "workflow",
+            target_type: @workflow_class.workflow_name,
+            target_id: @workflow_id,
+            method_name:,
+            rpc_kind: "workflow_command",
+            args:,
+            kwargs:,
+            retry_policy: @workflow_class.exposed_commands.fetch(method_name),
+          ) do |idempotency_key:, args:, kwargs:|
+            invoke_command(method_name, args:, kwargs:, idempotency_key:)
+          end
+        end
+
+        invoke_command(method_name, args:, kwargs:)
       else
         super
       end
@@ -294,6 +375,27 @@ module Durababble
 
       worker_pool = @worker_pool || "default"
       @store.workflow_rpc_client_factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
+    end
+
+    #: (untyped, args: untyped, kwargs: untyped, ?idempotency_key: untyped) -> untyped
+    def invoke_command(method_name, args:, kwargs:, idempotency_key: nil)
+      command_kwargs = kwargs.dup
+      idempotency_key ||= command_kwargs.delete(:idempotency_key)
+      payload = { "method" => method_name.to_s, "args" => args, "kwargs" => command_kwargs }
+      message_id = @store.enqueue_workflow_command(
+        workflow_id: @workflow_id,
+        workflow_name: @workflow_class.workflow_name,
+        method_name: method_name.to_s,
+        payload:,
+        idempotency_key:,
+      )
+      @store.deliver_target_message(
+        worker_pool: inbox_worker_pool(message_id),
+        target_kind: "workflow",
+        target_type: @workflow_class.workflow_name,
+        target_id: @workflow_id,
+      )
+      @store.wait_for_inbox_message(message_id)
     end
   end
 end

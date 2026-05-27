@@ -104,6 +104,11 @@ module Durababble
     # always available to the rescue handlers.
     #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil)
+      # Deferred boot check: at workflow execution time the host's initializers have run
+      # and ActiveSupport::IsolatedExecutionState.isolation_level should be :fiber. Running
+      # the Async reactor below with :thread isolation would share one AR connection across
+      # fan-out fibers and corrupt the wire protocol. See Durababble.assert_fiber_isolation!.
+      Durababble.assert_fiber_isolation!
       attributes = execute_attributes(workflow_class, workflow_id)
       Observability.trace("durababble.workflow.execute", attributes) do
         drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:)
@@ -224,7 +229,7 @@ module Durababble
 
     #: (untyped, StandardError, untyped) -> untyped
     def persist_workflow_failure(workflow_id, error, attributes)
-      raise if error.is_a?(InjectedCrash) || error.is_a?(LeaseConflict)
+      raise if error.is_a?(InjectedCrash) || error.is_a?(LeaseConflict) || error.is_a?(ConfigurationError)
 
       message = ErrorFormatting.format_error(error)
       @store.fail_workflow(workflow_id, error: message, worker_id: @worker_id)

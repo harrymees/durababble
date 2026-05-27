@@ -2,9 +2,15 @@
 # frozen_string_literal: true
 
 require "json"
+require "active_support/isolated_execution_state"
 
 require_relative "../../lib/durababble"
 require_relative "anthropic_client"
+
+# Durababble requires :fiber isolation so each reactor fiber checks out its own
+# ActiveRecord connection. In a Rails+Falcon host the Falcon Railtie sets this
+# defensively; standalone scripts like this one set it explicitly.
+ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
 
 module AgentLoopExample
   # These are the tools the model can call. Each tool is implemented below by
