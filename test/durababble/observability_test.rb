@@ -233,6 +233,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def migrate! = self
     def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
 
+    def current_object_lease(_object_type, _object_id) = nil
+
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds:)
+      _ = [object_type, object_id, lease_seconds]
+      { "worker_pool" => worker_pool, "worker_id" => worker_id }
+    end
+
     def object_state_entry(object_type:, object_id:)
       state = @state[[object_type, object_id]]
       state.nil? ? Durababble::Store::NO_OBJECT_STATE : state

@@ -58,6 +58,8 @@ module Durababble
 
   interface _RpcDeliverMessageClient
     def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
+    def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+    def call_transient_stream: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> ResultStream
   end
 
   interface _RpcClientFactory
@@ -70,6 +72,10 @@ module Durababble
 
   interface _StreamHandler
     def call: (request: Object, args: serialized_payload, writer: Rpc::StreamWriter) -> void
+  end
+
+  interface _WorkerIdProvider
+    def call: () -> String
   end
 
   interface _RpcRequester
@@ -119,6 +125,9 @@ module Durababble
   end
 
   class CommandTimeout < Error
+  end
+
+  class ObjectReadBlocked < Error
   end
 
   class IdempotencyKeyConflict < Error
@@ -210,6 +219,8 @@ module Durababble
     attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
     attr_accessor local_workflow_rpc_node_id: String?
     attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
+    attr_accessor local_worker_id: (String | _WorkerIdProvider)?
+    attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
     def self.from_active_record: (connection_pool: _ActiveRecordConnectionPool, ?schema: String, ?owner: _ActiveRecordOwner?) -> Store
@@ -226,6 +237,7 @@ module Durababble
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String], ?worker_pool: String, ?excluding_workflow_ids: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
     def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
+    def upsert_target_activation: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def heartbeat: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Object
     def workflow_owned?: (workflow_id: String, worker_id: String) -> bool
     def release_worker_leases!: (worker_id: String) -> lease_release_counts
@@ -366,6 +378,12 @@ module Durababble
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end
 
+  class DurableObjectTransientHandler
+    def self.assert_read_gate_open!: (Store store, object_type: String, object_id: String, ?worker_pool: String) -> void
+    def initialize: (store: Store, objects: object_registry, node_id: String | _WorkerIdProvider) -> void
+    def call: (request: Object, args: serialized_payload) -> serialized_payload
+  end
+
   class DurableObjectExecutor
     def initialize: (store: Store, objects: object_registry, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def drain_object_inbox: (String object_type, object_id: String, ?limit: Integer) -> Integer
@@ -408,8 +426,8 @@ module Durababble
   end
 
   # Server-side dispatcher for `call_transient_stream` RPCs: resolves the target
-  # workflow/object class, builds a snapshot instance, and runs its
-  # `expose_stream` method, forwarding yielded values to the RPC writer.
+  # workflow/object class, verifies lease ownership, and runs its `expose_stream`
+  # method, forwarding yielded values to the RPC writer.
   class StreamDispatcher
     def initialize: (store: Store, workflows: workflow_registry, objects: object_registry, node_id: String, ?object_stream_host: ObjectStreamHost?, ?lease_seconds: Integer) -> void
     def call: (request: Rpc::Messages::TransientRequest, args: Hash[String, serialized_payload]?, writer: Rpc::StreamWriter) -> void

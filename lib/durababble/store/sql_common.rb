@@ -749,6 +749,21 @@ module Durababble
       raise NotImplementedError
     end
 
+    public
+
+    # Transactional wrapper around `upsert_target_activation_without_transaction`
+    # for callers outside the store's internal transactional flows. Streaming
+    # consumers use this to wake up a worker that will claim the per-object
+    # lease (via `process_object_activation`) before they RPC in.
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
+    def upsert_target_activation(worker_pool:, target_kind:, target_type:, target_id:, ready_at: nil)
+      transaction do
+        upsert_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
+      end
+    end
+
+    private
+
     #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> [Integer, String]
     def allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
       raise NotImplementedError

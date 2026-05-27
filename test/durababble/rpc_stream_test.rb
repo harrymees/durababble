@@ -169,12 +169,7 @@ class DurababbleRpcStreamTest < DurababbleTestCase
         limit.times { |index| block.call("#{prefix}-#{index}") }
       end
     end
-    dispatcher = Durababble::StreamDispatcher.new(
-      store: SnapshotlessStore.new,
-      workflows: [],
-      objects: [object_class],
-      node_id: "node-a",
-    )
+    host, dispatcher = build_leased_dispatcher(objects: [object_class], node_id: "node-a")
     server = start_stream_server(dispatcher.method(:call))
     client = Durababble::Rpc::Client.new(address: server.address)
 
@@ -188,6 +183,7 @@ class DurababbleRpcStreamTest < DurababbleTestCase
 
     assert_equal(["row-0", "row-1", "row-2"], stream.each.to_a)
   ensure
+    host&.stop!
     server&.stop
   end
 
@@ -334,15 +330,6 @@ class DurababbleRpcStreamTest < DurababbleTestCase
     def current_workflow_lease(_workflow_id)
       @calls += 1
       { "worker_id" => @calls <= 1 ? @initial_owner : @later_owner }
-    end
-  end
-
-  # Minimal store for object-stream dispatch: object streams run against a state
-  # snapshot, and the stream methods under test do not read it, so a nil snapshot
-  # is enough to exercise the routing + argument-forwarding path.
-  class SnapshotlessStore
-    def object_state(object_type:, object_id:)
-      nil
     end
   end
 

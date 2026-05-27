@@ -5,9 +5,9 @@ require_relative "execution_context"
 
 module Durababble
   # Server-side handler for `call_transient_stream` RPCs. Resolves the target
-  # workflow/durable-object class from the request, builds a snapshot instance
-  # (the same instance shape exposed queries run against), then invokes the
-  # `expose_stream` method, forwarding each yielded value to the RPC writer.
+  # workflow/durable-object class from the request, builds an owner-local
+  # instance, then invokes the `expose_stream` method, forwarding each yielded
+  # value to the RPC writer.
   #
   # Both lanes re-check the lease before every emit and once up front: if this
   # node has lost the lease the dispatcher raises `StaleLease`, which the server
@@ -15,7 +15,8 @@ module Durababble
   # streams use `current_workflow_lease`; object streams hold the unified
   # `durable_objects` lease through an `ObjectStreamHost` (refcounted on this
   # node, renewed in a background thread). When no host is wired the dispatcher
-  # falls back to the snapshot-only path (test doubles, plain consumers).
+  # still requires the current object lease to belong to this node; it never
+  # serves a lease-free local snapshot.
   #
   # The wire `args` payload is `{ "args" => [...positional], "kwargs" => {...} }`,
   # matching what `WorkflowRef`/`DurableObjectRef` send when routing remotely.
@@ -61,14 +62,17 @@ module Durababble
           raise WorkflowRpc::StaleLease, "object lease for #{worker_pool}/#{object_type}/#{object_id} lost" if entry.lost
         end
       else
+        assert_object_lease!(object_type:, object_id:)
         run_object_producer(object_class:, object_id:, request:, args:, writer:, entry: nil)
+        assert_object_lease!(object_type:, object_id:)
       end
     end
 
     #: (object_class: untyped, object_id: String, request: Rpc::Messages::TransientRequest, args: Hash[String, untyped]?, writer: untyped, entry: ObjectStreamHost::Entry?) -> void
     def run_object_producer(object_class:, object_id:, request:, args:, writer:, entry:)
       state = @store.object_state(object_type: object_class.object_type, object_id:)
-      object = object_class.new(durable_id: object_id, state:, store: @store)
+      worker_pool = request.worker_pool.to_s.empty? ? "default" : request.worker_pool
+      object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:)
       object.instance_variable_set(:@__durababble_query_context, true)
       lease_writer = entry ? ObjectStreamLeaseWriter.new(writer, entry:) : writer
       invoke_stream(object, request:, args:, writer: lease_writer)
@@ -107,7 +111,7 @@ module Durababble
 
     # Only methods registered with `expose_stream` may be invoked over the wire.
     # Without this guard a `call_transient_stream` request could `public_send` any
-    # public method on the snapshot instance. Mirrors the `exposed_commands` guard
+    # public method on the owner-local instance. Mirrors the `exposed_commands` guard
     # on the durable-object command path.
     #: (untyped, Symbol) -> void
     def assert_exposed_stream!(target_class, method_name)
@@ -123,6 +127,15 @@ module Durababble
       return if lease.fetch("worker_id") == @node_id
 
       raise WorkflowRpc::StaleLease, "#{@node_id} does not own workflow #{workflow_id}; current owner is #{lease.fetch("worker_id")}"
+    end
+
+    #: (object_type: String, object_id: String) -> void
+    def assert_object_lease!(object_type:, object_id:)
+      lease = @store.current_object_lease(object_type, object_id)
+      raise WorkflowRpc::NoActiveLease, "durable object #{object_type}/#{object_id} has no active lease" unless lease
+      return if lease.fetch("worker_id") == @node_id
+
+      raise WorkflowRpc::StaleLease, "#{@node_id} does not own durable object #{object_type}/#{object_id}; current owner is #{lease.fetch("worker_id")}"
     end
 
     #: (untyped) -> Hash[Symbol, untyped]

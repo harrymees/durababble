@@ -107,7 +107,11 @@ class Account < Durababble::DurableObject
 end
 ```
 
-`expose` registers transient non-durable owner-local methods. Transient methods read latest persisted state, may run concurrently with other transient methods, must not enqueue inbox messages, call workflow steps, mutate durable state, schedule sleeps, or write Durababble tables, and reject `idempotency_key:`.
+`expose` registers transient non-durable owner-local methods. Transient methods are dispatched to the active object owner through `CallTransient` when one exists, with an in-process fast path only inside the runtime that currently owns the object lease. A caller must not satisfy an exposed read by loading persisted object state in its own process while another live owner exists. When no active owner exists, a caller may inspect persisted state only after claiming the object lease and after the read gate confirms there is no unresolved mailbox work for the object.
+
+The owner-local read gate admits an exposed read only when the object's mailbox has no pending, running, retry-failed, or dead-lettered message. Pending earlier asks/tells/wakes, an in-flight command, a retry-failed head waiting for its next attempt, and a dead-lettered head reject the transient read with `Durababble::ObjectReadBlocked`; callers observe this as a transient read failure rather than a stale snapshot. Completed earlier messages do not block. This policy favors correctness over availability: callers retry the read after the owner drains, retries, or operator-resolves the blocking mailbox work.
+
+Transient object methods may run concurrently with other admitted transient methods, must not enqueue inbox messages, call workflow steps, mutate durable state, schedule sleeps, or write Durababble tables, and reject `idempotency_key:`. `update_state` from an exposed read raises `Durababble::Error`.
 
 `expose_command` registers durable mailbox commands. Commands execute through the durable object's identity, receive `command_context`, and update state only through `update_state(new_state)`. `command_context.idempotency_key` is generated from object type, object id, and mailbox message id and is stable for the durable command.
 
@@ -325,9 +329,9 @@ Admin and observability surfaces expose patch usage by workflow type/id: normal 
 
 ## Durable object execution semantics
 
-Object commands, scheduled wakeups, and other mailbox work acquire an exclusive writer slot for the target. Exposed transient methods acquire shared read access, can run concurrently with each other, and stop entering once mailbox work is waiting.
+Object commands, scheduled wakeups, and other mailbox work acquire an exclusive writer slot for the target. Exposed transient methods acquire shared read access on the active owner, can run concurrently with each other, and stop entering once unresolved mailbox work is waiting.
 
-Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery.
+Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery. Exposed object reads use the same HTTP/2 `CallTransient` method as workflow transient calls: the caller looks up the current object lease, calls the owner node when the lease belongs to another runtime, uses the registered local transient handler when the current runtime owns the lease, and retries once on stale-owner or no-active-owner responses after refreshing the lease. Transport-unavailable owner failures are returned to the caller and do not fall back to caller-local persisted-state inspection. The owner validates its lease before and after executing the transient method.
 
 Commands execute one at a time in strict FIFO order per durable target. Target executors drain only the contiguous ready prefix from the mailbox head. `SKIP LOCKED` must not let later messages overtake a blocked head for the same target.
 

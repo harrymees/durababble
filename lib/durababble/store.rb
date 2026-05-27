@@ -37,6 +37,8 @@ module Durababble
     attr_accessor :local_workflow_rpc_node_id
     #: Hash[String, Object]?
     attr_accessor :local_workflow_rpc_handlers
+    #: Object
+    attr_accessor :local_worker_id, :local_transient_handler
 
     class << self
       #: (*Object?, **Object?) ?{ (Object?) -> Object? } -> Store
@@ -173,6 +175,8 @@ module Durababble
       @workflow_rpc_client_factory = ->(address, worker_pool:) { Durababble::Rpc::WorkflowClient.new(address:, worker_pool:) }
       @local_workflow_rpc_node_id = nil
       @local_workflow_rpc_handlers = nil
+      @local_worker_id = nil
+      @local_transient_handler = nil
     end
 
     #: () -> void
@@ -284,6 +288,16 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?now: Time, ?worker_pool: String) -> Object?
     def complete_target_activation(target_kind:, target_type:, target_id:, worker_id:, now: Time.now, worker_pool: "default")
+      raise NotImplementedError
+    end
+
+    # Public entry point for scheduling (or refreshing) a target activation.
+    # Wraps the internal `_without_transaction` variant in a `transaction` so
+    # external callers (e.g. a streaming consumer asking a worker to claim
+    # ownership of an object before it RPCs in) do not need to manage the
+    # store's transactional boundary themselves.
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
+    def upsert_target_activation(worker_pool:, target_kind:, target_type:, target_id:, ready_at: nil)
       raise NotImplementedError
     end
 

@@ -32,7 +32,7 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
   class FakeStreamStore
     attr_reader :lease_lookup_count, :object_claims, :object_releases
 
-    def initialize(object_state: nil, workflow_lease: nil, object_lease_holder: "host-worker")
+    def initialize(object_state: nil, workflow_lease: nil, object_lease_holder: "node-a")
       @object_state = object_state
       @workflow_lease = workflow_lease
       @lease_lookup_count = 0
@@ -50,9 +50,13 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       @workflow_lease
     end
 
+    def current_object_lease(_object_type, _object_id)
+      { "worker_id" => @object_lease_holder }
+    end
+
     def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
       @object_claims << { worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: }
-      { "worker_id" => @object_lease_holder, "worker_pool" => worker_pool }
+      { "worker_id" => worker_id, "worker_pool" => worker_pool }
     end
 
     def renew_object_lease(**_kwargs)
@@ -98,7 +102,7 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
     assert object_class.exposed_streams.key?(:history)
   end
 
-  test "dispatches an object stream against a state snapshot" do
+  test "dispatches an object stream only when this node owns the object lease" do
     object_class = Class.new(Durababble::DurableObject) do
       object_type "dispatcher_counter"
       expose_stream :ticks
@@ -117,6 +121,27 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       .call(request:, args: { "args" => [], "kwargs" => {} }, writer:)
 
     assert_equal [10, 20, 30], writer.values
+  end
+
+  test "rejects object stream dispatch without an object lease" do
+    object_class = Class.new(Durababble::DurableObject) do
+      object_type "dispatcher_unowned"
+      expose_stream :ticks
+      def ticks(&block)
+        block.call(1)
+      end
+    end
+    store = FakeStreamStore.new
+    store.define_singleton_method(:current_object_lease) { |_object_type, _object_id| nil }
+    request = Durababble::Rpc::Messages::TransientRequest.new(
+      class_name: "dispatcher_unowned",
+      durable_object_id: "counter-1",
+      method: "ticks",
+    )
+
+    assert_raises(Durababble::WorkflowRpc::NoActiveLease) do
+      dispatcher(objects: [object_class], store:).call(request:, args: empty_args, writer: CapturingWriter.new)
+    end
   end
 
   test "forwards positional and keyword arguments to the stream method" do

@@ -193,11 +193,13 @@ module Durababble
 
     #: () -> untyped
     def start_rpc_server
+      transient_handler = DurableObjectTransientHandler.new(store: @store, objects: @objects, node_id: -> { @worker_id })
       @rpc_server = Rpc::Server.new(
         node_id: nil,
         store: @store,
         worker_pool: @worker_pool,
         workflow_handlers: @workflow_rpc_handlers,
+        transient_handler:,
         host: @rpc_host,
         port: @rpc_port,
         credentials: @rpc_credentials,
@@ -212,6 +214,8 @@ module Durababble
       # The server assigns its `node_id` during `start`, so it is non-nil here.
       node_id = @rpc_server.node_id #: as String
       @worker_id = node_id
+      @store.local_worker_id = -> { @worker_id } if @store.respond_to?(:local_worker_id=)
+      @store.local_transient_handler = transient_handler if @store.respond_to?(:local_transient_handler=)
       # The host's renewal task uses `Store#with_dedicated_connection` so its
       # writes do not contend with the worker loop's reactor connection. Built
       # before the dispatcher so the dispatcher receives it.
@@ -279,6 +283,8 @@ module Durababble
 
       Durababble.local_stream_host = nil if Durababble.local_stream_host.equal?(host)
 
+      @store.local_worker_id = nil if @store.respond_to?(:local_worker_id=)
+      @store.local_transient_handler = nil if @store.respond_to?(:local_transient_handler=)
       clear_local_workflow_rpc(@store)
       @rpc_server = nil
       @rpc_address = nil

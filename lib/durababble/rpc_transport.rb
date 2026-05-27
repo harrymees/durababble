@@ -127,6 +127,8 @@ module Durababble
       # decides whether to raise now or carry it).
       #: (String, String) -> Exception
       def build_remote_error(klass, message)
+        return ObjectReadBlocked.new(message) if klass == "Durababble::ObjectReadBlocked" || klass == "ObjectReadBlocked"
+
         WorkflowRpc.remote_error_from_fields(klass, message) ||
           Durababble::Rpc::RemoteError.new("#{klass}: #{message}")
       end
@@ -304,13 +306,11 @@ module Durababble
       # server-side producer observes the cancellation and unwinds).
       #
       # Fencing note: unlike unary `call_transient`, this intentionally does not
-      # send `expected_worker_id`. Workflow streams are instead fenced server-side
-      # by lease ownership — `StreamDispatcher` verifies the lease up front and the
-      # `LeaseCheckingWriter` re-checks it as frames are produced, ending the stream
-      # with a terminal `StaleLease` if this node no longer owns the workflow. The
-      # consumer therefore observes a hand-off via a raised `StaleLease`, not via a
-      # rejected request. (Object streams run against a snapshot, so there is no
-      # owner to fence against.)
+      # send `expected_worker_id`. Streams are fenced server-side by lease
+      # ownership: workflows verify the lease up front and re-check while
+      # emitting, while objects run under `ObjectStreamHost`'s claimed/renewed
+      # lease. The consumer observes a hand-off via a terminal `StaleLease`, not
+      # a rejected request.
       #: (**Object?) -> ResultStream
       def call_transient_stream(**kwargs)
         worker_pool = kwargs.fetch(:worker_pool) #: as String
@@ -544,7 +544,7 @@ module Durababble
       # `credentials:`/`pool_size:` are accepted for call-site compatibility with
       # the former gRPC server but unused: the transport is cleartext H2C and the
       # reactor multiplexes connections on one fiber scheduler (no thread pool).
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method | DurableObjectTransientHandler)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
       def initialize(
         node_id:,
         store:,
@@ -712,7 +712,7 @@ module Durababble
     end
 
     class Service
-      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
+      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method | DurableObjectTransientHandler)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -927,7 +927,11 @@ module Durababble
 
       #: (Messages::TransientRequest) -> Messages::TransientResponse?
       def moved_response(request)
-        lease = @store.current_workflow_lease(request.workflow_id, worker_pool: request.worker_pool)
+        lease = if workflow_id(request).empty?
+          @store.current_object_lease(request.class_name, durable_object_id(request))
+        else
+          @store.current_workflow_lease(workflow_id(request), worker_pool: request.worker_pool)
+        end
         return unless lease
 
         new_node_id = lease.fetch("worker_id").to_s
@@ -939,6 +943,16 @@ module Durababble
             new_rpc_address: @node_directory.rpc_address_for(new_node_id).to_s,
           ),
         )
+      end
+
+      #: (untyped) -> String
+      def workflow_id(request)
+        request.workflow_id.to_s
+      end
+
+      #: (untyped) -> String
+      def durable_object_id(request)
+        request.respond_to?(:durable_object_id) ? request.durable_object_id.to_s : request["object_id"].to_s
       end
 
       #: (StandardError) -> Messages::TransientResponse
