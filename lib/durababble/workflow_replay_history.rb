@@ -155,6 +155,8 @@ module Durababble
 
       case event.fetch("kind")
       when "step_scheduled"
+        raise_duplicate_history!("step_scheduled", command_id) if @scheduled.key?(command_id)
+
         @scheduled[command_id] = event
       when *TERMINAL_KINDS
         # A step_failed event is terminal unless it explicitly carries a
@@ -163,8 +165,15 @@ module Durababble
         # the exception path.
         return if retrying_step_failure?(event)
 
+        raise_duplicate_history!("terminal", command_id) if @terminal.key?(command_id)
+
         @terminal[command_id] = event
       end
+    end
+
+    #: (String, Integer) -> void
+    def raise_duplicate_history!(kind, command_id)
+      raise NonDeterminismError, "workflow replay history contains duplicate #{kind} history for command #{command_id}"
     end
 
     #: (Hash[String, Object?]) -> bool
