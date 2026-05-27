@@ -18,7 +18,7 @@ module Durababble
 
     #: (store: Store, ?worker_id: String, ?lease_seconds: Numeric, ?crash_after: Symbol?, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, worker_id: "inline-worker", lease_seconds: DEFAULT_LEASE_SECONDS, crash_after: nil, migrate: true, worker_pool: "default", workflow_query_registry: nil)
-      @store = store #: as untyped
+      @store = store
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @crash_after = crash_after

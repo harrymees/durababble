@@ -18,7 +18,7 @@ module Durababble
 
     #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, history: Array[Hash[String, Object?]], root_task: Object, workflow_class: Class, workflow: Object, worker_pool: String, ?crash_after: Symbol?, ?history_warning_logged: bool) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false)
-      @store = store #: as untyped
+      @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds
@@ -644,9 +644,10 @@ module Durababble
 
       result = invoke_workflow_command(method_name, args:, kwargs:)
       reserve_workflow_command_history_event!
+      message_id = message.fetch("id").to_s
       synchronize_store do
         @store.complete_workflow_command(
-          message_id: message.fetch("id"),
+          message_id:,
           workflow_id: @workflow_id,
           result:,
           worker_id: @worker_id,
@@ -708,9 +709,10 @@ module Durababble
     #: (Hash[String, Object?], String) -> void
     def fail_workflow_command_message(message, error)
       reserve_workflow_command_history_event!
+      message_id = message.fetch("id").to_s
       synchronize_store do
         @store.fail_workflow_command(
-          message_id: message.fetch("id"),
+          message_id:,
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,

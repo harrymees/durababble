@@ -193,7 +193,7 @@ module Durababble
     def initialize(workflow_class, workflow_id, store:, worker_pool: nil)
       @workflow_class = workflow_class #: as untyped
       @workflow_id = workflow_id
-      @store = store #: as untyped
+      @store = store
       @worker_pool = worker_pool
     end
 
@@ -215,7 +215,7 @@ module Durababble
         return rpc_status #: as String
       end
 
-      @store.workflow(@workflow_id).fetch("status")
+      @store.workflow(@workflow_id).fetch("status").to_s
     end
 
     #: () -> Object?
@@ -250,7 +250,7 @@ module Durababble
         return rpc_error #: as String?
       end
 
-      @store.workflow(@workflow_id)["error"]
+      @store.workflow(@workflow_id)["error"]&.to_s
     end
 
     #: (?reason: Object?) -> Run
@@ -376,21 +376,24 @@ module Durababble
 
     #: (String, worker_pool: String) -> Object
     def workflow_rpc_client_for(worker_id, worker_pool:)
-      if @store.local_workflow_rpc_node_id == worker_id && @store.local_workflow_rpc_handlers
+      handlers = @store.local_workflow_rpc_handlers
+      if @store.local_workflow_rpc_node_id == worker_id && handlers
         return WorkflowRpc::LocalClient.new(
           store: @store,
           node_id: worker_id,
-          handlers: @store.local_workflow_rpc_handlers,
+          handlers:,
         )
       end
 
-      @store.workflow_rpc_client_factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
+      factory = @store.workflow_rpc_client_factory
+      factory = factory #: as untyped
+      factory.call(WorkerIdentity.address_for(worker_id), worker_pool:)
     end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: String?) -> Object?
     def invoke_command(method_name, args:, kwargs:, idempotency_key: nil)
       command_kwargs = kwargs.dup
-      idempotency_key ||= command_kwargs.delete(:idempotency_key)
+      idempotency_key ||= string_idempotency_key(command_kwargs.delete(:idempotency_key)) if command_kwargs.key?(:idempotency_key)
       payload = { "method" => method_name.to_s, "args" => args, "kwargs" => command_kwargs }
       message_id = @store.enqueue_workflow_command(
         workflow_id: @workflow_id,
@@ -406,6 +409,11 @@ module Durababble
         target_id: @workflow_id,
       )
       @store.wait_for_inbox_message(message_id)
+    end
+
+    #: (Object?) -> String?
+    def string_idempotency_key(value)
+      value&.to_s
     end
   end
 end

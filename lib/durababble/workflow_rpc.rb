@@ -54,7 +54,7 @@ module Durababble
 
       #: (store: Store, worker_ids: Array[String], ?lease_seconds: Numeric, ?await_attempts: Integer, ?await_sleep: Object?) -> void
       def initialize(store:, worker_ids:, lease_seconds: 60, await_attempts: 3, await_sleep: nil)
-        @store = store #: as untyped
+        @store = store
         @worker_ids = worker_ids
         @lease_seconds = lease_seconds
         @await_attempts = await_attempts
@@ -102,7 +102,7 @@ module Durababble
     class Router
       #: (store: Store, ?rpc_clients: Hash[String, Object], ?rpc_client_factory: Object?, ?retry_on_stale: bool, ?start_workflow: Object?, ?start_on_no_active_lease: bool) -> void
       def initialize(store:, rpc_clients: {}, rpc_client_factory: nil, retry_on_stale: false, start_workflow: nil, start_on_no_active_lease: true)
-        @store = store #: as untyped
+        @store = store
         @rpc_clients = rpc_clients
         @rpc_client_factory = rpc_client_factory
         @retry_on_stale = retry_on_stale
@@ -142,7 +142,7 @@ module Durababble
         lease = @store.current_workflow_lease(workflow_id)
         raise WorkflowRpc.inactive_workflow_error(@store, workflow_id) unless lease
 
-        worker_id = lease.fetch("worker_id")
+        worker_id = lease.fetch("worker_id").to_s
         worker_pool = lease.fetch("worker_pool", "default").to_s
         client = rpc_client_for(worker_id, workflow_id:, worker_pool:)
         client = client #: as untyped
@@ -187,7 +187,7 @@ module Durababble
     class LocalClient
       #: (store: Store, node_id: String, handlers: Hash[String, Object]) -> void
       def initialize(store:, node_id:, handlers:)
-        @store = store #: as untyped
+        @store = store
         @node_id = node_id
         @handlers = handlers
       end
@@ -216,7 +216,7 @@ module Durababble
     class Handler
       #: (store: Store, node_id: String, handlers: Hash[String, Object]) -> void
       def initialize(store:, node_id:, handlers:)
-        @store = store #: as untyped
+        @store = store
         @node_id = node_id
         @handlers = handlers
       end

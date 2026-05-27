@@ -12,7 +12,7 @@ module Durababble
 
     #: (store: Store, workflows: Object, worker_id: String, ?objects: Object, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default", workflow_query_registry: nil)
-      @store = store #: as untyped
+      @store = store
       @workflows = normalize_workflows(workflows)
       @objects = normalize_objects(objects)
       @worker_id = worker_id
@@ -41,7 +41,8 @@ module Durababble
         end
 
         workflow = @workflows.fetch(claimed.fetch("name"))
-        engine_for(@worker_pool).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+        workflow_id = claimed.fetch("id").to_s
+        engine_for(@worker_pool).resume(workflow, workflow_id:, claimed:)
         Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
         :worked
       end
@@ -116,20 +117,16 @@ module Durababble
       target = activation_target(activation, worker_pool:)
       if advisory
         if claimed
-          @store.reconcile_target_activation(**target)
+          reconcile_activation_target(target)
         else
           forward_target_activation(activation)
-          @store.rearm_target_activation(**target, ready_at: activation_retry_time(workflow_id))
+          rearm_activation_target(target, ready_at: activation_retry_time(workflow_id))
         end
         return
       end
 
       forward_target_activation(activation) unless claimed
-      @store.complete_target_activation(
-        **target,
-        worker_id: @worker_id,
-        now: claimed ? Time.now : activation_retry_time(workflow_id),
-      )
+      complete_activation_target(target, worker_id: @worker_id, now: claimed ? Time.now : activation_retry_time(workflow_id))
     end
 
     #: (untyped, ?advisory: untyped) -> untyped
@@ -142,25 +139,21 @@ module Durababble
       target = activation_target(activation, worker_pool:)
       if advisory
         if drained.positive?
-          @store.reconcile_target_activation(**target)
+          reconcile_activation_target(target)
         else
           forward_target_activation(activation)
-          @store.rearm_target_activation(**target, ready_at: Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
+          rearm_activation_target(target, ready_at: Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
         end
         return
       end
 
       forward_target_activation(activation) if drained.zero?
-      @store.complete_target_activation(
-        **target,
-        worker_id: @worker_id,
-        now: drained.positive? ? Time.now : Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS),
-      )
+      complete_activation_target(target, worker_id: @worker_id, now: drained.positive? ? Time.now : Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS))
     end
 
     #: (untyped) -> untyped
     def forward_target_activation(activation)
-      @store.deliver_target_message(**activation_target(activation, worker_pool: activation_worker_pool(activation)))
+      deliver_activation_target(activation_target(activation, worker_pool: activation_worker_pool(activation)))
     end
 
     #: (untyped) -> untyped
@@ -230,14 +223,57 @@ module Durababble
     # The target-identity keywords every reconcile/rearm/complete/deliver store
     # call shares for a given activation. Splat with `**` and add the call's own
     # keywords (ready_at:, now:, worker_id:) so the four-key bundle lives once.
-    #: (untyped, worker_pool: String) -> Hash[Symbol, untyped]
+    #: (untyped, worker_pool: String) -> Hash[Symbol, String]
     def activation_target(activation, worker_pool:)
       {
-        target_kind: activation.fetch("target_kind"),
-        target_type: activation.fetch("target_type"),
-        target_id: activation.fetch("target_id"),
+        target_kind: String(activation.fetch("target_kind")),
+        target_type: String(activation.fetch("target_type")),
+        target_id: String(activation.fetch("target_id")),
         worker_pool:,
       }
+    end
+
+    #: (Hash[Symbol, String]) -> Object?
+    def reconcile_activation_target(target)
+      @store.reconcile_target_activation(
+        target_kind: target.fetch(:target_kind),
+        target_type: target.fetch(:target_type),
+        target_id: target.fetch(:target_id),
+        worker_pool: target.fetch(:worker_pool),
+      )
+    end
+
+    #: (Hash[Symbol, String], ready_at: Time) -> Object?
+    def rearm_activation_target(target, ready_at:)
+      @store.rearm_target_activation(
+        target_kind: target.fetch(:target_kind),
+        target_type: target.fetch(:target_type),
+        target_id: target.fetch(:target_id),
+        worker_pool: target.fetch(:worker_pool),
+        ready_at:,
+      )
+    end
+
+    #: (Hash[Symbol, String], worker_id: String, now: Time) -> Object?
+    def complete_activation_target(target, worker_id:, now:)
+      @store.complete_target_activation(
+        target_kind: target.fetch(:target_kind),
+        target_type: target.fetch(:target_type),
+        target_id: target.fetch(:target_id),
+        worker_pool: target.fetch(:worker_pool),
+        worker_id:,
+        now:,
+      )
+    end
+
+    #: (Hash[Symbol, String]) -> bool
+    def deliver_activation_target(target)
+      @store.deliver_target_message(
+        target_kind: target.fetch(:target_kind),
+        target_type: target.fetch(:target_type),
+        target_id: target.fetch(:target_id),
+        worker_pool: target.fetch(:worker_pool),
+      )
     end
 
     #: (target_kind: untyped, target_type: untyped) -> bool

@@ -6,9 +6,9 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Object, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, retry_run_at:, crash:)
-      @store = store #: as untyped
+      @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
       @lease_seconds = lease_seconds

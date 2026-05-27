@@ -5,7 +5,6 @@ require "digest"
 require "logger"
 
 require_relative "durababble/version"
-require_relative "durababble/defaults"
 require_relative "durababble/statuses"
 require_relative "durababble/observability"
 require_relative "durababble/backoff"
@@ -145,7 +144,7 @@ module Durababble
 
     #: () -> String
     def default_database_url
-      ENV.fetch("DURABABBLE_DATABASE_URL", Defaults::DATABASE_URL)
+      ENV.fetch("DURABABBLE_DATABASE_URL")
     end
 
     #: () -> String

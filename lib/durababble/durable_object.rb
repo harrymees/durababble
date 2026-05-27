@@ -174,7 +174,7 @@ module Durababble
     def initialize(durable_id: nil, state: UNINITIALIZED, store: nil, command_context: nil, worker_pool: "default")
       @durable_id = durable_id
       @current_state = state
-      @store = store #: as untyped
+      @store = store
       @command_context = command_context
       @worker_pool = worker_pool
       @state_dirty = false
@@ -200,7 +200,10 @@ module Durababble
 
       @current_state = new_state
       @state_dirty = true
-      @store&.save_object_state(worker_pool: @worker_pool, object_type: self.class.object_type, object_id: durable_id, state: new_state) unless command_context
+      if @store && !command_context
+        object_id = durable_id || raise(Error, "durable object state cannot be saved without a durable id")
+        @store.save_object_state(worker_pool: @worker_pool, object_type: self.class.object_type, object_id:, state: new_state)
+      end
       new_state
     end
 
@@ -259,7 +262,7 @@ module Durababble
     def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
       @object_class = object_class #: as untyped
       @durable_id = durable_id
-      @store = store #: as untyped
+      @store = store
       @worker_pool = worker_pool || "default"
       @idempotency_key = idempotency_key
     end
@@ -336,7 +339,7 @@ module Durababble
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.command.enqueue", attributes) do
         command_kwargs = kwargs.dup
-        command_idempotency_key = idempotency_key || (command_kwargs.key?(:idempotency_key) ? command_kwargs.delete(:idempotency_key) : @idempotency_key)
+        command_idempotency_key = string_idempotency_key(idempotency_key) || (command_kwargs.key?(:idempotency_key) ? string_idempotency_key(command_kwargs.delete(:idempotency_key)) : @idempotency_key)
         command_id = @store.enqueue_object_command(
           worker_pool: @worker_pool,
           object_type: @object_class.object_type,
@@ -356,6 +359,11 @@ module Durababble
         )
         @store.wait_for_inbox_message(command_id, timeout: command_wait_timeout(retry_policy))
       end
+    end
+
+    #: (Object?) -> String?
+    def string_idempotency_key(value)
+      value&.to_s
     end
 
     #: (String) -> String
@@ -382,7 +390,7 @@ module Durababble
   class DurableObjectExecutor
     #: (store: Store, objects: Object, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def initialize(store:, objects:, worker_id:, lease_seconds:, worker_pool: "default")
-      @store = store #: as untyped
+      @store = store
       @objects = normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
