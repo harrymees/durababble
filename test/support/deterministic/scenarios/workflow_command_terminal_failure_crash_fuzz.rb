@@ -38,6 +38,9 @@ module Durababble
           h.store.enable_write_crashes!(percent: 20)
 
           drain = lambda do |worker_id|
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease;
+            # mimic production where each delivery worker holds the workflow lease.
+            h.store.mark_workflow_running(workflow_id, worker_id:, lease_seconds: 8)
             (command_count * 3 + 5).times do
               activation = h.store.claim_target_activation(
                 worker_id:,

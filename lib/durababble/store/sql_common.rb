@@ -39,7 +39,8 @@ module Durababble
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:)
-        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false)
+        # [DURABABBLE-STEP-2] A retryable failure and its backoff row commit atomically.
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, retrying: true)
         scheduled = schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
 
@@ -212,6 +213,17 @@ module Durababble
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
+        # Gate object inbox claims on ownership of the unified per-object lease so
+        # commands are only processed by the single, exclusive object owner.
+        # Lease acquisition happens AFTER the row scan: an empty row set means no
+        # work in this pool, so we must not side-effect a free lease into a held
+        # one (that would block the real owner in another pool from ever
+        # progressing). Workflow inbox claims keep the existing
+        # workflows.locked_by fence and are unaffected.
+        if target_kind == "object" && !rows.empty?
+          holder = claim_object_lease(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_seconds:)
+          next [] unless holder
+        end
         contiguous_claimable_inbox_rows(rows, now:).map do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
           claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
@@ -346,10 +358,18 @@ module Durababble
       transaction do
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
+        # Reject misrouted workflow_id before the lease guard so an inbox row
+        # belonging to a different workflow is a silent no-op rather than a
+        # LeaseConflict against an unrelated (not-running) workflow row.
         next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
         workflow = lock_workflow_for_update(workflow_id)
-        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+        terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
+        # [DURABABBLE-LEASE-4] Workflow command history commits need the workflow and inbox leases.
+        # Terminal workflows skip the lease assert so a late completion can dead-letter the inbox row.
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+
+        if terminal
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
           reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
           next updated
@@ -373,10 +393,17 @@ module Durababble
       transaction do
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
+        # Reject misrouted workflow_id before the lease guard, mirroring
+        # complete_workflow_command above.
         next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
         workflow = lock_workflow_for_update(workflow_id)
-        if workflow && WorkflowStatus.terminal?(decode_row(workflow))
+        terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
+        # [DURABABBLE-LEASE-4] Workflow command failure history is also a workflow commit.
+        # Terminal workflows skip the lease assert so a late failure can dead-letter the inbox row.
+        assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+
+        if terminal
           updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
           reconcile_target_activation_without_transaction(worker_pool: row_worker_pool(command), target_kind: command.fetch("target_kind"), target_type: command.fetch("target_type"), target_id: command.fetch("target_id"))
           next updated
@@ -439,15 +466,41 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before #{operation}"
     end
 
+    # Workflow completion is the one terminal write that must REJECT unfenced
+    # callers when nothing changed. Live durable work, an already-terminal row,
+    # and a stale lease all surface as a zero-row write; the contract for
+    # `complete_workflow` is "I expected to make this row terminal" and any of
+    # those mean the caller's belief was wrong. Cancel and fail are best-effort
+    # and stay silent in the same situation via require_fenced_workflow_update!.
+    # Fenced callers always raise LeaseConflict because their contract is
+    # "I own this row".
+    #: (Object?, workflow_id: String, worker_id: String?) -> Object?
+    def require_workflow_completion_update!(result, workflow_id:, worker_id:)
+      result = result #: as untyped
+      return result if result&.affected_rows.to_i == 1
+
+      message = "workflow #{workflow_id} cannot complete while incomplete durable work remains"
+      raise LeaseConflict, "#{message} or the lease expired or moved" if worker_id
+
+      raise Error, message
+    end
+
     # Terminal workflow writes have one shared postcondition: if the update was
     # made by a leased worker it must still own the row, and the workflow must
-    # not strand live waits, steps, or attempts after becoming terminal.
-    #: (workflow_id: String, worker_id: String?, operation: String) { () -> Object? } -> Object?
-    def finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation:, &block)
+    # not strand live waits, steps, or attempts after becoming terminal. The
+    # `failure_error` lets fail_workflow terminalize live steps/attempts as
+    # "failed" (carrying the workflow's own error) while cancel/complete leave
+    # them as "canceled".
+    #: (workflow_id: String, worker_id: String?, operation: String, ?failure_error: String?) { () -> Object? } -> Object?
+    def finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation:, failure_error: nil, &block)
       transaction do
         result = block.call
         require_fenced_workflow_update!(result, workflow_id:, worker_id:, operation:)
-        cancel_live_workflow_dependents(workflow_id)
+        if failure_error
+          fail_live_workflow_dependents(workflow_id, failure_error)
+        else
+          cancel_live_workflow_dependents(workflow_id)
+        end
         result
       end
     end
@@ -466,8 +519,38 @@ module Durababble
       execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
     end
 
-    #: (terminal: bool, error_class: String?, error_message: String?) -> Hash[String, Object?]?
-    def step_failure_payload(terminal:, error_class:, error_message:)
+    # Terminalize live waits/steps/attempts on workflow failure. A step that was
+    # actively running observed the failure and is marked 'failed' with the
+    # workflow's error. Scheduled/waiting steps never observed it and are
+    # canceled, matching how an abandoned parked branch lands. Pending waits are
+    # canceled because a wait has no failure semantics.
+    #: (String, String) -> Object?
+    def fail_live_workflow_dependents(workflow_id, error)
+      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
+      execute_fail_live_steps_for_workflow(workflow_id, error)
+      execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      # cancel_live_*_for_workflow filter on 'scheduled'/'waiting' (and 'running'
+      # for the attempts table) — anything we already marked 'failed' above no
+      # longer matches, so the remaining live rows get the canceled terminal.
+      execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
+      execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_steps_for_workflow(workflow_id, error)
+      raise NotImplementedError
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      raise NotImplementedError
+    end
+
+    #: (terminal: bool, error_class: String?, error_message: String?, ?retrying: bool) -> Hash[String, Object?]?
+    def step_failure_payload(terminal:, error_class:, error_message:, retrying: false)
+      # [DURABABBLE-STEP-2] A retryable failure carries a "retrying" payload so replay treats it as
+      # diagnostic rather than terminal.
+      return { "retrying" => true } if retrying
       return unless terminal
 
       payload = { "terminal" => true }
@@ -545,8 +628,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       raise NotImplementedError
     end
 

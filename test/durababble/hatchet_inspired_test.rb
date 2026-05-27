@@ -101,6 +101,54 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
       end
     end
 
+    test "rejects replay when current workflow skips an incomplete persisted step with #{backend.name}" do
+      with_durababble_store(backend, "hatchet_inspired") do |store|
+        store.migrate!
+        first_version = Class.new(Durababble::Workflow) do
+          workflow_name "incomplete-shape-check"
+
+          def execute(input)
+            old_step(input)
+          end
+
+          step def old_step(input)
+            input.merge("old" => true)
+          end
+        end
+        second_version = Class.new(Durababble::Workflow) do
+          workflow_name "incomplete-shape-check"
+
+          def execute(input)
+            input.merge("skipped" => true)
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: first_version.workflow_name, input: { "id" => "incomplete" })
+
+        assert_raises(Durababble::InjectedCrash) do
+          Durababble::Engine.new(
+            store:,
+            worker_id: "first-version",
+            crash_after: :step_started,
+            migrate: false,
+          ).resume(first_version, workflow_id:)
+        end
+        store.steal_expired_leases!(now: Time.now + 120)
+
+        run = Durababble::Engine.new(
+          store:,
+          worker_id: "second-version",
+          migrate: false,
+        ).resume(second_version, workflow_id:)
+
+        assert_equal "failed", run.status
+        assert_match(/ReplayDivergenceError/, run.error)
+        assert_match(/without consuming durable command history/, run.error)
+        assert_match(/0:old_step/, run.error)
+        assert_hash_includes store.steps_for(workflow_id).first, "name" => "old_step", "status" => "failed"
+        assert_equal ["failed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
+      end
+    end
+
     test "rejects replay when completed steps are reordered by new workflow code with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
         first_version = Class.new(Durababble::Workflow) do

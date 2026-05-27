@@ -1,5 +1,5 @@
 -- mysql_ack_outbox
-UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ?
+UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ? AND locked_until >= NOW(6)
 
 -- mysql_cancel_live_step_attempts_for_workflow
 UPDATE `durababble_mysql_snapshot_step_attempts`
@@ -35,7 +35,7 @@ WHERE workflow_id = ? AND status = 'waiting'
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_reason, ?),
   cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-WHERE id = ? AND status <> 'terminated'
+WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_cancel_workflow_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -93,6 +93,12 @@ ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
+-- mysql_claim_object_lease
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+WHERE object_type = ? AND object_id = ?
+  AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+
 -- mysql_claim_pending_outbox
 SELECT id, created_at FROM `durababble_mysql_snapshot_outbox`
 WHERE status = 'pending'
@@ -147,7 +153,9 @@ WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND lo
 SELECT id FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND worker_pool = ?
   AND (
-    status IN ('pending', 'waiting', 'canceling')
+    (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+    OR status = 'waiting'
+    OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
     OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
   )
@@ -162,7 +170,7 @@ WHERE id = ? AND worker_pool = ?
 SELECT id FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND worker_pool = ?
   AND (
-    status = 'pending'
+    (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
     OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
@@ -204,7 +212,11 @@ UPDATE `durababble_mysql_snapshot_waits` SET status = 'completed', payload = ?, 
 -- mysql_complete_workflow
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-WHERE id = ? AND status <> 'terminated'
+WHERE id = ?
+  AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
+  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_steps` WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting'))
+  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_step_attempts` WHERE workflow_id = ? AND status IN ('running', 'waiting'))
+  AND NOT EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_waits` WHERE workflow_id = ? AND status = 'pending')
 
 -- mysql_complete_workflow_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -227,11 +239,10 @@ SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_target_activations` FOR
 SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (<index>) WHERE status = 'running' AND locked_by = ?
 
 -- mysql_current_object_lease
-SELECT worker_pool, target_id AS object_id, locked_by AS worker_id, locked_until
-FROM `durababble_mysql_snapshot_inbox`
-WHERE target_kind = 'object' AND target_type = ? AND target_id = ? AND status = 'running'
+SELECT worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+FROM `durababble_mysql_snapshot_durable_objects`
+WHERE object_type = ? AND object_id = ?
   AND locked_by IS NOT NULL AND locked_until >= NOW(6)
-ORDER BY sequence
 LIMIT 1
 
 -- mysql_current_workflow_lease
@@ -262,6 +273,11 @@ ORDER BY wake_at, created_at
 LIMIT 100
 FOR UPDATE SKIP LOCKED
 
+-- mysql_ensure_object_row
+INSERT IGNORE INTO `durababble_mysql_snapshot_durable_objects`
+  (worker_pool, object_type, object_id, created_at, updated_at)
+VALUES (?, ?, ?, NOW(6), NOW(6))
+
 -- mysql_existing_inbox_message_for_idempotency
 SELECT id, worker_pool, target_kind, target_type, target_id, status, ready_at, shape_hash
 FROM `durababble_mysql_snapshot_inbox`
@@ -276,6 +292,16 @@ WHERE workflow_id = ? AND `key` = ? AND locked_by = ?
 -- mysql_fail_inbox_message
 UPDATE `durababble_mysql_snapshot_inbox` SET status = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN 'dead_lettered' ELSE 'failed' END, error = ?, locked_by = NULL, locked_until = NULL, dead_lettered_at = CASE WHEN max_attempts IS NOT NULL AND attempts >= max_attempts THEN NOW(6) ELSE dead_lettered_at END, updated_at = NOW(6) WHERE id = ?
 
+-- mysql_fail_live_step_attempts_for_workflow
+UPDATE `durababble_mysql_snapshot_step_attempts`
+SET status = 'failed', error = ?, completed_at = NOW(6)
+WHERE workflow_id = ? AND status = 'running'
+
+-- mysql_fail_live_steps_for_workflow
+UPDATE `durababble_mysql_snapshot_steps`
+SET status = 'failed', error = ?, updated_at = NOW(6)
+WHERE workflow_id = ? AND status = 'running'
+
 -- mysql_fail_step
 UPDATE `durababble_mysql_snapshot_steps`
 SET status = 'failed', error = ?, updated_at = NOW(6)
@@ -284,7 +310,7 @@ WHERE workflow_id = ? AND position = ?
 -- mysql_fail_workflow
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'failed', error = ?, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
-WHERE id = ? AND status <> 'terminated'
+WHERE id = ? AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_fail_workflow_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -406,6 +432,7 @@ FOR UPDATE
 SELECT 1 FROM `durababble_mysql_snapshot_target_activations`
 WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
   AND status = 'running' AND locked_by = ?
+  AND locked_until >= NOW(6)
 FOR UPDATE
 
 -- mysql_lock_workflow_for_termination
@@ -445,18 +472,19 @@ SET cancel_delivered_at = COALESCE(cancel_delivered_at, NOW(6)), updated_at = NO
 WHERE id = ? AND cancel_requested_at IS NOT NULL
 
 -- mysql_mark_workflow_running
-UPDATE `durababble_mysql_snapshot_workflows` SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ?
+UPDATE `durababble_mysql_snapshot_workflows` SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL
 
 -- mysql_mark_workflow_running_with_worker
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
 WHERE id = ? AND worker_pool = ?
+  AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
 -- mysql_next_workflow_history_event_index
 SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ?
 
 -- mysql_object_state
-SELECT state FROM `durababble_mysql_snapshot_durable_objects` WHERE object_type = ? AND object_id = ?
+SELECT state FROM `durababble_mysql_snapshot_durable_objects` WHERE object_type = ? AND object_id = ? AND state IS NOT NULL
 
 -- mysql_outbox_by_key
 SELECT id FROM `durababble_mysql_snapshot_outbox` WHERE `key` = ?
@@ -472,6 +500,11 @@ UPDATE `durababble_mysql_snapshot_inbox` FORCE INDEX (<index>)
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
 WHERE status = 'running' AND locked_by = ?
 
+-- mysql_release_object_lease
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE object_type = ? AND object_id = ? AND locked_by = ?
+
 -- mysql_release_outbox_leases
 UPDATE `durababble_mysql_snapshot_outbox` FORCE INDEX (<index>)
 SET status = 'pending', locked_by = NULL, locked_until = NULL
@@ -482,6 +515,11 @@ UPDATE `durababble_mysql_snapshot_target_activations` FORCE INDEX (<index>)
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
 WHERE status = 'running' AND locked_by = ?
 
+-- mysql_release_worker_object_leases
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE locked_by = ?
+
 -- mysql_release_workflow_leases
 UPDATE `durababble_mysql_snapshot_workflows` FORCE INDEX (<index>)
 SET status = CASE
@@ -490,6 +528,12 @@ SET status = CASE
   END,
   locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
 WHERE status = 'running' AND locked_by = ?
+
+-- mysql_renew_object_lease
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+WHERE object_type = ? AND object_id = ?
+  AND locked_by = ? AND locked_until >= NOW(6)
 
 -- mysql_request_workflow_cancellation
 UPDATE `durababble_mysql_snapshot_workflows`
@@ -534,6 +578,11 @@ SET status = CASE
   END,
   locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
 WHERE status = 'running' AND locked_until < ?
+
+-- mysql_steal_expired_object_leases
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE locked_by IS NOT NULL AND locked_until < ?
 
 -- mysql_step_attempt_count_for
 SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_step_attempts` WHERE workflow_id = ? AND position = ?

@@ -33,6 +33,8 @@ module Durababble
           retried = Hash.new(0)
           completed = []
           h.scheduler.schedule(actor: "command-worker", delay: 5, name: "drain_with_retries") do
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease; mimic production.
+            h.store.mark_workflow_running(workflow_id, worker_id: "command-worker", lease_seconds: 30)
             # Bounded at two passes per command (retry + complete) plus slack so
             # a stuck head fails a check rather than spinning the virtual clock.
             (command_count * 2 + 3).times do

@@ -32,17 +32,20 @@ module Durababble
       end
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
       transaction do
         name_sql, name_params = workflow_name_filter(workflow_names)
+        exclusion_sql, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids)
+        workflow_sql = "#{name_sql} #{exclusion_sql}"
+        workflow_params = name_params + exclusion_params
         candidates = []
-        candidates.concat(execute_store_query(:claim_pending_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_failed_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_canceling_workflow, [worker_pool] + name_params, name_sql:).to_a)
-        candidates.concat(execute_store_query(:claim_expired_workflow, [worker_pool] + name_params, name_sql:).to_a)
+        candidates.concat(execute_store_query(:claim_pending_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_failed_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_canceling_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
+        candidates.concat(execute_store_query(:claim_expired_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).to_a)
         candidate = candidates.min_by { |candidate_row| candidate_row.fetch("created_at").to_s }
         next unless candidate
 
@@ -110,7 +113,8 @@ module Durababble
         target_activation_index = index_name("target_activations", "worker_lease")
         target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
         execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
-        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows.to_i
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
@@ -220,18 +224,65 @@ module Durababble
       execute_store_query(:current_workflow_lease, [workflow_id]).first
     end
 
-    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
     def current_object_lease(object_type, object_id, worker_pool: nil)
+      # `worker_pool` is part of the lease KEY for stream routing but the
+      # `durable_objects` row's primary key is `(object_type, object_id)` — pool
+      # ownership is determined by the holder's `worker_id`, not the row. Accept
+      # the keyword to match `current_target_lease`'s dispatcher shape and
+      # discard it explicitly.
       _ = worker_pool
       execute_store_query(:current_object_lease, [object_type, object_id]).first
+    end
+
+    # MySQL has no RETURNING, so claim is split in two: ensure the
+    # `durable_objects` row exists (idempotent INSERT IGNORE), then run a
+    # conditional UPDATE whose WHERE gates on (free OR expired OR same
+    # worker). The UPDATE's affected_rows is the unambiguous win/loss signal
+    # — no follow-up SELECT. A single-statement upsert won't do here because
+    # the trilogy adapter forces CLIENT_FOUND_ROWS, which makes a rejected
+    # "matched but unchanged" branch indistinguishable from a winning fresh
+    # insert (both report affected_rows = 1).
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
+      result = execute_store_query(:claim_object_lease, [worker_id, lease_seconds.to_i, object_type, object_id, worker_id])
+      return unless result.affected_rows.to_i.positive?
+
+      { "worker_pool" => worker_pool, "object_type" => object_type, "object_id" => object_id, "worker_id" => worker_id }
+    end
+
+    # Conditional renew. MySQL reports affected_rows from the UPDATE; 0 means the lease
+    # has been lost (evicted, stolen, or released). Object identity is global —
+    # `worker_pool` isn't part of the lease key.
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
+    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      result = execute_store_query(:renew_object_lease, [lease_seconds.to_i, object_type, object_id, worker_id])
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        true
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        false
+      end
+    end
+
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def release_object_lease(object_type:, object_id:, worker_id:)
+      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id])
+      result.affected_rows.to_i.positive?
     end
 
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
       expired = execute_store_query(:count_expired_workflow_leases, [now]).first.fetch("count").to_i
       execute_store_query(:steal_expired_leases, [now])
-      Observability.count("durababble.leases.expired_recovery", by: expired)
-      expired
+      object_result = execute_store_query(:steal_expired_object_leases, [now])
+      stolen = expired + object_result.affected_rows.to_i
+      Observability.count("durababble.leases.expired_recovery", by: stolen)
+      stolen
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
@@ -276,12 +327,15 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow completion") do
-        if worker_id
+      transaction do
+        update = if worker_id
           execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
         else
-          execute_store_query(:complete_workflow, [serialized_result, workflow_id])
+          execute_store_query(:complete_workflow, [serialized_result, workflow_id, workflow_id, workflow_id, workflow_id])
         end
+        require_workflow_completion_update!(update, workflow_id:, worker_id:)
+        cancel_live_workflow_dependents(workflow_id)
+        update
       end
     end
 
@@ -299,13 +353,23 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure", failure_error: error) do
         if worker_id
           execute_store_query(:fail_workflow_with_worker, [error, workflow_id, worker_id])
         else
           execute_store_query(:fail_workflow, [error, workflow_id])
         end
       end
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_steps_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_steps_for_workflow, [error, workflow_id])
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_step_attempts_for_workflow, [error, workflow_id])
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
@@ -319,11 +383,11 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       execute_store_query(:fail_step, [error, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      payload = step_failure_payload(terminal:, error_class:, error_message:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:, retrying:)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
@@ -788,6 +852,14 @@ module Durababble
       return ["", []] unless workflow_names
 
       ["AND name IN (#{mysql_placeholders(workflow_names.length)})", workflow_names]
+    end
+
+    #: (Array[String]?) -> [String, Array[String]]
+    def workflow_exclusion_filter(workflow_ids)
+      workflow_ids = Array(workflow_ids).uniq
+      return ["", []] if workflow_ids.empty?
+
+      ["AND id NOT IN (#{mysql_placeholders(workflow_ids.length)})", workflow_ids]
     end
 
     #: (Integer) -> Object?

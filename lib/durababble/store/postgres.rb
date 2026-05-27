@@ -20,13 +20,17 @@ module Durababble
       @migrated = false
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
+    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
+      # [DURABABBLE-LEASE-1] Queue selection and lease assignment commit as one locked update
+      # so two pollers can never both hold a live workflow lease.
       name_filter, name_params = workflow_name_filter(workflow_names, offset: 4)
+      exclusion_filter, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids, offset: 4 + name_params.length)
+      workflow_filter = "#{name_filter} #{exclusion_filter}"
       row = retry_serialization_failures do
-        execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params, name_filter:).first
+        execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id, lease_seconds] + name_params + exclusion_params, name_filter: workflow_filter).first
       end
       typed_row = row #: as untyped
       observe_claim_latency(typed_row, "workflow") if typed_row
@@ -53,6 +57,7 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
+      # [DURABABBLE-LEASE-2] Heartbeats only extend an unexpired lease held by this worker.
       result = execute_store_query(:heartbeat_workflow, [workflow_id, worker_id, lease_seconds])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
@@ -64,12 +69,15 @@ module Durababble
 
     #: (worker_id: String) -> Object?
     def release_worker_leases!(worker_id:)
+      # [DURABABBLE-LEASE-3] Shutdown releases owned workflow / outbox / inbox / activation
+      # leases back to pending so another worker can resume the work.
       transaction do
         workflows = execute_store_query(:release_workflow_leases, [worker_id]).affected_rows
         outbox = execute_store_query(:release_outbox_leases, [worker_id]).affected_rows
         inbox = execute_store_query(:release_inbox_leases, [worker_id]).affected_rows
         target_activations = execute_store_query(:release_target_activation_leases, [worker_id]).affected_rows
-        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations }
+        objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows
+        released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
       end
@@ -179,18 +187,60 @@ module Durababble
       row&.transform_values(&:itself)
     end
 
-    #: (Object?, Object?, ?worker_pool: String?) -> Object?
+    #: (String, String, ?worker_pool: String?) -> Hash[String, Object?]?
     def current_object_lease(object_type, object_id, worker_pool: nil)
+      # `worker_pool` is part of the lease KEY for stream routing but the
+      # `durable_objects` row's primary key is `(object_type, object_id)` — pool
+      # ownership is determined by the holder's `worker_id`, not the row. Accept
+      # the keyword to match `current_target_lease`'s dispatcher shape and
+      # discard it explicitly.
       _ = worker_pool
       row = execute_store_query(:current_object_lease, [object_type, object_id]).first
       row&.transform_values(&:itself)
     end
 
+    # Atomic upsert-claim against the unified per-object lease in durable_objects.
+    # Returns the row representing this caller's hold on success, or `nil` when a
+    # different live lease blocks the claim. The conditional `DO UPDATE WHERE`
+    # only fires when the lease is free or already ours, and `RETURNING` then
+    # only surfaces the row when the write actually happened.
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      row = execute_store_query(:claim_object_lease, [worker_pool, object_type, object_id, worker_id, lease_seconds.to_i]).first
+      row&.transform_values(&:itself)
+    end
+
+    # Conditional renew. Returns true while the caller still owns the live lease,
+    # false once it has been lost (evicted, stolen, or released). Object identity
+    # is global (`(object_type, object_id)`); pool isn't part of the lease key.
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
+    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
+      Store.validate_positive_lease_seconds!(lease_seconds)
+      result = execute_store_query(:renew_object_lease, [object_type, object_id, worker_id, lease_seconds.to_i])
+      if result.affected_rows.to_i.positive?
+        Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        true
+      else
+        Observability.count("durababble.leases.conflicts", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
+        false
+      end
+    end
+
+    # Idempotent: only clears the lease when the caller is the current holder.
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def release_object_lease(object_type:, object_id:, worker_id:)
+      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id])
+      result.affected_rows.to_i.positive?
+    end
+
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
-      result = execute_store_query(:steal_expired_leases, [timestamp(now)])
-      Observability.count("durababble.leases.expired_recovery", by: result.affected_rows.to_i)
-      result.affected_rows
+      workflow_result = execute_store_query(:steal_expired_leases, [timestamp(now)])
+      object_result = execute_store_query(:steal_expired_object_leases, [timestamp(now)])
+      stolen = workflow_result.affected_rows.to_i + object_result.affected_rows.to_i
+      Observability.count("durababble.leases.expired_recovery", by: stolen)
+      stolen
     end
 
     #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
@@ -205,12 +255,15 @@ module Durababble
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow completion") do
-        if worker_id
+      transaction do
+        update = if worker_id
           execute_store_query(:complete_workflow_with_worker, [workflow_id, serialized_result, worker_id])
         else
           execute_store_query(:complete_workflow, [workflow_id, serialized_result])
         end
+        require_workflow_completion_update!(update, workflow_id:, worker_id:)
+        cancel_live_workflow_dependents(workflow_id)
+        update
       end
     end
 
@@ -228,13 +281,23 @@ module Durababble
 
     #: (String, error: String, ?worker_id: String?) -> Object
     def fail_workflow(workflow_id, error:, worker_id: nil)
-      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure") do
+      finalize_terminal_workflow_update!(workflow_id:, worker_id:, operation: "workflow failure", failure_error: error) do
         if worker_id
           execute_store_query(:fail_workflow_with_worker, [workflow_id, error, worker_id])
         else
           execute_store_query(:fail_workflow, [workflow_id, error])
         end
       end
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_steps_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_steps_for_workflow, [workflow_id, error])
+    end
+
+    #: (String, String) -> Object?
+    def execute_fail_live_step_attempts_for_workflow(workflow_id, error)
+      execute_store_query(:fail_live_step_attempts_for_workflow, [workflow_id, error])
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
@@ -307,6 +370,8 @@ module Durababble
 
     #: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> Object? } -> Object?
     def with_fence(workflow_id:, key:, poll_interval: 0.05, timeout: 10, &block)
+      # [DURABABBLE-FENCE-1] The fence row is persisted before yielding to the side effect,
+      # so a duplicate caller observes the running fence rather than re-running the work.
       token = SecureRandom.uuid
       inserted = execute_store_query(:insert_fence, [workflow_id, key, token, timeout])
       claimed = inserted.affected_rows == 1
@@ -348,6 +413,8 @@ module Durababble
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
+      # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row;
+      # subsequent enqueues resolve to the same row and never deliver twice.
       existing = execute_store_query(:outbox_by_key, [key]).first
       return existing.fetch("id") if existing
 
@@ -640,6 +707,8 @@ module Durababble
 
     #: (Time, Integer) -> Integer
     def complete_timer_waits(now, batch_size)
+      # [DURABABBLE-WAIT-1] Locked wait completion ensures concurrent wakeups observe one winner,
+      # so each due wait produces at most one durable wake event.
       completed = transaction do
         returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
         finish_completed_waits(returning, {})
@@ -681,11 +750,11 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       execute_store_query(:fail_step, [workflow_id, command_id, error])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
-      payload = step_failure_payload(terminal:, error_class:, error_message:)
+      payload = step_failure_payload(terminal:, error_class:, error_message:, retrying:)
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
@@ -772,6 +841,14 @@ module Durababble
       return ["", []] unless workflow_names
 
       ["AND name IN (#{postgres_placeholders(offset, workflow_names.length)})", workflow_names]
+    end
+
+    #: (Array[String]?, ?offset: Integer) -> [String, Array[String]]
+    def workflow_exclusion_filter(workflow_ids, offset: 1)
+      workflow_ids = Array(workflow_ids).uniq
+      return ["", []] if workflow_ids.empty?
+
+      ["AND id NOT IN (#{postgres_placeholders(offset, workflow_ids.length)})", workflow_ids]
     end
 
     #: (Integer, Integer) -> Object?

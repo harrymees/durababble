@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "bundler/gem_tasks"
+require "rbconfig"
 require "rake/testtask"
 
 desc "Format Markdown files with Prettier"
@@ -30,6 +31,15 @@ task :typecheck do
   Rake::Task[:rbs_strict].invoke
   sh("bundle exec srb tc")
 end
+
+task :alloy do
+  sh("scripts/verify-alloy.sh")
+end
+
+# Sigil drift is checked by `test/durababble/formal_sigil_drift_test.rb` which
+# runs on every PR with the rest of the fast `test` suite. The `formal` task
+# only triggers the slow Alloy verifier; no separate sigil step is needed.
+task formal: [:alloy]
 
 task lint: [:rubocop, :typecheck, "check:markdown"]
 

@@ -77,10 +77,13 @@ runtime = Durababble::WorkerRuntime.start(
   workflows: [FulfillOrder],
   objects: [Account],
   worker_pool: "orders",
+  concurrency: Integer(ENV.fetch("DURABABBLE_WORKER_CONCURRENCY", "8")),
   rpc_host: ENV.fetch("POD_IP"),  # the address other pods can reach this one at
   rpc_port: 50_051,
 )
 ```
+
+`concurrency:` defaults to `1`. Raise it when you want denser compute in one Ruby process: the runtime schedules that many workflow tasks, target activations, and durable-object command drains at once using `async` fibers, while keeping one active work item per durable target identity inside the process. Size the application database pool for that concurrency plus RPC handlers and normal app traffic. In ActiveRecord applications, Durababble assumes fiber-isolated execution state is enabled before the runtime starts, for example `ActiveSupport::IsolatedExecutionState.isolation_level = :fiber`.
 
 The address suffix is the worker's public endpoint, so `rpc_host` must be a value other pods can actually connect to. In Kubernetes this is typically the pod IP exposed through the downward API; on bare metal it is the host's routable address. The defaults (`rpc_host: "127.0.0.1"`, `rpc_port: 0`) are fine for single-process examples and tests but leave the worker unreachable from anywhere else. The transport is currently cleartext HTTP/2 (h2c) with no built-in peer authentication, so the RPC port must only be reachable inside a trusted pod network — see ["Transport Security" in Cluster RPC](cluster-rpc.md#transport-security) for what's planned to harden this.
 

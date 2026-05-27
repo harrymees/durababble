@@ -9,6 +9,7 @@ module Durababble
     # not be delivered. Applied through Backoff.jittered so a fleet of workers
     # racing on the same activation does not retry in lockstep.
     ACTIVATION_FORWARD_RETRY_SECONDS = 1
+    WorkItem = Data.define(:kind, :target_key, :payload)
 
     #: (store: Store, workflows: Object, worker_id: String, ?objects: Object, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default", workflow_query_registry: nil)
@@ -27,41 +28,93 @@ module Durababble
     def tick
       attributes = { "durababble.worker.id" => @worker_id }
       Observability.measure("durababble.worker.tick", attributes) do
-        activation = claim_next_target_activation
-        if activation
-          process_target_activation(activation)
-          Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
-          return :worked
-        end
-
-        claimed = @store.claim_runnable_workflow(worker_id: @worker_id, lease_seconds: @lease_seconds, workflow_names: @workflows.keys, worker_pool: @worker_pool)
-        unless claimed
+        work_item = claim_work
+        unless work_item
           Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "idle"))
           return :idle
         end
 
-        workflow = @workflows.fetch(claimed.fetch("name"))
-        workflow_id = claimed.fetch("id").to_s
-        engine_for(@worker_pool).resume(workflow, workflow_id:, claimed:)
+        perform_work(work_item)
         Observability.count("durababble.worker.ticks", attributes.merge("durababble.worker.tick.result" => "worked"))
         :worked
       end
     end
 
-    #: (target_kind: String, target_type: String, target_id: String, ?worker_pool: String) -> Symbol
-    def deliver_target(target_kind:, target_type:, target_id:, worker_pool: @worker_pool)
-      return :idle unless worker_pool == @worker_pool
-      return :idle unless registered_target?(target_kind:, target_type:)
+    #: (?excluding_target_keys: untyped) -> untyped
+    def claim_work(excluding_target_keys: nil)
+      activation = claim_next_target_activation
+      return target_activation_work_item(activation) if activation
 
-      process_target_activation(
-        {
-          "target_kind" => target_kind,
-          "target_type" => target_type,
-          "target_id" => target_id,
-          "worker_pool" => worker_pool,
-        },
-        advisory: true,
+      claimed = @store.claim_runnable_workflow(
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        workflow_names: @workflows.keys,
+        worker_pool: @worker_pool,
+        excluding_workflow_ids: excluded_workflow_ids(excluding_target_keys),
       )
+      return unless claimed
+
+      workflow_name = claimed.fetch("name")
+      WorkItem.new(
+        :workflow,
+        target_key(worker_pool: @worker_pool, target_kind: "workflow", target_type: workflow_name, target_id: claimed.fetch("id")),
+        [workflow_name, claimed],
+      )
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: String) -> untyped
+    def delivery_work(target_kind:, target_type:, target_id:, worker_pool: @worker_pool)
+      return unless worker_pool == @worker_pool
+      return unless registered_target?(target_kind:, target_type:)
+
+      activation = {
+        "target_kind" => target_kind,
+        "target_type" => target_type,
+        "target_id" => target_id,
+        "worker_pool" => worker_pool,
+      }
+      WorkItem.new(
+        :delivery,
+        target_key(worker_pool:, target_kind:, target_type:, target_id:),
+        activation,
+      )
+    end
+
+    #: (WorkItem) -> untyped
+    def perform_work(work_item)
+      case work_item.kind
+      when :target_activation
+        process_target_activation(work_item.payload)
+      when :delivery
+        process_target_activation(work_item.payload, advisory: true)
+      when :workflow
+        workflow_name, claimed = work_item.payload
+        workflow = @workflows.fetch(workflow_name)
+        engine_for(@worker_pool).resume(workflow, workflow_id: claimed.fetch("id"), claimed:)
+      else
+        raise ArgumentError, "unknown worker work item #{work_item.kind.inspect}"
+      end
+    end
+
+    #: (WorkItem, ready_at: Time) -> untyped
+    def defer_claimed_work(work_item, ready_at:)
+      return unless work_item.kind == :target_activation
+
+      activation = work_item.payload
+      worker_pool = activation_worker_pool(activation)
+      complete_activation_target(
+        activation_target(activation, worker_pool:),
+        worker_id: @worker_id,
+        now: ready_at,
+      )
+    end
+
+    #: (target_kind: untyped, target_type: untyped, target_id: untyped, ?worker_pool: String) -> untyped
+    def deliver_target(target_kind:, target_type:, target_id:, worker_pool: @worker_pool)
+      work_item = delivery_work(target_kind:, target_type:, target_id:, worker_pool:)
+      return :idle unless work_item
+
+      perform_work(work_item)
       :worked
     end
 
@@ -215,6 +268,33 @@ module Durababble
       )
     end
 
+    #: (untyped) -> Array[String]
+    def excluded_workflow_ids(target_keys)
+      Array(target_keys).filter_map do |target_key|
+        key = Array(target_key)
+        next unless key[0] == @worker_pool
+        next unless key[1] == "workflow"
+        next unless @workflows.key?(key[2])
+
+        key[3].to_s
+      end
+    end
+
+    #: (untyped) -> WorkItem
+    def target_activation_work_item(activation)
+      worker_pool = activation_worker_pool(activation)
+      WorkItem.new(
+        :target_activation,
+        target_key(
+          worker_pool:,
+          target_kind: activation.fetch("target_kind"),
+          target_type: activation.fetch("target_type"),
+          target_id: activation.fetch("target_id"),
+        ),
+        activation,
+      )
+    end
+
     #: (untyped) -> String
     def activation_worker_pool(activation)
       String(activation.fetch("worker_pool", @worker_pool))
@@ -274,6 +354,11 @@ module Durababble
         target_id: target.fetch(:target_id),
         worker_pool: target.fetch(:worker_pool),
       )
+    end
+
+    #: (worker_pool: String, target_kind: untyped, target_type: untyped, target_id: untyped) -> Array[String]
+    def target_key(worker_pool:, target_kind:, target_type:, target_id:)
+      [worker_pool, target_kind, target_type, target_id].map(&:to_s).freeze
     end
 
     #: (target_kind: untyped, target_type: untyped) -> bool

@@ -53,6 +53,8 @@ module Durababble
 
           delivered = []
           h.scheduler.schedule(actor: "recovery-worker", delay: 20, name: "drain_after_recovery") do
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease; mimic production.
+            h.store.mark_workflow_running(workflow_id, worker_id: "recovery-worker", lease_seconds: 30)
             (command_count + 3).times do
               activation = h.store.claim_target_activation(
                 worker_id: "recovery-worker",

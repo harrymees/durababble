@@ -33,6 +33,9 @@ module Durababble
           h.store.fault_plan.fail_after(:complete_workflow_command, message: "crash after durable command delivery")
 
           drain = lambda do |worker_id|
+            # [DURABABBLE-LEASE-4] Inbox command commits need the workflow lease;
+            # mimic production where each delivery worker holds the workflow lease.
+            h.store.mark_workflow_running(workflow_id, worker_id:, lease_seconds: 30)
             (command_count + 3).times do
               activation = h.store.claim_target_activation(
                 worker_id:,

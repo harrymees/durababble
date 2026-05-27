@@ -140,8 +140,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
       row
     end
 
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default")
-      row = @workflows.values.find { |workflow| workflow.fetch("worker_pool", "default") == worker_pool && workflow.fetch("status") == "pending" && (!workflow_names || workflow_names.include?(workflow.fetch("name"))) }
+    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
+      row = @workflows.values.find do |workflow|
+        workflow.fetch("worker_pool", "default") == worker_pool &&
+          workflow.fetch("status") == "pending" &&
+          (!workflow_names || workflow_names.include?(workflow.fetch("name"))) &&
+          !Array(excluding_workflow_ids).include?(workflow.fetch("id"))
+      end
       return unless row
 
       claim_workflow(workflow_id: row.fetch("id"), worker_id:, lease_seconds:, worker_pool:)
@@ -308,6 +313,10 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def retry_object_command(command_id:, error:, worker_id:, ready_at:)
       @commands.fetch(command_id).merge!("status" => "pending", "error" => error, "locked_by" => nil, "worker_id" => worker_id, "ready_at" => ready_at)
     end
+
+    # drain_object_inbox releases the unified object lease in its ensure block;
+    # this double does not model the lease, so the release is a no-op.
+    def release_object_lease(**) = false
   end
 
   def setup

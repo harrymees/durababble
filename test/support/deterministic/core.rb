@@ -111,8 +111,8 @@ module Durababble
         trace.event(@time, "scheduler", "advance", by: duration)
       end
 
-      #: (?max_events: untyped) -> untyped
-      def run(max_events: 10_000)
+      #: (?max_events: untyped, ?after_event: untyped) -> untyped
+      def run(max_events: 10_000, after_event: nil)
         count = 0
         until @events.empty?
           raise "deterministic scheduler exceeded #{max_events} events" if count >= max_events
@@ -121,6 +121,7 @@ module Durababble
           @time = event_time
           trace.event(@time, actor, "run", name:)
           block.call
+          after_event&.call(actor:, name:, time: @time)
           count += 1
         end
       end

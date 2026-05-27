@@ -284,7 +284,8 @@ module Durababble
             harness = Harness.new(scenario:, seed:, scheduler:, network:, store:)
             trace.event(0, "dst", "begin", scenario:, seed:)
             block.call(harness)
-            scheduler.run
+            harness.prepare_for_run!
+            scheduler.run(after_event: ->(**event) { harness.observe_transition!(**event) })
             harness.verify!
             trace.event(scheduler.time, "dst", "end", scenario:, seed:)
             trace_s = trace.to_s

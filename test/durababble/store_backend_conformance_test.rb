@@ -172,6 +172,47 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "atomically records failed retry attempts with retry backoff with #{backend.name}" do
+      with_durababble_store(backend, "step_retry_atomicity") do |store|
+        workflow_id = store.enqueue_workflow(name: "atomic-retry", input: {})
+        store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 30)
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+        store.record_step_started(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+
+        assert_raises(Durababble::LeaseConflict) do
+          store.record_step_failed_and_schedule_retry(
+            workflow_id:,
+            command_id: 0,
+            error: "RuntimeError: wrong owner",
+            worker_id: "worker-b",
+            run_at: Time.now + 60,
+          )
+        end
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "running"
+        assert_equal ["step_scheduled", "step_started"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
+
+        run_at = Time.now + 60
+        store.record_step_failed_and_schedule_retry(
+          workflow_id:,
+          command_id: 0,
+          error: "RuntimeError: retry me",
+          worker_id: "worker-a",
+          run_at:,
+        )
+
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "failed", "error" => "RuntimeError: retry me"
+        retry_row = store.workflow(workflow_id)
+        assert_hash_includes retry_row, "status" => "pending", "locked_by" => nil
+        refute_nil retry_row.fetch("next_run_at")
+        retry_history = store.workflow_history_for(workflow_id)
+        assert_equal ["step_scheduled", "step_started", "step_failed"], retry_history.map { |event| event.fetch("kind") }
+        assert_equal({ "retrying" => true }, retry_history.last.fetch("payload"))
+        assert_nil store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30)
+        store.make_workflow_due!(workflow_id, now: Time.now)
+        assert_hash_includes store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 30), "id" => workflow_id, "locked_by" => "worker-b"
+      end
+    end
+
     test "persists, claims, decodes, and acknowledges outbox messages with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
@@ -495,15 +536,102 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
         assert_nil store.claim_target_activation(worker_id: "other", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
 
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker",
+        )
         claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
         assert_equal [first], claimed.map { |message| message.fetch("id") }
         store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
-        store.complete_target_activation(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker")
+        assert store.suspend_workflow(workflow_id:, worker_id: "activation-worker")
+        store.complete_target_activation(
+          target_kind: "workflow",
+          target_type: "approval",
+          target_id: workflow_id,
+          worker_id: "activation-worker",
+        )
 
         rearmed = store.claim_target_activation(worker_id: "activation-worker-2", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
         assert_hash_includes rearmed, "target_id" => workflow_id, "locked_by" => "activation-worker-2"
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker-2", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker-2",
+        )
         remaining = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker-2", lease_seconds: 30, limit: 1)
         assert_equal [second], remaining.map { |message| message.fetch("id") }
+      end
+    end
+
+    test "workflow inbox command writes require a live workflow lease with #{backend.name}" do
+      with_durababble_store(backend, "workflow_inbox_lease_fence") do |store|
+        store.migrate!
+
+        [
+          [
+            "completion",
+            lambda do |workflow_id, message_id|
+              store.complete_workflow_command(
+                message_id:,
+                workflow_id:,
+                result: { "ok" => true },
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+          [
+            "failure",
+            lambda do |workflow_id, message_id|
+              store.fail_workflow_command(
+                message_id:,
+                workflow_id:,
+                error: "boom",
+                worker_id: "workflow-owner",
+              )
+            end,
+          ],
+        ].each do |operation, write_command|
+          workflow_id = store.enqueue_workflow(name: "approval", input: { "operation" => operation })
+          message_id = store.enqueue_workflow_command(
+            workflow_id:,
+            workflow_name: "approval",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: operation } },
+          )
+
+          assert_hash_includes(
+            store.claim_target_activation(
+              worker_id: "workflow-owner",
+              lease_seconds: 300,
+              target_kinds: ["workflow"],
+              target_types: ["approval"],
+            ),
+            "target_id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          assert_hash_includes(
+            store.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed_messages = store.claim_inbox_messages(
+            target_kind: "workflow",
+            target_type: "approval",
+            target_id: workflow_id,
+            worker_id: "workflow-owner",
+            lease_seconds: 300,
+          )
+          assert_equal(
+            [message_id],
+            claimed_messages.map { |message| message.fetch("id") },
+          )
+
+          assert_equal 1, store.steal_expired_leases!(now: Time.now + 31)
+          assert_raises(Durababble::LeaseConflict) { write_command.call(workflow_id, message_id) }
+          assert_equal [], store.workflow_history_for(workflow_id)
+          assert_hash_includes store.inbox_message(message_id), "status" => "running", "locked_by" => "workflow-owner"
+        end
       end
     end
 
@@ -820,6 +948,59 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "expired target activation owners cannot complete activations with #{backend.name}" do
+      with_durababble_store(backend, "target_activation_completion_lease") do |store|
+        store.migrate!
+        store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "stale-activation",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-owner",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-owner",
+        )
+        expire_target_activation!(
+          store,
+          backend,
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+        )
+
+        assert_nil store.complete_target_activation(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "stale-activation",
+          worker_id: "activation-owner",
+        )
+        assert_hash_includes(
+          store.target_activation(target_kind: "object", target_type: "counter", target_id: "stale-activation"),
+          "status" => "running",
+          "locked_by" => "activation-owner",
+        )
+        assert_hash_includes(
+          store.claim_target_activation(
+            worker_id: "activation-reclaimer",
+            lease_seconds: 30,
+            target_kinds: ["object"],
+            target_types: ["counter"],
+          ),
+          "target_id" => "stale-activation",
+          "locked_by" => "activation-reclaimer",
+        )
+      end
+    end
+
     test "deduplicates inbox enqueues and rejects idempotency shape conflicts with #{backend.name}" do
       with_durababble_store(backend, "inbox_idempotency") do |store|
         store.migrate!
@@ -1012,10 +1193,11 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
       with_durababble_store(backend, "inbox_crash_after_commit") do |store|
         store.migrate!
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
         message_id = store.enqueue_inbox_message(
           target_kind: "workflow",
           target_type: "approval",
-          target_id: "wf-2",
+          target_id: workflow_id,
           message_kind: "workflow_command",
           method_name: "approve",
           payload: { "reason" => "ok" },
@@ -1025,7 +1207,12 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         begin
           assert_hash_includes(recovered.inbox_message(message_id), "status" => "pending")
           assert_equal(1, recovered.inbox_message(message_id).fetch("sequence").to_i)
-          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-2", worker_id: "workflow-owner", lease_seconds: 30)
+          assert_hash_includes(
+            recovered.claim_workflow_for_activation(workflow_id:, worker_id: "workflow-owner", lease_seconds: 30),
+            "id" => workflow_id,
+            "locked_by" => "workflow-owner",
+          )
+          claimed = recovered.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "workflow-owner", lease_seconds: 30)
           assert_equal([message_id], claimed.map { |message| message.fetch("id") })
         ensure
           recovered.close
@@ -1062,6 +1249,33 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
         sequences = store.inbox_messages_for(target_kind: "object", target_type: "counter", target_id: "concurrent").map { |message| message.fetch("sequence").to_i }.sort
         assert_equal [1, 2, 3, 4, 5, 6], sequences
+      end
+    end
+
+    test "skips excluded workflow ids when claiming runnable work with #{backend.name}" do
+      with_durababble_store(backend, "workflow_claim_exclusion") do |store|
+        first = store.enqueue_workflow(name: "exclude-workflow", input: { "id" => "first" })
+        second = store.enqueue_workflow(name: "exclude-workflow", input: { "id" => "second" })
+
+        claimed = store.claim_runnable_workflow(
+          worker_id: "worker-a",
+          lease_seconds: 30,
+          workflow_names: ["exclude-workflow"],
+          excluding_workflow_ids: [first],
+        )
+        assert_hash_includes claimed, "id" => second, "locked_by" => "worker-a"
+        assert_hash_includes store.workflow(first), "status" => "pending", "locked_by" => nil
+        assert_nil store.claim_runnable_workflow(
+          worker_id: "worker-b",
+          lease_seconds: 30,
+          workflow_names: ["exclude-workflow"],
+          excluding_workflow_ids: [first],
+        )
+        assert_hash_includes(
+          store.claim_runnable_workflow(worker_id: "worker-c", lease_seconds: 30, workflow_names: ["exclude-workflow"]),
+          "id" => first,
+          "locked_by" => "worker-c",
+        )
       end
     end
 
@@ -1223,6 +1437,103 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "unfenced workflow status writes do not mutate terminal rows with #{backend.name}" do
+      with_durababble_store(backend, "terminal_immutability") do |store|
+        completed_id = store.enqueue_workflow(name: "terminal-completed", input: {})
+        store.complete_workflow(completed_id, result: { "done" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completed_id, result: { "done" => false })
+        end
+        store.cancel_workflow(completed_id, reason: "too late")
+        store.fail_workflow(completed_id, error: "too late")
+        store.mark_workflow_running(completed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(completed_id),
+          "status" => "completed",
+          "result" => { "done" => true },
+          "error" => nil,
+          "locked_by" => nil,
+        )
+
+        canceled_id = store.enqueue_workflow(name: "terminal-canceled", input: {})
+        store.cancel_workflow(canceled_id, reason: "operator stop", result: { "cleanup" => true })
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(canceled_id, result: { "done" => true })
+        end
+        store.cancel_workflow(canceled_id, reason: "second cancel")
+        store.fail_workflow(canceled_id, error: "too late")
+        store.mark_workflow_running(canceled_id)
+        assert_hash_includes(
+          store.workflow(canceled_id),
+          "status" => "canceled",
+          "result" => { "cleanup" => true },
+          "error" => "operator stop",
+          "locked_by" => nil,
+        )
+
+        failed_id = store.enqueue_workflow(name: "terminal-failed", input: {})
+        store.fail_workflow(failed_id, error: "fatal")
+
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(failed_id, result: { "done" => true })
+        end
+        store.cancel_workflow(failed_id, reason: "too late")
+        store.fail_workflow(failed_id, error: "different")
+        store.mark_workflow_running(failed_id, worker_id: "owner", lease_seconds: 30)
+        assert_hash_includes(
+          store.workflow(failed_id),
+          "status" => "failed",
+          "error" => "fatal",
+          "next_run_at" => nil,
+          "locked_by" => nil,
+        )
+      end
+    end
+
+    test "terminal workflow writes do not leave incomplete durable work with #{backend.name}" do
+      with_durababble_store(backend, "terminal_work_cleanup") do |store|
+        completion_id = store.create_workflow(name: "reject-incomplete-complete", input: {})
+        store.record_step_scheduled(workflow_id: completion_id, command_id: 0, name: "not_done")
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(completion_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(completion_id), "status" => "running", "result" => nil
+        assert_equal ["scheduled"], store.steps_for(completion_id).map { |step| step.fetch("status") }
+
+        pending_wait_id = store.create_workflow(name: "reject-pending-wait-complete", input: {})
+        store.record_wait(
+          workflow_id: pending_wait_id,
+          command_id: 0,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+        store.record_step_completed(workflow_id: pending_wait_id, command_id: 0, result: { "finished" => true })
+        assert_raises(Durababble::Error) do
+          store.complete_workflow(pending_wait_id, result: { "done" => true })
+        end
+        assert_hash_includes store.workflow(pending_wait_id), "status" => "waiting", "result" => nil
+        assert_equal ["pending"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
+
+        cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
+        store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
+        store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running")
+        store.record_wait(
+          workflow_id: cancel_id,
+          command_id: 2,
+          name: "waiting",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+
+        store.cancel_workflow(cancel_id, reason: "operator stop")
+        assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "error" => "operator stop"
+        assert_equal ["canceled", "canceled", "canceled"], store.steps_for(cancel_id).map { |step| step.fetch("status") }
+        assert_equal ["canceled"], store.step_attempts_for(cancel_id).map { |attempt| attempt.fetch("status") }
+        assert_equal ["canceled"], store.waits_for(cancel_id).map { |wait| wait.fetch("status") }
+      end
+    end
+
     test "reclaims expired durable object command leases with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(
@@ -1317,6 +1628,268 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal 0, mysql_transaction_depth
       end
     end
+
+    test "claims, renews, releases, and surfaces the unified object lease with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        # claim takes worker_pool as routing metadata; renew/release key only on
+        # (object_type, object_id) since object identity is global.
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "abc" }
+        key = { object_type: "counter", object_id: "abc" }
+        assert_nil store.current_object_lease("counter", "abc")
+
+        first = store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        assert_equal "owner-a", first.fetch("worker_id")
+        assert_hash_includes(
+          store.current_object_lease("counter", "abc"),
+          "worker_id" => "owner-a",
+        )
+
+        # Re-claim by the same worker refreshes the lease (no conflict).
+        same = store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        assert_equal "owner-a", same.fetch("worker_id")
+
+        # A different worker is rejected while a live lease holds the row, and the
+        # rejection surfaces as nil so callers branch on win/loss without having
+        # to compare worker ids. The existing holder is not exposed through this
+        # path; consumers read current_object_lease for routing.
+        assert_nil store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: 30)
+        assert_hash_includes(
+          store.current_object_lease("counter", "abc"),
+          "worker_id" => "owner-a",
+        )
+
+        # Negative or zero lease_seconds are rejected at the public boundary: a
+        # non-positive lease would be expired the moment it was written, which
+        # only confuses the takeover path. Tests that need to seed an expired
+        # row must do so explicitly (see expire_object_lease! below).
+        assert_raises(ArgumentError) do
+          store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: -1)
+        end
+        assert_raises(ArgumentError) do
+          store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: 0)
+        end
+
+        assert_equal true, store.renew_object_lease(**key, worker_id: "owner-a", lease_seconds: 30)
+        # A non-owner cannot renew.
+        assert_equal false, store.renew_object_lease(**key, worker_id: "intruder", lease_seconds: 30)
+
+        # A non-owner cannot release.
+        assert_equal false, store.release_object_lease(**key, worker_id: "intruder")
+        assert_hash_includes(store.current_object_lease("counter", "abc"), "worker_id" => "owner-a")
+
+        # The owner releases cleanly.
+        assert_equal true, store.release_object_lease(**key, worker_id: "owner-a")
+        assert_nil store.current_object_lease("counter", "abc")
+
+        # After release, renew on an empty row returns false.
+        assert_equal false, store.renew_object_lease(**key, worker_id: "owner-a", lease_seconds: 30)
+      end
+    end
+
+    test "takes over an expired object lease and reports it via release_worker_leases / steal with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "expired" }
+
+        # Claim normally, then explicitly backdate `locked_until` to simulate a
+        # crashed owner. This separates the seeding step from the takeover under
+        # test: the previous shortcut (`lease_seconds: -1`) blurred the two and
+        # depended on a since-removed permissive claim path.
+        store.claim_object_lease(**claim_key, worker_id: "crashed-owner", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "expired")
+        assert_nil store.current_object_lease("counter", "expired")
+
+        # A new owner can take over because the existing row is expired.
+        new_holder = store.claim_object_lease(**claim_key, worker_id: "new-owner", lease_seconds: 30)
+        assert_equal "new-owner", new_holder.fetch("worker_id")
+        assert_hash_includes(store.current_object_lease("counter", "expired"), "worker_id" => "new-owner")
+
+        # release_worker_leases! clears the new owner's holds across both tables.
+        counts = store.release_worker_leases!(worker_id: "new-owner")
+        assert_operator counts.fetch("durable_objects").to_i, :>=, 1
+        assert_nil store.current_object_lease("counter", "expired")
+
+        # steal_expired_leases! sweeps stale rows. Seed an expired row again and
+        # confirm the sweep clears it.
+        store.claim_object_lease(**claim_key, worker_id: "another-crashed", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "expired")
+        stolen = store.steal_expired_leases!(now: Time.now)
+        assert_operator stolen, :>=, 1
+        # The next claim succeeds because the stale row was cleared.
+        fresh = store.claim_object_lease(**claim_key, worker_id: "post-steal", lease_seconds: 30)
+        assert_equal "post-steal", fresh.fetch("worker_id")
+      end
+    end
+
+    test "gates claim_inbox_messages for objects on the unified lease with #{backend.name}" do
+      with_durababble_store(backend, "conformance") do |store|
+        store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "increment",
+          args: [],
+          kwargs: {},
+        )
+
+        # A non-owner is rejected: the claim returns no rows because the lease
+        # acquisition inside the transaction did not award them ownership.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "owner", lease_seconds: 30)
+        rejected = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "abc", worker_id: "intruder", lease_seconds: 30)
+        assert_empty rejected
+
+        # The owner can claim normally.
+        claimed = store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "abc", worker_id: "owner", lease_seconds: 30)
+        assert_equal 1, claimed.size
+      end
+    end
+
+    test "awards the object lease to exactly one of many concurrent claimers with #{backend.name}" do
+      # The atomic-claim primitive's contract is "exactly one wins" — Ruby-level
+      # serialization through a single connection only proves the WHERE clause
+      # rejects the second claim in sequence. To pin down the SQL-engine-level
+      # race we fan out N independent stores (separate connections) and have
+      # them all attempt to claim the same fresh row at once. The DB has to
+      # serialize the writes; this test asserts the loser branch returns nil
+      # rather than blowing up on a unique-key violation, deadlock, or partial
+      # update. SQLite skips: the conformance harness uses a single in-memory
+      # database with serialized access, which doesn't model the contention.
+      skip("in-memory SQLite serializes connections; this test needs real concurrency") if backend.sqlite?
+
+      with_durababble_store(backend, "object_lease_race") do |store|
+        store.migrate!
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "race" }
+        queue = Queue.new
+        thread_count = 8
+        mutex = Mutex.new
+        condition = ConditionVariable.new
+        ready = 0
+        release = false
+
+        threads = thread_count.times.map do |index|
+          Thread.new do
+            thread_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+            begin
+              mutex.synchronize do
+                ready += 1
+                condition.broadcast
+                condition.wait(mutex) until release
+              end
+              holder = thread_store.claim_object_lease(**claim_key, worker_id: "owner-#{index}", lease_seconds: 30)
+              queue << (holder ? [:won, "owner-#{index}", holder] : [:lost, "owner-#{index}"])
+            rescue StandardError => e
+              queue << [:error, "owner-#{index}", e]
+            ensure
+              thread_store.close
+            end
+          end
+        end
+
+        mutex.synchronize do
+          condition.wait(mutex) until ready == thread_count
+          release = true
+          condition.broadcast
+        end
+
+        results = thread_count.times.map { queue.pop }
+        threads.each(&:join)
+
+        errors = results.select { |status, *_| status == :error }
+        raise errors.first.last unless errors.empty?
+
+        winners = results.select { |status, *_| status == :won }
+        losers = results.select { |status, *_| status == :lost }
+        assert_equal 1, winners.size, "expected exactly one winner, got #{winners.map { |_, id, _| id }.inspect}"
+        assert_equal thread_count - 1, losers.size
+
+        # The lease the database actually holds matches the unique winner.
+        winning_worker = winners.first[1]
+        live = store.current_object_lease("counter", "race")
+        assert_hash_includes live, "worker_id" => winning_worker
+
+        # And the winner's claim row reports the same worker — i.e., the row
+        # the DB awarded matches what the caller was told it won.
+        winning_row = winners.first[2]
+        assert_equal winning_worker, winning_row.fetch("worker_id")
+      end
+    end
+
+    test "release after steal is a safe no-op for the original holder with #{backend.name}" do
+      # The hot-path scenario: worker A claims, A's process stalls past the
+      # lease deadline, worker B steals the row and starts processing, and
+      # then A's `ensure`-block release finally fires. A's release must NOT
+      # clear B's hold — the conditional `WHERE locked_by = worker_id` in the
+      # release SQL is what makes this safe, and a regression here would
+      # silently strand a real owner. (`drain_object_inbox` relies on this in
+      # its ensure clause, as does any stream lease releaser layered on top.)
+      with_durababble_store(backend, "object_lease_release_after_steal") do |store|
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "stale" }
+        key = { object_type: "counter", object_id: "stale" }
+
+        # A holds the lease, then the row is backdated to simulate A's process
+        # stalling. We don't actually wait `lease_seconds` — `expire_object_lease!`
+        # rewrites locked_until directly, mirroring how `steal_expired_leases!`
+        # would observe a crashed owner.
+        store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 30)
+        expire_object_lease!(store, backend, "counter", "stale")
+
+        # B takes over by claiming the now-expired row. After the takeover, B
+        # is the only legitimate holder; current_object_lease reflects that.
+        assert_equal "owner-b", store.claim_object_lease(**claim_key, worker_id: "owner-b", lease_seconds: 30).fetch("worker_id")
+        assert_hash_includes(store.current_object_lease("counter", "stale"), "worker_id" => "owner-b")
+
+        # A's release fires late. The `WHERE locked_by = worker_id` guard
+        # means it returns false (nothing to release for A) and does not
+        # touch B's hold.
+        assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
+        assert_hash_includes(store.current_object_lease("counter", "stale"), "worker_id" => "owner-b")
+
+        # B can still renew and release normally — the row is intact.
+        assert_equal true, store.renew_object_lease(**key, worker_id: "owner-b", lease_seconds: 30)
+        assert_equal true, store.release_object_lease(**key, worker_id: "owner-b")
+        assert_nil store.current_object_lease("counter", "stale")
+
+        # And A's release remains idempotent on the now-empty row.
+        assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
+      end
+    end
+  end
+
+  def expire_target_activation!(store, backend, target_kind:, target_type:, target_id:)
+    table = store.send(:table, "target_activations")
+    if backend.sqlite?
+      # SqliteStore stores locked_until as an integer microsecond clock; subtract
+      # 1 hour worth of integer ticks from dura_now() so the comparison matches
+      # the integer clock the translated NOW(6) reads.
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = dura_now() - (3600 * #{store.send(:seconds_scale)})
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [target_kind, target_type, target_id],
+      )
+    elsif backend.mysql?
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = ?
+          WHERE target_kind = ? AND target_type = ? AND target_id = ?
+        SQL
+        [expired_at, target_kind, target_type, target_id],
+      )
+    else
+      store.send(
+        :execute_params,
+        <<~SQL,
+          UPDATE #{table}
+          SET locked_until = now() - interval '1 hour'
+          WHERE target_kind = $1 AND target_type = $2 AND target_id = $3
+        SQL
+        [target_kind, target_type, target_id],
+      )
+    end
   end
 
   def mysql_transaction_depth
@@ -1332,5 +1905,37 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       ).first
     end
     row.fetch("in_tx").to_i
+  end
+
+  # Backdate a row's locked_until to simulate a crashed owner without relying
+  # on a permissive `claim_object_lease(lease_seconds: -1)` shortcut, which the
+  # public API now rejects. Each backend stores `locked_until` in its own
+  # native form: Postgres takes a literal interval; MySQL uses a DATETIME(6)
+  # string; SQLite stores an integer microsecond epoch (dura_now()'s clock),
+  # so we have to hand it the integer that comparison against dura_now() will
+  # treat as "in the past".
+  def expire_object_lease!(store, backend, object_type, object_id)
+    table = store.send(:table, "durable_objects")
+    if backend.postgres?
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = now() - interval '1 hour' WHERE object_type = $1 AND object_id = $2",
+        [object_type, object_id],
+      )
+    elsif backend.sqlite?
+      expired_at = ((Time.now.to_r - 3600) * 1_000_000).to_i
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE object_type = ? AND object_id = ?",
+        [expired_at, object_type, object_id],
+      )
+    else
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = ? WHERE object_type = ? AND object_id = ?",
+        [expired_at, object_type, object_id],
+      )
+    end
   end
 end

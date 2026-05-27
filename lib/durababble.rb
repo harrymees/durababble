@@ -235,11 +235,11 @@ module Durababble
       self.default_store = Store.connect(database_url:, schema:)
     end
 
-    # Durababble runs workflows inside an Async fiber reactor. Each step, handle-RPC
-    # dispatch task, and user-spawned fan-out fiber shares one workflow execution but
-    # needs its OWN ActiveRecord connection — otherwise concurrent fibers interleave
-    # packets on a shared socket and corrupt the wire protocol (trilogy/pg yield to
-    # the fiber scheduler mid-query via rb_wait_for_single_fd).
+    # Durababble runs worker runtimes and workflows inside an Async fiber reactor.
+    # Each workflow step, durable-object command drain, handle-RPC dispatch task, and
+    # user-spawned fan-out fiber needs its OWN ActiveRecord connection — otherwise
+    # concurrent fibers interleave packets on a shared socket and corrupt the wire
+    # protocol (trilogy/pg yield to the fiber scheduler mid-query via rb_wait_for_single_fd).
     #
     # ActiveRecord checks connections out per `IsolatedExecutionState.isolation_level`.
     # The default is :thread, which is wrong for us. Hosts running workflows must run
@@ -255,11 +255,11 @@ module Durababble
 
       raise ConfigurationError, <<~MSG.tr("\n", " ").strip
         Durababble requires ActiveSupport::IsolatedExecutionState.isolation_level = :fiber
-        (current: #{isolated_execution_state_isolation_level.inspect}). Workflows run
-        fan-out fibers that each need their own ActiveRecord connection; the default
-        :thread isolation causes wire-protocol corruption when fibers interleave on a
-        shared connection. Set ActiveSupport::IsolatedExecutionState.isolation_level =
-        :fiber in your host before booting a Durababble worker. Falcon's Railtie does
+        (current: #{isolated_execution_state_isolation_level.inspect}). Worker runtimes
+        and workflows run fibers that each need their own ActiveRecord connection; the
+        default :thread isolation causes wire-protocol corruption when fibers interleave
+        on a shared connection. Set ActiveSupport::IsolatedExecutionState.isolation_level
+        = :fiber in your host before booting a Durababble worker. Falcon's Railtie does
         this defensively even under Puma.
       MSG
     end

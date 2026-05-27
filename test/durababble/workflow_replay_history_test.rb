@@ -145,9 +145,9 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     assert history.validate_scheduled_shape!(workflow_id: "wf", command_id: 0, shape: { "name" => "legacy" })
   end
 
-  test "non-terminal step failures are not replay terminal events" do
+  test "retrying step failures are not replay terminal events" do
     history = Durababble::WorkflowReplayHistory.new([
-      { "kind" => "step_failed", "command_id" => 0, "event_index" => 0, "error" => "RuntimeError: retry" },
+      { "kind" => "step_failed", "command_id" => 0, "event_index" => 0, "error" => "RuntimeError: retry", "payload" => { "retrying" => true } },
     ])
 
     assert_nil history.next_undeliverable_command_id({})

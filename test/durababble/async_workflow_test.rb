@@ -21,6 +21,19 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
     assert_equal "first", error.message
   end
 
+  test "workflow replay treats non-retrying step failures as terminal resolutions" do
+    failed = {
+      "kind" => "step_failed",
+      "command_id" => 0,
+      "event_index" => 1,
+      "error" => "RuntimeError: boom",
+    }
+    retrying = failed.merge("payload" => { "retrying" => true })
+
+    assert Durababble::WorkflowReplayHistory.new([failed]).terminal_recorded?(0)
+    refute Durababble::WorkflowReplayHistory.new([retrying]).terminal_recorded?(0)
+  end
+
   durababble_store_backends.each do |backend|
     test "raw Async scatter gather fanout schedules every branch before completions with #{backend.name}" do
       with_durababble_store(backend, "async_workflow") do |store|
@@ -172,6 +185,47 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         assert_match(/ReplayDivergenceError/, run.error)
         assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
         assert_empty store.step_attempts_for(workflow_id)
+      end
+    end
+
+    test "caught step failures replay from history without rerunning the failed step with #{backend.name}" do
+      with_durababble_store(backend, "async_workflow") do |store|
+        failed_runs = 0
+        cleanup_runs = 0
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "caught-step-failure-replay"
+
+          define_method(:execute) do |_input|
+            risky_step
+          rescue StandardError => e
+            cleanup_after_failure(e.class.name)
+          end
+
+          define_method(:risky_step) do
+            failed_runs += 1
+            raise "should not rerun"
+          end
+          step :risky_step
+
+          define_method(:cleanup_after_failure) do |error_class|
+            cleanup_runs += 1
+            { "handled" => error_class }
+          end
+          step :cleanup_after_failure
+        end
+
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+        store.claim_workflow(workflow_id:, worker_id: "failure-history-seeder", lease_seconds: 60)
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "risky_step", metadata: { "retry" => default_retry_shape })
+        store.record_step_started(workflow_id:, command_id: 0, name: "risky_step")
+        store.record_step_failed(workflow_id:, command_id: 0, error: "RuntimeError: persisted failure")
+
+        run = Durababble::Engine.new(store:, worker_id: "failure-history-seeder").resume(workflow, workflow_id:)
+
+        assert_equal "completed", run.status
+        assert_equal({ "handled" => "RuntimeError" }, run.result)
+        assert_equal 0, failed_runs
+        assert_equal 1, cleanup_runs
       end
     end
 
