@@ -17,27 +17,12 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
 
       now = Time.now.utc
       expectations = {
-        "pending workflow claim probe" => {
-          sql: query_sql(:claim_pending_workflow, name_sql: ""),
+        "workflow claim probe" => {
+          sql: query_sql(:claim_runnable_workflow, name_sql: ""),
           params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "failed workflow claim probe" => {
-          sql: query_sql(:claim_failed_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "canceling workflow claim probe" => {
-          sql: query_sql(:claim_canceling_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "expired workflow claim probe" => {
-          sql: query_sql(:claim_expired_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_expired_lease",
+          expected_key_fragment: "workflows_claim",
           expected_access_types: ["range"],
-          allow_filesort: true,
+          max_rows_examined_per_scan: 4_000,
         },
         "pending outbox claim probe" => {
           sql: query_sql(:claim_pending_outbox),
@@ -239,8 +224,8 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
 
   def mysql_expected_key_parts(expected_key_fragment)
     case expected_key_fragment
-    when "workflows_queue"
-      ["worker_pool", "status"]
+    when "workflows_claim"
+      ["worker_pool", "queue_available_at"]
     when "workflows_expired_lease"
       ["worker_pool", "status", "locked_until"]
     when "outbox_queue"

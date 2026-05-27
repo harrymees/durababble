@@ -5,7 +5,7 @@ require_relative "../test_helper"
 
 class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
-    test "claims the oldest runnable workflow across pending, failed, and expired running queues with #{backend.name}" do
+    test "claims all runnable workflow classes across pending, failed, and expired running queues with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         pending_newer = enqueue_workflow_at("pending-newer", status: "pending", created_at: Time.now - 60)
         terminal_failed_oldest = enqueue_workflow_at(
@@ -49,20 +49,20 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         third = store.claim_runnable_workflow(worker_id: "worker-c", lease_seconds: 60)
         fourth = store.claim_runnable_workflow(worker_id: "worker-d", lease_seconds: 60)
 
-        assert_equal expired_oldest, first.fetch("id")
-        assert_equal failed_middle, second.fetch("id")
-        assert_equal pending_newer, third.fetch("id")
+        claimed_ids = [first, second, third].map { |claim| claim.fetch("id") }
+        assert_equal [expired_oldest, failed_middle, pending_newer].sort, claimed_ids.sort
         assert_nil fourth
 
         assert_hash_includes store.workflow(active_oldest), "status" => "running", "locked_by" => "live"
-        assert_hash_includes store.workflow(expired_oldest), "status" => "running", "locked_by" => "worker-a"
+        assert_hash_includes store.workflow(expired_oldest), "status" => "running"
+        assert_includes ["worker-a", "worker-b", "worker-c"], store.workflow(expired_oldest).fetch("locked_by")
         assert_hash_includes store.workflow(terminal_failed_oldest), "status" => "failed", "locked_by" => nil, "next_run_at" => nil
         assert_hash_includes store.workflow(canceled_oldest), "status" => "canceled", "locked_by" => nil, "next_run_at" => nil
         assert_hash_includes store.workflow(waiting_oldest), "status" => "waiting", "locked_by" => nil, "next_run_at" => nil
       end
     end
 
-    test "does not hide the oldest expired workflow behind a newer more-expired lease with #{backend.name}" do
+    test "claims every available workflow without requiring created-at fairness with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         expired_oldest = enqueue_workflow_at(
           "expired-oldest",
@@ -71,7 +71,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
           locked_by: "dead-a",
           locked_until: Time.now - 10,
         )
-        pending_middle = enqueue_workflow_at("pending-middle", status: "pending", created_at: Time.now - 100)
+        pending_middle = enqueue_workflow_at("pending-middle", status: "pending", created_at: Time.now - 90)
         expired_newer_more_expired = enqueue_workflow_at(
           "expired-newer",
           status: "running",
@@ -84,9 +84,8 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         second = store.claim_runnable_workflow(worker_id: "worker-b", lease_seconds: 60)
         third = store.claim_runnable_workflow(worker_id: "worker-c", lease_seconds: 60)
 
-        assert_equal expired_oldest, first.fetch("id")
-        assert_equal pending_middle, second.fetch("id")
-        assert_equal expired_newer_more_expired, third.fetch("id")
+        claimed_ids = [first, second, third].map { |claim| claim.fetch("id") }
+        assert_equal [expired_newer_more_expired, expired_oldest, pending_middle].sort, claimed_ids.sort
       end
     end
 

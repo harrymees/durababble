@@ -26,8 +26,15 @@ module Durababble
           cancel_delivered_at DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          INDEX #{quote_column_name(index_name("workflows", "queue"))} (worker_pool, status, created_at),
-          INDEX #{quote_column_name(index_name("workflows", "runnable_due"))} (worker_pool, status, next_run_at, created_at),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
+          INDEX #{quote_column_name(index_name("workflows", "claim"))} (worker_pool, queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
           INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )

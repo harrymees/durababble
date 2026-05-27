@@ -28,7 +28,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         store.claim_workflow(workflow_id:, worker_id: "cleanup-worker", lease_seconds: 30)
 
         runnable_id = store.enqueue_workflow(name: "query-count-claim", input: { "ok" => true })
-        claimed = assert_sql_query_budget("claim_runnable_workflow", mysql: 6, postgres: 1) do
+        claimed = assert_sql_query_budget("claim_runnable_workflow", mysql: 3, postgres: 1) do
           store.claim_runnable_workflow(worker_id: "claim-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed, "id" => runnable_id, "status" => "running"

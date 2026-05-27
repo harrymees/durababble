@@ -34,7 +34,15 @@ module Durababble
           cancel_requested_at INTEGER,
           cancel_delivered_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
-          updated_at INTEGER NOT NULL DEFAULT (dura_now())
+          updated_at INTEGER NOT NULL DEFAULT (dura_now()),
+          queue_available_at INTEGER GENERATED ALWAYS AS (
+            CASE
+              WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED
         )
       SQL
       execute(<<~SQL)

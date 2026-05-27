@@ -73,14 +73,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_cancel_waiting_steps_for_workflow,
     :mysql_cancel_workflow,
     :mysql_cancel_workflow_with_worker,
-    :mysql_claim_canceling_workflow,
     :mysql_claim_expired_outbox,
     :mysql_claim_expired_target_activation,
-    :mysql_claim_expired_workflow,
-    :mysql_claim_failed_workflow,
     :mysql_claim_pending_outbox,
     :mysql_claim_pending_target_activation,
-    :mysql_claim_pending_workflow,
+    :mysql_claim_runnable_workflow,
     :mysql_claim_selected_outbox,
     :mysql_claim_selected_target_activation,
     :mysql_claim_selected_workflow,
@@ -392,7 +389,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     plan = {
       "Node Type" => "Bitmap Heap Scan",
       "Relation Name" => "workflows",
-      "Plans" => [{ "Node Type" => "Bitmap Index Scan", "Index Name" => "workflows_queue_idx" }],
+      "Plans" => [{ "Node Type" => "Bitmap Index Scan", "Index Name" => "workflows_claim_idx" }],
     }
 
     assert_raises_matching(Minitest::Assertion, /Bitmap Heap Scan/) do
@@ -498,11 +495,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   end
 
   test "accepts index-only scans as valid index scans" do
-    plan = { "Node Type" => "Index Only Scan", "Index Name" => "workflows_queue_idx" }
+    plan = { "Node Type" => "Index Only Scan", "Index Name" => "workflows_claim_idx" }
 
     QueryPlanAssertions.assert_indexes_only!(
       plan,
-      allowed_indexes: ["workflows_queue_idx"],
+      allowed_indexes: ["workflows_claim_idx"],
       sql: "SELECT id FROM workflows",
     )
     assert true
@@ -515,8 +512,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     operations = {
       "claim_runnable_workflow" => {
         call: -> { store.claim_runnable_workflow(worker_id: "plan-worker", lease_seconds: 60) },
-        allowed_indexes: ["workflows_pkey", "workflows_queue_idx", "workflows_runnable_due_idx", "workflows_expired_lease_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx"],
-        allow_post_filter_indexes: ["workflows_queue_idx", "workflows_runnable_due_idx", "workflows_pending_created_idx", "workflows_failed_due_idx", "workflows_canceling_created_idx", "workflows_expired_lease_idx"],
+        allowed_indexes: ["workflows_pkey", "workflows_claim_idx"],
+        allow_post_filter_indexes: ["workflows_claim_idx"],
       },
       "claim_workflow" => {
         call: -> { store.claim_workflow(workflow_id: "pending-target", worker_id: "plan-worker", lease_seconds: 60) },
@@ -535,8 +532,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "release_worker_leases" => {
         call: -> { store.release_worker_leases!(worker_id: "owner") },
-        allowed_indexes: ["workflows_worker_lease_idx", "workflows_pending_created_idx", "outbox_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
-        allow_post_filter_indexes: ["workflows_pending_created_idx"],
+        allowed_indexes: ["workflows_worker_lease_idx", "outbox_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
       },
       "heartbeat_step" => {
         call: -> { store.heartbeat_step(workflow_id: "running-owned", position: 0, worker_id: "owner", lease_seconds: 60, cursor: { "offset" => 1 }) },
