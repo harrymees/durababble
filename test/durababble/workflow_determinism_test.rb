@@ -48,6 +48,16 @@ class DurababbleWorkflowDeterminismTest < DurababbleTestCase
     assert_nil determinism_violation_for(:object_id, receiver: Object.new)
   end
 
+  test "classifies violation candidates before callsite lookup" do
+    safe_event = FakeTraceEvent.new(method_id: :object_id, receiver: Object.new, defined_class: Object)
+    file_event = FakeTraceEvent.new(method_id: :read, receiver: File, defined_class: File)
+    secure_random_event = FakeTraceEvent.new(method_id: :uuid, receiver: SecureRandom, defined_class: SecureRandom)
+
+    assert_nil Durababble::WorkflowDeterminism.send(:violation_candidate_for, safe_event)
+    assert_equal ["File.read", true], Durababble::WorkflowDeterminism.send(:violation_candidate_for, file_event)
+    assert_equal ["SecureRandom.uuid", false], Durababble::WorkflowDeterminism.send(:violation_candidate_for, secure_random_event)
+  end
+
   test "allows internal Durababble callsites while rejecting unknown callsites" do
     assert_nil determinism_violation_for(:sleep, receiver: Kernel, defined_class: Kernel, callsite: internal_callsite)
     assert_nil determinism_violation_for(:now, receiver: Time, callsite: internal_callsite)
@@ -121,6 +131,7 @@ class DurababbleWorkflowDeterminismTest < DurababbleTestCase
       assert_nil Durababble::WorkflowDeterminism.allow_host_operations {
         Durababble::WorkflowDeterminism.send(:check_event!, "allowed", unsafe_event, locations: [unsafe_callsite])
       }
+      assert_nil Durababble::WorkflowDeterminism.send(:check_event!, "safe", safe_event)
       assert_nil Durababble::WorkflowDeterminism.send(:check_event!, "safe", safe_event, locations: [unsafe_callsite])
 
       error = assert_raises(Durababble::DeterminismError) do

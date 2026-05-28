@@ -151,41 +151,6 @@ Use deterministic workflow ids when the caller has a natural idempotency key, su
 
 Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or terminated workflow still counts as existing, so a later enqueue with the same deterministic id is rejected rather than starting a second run. Callers that want retry-after-completion semantics should choose a new workflow id, such as one that includes an attempt number or version.
 
-## Replay
-
-Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
-
-```ruby
-def execute(order)
-  payment = charge_card(order)      # reused from storage if step 0 completed
-  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
-
-  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
-end
-```
-
-Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::ReplayDivergenceError` instead of quietly attaching old side effects to new control flow.
-
-### Workflow History Length
-
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. A workflow that never ends accumulates an ever-growing event log, and as that log grows replay takes longer and system performance suffers.
-
-Prefer durable objects for long-lived identities, and split very large jobs into a workflow per bounded batch or phase:
-
-```ruby
-# Prefer this shape for ongoing per-shop state:
-ShopSync.at(shop_id).record_cursor(cursor)
-
-# Prefer this shape for bounded work:
-SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
-```
-
-To keep an unbounded run from degrading silently, Durababble bounds replay by counting persisted `workflow_history` rows before loading replay payloads. The hard limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. The warning threshold defaults to `8_000` events and can be tuned with `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS` or `Durababble.workflow_history_warning_events = 8_000`; reaching it logs a warning through `Durababble.logger` but does not stop the run.
-
-When an open workflow exceeds the hard limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`. The terminal failure clears workflow leases and retry deadlines, and terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming it, so workers do not repeatedly claim the same oversized run. Completed, canceled, and failed workflows are returned as-is and remain inspectable.
-
-Treat a warning log or `WorkflowHistoryLimitExceeded` as a design or retention signal rather than a number to raise reflexively. Reshape the workload using the patterns above, compact completed history through a deliberate retention tool, or raise the hard limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.
-
 ## Sleeping
 
 A workflow can park itself without keeping a worker thread busy. `sleep_until(time, context)` and `wait_until(time, context)` are timer waits: the workflow resumes at or after the given time. Under the hood, Durababble stores the wait, releases the worker lease, and wakes the workflow when the timer is due.
@@ -415,3 +380,38 @@ handle.note(message: "approved by legal")
 ```
 
 Durababble handles the RPC machinery between your workers automatically, routing transient queries to the worker that currently owns the live workflow lease and routing durable commands through the inbox. If a workflow is not active when you send a command to it, Durababble will warm it up on a worker and then deliver your message; transient queries require an active owner and return a not-running error instead of creating durable work.
+
+## Replay
+
+Replay is what lets a workflow continue after a crash without rerunning completed side effects. When Durababble resumes a workflow, it calls `#execute` again from the top, but completed step positions return their persisted results instead of invoking the Ruby method body. The workflow code must therefore be deterministic around step calls. Any branch on input, persisted step results, or durable wait payloads must happen the same way it did the first time. For this reason, Durababble guards workflow orchestration against direct host randomness, wall-clock time, blocking sleeps, process calls, and blocking file/IO. The guard is scoped to managed workflow fibers, so step bodies and unrelated host fibers keep normal Ruby semantics.
+
+```ruby
+def execute(order)
+  payment = charge_card(order)      # reused from storage if step 0 completed
+  label = buy_shipping_label(order, payment) # reruns only if step 1 did not complete
+
+  { "payment_id" => payment.fetch("id"), "label_id" => label.fetch("id") }
+end
+```
+
+Replay is intentionally strict. If deployed code reaches a different completed step method at the same position, or returns before consuming completed history, the run fails with `Durababble::ReplayDivergenceError` instead of quietly attaching old side effects to new control flow.
+
+### Workflow History Length
+
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. A workflow that never ends accumulates an ever-growing event log, and as that log grows replay takes longer and system performance suffers.
+
+Prefer durable objects for long-lived identities, and split very large jobs into a workflow per bounded batch or phase:
+
+```ruby
+# Prefer this shape for ongoing per-shop state:
+ShopSync.at(shop_id).record_cursor(cursor)
+
+# Prefer this shape for bounded work:
+SyncOneShopBatch.enqueue({ "shop_id" => shop_id, "cursor" => cursor })
+```
+
+To keep an unbounded run from degrading silently, Durababble bounds replay by counting persisted `workflow_history` rows before loading replay payloads. The hard limit defaults to `10_000` events and can be tuned with `DURABABBLE_MAX_WORKFLOW_HISTORY_EVENTS` or `Durababble.max_workflow_history_events = 20_000`. The warning threshold defaults to `8_000` events and can be tuned with `DURABABBLE_WARN_WORKFLOW_HISTORY_EVENTS` or `Durababble.workflow_history_warning_events = 8_000`; reaching it logs a warning through `Durababble.logger` but does not stop the run.
+
+When an open workflow exceeds the hard limit, resume fails durably with `Durababble::WorkflowHistoryLimitExceeded` and the workflow becomes terminal `failed`. The terminal failure clears workflow leases and retry deadlines, and terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming it, so workers do not repeatedly claim the same oversized run. Completed, canceled, and failed workflows are returned as-is and remain inspectable.
+
+Treat a warning log or `WorkflowHistoryLimitExceeded` as a design or retention signal rather than a number to raise reflexively. Reshape the workload using the patterns above, compact completed history through a deliberate retention tool, or raise the hard limit only after benchmarking replay latency with `mise exec -- ruby bench/run.rb --profile history-smoke`.

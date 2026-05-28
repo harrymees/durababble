@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require_relative "../../scripts/mysql-hot-path-report"
 
 require "uri"
 
@@ -71,7 +72,7 @@ class DurababbleDocumentationTest < DurababbleTestCase
       "docs/content/object-patterns.md",
       "docs/content/reference.md",
       "docs/spec.md",
-      "docs/content/architecture.md",
+      "docs/content/internals/architecture.md",
     ]
 
     current_docs.each do |path|
@@ -165,6 +166,14 @@ class DurababbleDocumentationTest < DurababbleTestCase
       unpinned.map { |path, url| "#{path.delete_prefix("#{root}/")}: #{url}" },
       "docs theme CDN imports must pin npm packages with an explicit @version",
     )
+  end
+
+  test "query performance docs link every registered hot-path reporter scenario" do
+    docs = read("docs/content/internals/query-perf.md")
+
+    DurababbleMysqlHotPathReport.scenarios.keys.sort.each do |scenario_name|
+      assert_includes docs, "](/query-perf/#{scenario_name}.html)", "missing docs link for #{scenario_name}"
+    end
   end
 
   private

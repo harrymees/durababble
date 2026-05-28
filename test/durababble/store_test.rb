@@ -383,6 +383,9 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "UPDATE"
     assert_includes sql, "RETURNING workflows.*"
     assert_includes sql, "FOR UPDATE SKIP LOCKED"
+    assert_includes sql, "COALESCE(next_run_at, created_at)"
+    refute_includes sql, "UNION ALL"
+    refute_includes sql, "ORDER BY"
     assert_equal ["default", "worker-a", 9, "demo"], params
   end
 
@@ -448,8 +451,7 @@ class DurababbleStoreTest < DurababbleTestCase
         SQL
       end
 
-      assert_includes indexes, "workflows_queue_idx"
-      assert_includes indexes, "workflows_runnable_due_idx"
+      assert_includes indexes, "workflows_claim_idx"
       assert_includes indexes, "workflows_expired_lease_idx"
       assert_includes indexes, "waits_event_pending_idx"
       assert_includes indexes, "waits_timer_pending_idx"
@@ -992,7 +994,7 @@ class DurababbleStoreTest < DurababbleTestCase
     # complete_workflow / cancel_workflow / fail_workflow each also issue the idempotent
     # wait/step/attempt cleanup cascade (three extra queries per terminal transition), so
     # each terminal call emits four queries; scope the fence assertions to the terminal
-    # workflow-row updates (the only queries that touch runnable_immediately). Provide one
+    # workflow-row updates (the only queries that touch next_run_at). Provide one
     # affected_rows:1 result per emitted query so every fenced workflow-row update sees a
     # live lease rather than falling onto a default empty result and raising LeaseConflict.
     pg_fenced_connection = ScriptedPgConnection.new(params_results: Array.new(12) { sql_result([], affected_rows: 1) })

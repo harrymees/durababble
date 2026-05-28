@@ -23,6 +23,8 @@ The published site content lives in `docs/content/`. Existing design and review 
 devx zeitung              # Preview locally on port 1313
 devx zeitung --port 8080  # Preview locally on another port
 devx zeitung build        # Build static output into docs/build
+bundle exec rake docs:query_perf # Generate MySQL query performance reports into docs/static/query-perf
+bundle exec rake docs:build      # Generate query reports, then build static output into docs/build
 npm run format:markdown   # Format Markdown docs and repository README files
 npm run check:markdown    # Check Markdown formatting; also runs through rake lint
 ```

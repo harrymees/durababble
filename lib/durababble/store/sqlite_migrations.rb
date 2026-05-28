@@ -34,7 +34,15 @@ module Durababble
           cancel_requested_at INTEGER,
           cancel_delivered_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
-          updated_at INTEGER NOT NULL DEFAULT (dura_now())
+          updated_at INTEGER NOT NULL DEFAULT (dura_now()),
+          queue_available_at INTEGER GENERATED ALWAYS AS (
+            CASE
+              WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED
         )
       SQL
       execute(<<~SQL)
@@ -168,23 +176,6 @@ module Durababble
         ON #{table("object_wakeups")} (wake_at, created_at)
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id TEXT PRIMARY KEY,
-          object_type TEXT NOT NULL,
-          object_id TEXT NOT NULL,
-          method_name TEXT NOT NULL,
-          args BLOB NOT NULL,
-          kwargs BLOB NOT NULL,
-          status TEXT NOT NULL,
-          result BLOB,
-          error TEXT,
-          locked_by TEXT,
-          locked_until INTEGER,
-          created_at INTEGER NOT NULL DEFAULT (dura_now()),
-          completed_at INTEGER
-        )
-      SQL
       @migrated = true
       self
     end
@@ -251,12 +242,19 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
+          queue_available_at INTEGER GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN ready_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
           PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
-        CREATE INDEX IF NOT EXISTS #{index_name("target_activations", "queue")}
-        ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)
+        CREATE INDEX IF NOT EXISTS #{index_name("target_activations", "claim")}
+        ON #{table("target_activations")} (worker_pool, target_kind, target_type, queue_available_at, created_at)
       SQL
     end
   end

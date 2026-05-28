@@ -17,31 +17,28 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
 
       now = Time.now.utc
       expectations = {
-        "pending workflow claim probe" => {
-          sql: query_sql(:claim_pending_workflow, name_sql: ""),
+        "workflow claim probe" => {
+          sql: query_sql(:claim_runnable_workflow, name_sql: ""),
           params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "failed workflow claim probe" => {
-          sql: query_sql(:claim_failed_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "canceling workflow claim probe" => {
-          sql: query_sql(:claim_canceling_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_queue",
-        },
-        "expired workflow claim probe" => {
-          sql: query_sql(:claim_expired_workflow, name_sql: ""),
-          params: ["default"],
-          expected_key_fragment: "workflows_expired_lease",
+          expected_key_fragment: "workflows_claim",
           expected_access_types: ["range"],
-          allow_filesort: true,
+          max_rows_examined_per_scan: 4_000,
         },
         "pending outbox claim probe" => {
           sql: query_sql(:claim_pending_outbox),
           expected_key_fragment: "outbox_queue",
+        },
+        "expired workflow lease count probe" => {
+          sql: query_sql(:count_expired_workflow_leases),
+          params: [now],
+          expected_key_fragment: "workflows_expired_lease",
+          expected_access_types: ["range"],
+        },
+        "expired workflow lease recovery probe" => {
+          sql: query_sql(:steal_expired_leases),
+          params: [now],
+          expected_key_fragment: "workflows_expired_lease",
+          expected_access_types: ["range"],
         },
         "expired outbox claim probe" => {
           sql: query_sql(:claim_expired_outbox),
@@ -56,18 +53,23 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_access_types: ["range", "eq_ref"],
           max_rows_examined_per_scan: 5,
         },
-        "pending target activation claim probe" => {
-          sql: query_sql(:claim_pending_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
-          params: ["default", now, "object", "counter"],
-          expected_key_fragment: "target_activations_queue",
+        "workflow suspend pending wait probe" => {
+          sql: query_sql(:suspend_workflow),
+          params: ["running-active-1", "running-active-1", nil, nil],
+          expected_key_fragment: "waits_workflow_status",
+          expected_access_types: ["const", "ref"],
+        },
+        "cancel workflow pending waits probe" => {
+          sql: query_sql(:cancel_pending_waits_for_workflow),
+          params: ["running-active-1"],
+          expected_key_fragment: "waits_workflow_status",
           expected_access_types: ["range"],
         },
-        "expired target activation claim probe" => {
-          sql: query_sql(:claim_expired_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
+        "target activation claim probe" => {
+          sql: query_sql(:claim_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
           params: ["default", now, "object", "counter"],
-          expected_key_fragment: "target_activations_expired",
+          expected_key_fragment: "target_activations_claim",
           expected_access_types: ["range"],
-          allow_filesort: true,
         },
         "inbox mailbox claim probe" => {
           sql: query_sql(:inbox_claim_rows_for_update, limit: 10),
@@ -239,20 +241,20 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
 
   def mysql_expected_key_parts(expected_key_fragment)
     case expected_key_fragment
-    when "workflows_queue"
-      ["worker_pool", "status"]
+    when "workflows_claim"
+      ["worker_pool", "queue_available_at"]
     when "workflows_expired_lease"
-      ["worker_pool", "status", "locked_until"]
+      ["status", "locked_until"]
     when "outbox_queue"
       ["status"]
     when "outbox_expired_lease"
       ["status", "locked_until"]
     when "waits_timer_pending"
       ["status", "kind", "wake_at"]
-    when "target_activations_queue"
-      ["worker_pool", "status", "ready_at"]
-    when "target_activations_expired"
-      ["worker_pool", "status", "locked_until"]
+    when "waits_workflow_status"
+      ["workflow_id", "status"]
+    when "target_activations_claim"
+      ["worker_pool", "target_kind", "target_type", "queue_available_at"]
     when "inbox_target"
       ["target_kind", "target_type", "target_id"]
     when "inbox_idempotency_hash"
@@ -361,7 +363,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     # without `locked_by`/`locked_until` populated, the planner short-circuits to
     # "Impossible WHERE" and the EXPLAIN tree has no access-path nodes to inspect.
     execute("INSERT INTO #{table("durable_objects")} (object_type, object_id, state, locked_by, locked_until, created_at, updated_at) VALUES ('counter', 'object-1', #{result}, 'owner', #{mysql_literal(now + 300)}, #{mysql_literal(now - 3600)}, #{mysql_literal(now)})")
-    execute("INSERT INTO #{table("durable_object_commands")} (id, object_type, object_id, method_name, args, kwargs, status, created_at) VALUES ('object-command-pending', 'counter', 'object-1', 'increment', #{empty}, #{empty}, 'pending', #{mysql_literal(now - 3600)})")
     execute("COMMIT")
   rescue StandardError
     begin

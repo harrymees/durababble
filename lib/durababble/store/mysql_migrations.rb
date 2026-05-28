@@ -26,9 +26,16 @@ module Durababble
           cancel_delivered_at DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          INDEX #{quote_column_name(index_name("workflows", "queue"))} (worker_pool, status, created_at),
-          INDEX #{quote_column_name(index_name("workflows", "runnable_due"))} (worker_pool, status, next_run_at, created_at),
-          INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
+          INDEX #{quote_column_name(index_name("workflows", "claim"))} (worker_pool, queue_available_at, created_at),
+          INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (status, locked_until, created_at),
           INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )
       SQL
@@ -128,6 +135,7 @@ module Durababble
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           INDEX #{quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
+          INDEX #{quote_column_name(index_name("waits", "workflow_status"))} (workflow_id, status),
           INDEX #{quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
           INDEX #{quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
@@ -163,24 +171,6 @@ module Durababble
         )
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id VARCHAR(191) PRIMARY KEY,
-          object_type VARCHAR(191) NOT NULL,
-          object_id VARCHAR(191) NOT NULL,
-          method_name VARCHAR(191) NOT NULL,
-          args LONGBLOB NOT NULL,
-          kwargs LONGBLOB NOT NULL,
-          status VARCHAR(32) NOT NULL,
-          result LONGBLOB,
-          error TEXT,
-          locked_by VARCHAR(191),
-          locked_until DATETIME(6),
-          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          completed_at DATETIME(6),
-          INDEX #{quote_column_name(index_name("durable_object_commands", "object_status"))} (object_type, object_id, status, created_at)
-        )
-      SQL
       @migrated = true
       self
     end
@@ -246,9 +236,15 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN ready_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
           PRIMARY KEY (target_kind, target_type, target_id),
-          INDEX #{quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
-          INDEX #{quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("target_activations", "claim"))} (worker_pool, target_kind, target_type, queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
         )
       SQL

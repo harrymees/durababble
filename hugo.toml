@@ -3,6 +3,7 @@ title = "Durababble"
 theme = "theme"
 themesdir = "docs"
 contentdir = "docs/content"
+staticdir = "docs/static"
 builddrafts = false
 buildexpired = true
 buildfuture = true

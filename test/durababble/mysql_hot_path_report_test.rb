@@ -2,24 +2,26 @@
 # frozen_string_literal: true
 
 require "tempfile"
+require "tmpdir"
 
 require_relative "../test_helper"
 require_relative "../../scripts/mysql-hot-path-report"
+require_relative "../../scripts/generate-doc-query-reports"
 
 class DurababbleMysqlHotPathReportTest < DurababbleTestCase
   test "records colocated query descriptions and deterministic transaction context" do
     recorder = DurababbleMysqlHotPathReport::SqlRecorder.new(root: File.expand_path("../..", __dir__))
     transaction = recorder.begin_transaction(isolation: :read_committed)
     query = recorder.record_query(
-      query_id: :mysql_claim_pending_workflow,
-      sql: "SELECT id FROM workflows WHERE status = 'pending'",
+      query_id: :mysql_claim_runnable_workflow,
+      sql: "SELECT id FROM workflows WHERE queue_available_at <= NOW(6)",
       params: ["default"],
       callsite: "lib/durababble/store/mysql.rb:34:in block in claim_runnable_workflow",
     )
     recorder.finish_query(query, ActiveRecord::Result.empty(affected_rows: 0))
     recorder.end_transaction(transaction, "commit")
 
-    assert_equal "Probe the pending workflow queue for the oldest runnable candidate in this worker pool.", query.fetch(:description)
+    assert_equal "Probe the unified workflow queue for one runnable candidate in this worker pool.", query.fetch(:description)
     assert_equal 1, query.fetch(:transaction).fetch(:id)
     assert_equal 1, query.fetch(:transaction).fetch(:depth)
     assert_equal({ isolation: "read_committed" }, query.fetch(:transaction).fetch(:options))
@@ -30,12 +32,12 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
   test "markdown report includes query SQL callsite explain and transaction details" do
     markdown = DurababbleMysqlHotPathReport::MarkdownRenderer.new(hot_path_report_fixture).render
 
-    assert_includes markdown, "Probe the pending workflow queue"
+    assert_includes markdown, "Probe the unified workflow queue"
     assert_includes markdown, "0.123ms"
     assert_includes markdown, "tx1 depth=1"
     assert_includes markdown, "lib/durababble/store/mysql.rb"
     assert_includes markdown, "SELECT id FROM"
-    assert_includes markdown, "durababble_hot_path_test_workflows_queue_idx"
+    assert_includes markdown, "durababble_hot_path_test_workflows_claim_idx"
     assert_includes markdown, "Using index condition"
     assert_includes markdown, "## Schema Appendix"
     assert_includes markdown, "CREATE TABLE `durababble_hot_path_test_workflows`"
@@ -48,7 +50,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     assert_includes html, '<pre class="sql"><code><span class="sql-keyword">SELECT</span>'
     assert_includes html, '<span class="sql-keyword">WHERE</span>'
     assert_includes html, '<span class="sql-identifier sql-table" tabindex="0">`durababble_hot_path_test_workflows`'
-    assert_includes html, '<span class="sql-string">&#39;pending&#39;</span>'
+    assert_includes html, '<span class="sql-keyword">NOW</span>'
     assert_includes html, '<span class="sql-placeholder">?</span>'
   end
 
@@ -67,7 +69,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     assert_includes html, 'class="explain-card"'
     assert_includes html, "Possible keys"
     assert_includes html, "Chosen key"
-    assert_includes html, "access: ref"
+    assert_includes html, "access: range"
     assert_includes html, "Using index condition"
     refute_includes html, "EXPLAIN JSON"
     refute_includes html, "query_block"
@@ -104,6 +106,33 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
     DurababbleMysqlHotPathReport.instance_variable_set(:@scenarios, original_scenarios) if original_scenarios
   end
 
+  test "docs query report generator runs every registered scenario into static docs paths" do
+    scenario_names = DurababbleMysqlHotPathReport.scenarios.keys.sort
+    recorded_options = []
+
+    Dir.mktmpdir("durababble-doc-query-reports") do |dir|
+      stale_report = File.join(dir, "stale.html")
+      File.write(stale_report, "stale")
+
+      DurababbleDocsQueryReports::Generator.new(
+        output_dir: dir,
+        database_url: "mysql://root@127.0.0.1:3306/sidekick_server_test",
+        fixture_size: 7,
+        runner: ->(options) { recorded_options << options },
+      ).run
+
+      refute File.exist?(stale_report)
+    end
+
+    assert_equal scenario_names, recorded_options.map { |options| options.fetch(:operation) }
+    assert_equal ["html"], recorded_options.map { |options| options.fetch(:format) }.uniq
+    assert_equal [7], recorded_options.map { |options| options.fetch(:fixture_size) }.uniq
+    assert_equal(
+      scenario_names.map { |scenario_name| "#{scenario_name}.html" },
+      recorded_options.map { |options| File.basename(options.fetch(:output)) },
+    )
+  end
+
   private
 
   def hot_path_report_fixture
@@ -123,7 +152,7 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
             `worker_pool` varchar(191) NOT NULL DEFAULT 'default',
             `status` varchar(64) NOT NULL,
             PRIMARY KEY (`id`),
-            KEY `durababble_hot_path_test_workflows_queue_idx` (`worker_pool`,`status`,`created_at`)
+            KEY `durababble_hot_path_test_workflows_claim_idx` (`worker_pool`,`queue_available_at`,`created_at`)
           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         SQL
       },
@@ -131,9 +160,9 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
       queries: [
         {
           sequence: 1,
-          query_id: :mysql_claim_pending_workflow,
-          description: Durababble::StoreQueries.description_for(:mysql_claim_pending_workflow),
-          sql: "SELECT id FROM `durababble_hot_path_test_workflows` WHERE status = 'pending' AND worker_pool = ?",
+          query_id: :mysql_claim_runnable_workflow,
+          description: Durababble::StoreQueries.description_for(:mysql_claim_runnable_workflow),
+          sql: "SELECT id FROM `durababble_hot_path_test_workflows` FORCE INDEX (durababble_hot_path_test_workflows_claim_idx) WHERE worker_pool = ? AND queue_available_at <= NOW(6)",
           params: ["default"],
           callsite: "lib/durababble/store/mysql.rb:34:in block in claim_runnable_workflow",
           transaction: { id: 1, depth: 1, parent_id: nil, options: {} },
@@ -147,9 +176,9 @@ class DurababbleMysqlHotPathReportTest < DurababbleTestCase
                 "select_type" => "SIMPLE",
                 "table" => "durababble_hot_path_test_workflows",
                 "partitions" => nil,
-                "type" => "ref",
-                "possible_keys" => "durababble_hot_path_test_workflows_queue_idx",
-                "key" => "durababble_hot_path_test_workflows_queue_idx",
+                "type" => "range",
+                "possible_keys" => "durababble_hot_path_test_workflows_claim_idx",
+                "key" => "durababble_hot_path_test_workflows_claim_idx",
                 "key_len" => "1022",
                 "ref" => "const,const",
                 "rows" => 1,

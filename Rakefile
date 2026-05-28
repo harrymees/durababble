@@ -43,6 +43,18 @@ task formal: [:alloy]
 
 task lint: [:rubocop, :typecheck, "check:markdown"]
 
+namespace :docs do
+  desc "Generate docs query performance reports from the registered MySQL hot-path reporter scenarios"
+  task :query_perf do
+    ruby("scripts/generate-doc-query-reports.rb")
+  end
+
+  desc "Generate query performance reports and build the static docs site"
+  task build: [:query_perf] do
+    sh("hugo --minify --destination docs/build")
+  end
+end
+
 # The Deterministic Simulation Testing files. They run uninstrumented in their
 # own CI job (`rake dst`) rather than under the coverage gate: the seed sweeps
 # iterate the same lib/ lines thousands of times, adding ~no incremental

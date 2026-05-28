@@ -9,8 +9,8 @@ module Durababble
         run(seed, "bug_stuck_activation") do |h|
           # A target_activation (the #69 wakeup row) claimed (`running`) by a
           # crashed worker, its lease already expired and never reclaimed by
-          # `claim_expired_target_activation` — the stuck-activation checker must
-          # flag it (completes the lease-reclaim quartet alongside
+          # `claim_target_activation` — the stuck-activation checker must flag
+          # it (completes the lease-reclaim quartet alongside
           # fence/outbox/inbox). Composite-keyed, so no workflow row is required.
           h.store.inject_target_activation({
             "worker_pool" => "default",

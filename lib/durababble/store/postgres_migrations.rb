@@ -24,7 +24,6 @@ module Durababble
           locked_by text,
           locked_until timestamptz,
           next_run_at timestamptz,
-          runnable_immediately boolean NOT NULL DEFAULT true,
           cancel_reason text,
           cancel_requested_at timestamptz,
           cancel_delivered_at timestamptz,
@@ -145,23 +144,6 @@ module Durababble
         )
       SQL
       create_inbox_tables!
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("durable_object_commands")} (
-          id text PRIMARY KEY,
-          object_type text NOT NULL,
-          object_id text NOT NULL,
-          method_name text NOT NULL,
-          args bytea NOT NULL,
-          kwargs bytea NOT NULL,
-          status text NOT NULL,
-          result bytea,
-          error text,
-          locked_by text,
-          locked_until timestamptz,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          completed_at timestamptz
-        )
-      SQL
       create_performance_indexes!
       @migrated = true
       self
@@ -233,12 +215,8 @@ module Durababble
     # require a separate statement), so the secondary indexes are created here in their final shape.
     #: () -> untyped
     def create_performance_indexes!
-      create_postgres_index("workflows_queue_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, created_at ASC)")
-      create_postgres_index("workflows_runnable_due_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, next_run_at ASC, created_at ASC)")
+      create_postgres_index("workflows_claim_idx", "ON #{table("workflows")} (worker_pool ASC, (#{StoreQueries::POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, locked_until ASC)")
-      create_postgres_index("workflows_pending_created_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, runnable_immediately ASC, created_at ASC)")
-      create_postgres_index("workflows_failed_due_idx", "ON #{table("workflows")} (worker_pool ASC, next_run_at ASC, created_at ASC) WHERE status = 'failed'")
-      create_postgres_index("workflows_canceling_created_idx", "ON #{table("workflows")} (worker_pool ASC, created_at ASC) WHERE status = 'canceling'")
       create_postgres_index("workflow_history_command_idx", "ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
       create_postgres_index("waits_event_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, event_key ASC, created_at ASC)")
       create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")
@@ -256,8 +234,7 @@ module Durababble
       create_postgres_index("inbox_idempotency_hash_idx", "ON #{table("inbox")} (idempotency_hash) WHERE idempotency_hash IS NOT NULL", unique: true)
       create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
       create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
-      create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
-      create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
+      create_postgres_index("target_activations_claim_idx", "ON #{table("target_activations")} (worker_pool ASC, target_kind ASC, target_type ASC, (#{StoreQueries::POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("durable_objects_worker_lease_idx", "ON #{table("durable_objects")} (locked_by) WHERE locked_by IS NOT NULL")
       create_postgres_index("durable_objects_expired_lease_idx", "ON #{table("durable_objects")} (locked_until) WHERE locked_by IS NOT NULL")
     end

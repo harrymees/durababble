@@ -134,4 +134,4 @@ handle.note(message: "approved by legal")
 - [Durable Objects](durable-objects.md) for object commands, mailboxes, and RPC.
 - [Storage](storage.md) for what gets persisted and why.
 - [Observability](observability.md) for OpenTelemetry spans and metrics.
-- [Testing](testing.md) for deterministic simulation tests.
+- [Testing](testing.md) for durable object and workflow tests in application code.
