@@ -43,6 +43,8 @@ module Durababble
 
       #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle)
       def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child enqueue cannot specify store: or engine:" if store || engine
 
@@ -83,6 +85,8 @@ module Durababble
 
       #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (WorkflowRef | ChildWorkflowHandle)
       def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child start cannot specify store: or engine:" if store || engine
 

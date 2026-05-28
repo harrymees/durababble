@@ -9,7 +9,7 @@ require_relative "execution_context"
 require_relative "error_formatting"
 
 module Durababble
-  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
+  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -183,6 +183,7 @@ module Durababble
       @state_dirty = false
       @wakeup_changes = []
       @__durababble_query_context = false
+      @__durababble_child_workflow_sequence = 0
     end
 
     #: () -> Object?
@@ -252,7 +253,8 @@ module Durababble
       context = command_context #: as CommandContext
       child_workflow_name = workflow_class.workflow_name
       child_worker_pool = worker_pool || @worker_pool
-      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{child_workflow_name}"
+      start_sequence = next_child_workflow_sequence
+      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{start_sequence}:#{child_workflow_name}"
       resolved_id = id || generated_child_workflow_id(child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key: resolved_key)
       policy = normalize_child_cancellation_policy(cancellation)
       store = @store #: as Store
@@ -261,6 +263,7 @@ module Durababble
         parent_object_type: self.class.object_type,
         parent_object_id: durable_id,
         parent_object_command_id: context.command_id,
+        parent_object_worker_id: context.worker_id,
         child_workflow_name:,
         child_workflow_id: resolved_id,
         input:,
@@ -292,6 +295,11 @@ module Durababble
     def state_dirty? = @state_dirty
 
     private
+
+    #: () -> Integer
+    def next_child_workflow_sequence
+      @__durababble_child_workflow_sequence += 1
+    end
 
     #: (child_workflow_name: String, input: Object?, worker_pool: String, idempotency_key: String) -> String
     def generated_child_workflow_id(child_workflow_name:, input:, worker_pool:, idempotency_key:)
@@ -401,7 +409,9 @@ module Durababble
         state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
-        object.public_send(method_name, *args, **kwargs, &block)
+        ObjectQueryExecutionContext.with_current(object) do
+          object.public_send(method_name, *args, **kwargs, &block)
+        end
       end
     end
 
@@ -577,6 +587,7 @@ module Durababble
         command_id: message.fetch("id"),
         attempt_number: message.fetch("attempts").to_i,
         idempotency_key: "durababble:v1:object:#{object_class.object_type}:#{object_id}:command:#{message.fetch("id")}",
+        worker_id: @worker_id,
       )
       object_class.new(durable_id: object_id, state:, store: @store, command_context: context, worker_pool:) #: as untyped
     end

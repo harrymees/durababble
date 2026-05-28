@@ -631,6 +631,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             origin_kind: "workflow",
             parent_workflow_id: "running-owned",
             parent_command_id: 42,
+            parent_worker_id: "owner",
             child_workflow_name: "child-demo",
             child_workflow_id: "child-workflow-existing",
             input: { "count" => 1 },

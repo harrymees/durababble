@@ -412,9 +412,18 @@ module Durababble
       end
     end
 
-    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> Hash[String, Object?]
-    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil)
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil)
       result = transaction do
+        fence_child_workflow_origin!(
+          origin_kind:,
+          parent_workflow_id:,
+          parent_worker_id:,
+          parent_object_type:,
+          parent_object_id:,
+          parent_object_command_id:,
+          parent_object_worker_id:,
+        )
         begin
           transaction do
             insert_child_workflow_without_transaction(
@@ -644,6 +653,26 @@ module Durababble
       return if lock_owned_workflow_for_update(workflow_id:, worker_id:)
 
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
+    end
+
+    #: (origin_kind: String, parent_workflow_id: String?, parent_worker_id: String?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, parent_object_worker_id: String?) -> void
+    def fence_child_workflow_origin!(origin_kind:, parent_workflow_id:, parent_worker_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, parent_object_worker_id:)
+      case origin_kind
+      when "workflow"
+        raise ArgumentError, "workflow-origin child starts require parent_workflow_id" unless parent_workflow_id
+        raise ArgumentError, "workflow-origin child starts require parent_worker_id" unless parent_worker_id
+
+        raise LeaseConflict, "workflow #{parent_workflow_id} lease expired or moved before child workflow start" unless lock_owned_workflow_for_update(workflow_id: parent_workflow_id, worker_id: parent_worker_id)
+      when "object"
+        raise ArgumentError, "object-origin child starts require parent_object_command_id" unless parent_object_command_id
+        raise ArgumentError, "object-origin child starts require parent_object_worker_id" unless parent_object_worker_id
+
+        command = lock_inbox_message_for_completion(message_id: parent_object_command_id, worker_id: parent_object_worker_id)
+        matches_target = command && command.fetch("target_kind", nil) == "object" && command.fetch("target_type", nil) == parent_object_type && command.fetch("target_id", nil) == parent_object_id
+        raise LeaseConflict, "object command #{parent_object_command_id} lease expired or moved before child workflow start" unless matches_target
+      else
+        raise ArgumentError, "unknown child workflow origin kind: #{origin_kind.inspect}"
+      end
     end
 
     # Apply an object command's ordered wake mutations within the completion

@@ -183,6 +183,7 @@ module Durababble
     attr_reader command_id: String
     attr_reader attempt_number: Integer
     attr_reader idempotency_key: String
+    attr_reader worker_id: String
   end
 
   class Heartbeat
@@ -295,7 +296,7 @@ module Durababble
     def retry_object_command: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
     def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String) -> Object?
     def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
-    def start_child_workflow: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: serialized_payload, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?) -> workflow_row
+    def start_child_workflow: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: serialized_payload, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> workflow_row
     def observe_child_workflow: (String child_workflow_id) -> workflow_row
     def child_workflow_rows_for_parent: (parent_workflow_id: String) -> Array[workflow_row]
     def child_workflow_rows_for_object: (parent_object_type: String, parent_object_id: String) -> Array[workflow_row]

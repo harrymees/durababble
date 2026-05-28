@@ -153,6 +153,17 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       handle.workflow_id
     end
 
+    expose_command def start_two_children(value)
+      first = ChildEchoWorkflow.enqueue({ "value" => value })
+      second = ChildEchoWorkflow.enqueue({ "value" => value })
+      update_state(current_state.merge("child_ids" => [first.workflow_id, second.workflow_id]))
+      [first.workflow_id, second.workflow_id]
+    end
+
+    expose def forbidden_query_enqueue(value)
+      ChildEchoWorkflow.enqueue({ "value" => value }, id: "query-guard-child", store: @store, worker_pool: @worker_pool)
+    end
+
     def on_wake(name:, payload:)
       handle = ChildEchoWorkflow.handle(payload.fetch("child_id"), store: @store)
       update_state(current_state.merge("observed" => { "name" => name, "status" => handle.status, "result" => handle.result }))
@@ -369,6 +380,35 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       end
     end
 
+    test "durable object duplicate sibling workflow starts get distinct default identity with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_object_fanout") do |store|
+        message_id = ObjectStarter.tell("starter-fanout", :start_two_children, "same-shape", store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectStarter])
+        child_ids = store.inbox_message(message_id).fetch("result")
+
+        assert_equal 2, child_ids.length
+        assert_equal 2, child_ids.uniq.length
+        assert_equal(
+          child_ids.sort,
+          store.child_workflow_rows_for_object(parent_object_type: ObjectStarter.object_type, parent_object_id: "starter-fanout")
+            .map { |row| row.fetch("child_workflow_id") }
+            .sort,
+        )
+        assert_equal([{ "echo" => "same-shape" }, { "echo" => "same-shape" }], child_ids.map { |child_id| store.workflow(child_id).fetch("result") })
+      end
+    end
+
+    test "durable object query cannot enqueue workflows through class helpers with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_object_query_guard") do |store|
+        assert_raises_matching(Durababble::Error, /cannot start workflows from an exposed query/) do
+          ObjectStarter.at("starter-query-guard", store:).forbidden_query_enqueue("from-query")
+        end
+
+        assert_empty store.child_workflow_rows_for_object(parent_object_type: ObjectStarter.object_type, parent_object_id: "starter-query-guard")
+        assert_raises(KeyError) { store.workflow("query-guard-child") }
+      end
+    end
+
     test "durable object workflow enqueue records cancellation policy with #{backend.name}" do
       with_durababble_store(backend, "child_workflow_object_policy") do |store|
         message_id = ObjectStarter.tell("starter-policy", :start_child_with_policy, "policy", "request_cancel", store:)
@@ -436,11 +476,21 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
   private
 
   def child_handle_for(store, child_id, input:)
+    object_id = "external-starter-#{child_id}"
+    command_id = store.enqueue_object_command(
+      object_type: ObjectStarter.object_type,
+      object_id:,
+      method_name: "start_child",
+      args: [],
+      kwargs: {},
+    )
+    store.claim_object_command(command_id:, worker_id: "external-starter-worker", lease_seconds: 30)
     store.start_child_workflow(
       origin_kind: "object",
       parent_object_type: ObjectStarter.object_type,
-      parent_object_id: "external-starter",
-      parent_object_command_id: "command-#{child_id}",
+      parent_object_id: object_id,
+      parent_object_command_id: command_id,
+      parent_object_worker_id: "external-starter-worker",
       child_workflow_name: ChildEchoWorkflow.workflow_name,
       child_workflow_id: child_id,
       input:,

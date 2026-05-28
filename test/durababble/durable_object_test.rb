@@ -509,7 +509,7 @@ class DurababbleDurableObjectTest < DurababbleTestCase
   test "records and rejects durable object wake changes in the right contexts" do
     wake_at = Time.utc(2026, 5, 25, 14, 0, 0)
     later_at = Time.utc(2026, 5, 25, 15, 0, 0)
-    context = Durababble::CommandContext.new("alarm_test_object", "alarm-guard", "cmd-guard", 1, "idem")
+    context = Durababble::CommandContext.new("alarm_test_object", "alarm-guard", "cmd-guard", 1, "idem", "worker")
 
     command_object = AlarmTestObject.new(durable_id: "alarm-guard", command_context: context)
     assert_same wake_at, command_object.schedule_wake(name: "ttl", at: wake_at, payload: { "name" => "guard" })

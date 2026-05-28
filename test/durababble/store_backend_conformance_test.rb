@@ -635,6 +635,48 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "workflow-origin child starts require a live parent workflow lease with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_parent_lease_fence") do |store|
+        workflow_id = store.enqueue_workflow(name: "parent", input: {})
+        assert_hash_includes(
+          store.claim_workflow(workflow_id:, worker_id: "stale-parent", lease_seconds: -1),
+          "locked_by" => "stale-parent",
+        )
+
+        assert_raises_matching(Durababble::LeaseConflict, /lease expired or moved/) do
+          store.start_child_workflow(
+            origin_kind: "workflow",
+            parent_workflow_id: workflow_id,
+            parent_command_id: 0,
+            parent_worker_id: "stale-parent",
+            child_workflow_name: "child",
+            child_workflow_id: "stale-parent-child",
+            input: { "value" => "blocked" },
+            worker_pool: "default",
+            cancellation_policy: "request_cancel",
+          )
+        end
+        assert_raises(KeyError) { store.workflow("stale-parent-child") }
+
+        assert_hash_includes(
+          store.claim_workflow(workflow_id:, worker_id: "current-parent", lease_seconds: 30),
+          "locked_by" => "current-parent",
+        )
+        child = store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: workflow_id,
+          parent_command_id: 0,
+          parent_worker_id: "current-parent",
+          child_workflow_name: "child",
+          child_workflow_id: "current-parent-child",
+          input: { "value" => "allowed" },
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+        )
+        assert_hash_includes child, "child_workflow_id" => "current-parent-child", "parent_workflow_id" => workflow_id
+      end
+    end
+
     test "does not complete workflow commands for a different workflow with #{backend.name}" do
       with_durababble_store(backend, "workflow_command_target_identity") do |store|
         store.enqueue_workflow(name: "approval", input: {}, id: "wf-a")
@@ -1596,6 +1638,56 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           store.claim_object_command(command_id: stale_retry, worker_id: "recovery-object-worker", lease_seconds: 30),
           "locked_by" => "recovery-object-worker",
         )
+      end
+    end
+
+    test "object-origin child starts require a live object command lease with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_object_command_lease_fence") do |store|
+        command_id = store.enqueue_object_command(
+          object_type: "counter",
+          object_id: "abc",
+          method_name: "start_child",
+          args: [],
+          kwargs: {},
+        )
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "stale-object-worker", lease_seconds: -1),
+          "locked_by" => "stale-object-worker",
+        )
+
+        assert_raises_matching(Durababble::LeaseConflict, /lease expired or moved/) do
+          store.start_child_workflow(
+            origin_kind: "object",
+            parent_object_type: "counter",
+            parent_object_id: "abc",
+            parent_object_command_id: command_id,
+            parent_object_worker_id: "stale-object-worker",
+            child_workflow_name: "child",
+            child_workflow_id: "stale-object-child",
+            input: { "value" => "blocked" },
+            worker_pool: "default",
+            cancellation_policy: "abandon",
+          )
+        end
+        assert_raises(KeyError) { store.workflow("stale-object-child") }
+
+        assert_hash_includes(
+          store.claim_object_command(command_id:, worker_id: "current-object-worker", lease_seconds: 30),
+          "locked_by" => "current-object-worker",
+        )
+        child = store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: "counter",
+          parent_object_id: "abc",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "current-object-worker",
+          child_workflow_name: "child",
+          child_workflow_id: "current-object-child",
+          input: { "value" => "allowed" },
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+        )
+        assert_hash_includes child, "child_workflow_id" => "current-object-child", "parent_object_command_id" => command_id
       end
     end
 

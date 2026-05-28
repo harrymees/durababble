@@ -238,6 +238,7 @@ module Durababble
             origin_kind: "workflow",
             parent_workflow_id: @workflow_id,
             parent_command_id: command_id,
+            parent_worker_id: @worker_id,
             child_workflow_name:,
             child_workflow_id: resolved_id,
             input:,
