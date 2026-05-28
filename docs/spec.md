@@ -484,18 +484,18 @@ Routing keeps hot ids on the pod that already has them in memory:
 
 ## Inter-node RPC
 
-Remote intranode/inter-pod communication uses HTTP/2 (via `async-http`), one path per RPC method, with Paquito/Marshal value-object payloads (Ruby-to-Ruby — durababble does not carry cross-language interop, so it does not pay the protobuf tax). Each pod runs a dedicated `Durababble::Rpc::Server` (an `Async::HTTP::Server` on a reactor thread), bound to `rpc_host:rpc_port`. The transport is currently cleartext h2c with no built-in peer authentication; an optional `authorize:` hook on `Rpc::Server` runs at the application layer. Production hardening (mTLS / SPIFFE identity, ideally provided by the deployment's service mesh) is target work — see [Cluster RPC § Transport Security](content/cluster-rpc.md#transport-security).
+Remote intranode/inter-pod communication uses gRPC over HTTP/2 (via `async-grpc`), with Paquito/Marshal value-object payloads inside gRPC messages (Ruby-to-Ruby — durababble does not carry cross-language interop, so it does not pay the protobuf schema tax). Each pod runs a dedicated `Durababble::Rpc::Server` (an `Async::HTTP::Server` with an `Async::GRPC::Dispatcher` on a reactor thread), bound to `rpc_host:rpc_port`. The transport is currently cleartext h2c with no built-in peer authentication; an optional `authorize:` hook on `Rpc::Server` runs at the application layer. Production hardening (mTLS / SPIFFE identity, ideally provided by the deployment's service mesh) is target work — see [Cluster RPC § Transport Security](content/cluster-rpc.md#transport-security).
 
 The four-method service shape is part of the runtime contract:
 
-| Method | Path | Request | Response |
-| --- | --- | --- | --- |
-| `AwakenBatch` | `POST /durababble/v1/awaken_batch` | `Messages::AwakenBatchRequest` | `Messages::AwakenBatchResponse` |
-| `EvictLease` | `POST /durababble/v1/evict_lease` | `Messages::EvictLeaseRequest` | `Messages::EvictLeaseResponse` |
-| `DeliverMessage` | `POST /durababble/v1/deliver_message` | `Messages::DeliverMessageRequest` | `Messages::DeliverMessageResponse` |
-| `CallTransient` | `POST /durababble/v1/call_transient` | `Messages::TransientRequest` | `Messages::TransientResponse` |
+| Method | Request | Response |
+| --- | --- | --- |
+| `AwakenBatch` | `Messages::AwakenBatchRequest` | `Messages::AwakenBatchResponse` |
+| `EvictLease` | `Messages::EvictLeaseRequest` | `Messages::EvictLeaseResponse` |
+| `DeliverMessage` | `Messages::DeliverMessageRequest` | `Messages::DeliverMessageResponse` |
+| `CallTransient` | `Messages::TransientRequest` | `Messages::TransientResponse` |
 
-All bodies are `Durababble::Rpc.dump`/`Rpc.load` (Paquito with a single-byte version prefix wrapping Marshal). The `Messages` value-object fields (see `lib/durababble/rpc_messages.rb`):
+All message bodies are `Durababble::Rpc.dump`/`Rpc.load` (Paquito with a single-byte version prefix wrapping Marshal). The `Messages` value-object fields (see `lib/durababble/rpc_messages.rb`):
 
 - `AwakenBatchRequest { worker_pool, workflow_ids }`
 - `EvictLeaseRequest { worker_pool, target_kind, target_class, target_id, expected_worker_id }` (target_kind: `"object" | "workflow"`; target_class empty for workflows)
@@ -515,7 +515,7 @@ RPC semantics:
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
 - Auxiliary test transports must not be used for production intranode communication.
 
-**Retry policy (only known errors are retried).** Routing layers retry only typed routing failures (`NodeUnavailable` for transport-level unavailability — connection refused / timeout / HTTP/2 stream reset / server-returned 503; `StaleLease` for a moved lease; `NoActiveLease` for an unowned workflow). An unexpected raise inside a handler is returned as HTTP 500 and surfaces on the client as `Rpc::Error` (deliberately not a subclass of `Rpc::Unavailable`); the router does **not** retry. The rationale is to avoid amplifying load against a peer that has just hit an unforeseen bug — a stampede caused by automatic retries can compound a single bad node into a cluster-wide failure.
+**Retry policy (only known errors are retried).** Routing layers retry only typed routing failures (`NodeUnavailable` for transport-level unavailability — connection refused / timeout / HTTP/2 stream reset / gRPC `Unavailable` / gRPC `DeadlineExceeded`; `StaleLease` for a moved lease; `NoActiveLease` for an unowned workflow). An unexpected raise inside a handler is returned as gRPC `Internal` and surfaces on the client as `Rpc::Error` (deliberately not a subclass of `Rpc::Unavailable`); the router does **not** retry. The rationale is to avoid amplifying load against a peer that has just hit an unforeseen bug — a stampede caused by automatic retries can compound a single bad node into a cluster-wide failure.
 
 ## Configuration, limits, and operations
 
@@ -610,8 +610,8 @@ Observability requirements:
 | Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side broadcast wait is required. | Workflow command mailbox specs plus RPC wakeup specs |
 | Synchronous durable commands return results | Ask rows store serialized result/error and caller retries with the same idempotency key reattach. | Workflow/object ask specs |
 | Inbox is not a second global polling queue | Workers poll coalesced target activations and target owners drain inbox rows for their own target. | Query-plan and mailbox specs |
-| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus HTTP/2 RPC transport spec plus DST scenarios |
-| Inter-pod RPC uses full four-method HTTP/2 service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` over async-http with an optional application-layer authorize hook. | RPC transport integration/contract tests plus DST response scenarios |
+| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus gRPC transport spec plus DST scenarios |
+| Inter-pod RPC uses full four-method gRPC service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` over async-grpc with an optional application-layer authorize hook. | RPC transport integration/contract tests plus DST response scenarios |
 | Multi-row state transitions are transactional | Step start/finish/failure, wait transitions, inbox enqueue, mailbox advancement, and state/result writes commit atomically where required. | Implementation plus regression suite |
 | Runtime values are Paquito bytes | Runtime payloads use Paquito bytes in `bytea` / `LONGBLOB`, not JSONB. | Payload storage specs |
 | MySQL/MariaDB honors common store semantics | MySQL/MariaDB and PostgreSQL/YSQL satisfy the same store behavior contract. | Backend conformance spec |
@@ -697,7 +697,7 @@ These constraints are part of the contract:
 - No streams API without a concrete consumer requirement.
 - No automatic cross-pool routing; relocation/failover is explicit.
 - No silent payload spill to blob storage; oversized values fail loudly.
-- No production RPC transport other than the four-method HTTP/2 service over `async-http`.
+- No production RPC transport other than the four-method gRPC service over `async-grpc`.
 - No runtime loading or validation of user RBS.
 - MySQL/MariaDB support is required for the common public contract.
 - Worker registry misses are avoided by claiming only workflow/object classes present in the supplied registry. Enqueuing a workflow name with no corresponding worker pool leaves it pending until an appropriate pool starts.

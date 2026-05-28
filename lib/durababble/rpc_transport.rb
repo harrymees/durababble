@@ -3,9 +3,11 @@
 
 require "paquito"
 require "async"
+require "async/grpc"
 require "async/http"
 require "async/http/endpoint"
-require "protocol/http/response"
+require "protocol/http/middleware"
+require "protocol/grpc"
 require_relative "rpc_messages"
 
 module Durababble
@@ -13,31 +15,21 @@ module Durababble
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     DEFAULT_TIMEOUT = 5.0
 
-    # One HTTP path per unary method. The wire payload on both legs is
-    # `Rpc.dump`/`Rpc.load` (Paquito/Marshal), Ruby-to-Ruby — durababble never
-    # used protobuf for cross-language interop, so HTTP/2 + Paquito carries the
-    # same opaque bytes the gRPC transport did.
-    PATHS = {
-      awaken_batch: "/durababble/v1/awaken_batch",
-      evict_lease: "/durababble/v1/evict_lease",
-      deliver_message: "/durababble/v1/deliver_message",
-      call_transient: "/durababble/v1/call_transient",
-    }.freeze #: Hash[Symbol, String]
-
-    ROUTES = PATHS.invert.freeze #: Hash[String, Symbol]
-
-    OCTET_HEADERS = { "content-type" => "application/octet-stream" }.freeze #: Hash[String, String]
+    SERVICE_NAME = "durababble.v1.Rpc"
 
     class Error < Durababble::Error; end
     class Unavailable < Error; end
     class Unauthenticated < Error; end
     class RemoteError < Error; end
 
-    # The cache lives in a *thread* variable (not a fiber-local `Thread.current[]`)
-    # because `unary` runs inside `Sync { … }`, which creates a fresh fiber per
-    # call. `Thread.current[]` is fiber-local in Ruby; `thread_variable_get/set`
-    # is genuinely thread-scoped and shared across all fibers on the thread.
-    HTTP_CLIENT_CACHE_KEY = :__durababble_rpc_http_clients
+    GRPC_CLIENT_CACHE_KEY = :__durababble_rpc_grpc_clients
+
+    class Interface < Protocol::GRPC::Interface
+      rpc :AwakenBatch, Messages::AwakenBatchRequest, Messages::AwakenBatchResponse
+      rpc :EvictLease, Messages::EvictLeaseRequest, Messages::EvictLeaseResponse
+      rpc :DeliverMessage, Messages::DeliverMessageRequest, Messages::DeliverMessageResponse
+      rpc :CallTransient, Messages::TransientRequest, Messages::TransientResponse
+    end
 
     class << self
       # `surface:`/`context:` opt this dump into `Durababble.enforce_payload_limit!`
@@ -53,44 +45,36 @@ module Durababble
       #: (String?) -> Object?
       def load(bytes) = bytes.nil? || bytes.empty? ? nil : SERIALIZER.load(bytes)
 
-      # Thread-local cache of `Async::HTTP::Client` keyed by remote address so
+      # Thread-local cache of `Async::GRPC::Client` keyed by remote address so
       # repeated RPC calls to the same peer reuse the same HTTP/2 connection
-      # (multiplexed across streams) instead of paying a fresh TCP + h2c
-      # handshake per call. `Async::HTTP::Client` is itself a connection pool —
-      # the cache just keeps the pool object alive across the short-lived
-      # `Sync { … }` blocks that wrap each `unary` call so the underlying
-      # connection (when present) can be reused. The cache is per-thread (not
-      # global) because each `Async::HTTP::Client` is tied to whichever fiber
-      # scheduler created it; sharing one across threads would cross schedulers.
-      # `shutdown_http_clients!` lets the calling thread close everything
-      # deterministically on shutdown.
+      # pool. The cache is per-thread because each client is tied to whichever
+      # fiber scheduler created it; sharing one across threads would cross
+      # schedulers.
       #
-      # There is no per-entry eviction: we rely on `Async::HTTP::Client`'s own
-      # internal pool to reconnect a downed peer's underlying TCP/H2 connection
-      # on the next request. A `Sync` call site that catches `Rpc::Unavailable`
-      # gets the next `client.post` attempt over a fresh connection without us
-      # touching the cache. The cache only retires entries on `shutdown_http_clients!`
-      # (process/thread shutdown) or via process exit.
-      #: (String) -> Async::HTTP::Client
-      def http_client_for(address)
-        cache = http_client_cache
+      # There is no per-entry eviction: the underlying HTTP client reconnects a
+      # downed peer on the next request. The cache retires entries on
+      # `shutdown_grpc_clients!` (process/thread shutdown) or process exit.
+      #: (String) -> Async::GRPC::Client
+      def grpc_client_for(address)
+        cache = grpc_client_cache
         cache[address] ||= begin
-          endpoint = Async::HTTP::Endpoint.parse(address.include?("://") ? address : "http://#{address}")
-          Async::HTTP::Client.new(endpoint, protocol: Async::HTTP::Protocol::HTTP2)
+          endpoint = Async::HTTP::Endpoint.parse(address.include?("://") ? address : "http://#{address}", protocol: Async::HTTP::Protocol::HTTP2)
+          http_client = Async::HTTP::Client.new(endpoint, protocol: Async::HTTP::Protocol::HTTP2)
+          Async::GRPC::Client.new(http_client)
         end
       end
 
       #: (String) -> bool
-      def http_client_cached?(address)
-        cache = Thread.current.thread_variable_get(HTTP_CLIENT_CACHE_KEY)
+      def grpc_client_cached?(address)
+        cache = Thread.current.thread_variable_get(GRPC_CLIENT_CACHE_KEY)
         return false unless cache.is_a?(Hash)
 
         cache.key?(address)
       end
 
       #: () -> void
-      def shutdown_http_clients!
-        cache = Thread.current.thread_variable_get(HTTP_CLIENT_CACHE_KEY)
+      def shutdown_grpc_clients!
+        cache = Thread.current.thread_variable_get(GRPC_CLIENT_CACHE_KEY)
         return unless cache.is_a?(Hash)
 
         cache.each_value do |client|
@@ -105,12 +89,12 @@ module Durababble
       private
 
       #: () -> Hash[String, untyped]
-      def http_client_cache
-        cache = Thread.current.thread_variable_get(HTTP_CLIENT_CACHE_KEY)
+      def grpc_client_cache
+        cache = Thread.current.thread_variable_get(GRPC_CLIENT_CACHE_KEY)
         return cache if cache.is_a?(Hash)
 
         cache = {}
-        Thread.current.thread_variable_set(HTTP_CLIENT_CACHE_KEY, cache)
+        Thread.current.thread_variable_set(GRPC_CLIENT_CACHE_KEY, cache)
         cache
       end
     end
@@ -173,16 +157,16 @@ module Durababble
         end
       end
 
-      # `http_client:` is an injection seam for tests (it must respond to
-      # `#post(path, headers, body)` and `#close`); production callers leave it
-      # nil and a per-call `Async::HTTP::Client` is built and closed inside the
-      # request `Sync` block. `credentials:` is accepted for call-site
-      # compatibility but unused now that the transport is cleartext H2C.
-      #: (address: String, ?credentials: Object?, ?timeout: Numeric, ?http_client: Object?) -> void
-      def initialize(address:, credentials: nil, timeout: DEFAULT_TIMEOUT, http_client: nil)
+      # `grpc_client:` is an injection seam for tests; production callers leave
+      # it nil and a cached `Async::GRPC::Client` is built inside the request
+      # `Sync` block.
+      # `credentials:` is accepted for call-site compatibility but unused now
+      # that the transport is cleartext h2c.
+      #: (address: String, ?credentials: Object?, ?timeout: Numeric, ?grpc_client: Object?) -> void
+      def initialize(address:, credentials: nil, timeout: DEFAULT_TIMEOUT, grpc_client: nil)
         @address = address
         @timeout = timeout
-        @injected_client = http_client
+        @injected_client = grpc_client
       end
 
       #: (worker_pool: String, workflow_ids: Array[String]) -> bool
@@ -247,55 +231,21 @@ module Durababble
 
       private
 
-      # Performs one unary request: encode the value object, POST it over HTTP/2,
-      # then decode the response value object. Runs inside `Sync` so it is
-      # callable both from a plain thread (worker control-plane) and from the
-      # ambient reactor (engine/server handler), and applies the request timeout.
-      # Uses the thread-local `Rpc.http_client_for` cache so back-to-back calls
-      # to the same peer reuse the cached HTTP/2 connection pool — see the docs
-      # on `Rpc.http_client_for`. Injected clients (for tests) bypass the cache
-      # and are owned by the caller.
+      # Performs one unary gRPC request. Runs inside `Sync` so it is callable
+      # both from a plain thread (worker control-plane) and from the ambient
+      # reactor (engine/server handler). Injected clients bypass the cache and
+      # are owned by the caller.
       #: (Symbol, Object) -> Object?
       def unary(method, request_value)
         with_rpc_errors do
           Sync do |task|
             task.with_timeout(@timeout) do
-              client = @injected_client || Rpc.http_client_for(@address) #: as untyped
-              response = client.post(PATHS.fetch(method), OCTET_HEADERS, [Rpc.dump(request_value)])
-              handle_response(response)
+              client = @injected_client || Rpc.grpc_client_for(@address) #: as untyped
+              stub = client.stub(Interface, SERVICE_NAME)
+              stub.public_send(method, request_value)
             end
           end
         end
-      end
-
-      # Status-to-exception mapping; `call_transient` re-raises `Unavailable` as
-      # `WorkflowRpc::NodeUnavailable` (which the router retries) and lets `Error`
-      # propagate untouched (no retry). Only 503 maps to `Unavailable` — an
-      # unexpected 500 from a peer signals a bug, not a healthy-but-busy node, so
-      # retrying it would just amplify the failure. See the "Retry Semantics"
-      # section in docs/content/cluster-rpc.md.
-      #: (Object) -> Object?
-      def handle_response(response)
-        response = response #: as untyped
-        status = response.status
-        body = response.read
-        case status
-        when 200
-          Rpc.load(body)
-        when 401
-          raise Unauthenticated, error_message(body, "durababble RPC peer is not authorized")
-        when 503
-          raise Unavailable, error_message(body, "durababble RPC node is unavailable")
-        when 500
-          raise Error, error_message(body, "durababble RPC handler raised on the peer")
-        else
-          raise Error, error_message(body, "durababble RPC failed with status #{status}")
-        end
-      end
-
-      #: (String?, String) -> String
-      def error_message(body, default)
-        body.nil? || body.empty? ? default : body
       end
 
       #: () { () -> Object? } -> Object?
@@ -305,10 +255,26 @@ module Durababble
         raise
       rescue Async::TimeoutError, Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::EPIPE, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError, IOError => e
         raise Unavailable, e.message
+      rescue Protocol::GRPC::Unauthenticated => e
+        raise Unauthenticated, grpc_error_message(e, "durababble RPC peer is not authorized")
+      rescue Protocol::GRPC::Unavailable, Protocol::GRPC::DeadlineExceeded, Protocol::GRPC::Cancelled => e
+        raise Unavailable, grpc_error_message(e, "durababble RPC node is unavailable")
+      rescue Protocol::GRPC::Internal => e
+        raise Error, grpc_error_message(e, "durababble RPC handler raised on the peer")
+      rescue Protocol::GRPC::Error => e
+        raise Error, grpc_error_message(e, "durababble RPC failed with gRPC status #{e.status_code}")
       rescue StandardError => e
         raise Unavailable, e.message if e.is_a?(Protocol::HTTP2::Error)
 
         raise
+      end
+
+      #: (Exception, String) -> String
+      def grpc_error_message(error, default)
+        cause = error.cause
+        message = cause&.message.to_s
+        message = error.message.to_s if message.empty? || message == cause.class.name.to_s
+        message.empty? ? default : message
       end
     end
 
@@ -341,8 +307,8 @@ module Durababble
       #: Integer?
       attr_reader :port
 
-      # `credentials:`/`pool_size:` are accepted for call-site compatibility with
-      # the former gRPC server but unused: the transport is cleartext H2C and the
+      # `credentials:`/`pool_size:` are accepted for call-site compatibility but
+      # unused: the transport is currently cleartext gRPC over h2c and the
       # reactor multiplexes connections on one fiber scheduler (no thread pool).
       # `identity_id:` seeds the generated `node_id` (`<id>@<address>`) so a worker
       # keeps a stable identity across address reuse (see #68/#69).
@@ -442,7 +408,7 @@ module Durababble
 
       #: (String) -> Object
       def current_async_task!(operation)
-        Async::Task.current
+        Async::Task.current || raise(RuntimeError)
       rescue RuntimeError
         raise ConfigurationError, "#{operation} must be called from inside a running Async reactor; pass parent: from your application's Async supervisor"
       end
@@ -474,13 +440,18 @@ module Durababble
 
       #: () -> Async::HTTP::Server
       def build_http_server
-        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
+        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}", protocol: Async::HTTP::Protocol::HTTP2)
         @bound = http_endpoint.bound
         @port = @bound.sockets.first.local_address.ip_port
         @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
-        service = build_service
-        app = ->(request) { route(service, request) }
-        Async::HTTP::Server.new(app, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+        dispatcher = Async::GRPC::Dispatcher.new(Protocol::HTTP::Middleware::NotFound)
+        dispatcher.register(build_grpc_service)
+        Async::HTTP::Server.new(dispatcher, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+      end
+
+      #: () -> RpcService
+      def build_grpc_service
+        RpcService.new(build_service)
       end
 
       #: () -> Service
@@ -500,49 +471,80 @@ module Durababble
           verify_deliver_message_owner: @verify_deliver_message_owner,
         )
       end
+    end
 
-      # Maps an HTTP request to a service method. Application-level errors are
-      # already encoded as discriminated response bodies by `Service`
-      # (`call_transient` returns `not_running`/`moved`/`err` frames with a 200);
-      # only authorization failures and unexpected raises become status codes.
-      # Unexpected raises return 500 (`Rpc::Error`, NOT retried) so an unforeseen
-      # bug on one node cannot get amplified by client-side retries into a stampede
-      # against an already-struggling cluster. 503 is reserved for transport-level
-      # unavailability (timeouts, connection failures — produced by `with_rpc_errors`,
-      # not by `route`) which IS retried via `WorkflowRpc::NodeUnavailable`.
-      #
-      # The case/when below is the one place where decoded wire bytes (`Object`
-      # from `Rpc.load`) cross into the typed `Service` API — each branch's
-      # `#: as` cast is the single boundary between "we trust the bytes match
-      # the path we routed" and the concrete `Messages::*` shape. Service
-      # methods are typed in terms of those `Messages::*` classes downstream and
-      # need no per-method casts.
-      #: (Service, Object) -> Object
-      def route(service, request)
-        request = request #: as untyped
-        method = ROUTES[request.path]
-        return Protocol::HTTP::Response[404, OCTET_HEADERS, []] unless method
+    class RpcService < Async::GRPC::Service
+      #: (Service) -> void
+      def initialize(service)
+        super(Interface, SERVICE_NAME)
+        @service = service
+      end
 
-        request_value = Rpc.load(request.read)
-        response_value = case method
-        when :awaken_batch
-          awaken = request_value #: as Messages::AwakenBatchRequest
-          service.awaken_batch(awaken, request)
-        when :evict_lease
-          evict = request_value #: as Messages::EvictLeaseRequest
-          service.evict_lease(evict, request)
-        when :deliver_message
-          deliver = request_value #: as Messages::DeliverMessageRequest
-          service.deliver_message(deliver, request)
-        when :call_transient
-          transient = request_value #: as Messages::TransientRequest
-          service.call_transient(transient, request)
-        end
-        Protocol::HTTP::Response[200, OCTET_HEADERS, [Rpc.dump(response_value)]]
+      #: (Object, Object, Object) -> void
+      def awaken_batch(input, output, call)
+        rpc_input = input #: as untyped
+        rpc_output = output #: as untyped
+        rpc_output.write(@service.awaken_batch(rpc_input.read, call))
       rescue Unauthenticated => e
-        Protocol::HTTP::Response[401, OCTET_HEADERS, [e.message.to_s]]
+        raise Protocol::GRPC::Unauthenticated, e.message
+      rescue Async::TimeoutError => e
+        raise_deadline_timeout_or_internal!(e, call)
       rescue StandardError => e
-        Protocol::HTTP::Response[500, OCTET_HEADERS, [e.message.to_s]]
+        raise Protocol::GRPC::Internal, e.message
+      end
+
+      #: (Object, Object, Object) -> void
+      def evict_lease(input, output, call)
+        rpc_input = input #: as untyped
+        rpc_output = output #: as untyped
+        rpc_output.write(@service.evict_lease(rpc_input.read, call))
+      rescue Unauthenticated => e
+        raise Protocol::GRPC::Unauthenticated, e.message
+      rescue Async::TimeoutError => e
+        raise_deadline_timeout_or_internal!(e, call)
+      rescue StandardError => e
+        raise Protocol::GRPC::Internal, e.message
+      end
+
+      #: (Object, Object, Object) -> void
+      def deliver_message(input, output, call)
+        rpc_input = input #: as untyped
+        rpc_output = output #: as untyped
+        rpc_output.write(@service.deliver_message(rpc_input.read, call))
+      rescue Unauthenticated => e
+        raise Protocol::GRPC::Unauthenticated, e.message
+      rescue Async::TimeoutError => e
+        raise_deadline_timeout_or_internal!(e, call)
+      rescue StandardError => e
+        raise Protocol::GRPC::Internal, e.message
+      end
+
+      #: (Object, Object, Object) -> void
+      def call_transient(input, output, call)
+        rpc_input = input #: as untyped
+        rpc_output = output #: as untyped
+        rpc_output.write(@service.call_transient(rpc_input.read, call))
+      rescue Unauthenticated => e
+        raise Protocol::GRPC::Unauthenticated, e.message
+      rescue Async::TimeoutError => e
+        raise_deadline_timeout_or_internal!(e, call)
+      rescue StandardError => e
+        raise Protocol::GRPC::Internal, e.message
+      end
+
+      private
+
+      #: (Async::TimeoutError, Object) -> bot
+      def raise_deadline_timeout_or_internal!(error, call)
+        raise error if grpc_deadline_exceeded?(call)
+
+        raise Protocol::GRPC::Internal, error.message
+      end
+
+      #: (Object) -> bool
+      def grpc_deadline_exceeded?(call)
+        call = call #: as untyped
+        call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
       end
     end
 
@@ -631,11 +633,16 @@ module Durababble
       rescue WorkflowRpc::StaleLease => e
         moved_response(request) || remote_error_response(e)
       rescue Unauthenticated
-        # Let the wire-level 401 stand. Without this re-raise the catch-all
+        # Let the wire-level unauthenticated status stand. Without this re-raise the catch-all
         # `rescue StandardError` below would convert authorization failures
         # into a 200 with an `err` frame, defeating the status-code contract
-        # that `Server#route` translates `Unauthenticated` into HTTP 401.
+        # that `RpcService` translates `Unauthenticated` into gRPC unauthenticated.
         raise
+      rescue Async::TimeoutError => e
+        raise if grpc_deadline_exceeded?(call)
+
+        observe_transient_error(request, e)
+        remote_error_response(e)
       rescue StandardError => e
         observe_transient_error(request, e)
         remote_error_response(e)
@@ -669,6 +676,12 @@ module Durababble
         return if @authorize.call(call)
 
         raise Unauthenticated, "durababble RPC peer is not authorized"
+      end
+
+      #: (Object) -> bool
+      def grpc_deadline_exceeded?(call)
+        call = call #: as untyped
+        call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
       end
 
       #: (Messages::TransientRequest) -> Object?

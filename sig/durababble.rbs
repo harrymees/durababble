@@ -572,9 +572,9 @@ module Durababble
 
     def self.dump: (serialized_payload value, ?surface: Symbol?, ?context: String?) -> String
     def self.load: (String? bytes) -> serialized_payload
-    def self.http_client_for: (String address) -> Async::HTTP::Client
-    def self.http_client_cached?: (String address) -> bool
-    def self.shutdown_http_clients!: () -> void
+    def self.grpc_client_for: (String address) -> Async::GRPC::Client
+    def self.grpc_client_cached?: (String address) -> bool
+    def self.shutdown_grpc_clients!: () -> void
 
     class Error < Durababble::Error
     end
@@ -663,7 +663,7 @@ module Durababble
     class Client
       attr_reader address: String
 
-      def initialize: (address: String, ?credentials: credentials?, ?timeout: Numeric, ?http_client: Object?) -> void
+      def initialize: (address: String, ?credentials: credentials?, ?timeout: Numeric, ?grpc_client: Object?) -> void
       def awaken_batch: (worker_pool: String, workflow_ids: Array[String]) -> true
       def evict_lease: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
       def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
