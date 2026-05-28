@@ -338,7 +338,7 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
     assert_operator store.lease_lookup_count, :<=, 2
   end
 
-  test "claims and releases the unified object lease when wired with a host" do
+  test "claims the unified object lease and retains it for residency when wired with a host" do
     object_class = Class.new(Durababble::DurableObject) do
       object_type "leased_object_stream"
       expose_stream :ticks
@@ -347,7 +347,7 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       end
     end
     store = FakeStreamStore.new(object_state: nil)
-    host = Durababble::ObjectStreamHost.new(store:, worker_id: "host-worker", node_id: "host-worker", lease_seconds: 30, renew_interval: 1.0)
+    host = Durababble::ObjectStreamHost.new(store:, worker_id: "host-worker", node_id: "host-worker", lease_seconds: 30, renew_interval: 1.0, objects: [object_class])
     writer = CapturingWriter.new
     request = Durababble::Rpc::Messages::TransientRequest.new(
       worker_pool: "default",
@@ -367,7 +367,13 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
     dispatcher_with_host.call(request:, args: empty_args, writer:)
 
     assert_equal([1, 2, 3], writer.values)
+    # Sticky residency: one claim, and the lease is retained after the stream
+    # finishes (released only on eviction/idle/stop), not dropped per stream.
     assert_equal(1, store.object_claims.size)
+    assert_empty(store.object_releases)
+    assert(host.holds?(worker_pool: "default", object_type: "leased_object_stream", object_id: "obj-1"))
+
+    assert(host.evict!(worker_pool: "default", object_type: "leased_object_stream", object_id: "obj-1"))
     assert_equal(1, store.object_releases.size)
   ensure
     host&.stop!
@@ -382,16 +388,21 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       end
     end
     store = FakeStreamStore.new(object_state: nil)
-    # Eviction occurs from a sibling thread mid-with_lease; here we simulate it
-    # by pre-flagging the entry via a wrapping decorator that flips `lost`
-    # before the producer block runs.
-    host = Durababble::ObjectStreamHost.new(store:, worker_id: "host-worker", node_id: "host-worker", lease_seconds: 30, renew_interval: 1.0)
+    # Simulate the lease being lost before the producer emits: register a
+    # pre-lost entry so the real `resident_instance` still materializes via the
+    # registry, then let the dispatcher's own post-producer `entry.lost` check
+    # surface `StaleLease` rather than a clean end.
+    host = Durababble::ObjectStreamHost.new(store:, worker_id: "host-worker", node_id: "host-worker", lease_seconds: 30, renew_interval: 1.0, objects: [object_class])
     host.define_singleton_method(:with_lease) do |worker_pool: nil, object_type: nil, object_id: nil, lease_seconds: nil, &block|
-      _ = [worker_pool, object_type, object_id, lease_seconds]
-      entry = Durababble::ObjectStreamHost::Entry.new(refcount: 1, lost: false)
-      block.call(entry)
-      entry.lost = true
-      raise Durababble::WorkflowRpc::StaleLease, "evicted" if entry.lost
+      _ = [worker_pool, lease_seconds]
+      key = [object_type, object_id]
+      entry = Durababble::ObjectStreamHost::Entry.new(refcount: 1, lost: true)
+      instance_variable_get(:@entries)[key] = entry
+      begin
+        block.call(entry)
+      ensure
+        instance_variable_get(:@entries).delete(key)
+      end
     end
 
     dispatcher_with_host = Durababble::StreamDispatcher.new(

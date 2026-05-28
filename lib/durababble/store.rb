@@ -37,8 +37,10 @@ module Durababble
     attr_accessor :local_workflow_rpc_node_id
     #: Hash[String, Object]?
     attr_accessor :local_workflow_rpc_handlers
+    #: String?
+    attr_accessor :local_worker_id
     #: Object
-    attr_accessor :local_worker_id, :local_transient_handler
+    attr_accessor :local_transient_handler
 
     class << self
       #: (*Object?, **Object?) ?{ (Object?) -> Object? } -> Store

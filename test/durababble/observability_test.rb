@@ -225,6 +225,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
   class ObjectStore
     Result = Data.define(:affected_rows)
 
+    # Every store exposes these owner-routing hooks (set as a pair by the worker
+    # runtime); a nil pair means this process runs no worker, so queries claim a
+    # synthesized local worker id.
+    attr_accessor :local_worker_id, :local_transient_handler
+
     def initialize
       @state = {}
       @commands = {}

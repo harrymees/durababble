@@ -92,8 +92,6 @@ module Durababble
 
       #: (String, String) -> Exception
       def build_remote_error(klass, message)
-        return ObjectReadBlocked.new(message) if klass == "Durababble::ObjectReadBlocked" || klass == "ObjectReadBlocked"
-
         WorkflowRpc.remote_error_from_fields(klass, message) ||
           Durababble::Rpc::RemoteError.new("#{klass}: #{message}")
       end
@@ -189,7 +187,7 @@ module Durababble
         # concrete `Messages::RemoteError` or the test's lookalike Struct.
         # Reconstruction goes through the shared `build_remote_error` helper so
         # the unary and streaming response paths rebuild the same typed errors
-        # (e.g. `ObjectReadBlocked`) rather than diverging.
+        # rather than diverging.
         #: (Object) -> bot
         def raise_remote_error(error)
           error = error #: as untyped

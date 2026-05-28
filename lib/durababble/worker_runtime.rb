@@ -31,7 +31,7 @@ module Durababble
       end
     end
 
-    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Object, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
+    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?object_idle_ttl: Numeric?, ?poll_interval: Numeric, ?concurrency: Object, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
     def initialize(
       workflows:,
       worker_pool:,
@@ -41,6 +41,7 @@ module Durababble
       schema: nil,
       worker_id: nil,
       lease_seconds: Engine::DEFAULT_LEASE_SECONDS,
+      object_idle_ttl: nil,
       poll_interval: DEFAULT_POLL_INTERVAL,
       concurrency: 1,
       migrate: true,
@@ -74,6 +75,11 @@ module Durababble
       @worker_identity_id = worker_id || "#{worker_pool}-#{SecureRandom.hex(6)}"
       @worker_id = @worker_identity_id
       @lease_seconds = lease_seconds
+      # How long a resident object instance stays warm after its last
+      # command/query/stream before idle-TTL eviction runs `on_destroy` and
+      # releases the lease. Defaults to `lease_seconds` (the host applies that
+      # fallback when nil).
+      @object_idle_ttl = object_idle_ttl
       @poll_interval = poll_interval
       @concurrency = parsed_concurrency
       @migrate = migrate
@@ -231,8 +237,8 @@ module Durababble
       # The server assigns its `node_id` during `start`, so it is non-nil here.
       node_id = @rpc_server.node_id #: as String
       @worker_id = node_id
-      @store.local_worker_id = -> { @worker_id } if @store.respond_to?(:local_worker_id=)
-      @store.local_transient_handler = transient_handler if @store.respond_to?(:local_transient_handler=)
+      @store.local_worker_id = node_id
+      @store.local_transient_handler = transient_handler
       # The host's renewal task uses `Store#with_dedicated_connection` so its
       # writes do not contend with the worker loop's reactor connection. Built
       # before the dispatcher so the dispatcher receives it.
@@ -243,6 +249,8 @@ module Durababble
         node_id:,
         worker_pool: @worker_pool,
         lease_seconds:,
+        objects: @objects,
+        idle_ttl: @object_idle_ttl,
       )
       @object_stream_host.start_async(parent:) if parent
       # Build the dispatcher once, now that `@worker_id` is assigned. It normalizes
@@ -301,8 +309,8 @@ module Durababble
 
       Durababble.local_stream_host = nil if Durababble.local_stream_host.equal?(host)
 
-      @store.local_worker_id = nil if @store.respond_to?(:local_worker_id=)
-      @store.local_transient_handler = nil if @store.respond_to?(:local_transient_handler=)
+      @store.local_worker_id = nil
+      @store.local_transient_handler = nil
       clear_local_workflow_rpc(@store)
       @rpc_server = nil
       @rpc_address = nil

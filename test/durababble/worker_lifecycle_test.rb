@@ -9,6 +9,8 @@ require "logger"
 class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class RuntimeBranchStore
     attr_reader :closed, :released
+    # Owner-routing hooks the worker runtime sets on start and clears on stop.
+    attr_accessor :local_worker_id, :local_transient_handler
 
     def initialize(tick_results: [])
       @tick_results = tick_results.dup

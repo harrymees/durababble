@@ -107,9 +107,9 @@ class ChatRoomExampleTest < DurababbleTestCase
           room.post_message("ghost", "i should not be here")
         end
         assert_match(/ghost/, error.message)
-        assert_raises_matching(Durababble::ObjectReadBlocked, /dead_lettered mailbox head/) do
-          room.snapshot
-        end
+        # The failed command dead-letters without persisting state; a read no
+        # longer blocks on the dead-lettered head and serves the initial snapshot.
+        assert_equal([], room.snapshot.fetch("messages"))
         assert_nil(store.object_state(object_type: ChatRoomExample::ChatRoom.object_type, object_id: "lobby"))
       ensure
         stop = true

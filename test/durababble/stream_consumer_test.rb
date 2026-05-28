@@ -181,7 +181,7 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     object_host = if objects.empty?
       nil
     else
-      Durababble::ObjectStreamHost.new(store:, worker_id: server.node_id, node_id: server.node_id, worker_pool: "default", lease_seconds: 60, renew_interval: 1.0)
+      Durababble::ObjectStreamHost.new(store:, worker_id: server.node_id, node_id: server.node_id, worker_pool: "default", lease_seconds: 60, renew_interval: 1.0, objects:)
     end
     dispatcher = Durababble::StreamDispatcher.new(store:, workflows:, objects:, node_id: server.node_id, object_stream_host: object_host, lease_seconds: 60)
     @object_hosts << object_host if object_host

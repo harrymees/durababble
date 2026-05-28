@@ -250,7 +250,7 @@ module Durababble
     attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
     attr_accessor local_workflow_rpc_node_id: String?
     attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
-    attr_accessor local_worker_id: (String | _WorkerIdProvider)?
+    attr_accessor local_worker_id: String?
     attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store

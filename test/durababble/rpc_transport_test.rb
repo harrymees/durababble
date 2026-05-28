@@ -654,13 +654,10 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
   end
 
-  test "build_remote_error reconstructs object-read-blocked, typed workflow, and unknown errors" do
-    blocked = Durababble::Rpc.build_remote_error("Durababble::ObjectReadBlocked", "head pending")
-    assert_instance_of Durababble::ObjectReadBlocked, blocked
-    assert_equal "head pending", blocked.message
-
+  test "build_remote_error reconstructs typed workflow and unknown errors" do
     typed = Durababble::Rpc.build_remote_error("Durababble::WorkflowRpc::NoActiveLease", "no lease")
     assert_instance_of Durababble::WorkflowRpc::NoActiveLease, typed
+    assert_equal "no lease", typed.message
 
     fallback = Durababble::Rpc.build_remote_error("SomeUnknownError", "boom")
     assert_instance_of Durababble::Rpc::RemoteError, fallback

@@ -12,7 +12,6 @@ require_relative "worker_identity"
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
-  class ObjectReadBlocked < Error; end
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -186,6 +185,22 @@ module Durababble
       @state_dirty = false
       @wakeup_changes = []
       @__durababble_query_context = false
+      @__durababble_child_workflow_sequence = 0
+    end
+
+    # Reset the per-operation state of a resident instance so it can serve the
+    # next command/query/stream without rebuilding (the expensive user resource
+    # set up in `on_create`/`on_load` stays put). Durable state is re-read from
+    # the store every time, so resident memory never substitutes for the store.
+    #: (state: Object?, store: Store?, worker_pool: String, command_context: CommandContext?, query: bool) -> void
+    def __durababble_rebind!(state:, store:, worker_pool:, command_context:, query:)
+      @current_state = state
+      @store = store
+      @worker_pool = worker_pool
+      @command_context = command_context
+      @state_dirty = false
+      @wakeup_changes = []
+      @__durababble_query_context = query
       @__durababble_child_workflow_sequence = 0
     end
 
@@ -617,7 +632,7 @@ module Durababble
         attempts = 0
         begin
           if (lease = current_object_lease)
-            return invoke_owned_query(method_name, args:, kwargs:, block:, lease:) if current_runtime_owns?(lease)
+            return invoke_owned_query(method_name, args:, kwargs:, lease:) if current_runtime_owns?(lease)
 
             begin
               return invoke_remote_query(method_name, args:, kwargs:, lease:)
@@ -648,9 +663,7 @@ module Durababble
 
     #: (Hash[String, Object?]) -> bool
     def current_runtime_owns?(lease)
-      worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
-      worker_id = worker_id #: as untyped
-      worker_id = worker_id.call if worker_id.respond_to?(:call)
+      worker_id = resolved_local_worker_id
       !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
     end
 
@@ -671,20 +684,17 @@ module Durababble
       !!(refreshed && refreshed.fetch("worker_id") == previous.fetch("worker_id"))
     end
 
-    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, lease: Hash[String, Object?]) -> Object?
-    def invoke_owned_query(method_name, args:, kwargs:, block:, lease:)
+    # This node owns the object, so its worker runtime always has the resident
+    # instance and a transient handler wired up (set as a pair with the worker id
+    # the lease routes to). Route through the handler to the resident instance.
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
+    def invoke_owned_query(method_name, args:, kwargs:, lease:)
       worker_pool = lease_worker_pool(lease)
-      handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
-      handler = handler #: as untyped
-      if handler
-        return handler.call(
-          request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool:),
-          args: { "args" => args, "kwargs" => kwargs },
-        )
-      end
-
-      DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
-      invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+      handler = @store.local_transient_handler #: as untyped
+      handler.call(
+        request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool:),
+        args: { "args" => args, "kwargs" => kwargs },
+      )
     end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
@@ -704,8 +714,33 @@ module Durababble
       raise WorkflowRpc::NodeUnavailable, e.message
     end
 
+    # No node owns the object. When this process runs a residency host, claim the
+    # lease and become the resident owner (materialize via `on_create`/`on_load`,
+    # keep it warm; idle-TTL evicts later). A pure-client process with no host
+    # falls back to a transient claim-read-release.
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
     def invoke_claimed_local_query(method_name, args:, kwargs:, block:)
+      object_type = @object_class.object_type
+      host = local_residency_host
+      if host
+        return host.with_resident(object_type:, object_id: @durable_id, worker_pool: @worker_pool) do |object|
+          object = object #: as untyped
+          object.__durababble_rebind!(
+            state: DurableObject.state_from_store(@store, object_type:, object_id: @durable_id),
+            store: @store,
+            worker_pool: @worker_pool,
+            command_context: nil,
+            query: true,
+          )
+          run_local_query(object, method_name:, args:, kwargs:, block:)
+        end
+      end
+
+      invoke_transient_claimed_local_query(method_name, args:, kwargs:, block:)
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def invoke_transient_claimed_local_query(method_name, args:, kwargs:, block:)
       worker_id = local_query_worker_id
       holder = @store.claim_object_lease(
         worker_pool: @worker_pool,
@@ -718,7 +753,6 @@ module Durababble
 
       worker_pool = lease_worker_pool(holder)
       begin
-        DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
         invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
       ensure
         @store.release_object_lease(object_type: @object_class.object_type, object_id: @durable_id, worker_id:)
@@ -730,17 +764,41 @@ module Durababble
       state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
       object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool:) #: as untyped
       object.instance_variable_set(:@__durababble_query_context, true)
+      run_local_query(object, method_name:, args:, kwargs:, block:)
+    end
+
+    #: (untyped, method_name: Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def run_local_query(object, method_name:, args:, kwargs:, block:)
       ObjectQueryExecutionContext.with_current(object) do
         kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
       end
     end
 
+    # The residency host for this process, but only when it owns the same worker
+    # id the store routes leases to — otherwise a claim here would race the real
+    # owner. Returns nil for pure-client processes (no host) so the caller can
+    # fall back to a transient claim-read-release.
+    #: () -> ObjectStreamHost?
+    def local_residency_host
+      host = Durababble.local_stream_host #: as ObjectStreamHost?
+      return unless host
+
+      worker_id = resolved_local_worker_id
+      return if worker_id.nil?
+
+      host if host.worker_id == worker_id
+    end
+
     #: () -> String
     def local_query_worker_id
-      worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
-      worker_id = worker_id #: as untyped
-      worker_id = worker_id.call if worker_id.respond_to?(:call)
-      worker_id&.to_s || "durababble-local-query-#{Process.pid}-#{SecureRandom.hex(6)}"
+      resolved_local_worker_id || "durababble-local-query-#{Process.pid}-#{SecureRandom.hex(6)}"
+    end
+
+    # The worker id the store routes leases to. Nil for a pure-client process that
+    # runs no worker, so callers decide whether to synthesize one.
+    #: () -> String?
+    def resolved_local_worker_id
+      @store.local_worker_id
     end
 
     #: (Hash[String, Object?]) -> String
@@ -802,28 +860,6 @@ module Durababble
   end
 
   class DurableObjectTransientHandler
-    BLOCKING_READ_STATUSES = ["pending", "failed", "running", "dead_lettered"].freeze
-
-    class << self
-      #: (untyped, object_type: untyped, object_id: untyped, ?worker_pool: untyped) -> void
-      def assert_read_gate_open!(store, object_type:, object_id:, worker_pool: "default")
-        blocker = blocking_read_message(store, worker_pool:, object_type:, object_id:)
-        return unless blocker
-
-        raise ObjectReadBlocked, "durable object #{object_type}/#{object_id} transient read is blocked by #{blocker.fetch("status")} mailbox head #{blocker.fetch("id")}"
-      end
-
-      private
-
-      #: (untyped, worker_pool: untyped, object_type: untyped, object_id: untyped) -> untyped
-      def blocking_read_message(store, worker_pool:, object_type:, object_id:)
-        return unless store.respond_to?(:inbox_messages_for)
-
-        messages = store.inbox_messages_for(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
-        messages.find { |message| BLOCKING_READ_STATUSES.include?(message.fetch("status").to_s) }
-      end
-    end
-
     #: (store: untyped, objects: untyped, node_id: untyped) -> void
     def initialize(store:, objects:, node_id:)
       @store = store
@@ -845,7 +881,6 @@ module Durababble
       end
 
       assert_current_lease!(object_type:, object_id:)
-      self.class.assert_read_gate_open!(@store, worker_pool:, object_type:, object_id:)
       result = invoke_query(object_class, worker_pool:, object_id:, method_name:, payload: args || {})
       assert_current_lease!(object_type:, object_id:)
       result
@@ -896,9 +931,24 @@ module Durababble
       payload ||= {}
       args = payload.fetch("args", [])
       kwargs = symbolize_keys(payload.fetch("kwargs", {}))
-      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
-      object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:) #: as untyped
-      object.instance_variable_set(:@__durababble_query_context, true)
+      object_type = object_class.object_type
+      host = Durababble.local_stream_host #: as ObjectStreamHost?
+      if host && host.worker_id == node_id
+        host.with_resident(object_type:, object_id:, worker_pool:) do |object|
+          object = object #: as untyped
+          object.__durababble_rebind!(state: DurableObject.state_from_store(@store, object_type:, object_id:), store: @store, worker_pool:, command_context: nil, query: true)
+          run_query(object, method_name:, args:, kwargs:)
+        end
+      else
+        state = DurableObject.state_from_store(@store, object_type:, object_id:)
+        object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:) #: as untyped
+        object.instance_variable_set(:@__durababble_query_context, true)
+        run_query(object, method_name:, args:, kwargs:)
+      end
+    end
+
+    #: (untyped, method_name: untyped, args: untyped, kwargs: untyped) -> untyped
+    def run_query(object, method_name:, args:, kwargs:)
       kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
     end
 
@@ -1035,15 +1085,29 @@ module Durababble
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def build_object(object_class, object_id:, message:)
       worker_pool = message.fetch("worker_pool", @worker_pool)
-      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
+      object_type = object_class.object_type
+      state = DurableObject.state_from_store(@store, object_type:, object_id:)
       context = CommandContext.new(
-        object_type: object_class.object_type,
+        object_type:,
         durable_id: object_id,
         command_id: message.fetch("id"),
         attempt_number: message.fetch("attempts").to_i,
-        idempotency_key: "durababble:v1:object:#{object_class.object_type}:#{object_id}:command:#{message.fetch("id")}",
+        idempotency_key: "durababble:v1:object:#{object_type}:#{object_id}:command:#{message.fetch("id")}",
         worker_id: @worker_id,
       )
+
+      # The drain runs inside the host's `with_lease`, so when a resident host
+      # owns this lease the command must execute against the one warm instance
+      # (the expensive user resource set up in `on_load` lives there). Rebind it
+      # with freshly-read durable state + this command's context. Without a host
+      # (direct executor use in tests / pure-client drains), build a throwaway.
+      host = Durababble.local_stream_host #: as ObjectStreamHost?
+      if host && host.worker_id == @worker_id && host.holds?(worker_pool:, object_type:, object_id:)
+        object = host.resident_instance(object_type:, object_id:, worker_pool:) #: as untyped
+        object.__durababble_rebind!(state:, store: @store, worker_pool:, command_context: context, query: false)
+        return object
+      end
+
       object_class.new(durable_id: object_id, state:, store: @store, command_context: context, worker_pool:) #: as untyped
     end
 
