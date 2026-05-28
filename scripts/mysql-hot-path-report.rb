@@ -31,6 +31,8 @@ module DurababbleMysqlHotPathReport
     "claim_outbox" => "Trace the unified outbox queue probe and lease update used when a sender claims a message.",
     "worker_poll_idle" => "Trace one Worker#tick poll when no workflow work is available.",
     "worker_tick_claim" => "Trace one Worker#tick that polls, claims a workflow, and runs it to completion.",
+    "record_step_started" => "Trace the durable workflow-history append when a leased worker starts a step.",
+    "record_step_completed" => "Trace the durable workflow-history append when a leased worker completes a step.",
   }.freeze
   OPERATIONS = BUILTIN_OPERATION_DESCRIPTIONS
   SQL_KEYWORDS = [
@@ -1188,6 +1190,56 @@ module DurababbleMysqlHotPathReport
     end,
   ) do |context|
     context.worker.tick
+  end
+
+  register_scenario(
+    "record_step_started",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("record_step_started"),
+    setup: lambda do |context|
+      context.enqueue_report_workflow(id: "hot-path-step")
+      context.seed_pending_workflows
+      context.store.claim_runnable_workflow(
+        worker_id: DEFAULT_WORKER_ID,
+        lease_seconds: 60,
+        workflow_names: [DEFAULT_WORKFLOW_NAME],
+        worker_pool: DEFAULT_WORKER_POOL,
+      )
+    end,
+  ) do |context|
+    context.store.record_step_started(
+      workflow_id: "hot-path-step",
+      name: "report-step",
+      command_id: 1,
+      worker_id: DEFAULT_WORKER_ID,
+    )
+  end
+
+  register_scenario(
+    "record_step_completed",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("record_step_completed"),
+    setup: lambda do |context|
+      context.enqueue_report_workflow(id: "hot-path-step")
+      context.seed_pending_workflows
+      context.store.claim_runnable_workflow(
+        worker_id: DEFAULT_WORKER_ID,
+        lease_seconds: 60,
+        workflow_names: [DEFAULT_WORKFLOW_NAME],
+        worker_pool: DEFAULT_WORKER_POOL,
+      )
+      context.store.record_step_started(
+        workflow_id: "hot-path-step",
+        name: "report-step",
+        command_id: 1,
+        worker_id: DEFAULT_WORKER_ID,
+      )
+    end,
+  ) do |context|
+    context.store.record_step_completed(
+      workflow_id: "hot-path-step",
+      command_id: 1,
+      result: { "ok" => true },
+      worker_id: DEFAULT_WORKER_ID,
+    )
   end
 end
 
