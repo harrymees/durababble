@@ -599,6 +599,11 @@ module Durababble
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
     end
 
+    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    def lock_owned_object_for_update(object_type:, object_id:, worker_id:)
+      execute_store_query(:lock_owned_object_for_update, [object_type, object_id, worker_id]).first
+    end
+
     #: (id: String, worker_pool: String, target_kind: String, target_type: String, target_id: String, sequence: Integer, message_kind: String, method_name: String?, operation_id: String, idempotency_key: String?, shape_hash: String, payload: Object?, ?ready_at: Object?, ?max_attempts: Integer?) -> Object?
     def insert_inbox_message_without_transaction(id:, worker_pool:, target_kind:, target_type:, target_id:, sequence:, message_kind:, method_name:, operation_id:, idempotency_key:, shape_hash:, payload:, ready_at: nil, max_attempts: nil)
       idempotency_hash = inbox_idempotency_hash(idempotency_key, target_kind:, target_type:, target_id:)

@@ -240,18 +240,18 @@ module Durababble
       Store.validate_positive_lease_seconds!(lease_seconds)
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
+        claimable = contiguous_claimable_inbox_rows(rows, now:)
         # Gate object inbox claims on ownership of the unified per-object lease so
         # commands are only processed by the single, exclusive object owner.
-        # Lease acquisition happens AFTER the row scan: an empty row set means no
-        # work in this pool, so we must not side-effect a free lease into a held
-        # one (that would block the real owner in another pool from ever
-        # progressing). Workflow inbox claims keep the existing
-        # workflows.locked_by fence and are unaffected.
-        if target_kind == "object" && !rows.empty?
+        # Lease acquisition happens AFTER selecting a claimable prefix: an empty
+        # or blocked row set means no work can run in this pool yet, so we must
+        # not side-effect a free lease into a held one. Workflow inbox claims
+        # keep the existing workflows.locked_by fence and are unaffected.
+        if target_kind == "object" && !claimable.empty?
           holder = claim_object_lease(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_seconds:)
           next [] unless holder
         end
-        contiguous_claimable_inbox_rows(rows, now:).map do |row|
+        claimable.map do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
           claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
         end
@@ -345,6 +345,7 @@ module Durababble
         next nil unless command
         next nil unless object_command_completion_target_matches?(command, object_type:, object_id:, state:, wakeup_changes:)
 
+        assert_object_command_lease_for_update!(command, worker_id:)
         worker_pool = row_worker_pool(command)
         save_object_state(worker_pool:, object_type:, object_id:, state:) unless state.equal?(Store::NO_OBJECT_STATE)
         apply_object_wakeup_changes_without_transaction(worker_pool:, object_type:, object_id:, wakeup_changes:) unless wakeup_changes.empty?
@@ -360,6 +361,7 @@ module Durababble
         command = lock_inbox_message_for_failure(command_id:, worker_id:)
         next nil unless command
 
+        assert_object_command_lease_for_update!(command, worker_id:)
         updated = if terminal
           dead_letter_inbox_message_without_transaction(message_id: command_id, error:)
         else
@@ -376,6 +378,7 @@ module Durababble
         command = lock_inbox_message_for_failure(command_id:, worker_id:)
         next nil unless command
 
+        assert_object_command_lease_for_update!(command, worker_id:)
         updated = retry_inbox_message_without_transaction(message_id: command_id, error:, ready_at:)
         reconcile_command_target_activation(command) if command.key?("target_kind")
         updated
@@ -711,6 +714,18 @@ module Durababble
       end
     end
 
+    #: (Hash[String, Object?], worker_id: String?) -> void
+    def assert_object_command_lease_for_update!(command, worker_id:)
+      return unless worker_id
+      return unless command.fetch("target_kind", nil) == "object"
+
+      object_type = command.fetch("target_type").to_s
+      object_id = command.fetch("target_id").to_s
+      return if lock_owned_object_for_update(object_type:, object_id:, worker_id:)
+
+      raise LeaseConflict, "durable object #{object_type}/#{object_id} lease expired or moved before object command update"
+    end
+
     # Apply an object command's ordered wake mutations within the completion
     # transaction so every change commits atomically with state and command
     # completion. A single command may schedule, replace, and cancel several
@@ -887,6 +902,11 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
+      raise NotImplementedError
+    end
+
+    #: (object_type: String, object_id: String, worker_id: String) -> Hash[String, Object?]?
+    def lock_owned_object_for_update(object_type:, object_id:, worker_id:)
       raise NotImplementedError
     end
 
@@ -1067,8 +1087,13 @@ module Durababble
         head = head #: as Hash[String, Object?]
         next unless inbox_row_claimable?(head, now:)
 
+        if target_kind == "object"
+          holder = claim_object_lease(worker_pool:, object_type: target_type.to_s, object_id: target_id.to_s, worker_id:, lease_seconds:)
+          next unless holder
+        end
+
         mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
-        inbox_message(message_id)
+        claimed_inbox_row(head, worker_id:, lease_seconds:, now:)
       end
     end
 

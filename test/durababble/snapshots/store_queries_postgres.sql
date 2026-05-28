@@ -383,6 +383,13 @@ SELECT * FROM "durababble_pg_snapshot"."inbox"
 WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
 FOR UPDATE
 
+-- pg_lock_owned_object_for_update
+SELECT 1
+FROM "durababble_pg_snapshot"."durable_objects"
+WHERE object_type = $1 AND object_id = $2
+  AND locked_by = $3 AND locked_until >= now()
+FOR UPDATE
+
 -- pg_lock_owned_workflow_for_update
 SELECT 1
 FROM "durababble_pg_snapshot"."workflows"
