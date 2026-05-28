@@ -39,20 +39,20 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
       row = execute_store_query(:claim_workflow_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
-      decode_row(row) if row
+      return decode_row(row) if row
+
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
       row = execute_store_query(:claim_workflow_for_activation_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
-      decode_row(row) if row
+      return decode_row(row) if row
+
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result

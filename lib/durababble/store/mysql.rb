@@ -55,20 +55,24 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      updated = execute_store_query(:claim_workflow_update, [worker_id, lease_seconds, workflow_id, worker_pool])
-      return workflow(workflow_id) if updated.affected_rows == 1
+      transaction do
+        candidate = execute_store_query(:claim_workflow_lock, [workflow_id, worker_pool, worker_id]).first
+        next unless candidate
 
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      decode_row(already_owned) if already_owned
+        execute_store_query(:claim_workflow_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+        workflow(workflow_id)
+      end
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      updated = execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_seconds, workflow_id, worker_pool])
-      return workflow(workflow_id) if updated.affected_rows == 1
+      transaction do
+        candidate = execute_store_query(:claim_workflow_for_activation_lock, [workflow_id, worker_pool, worker_id]).first
+        next unless candidate
 
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      decode_row(already_owned) if already_owned
+        execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+        workflow(workflow_id)
+      end
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
@@ -86,13 +90,17 @@ module Durababble
     def release_worker_leases!(worker_id:)
       transaction do
         workflow_index = index_name("workflows", "worker_lease")
-        workflows = execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index).affected_rows.to_i
+        workflows = execute_store_query(:count_workflow_leases, [worker_id], index: workflow_index).first.fetch("count").to_i
+        execute_store_query(:release_workflow_leases, [worker_id], index: workflow_index)
         outbox_index = index_name("outbox", "worker_lease")
-        outbox = execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index).affected_rows.to_i
+        outbox = execute_store_query(:count_outbox_leases, [worker_id], index: outbox_index).first.fetch("count").to_i
+        execute_store_query(:release_outbox_leases, [worker_id], index: outbox_index)
         inbox_index = index_name("inbox", "worker_lease")
-        inbox = execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index).affected_rows.to_i
+        inbox = execute_store_query(:count_inbox_leases, [worker_id], index: inbox_index).first.fetch("count").to_i
+        execute_store_query(:release_inbox_leases, [worker_id], index: inbox_index)
         target_activation_index = index_name("target_activations", "worker_lease")
-        target_activations = execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index).affected_rows.to_i
+        target_activations = execute_store_query(:count_target_activation_leases, [worker_id], index: target_activation_index).first.fetch("count").to_i
+        execute_store_query(:release_target_activation_leases, [worker_id], index: target_activation_index)
         objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows.to_i
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)

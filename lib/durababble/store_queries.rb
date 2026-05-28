@@ -523,10 +523,17 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_workflow_already_owned, backend: :mysql, description: "Check whether this worker already holds a live workflow lease.") do |store|
+    define(:mysql_claim_workflow_lock, backend: :mysql, description: "Lock a target workflow row before a MySQL lease update.") do |store|
       <<~SQL.chomp
-        SELECT * FROM #{table(store, "workflows")}
-        WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
+        SELECT id FROM #{table(store, "workflows")}
+        WHERE id = ? AND worker_pool = ?
+          AND (
+            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
+            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
+            OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
+          )
+        FOR UPDATE SKIP LOCKED
       SQL
     end
 
@@ -535,12 +542,6 @@ module Durababble
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
-            OR (status = 'running' AND locked_until < NOW(6))
-          )
       SQL
     end
 
@@ -625,6 +626,10 @@ module Durababble
       SQL
     end
 
+    define(:mysql_count_workflow_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "workflows")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
+    end
+
     define(:mysql_release_workflow_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")} FORCE INDEX (#{index})
@@ -643,6 +648,10 @@ module Durababble
         SET status = 'pending', locked_by = NULL, locked_until = NULL
         WHERE status = 'processing' AND locked_by = ?
       SQL
+    end
+
+    define(:mysql_count_outbox_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "outbox")} FORCE INDEX (#{index}) WHERE status = 'processing' AND locked_by = ?"
     end
 
     define(:mysql_claim_pending_outbox, backend: :mysql) do |store|
@@ -1325,6 +1334,7 @@ module Durababble
         SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
         FROM #{table(store, "workflow_history")}
         WHERE workflow_id = $8
+        RETURNING event_index
       SQL
     end
 
@@ -1387,19 +1397,31 @@ module Durababble
       "UPDATE #{table(store, "workflows")} SET status = 'running', error = NULL, updated_at = NOW(6) WHERE id = ? AND worker_pool = ? AND status = 'pending' AND locked_by IS NULL"
     end
 
-    define(:mysql_claim_workflow_for_activation_update, backend: :mysql, description: "Claim a workflow through its activation path.") do |store|
+    define(:mysql_claim_workflow_for_activation_lock, backend: :mysql, description: "Lock a workflow activation target before claiming it.") do |store|
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SELECT id FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR status = 'waiting'
             OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
             OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= NOW(6))
-            OR (status = 'running' AND locked_until < NOW(6))
+            OR (status = 'running' AND (locked_by = ? OR locked_until < NOW(6)))
           )
+        FOR UPDATE SKIP LOCKED
       SQL
+    end
+
+    define(:mysql_claim_workflow_for_activation_update, backend: :mysql, description: "Claim a workflow through its activation path.") do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "workflows")}
+        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        WHERE id = ? AND worker_pool = ?
+      SQL
+    end
+
+    define(:mysql_count_inbox_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "inbox")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
     end
 
     define(:mysql_release_inbox_leases, backend: :mysql) do |store, index:|
@@ -1408,6 +1430,10 @@ module Durababble
         SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE status = 'running' AND locked_by = ?
       SQL
+    end
+
+    define(:mysql_count_target_activation_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "target_activations")} FORCE INDEX (#{index}) WHERE status = 'running' AND locked_by = ?"
     end
 
     define(:mysql_release_target_activation_leases, backend: :mysql) do |store, index:|
@@ -2088,6 +2114,10 @@ module Durababble
       SQL
     end
 
+    define(:mysql_inserted_workflow_history_event_index, backend: :mysql, description: "Read the workflow history event index inserted by the previous statement.") do |store|
+      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
+    end
+
     define(:mysql_workflow_history_for, backend: :mysql, description: "Read workflow history events in replay order.") do |store|
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = ? ORDER BY event_index"
     end
@@ -2209,6 +2239,19 @@ module Durababble
           LIMIT 1
         )
       SQL
+    end
+
+    define(:sqlite_insert_workflow_history, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
+        FROM #{table(store, "workflow_history")}
+        WHERE workflow_id = ?
+      SQL
+    end
+
+    define(:sqlite_inserted_workflow_history_event_index, backend: :sqlite) do |store|
+      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     # No :sqlite_claim_object_lease override: the two-step

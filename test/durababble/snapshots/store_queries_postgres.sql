@@ -374,6 +374,7 @@ INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_inde
 SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
 FROM "durababble_pg_snapshot"."workflow_history"
 WHERE workflow_id = $8
+RETURNING event_index
 
 -- pg_insert_workflow_with_worker
 INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))

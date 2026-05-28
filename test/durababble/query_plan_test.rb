@@ -84,8 +84,9 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_claim_selected_outbox,
     :mysql_claim_selected_target_activation,
     :mysql_claim_selected_workflow,
-    :mysql_claim_workflow_already_owned,
+    :mysql_claim_workflow_for_activation_lock,
     :mysql_claim_workflow_for_activation_update,
+    :mysql_claim_workflow_lock,
     :mysql_claim_workflow_update,
     :mysql_complete_fence,
     :mysql_complete_inbox_message,
@@ -423,9 +424,13 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   test "mysql lease query builders accept explicit force indexes" do
     store = fake_store_with_prefix(:mysql)
     indexed_queries = {
+      count_workflow_leases: "workflows_worker_lease_idx",
       release_workflow_leases: "workflows_worker_lease_idx",
+      count_outbox_leases: "outbox_worker_lease_idx",
       release_outbox_leases: "outbox_worker_lease_idx",
+      count_inbox_leases: "inbox_worker_lease_idx",
       release_inbox_leases: "inbox_worker_lease_idx",
+      count_target_activation_leases: "target_activations_worker_lease_idx",
       release_target_activation_leases: "target_activations_worker_lease_idx",
     }
 
@@ -755,19 +760,19 @@ class DurababbleQueryPlanTest < DurababbleTestCase
         ('pending-target', 'demo', 'pending', decode('#{serialized_count}', 'hex'), NULL, NULL, now() - interval '2 hours', now()),
         ('running-owned', 'demo', 'running', decode('#{serialized_count}', 'hex'), 'owner', now() + interval '5 minutes', now() - interval '3 hours', now());
 
-	      INSERT INTO #{quoted_schema}.workflows (
-	        id, name, status, input, worker_pool, child_origin_kind, parent_workflow_id,
-	        parent_command_id, child_cancellation_policy, created_at, updated_at
-	      )
-	      VALUES
-	        ('child-workflow-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'workflow', 'running-owned', 42, 'request_cancel', now() - interval '1 hour', now());
+        INSERT INTO #{quoted_schema}.workflows (
+          id, name, status, input, worker_pool, child_origin_kind, parent_workflow_id,
+          parent_command_id, child_cancellation_policy, created_at, updated_at
+        )
+        VALUES
+          ('child-workflow-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'workflow', 'running-owned', 42, 'request_cancel', now() - interval '1 hour', now());
 
-	      INSERT INTO #{quoted_schema}.workflows (
-	        id, name, status, input, worker_pool, child_origin_kind, parent_object_type,
-	        parent_object_id, parent_object_command_id, child_cancellation_policy, created_at, updated_at
-	      )
-	      VALUES
-	        ('child-object-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'object', 'counter', 'object-1', 'command-1', 'abandon', now() - interval '1 hour', now());
+        INSERT INTO #{quoted_schema}.workflows (
+          id, name, status, input, worker_pool, child_origin_kind, parent_object_type,
+          parent_object_id, parent_object_command_id, child_cancellation_policy, created_at, updated_at
+        )
+        VALUES
+          ('child-object-existing', 'child-demo', 'pending', decode('#{serialized_count}', 'hex'), 'default', 'object', 'counter', 'object-1', 'command-1', 'abandon', now() - interval '1 hour', now());
 
       INSERT INTO #{quoted_schema}.steps (workflow_id, position, name, status, result, started_at, completed_at, updated_at)
       SELECT 'running-owned', i, 'step-' || i, CASE WHEN i = 0 THEN 'running' ELSE 'completed' END, decode('#{serialized_result}', 'hex'), now() - (i || ' seconds')::interval, now(), now()
