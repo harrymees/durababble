@@ -7,10 +7,9 @@ require_relative "../test_helper"
 
 # End-to-end coverage for the streaming-result consumer entrypoints: opening a
 # stream off a `DurableObjectRef` / `WorkflowRef` and the routing that picks a
-# local snapshot vs. the lease-holding worker. The remote paths run a real
-# `Rpc::Server` whose handler is a `StreamDispatcher`, exercising the full
-# WorkflowRef -> rpc_client_factory -> Client -> Server -> dispatcher -> producer
-# round-trip over localhost gRPC.
+# lease-holding worker. The remote paths run a real `Rpc::Server` whose handler
+# is a `StreamDispatcher`, exercising the full WorkflowRef -> rpc_client_factory
+# -> Client -> Server -> dispatcher -> producer round-trip over localhost gRPC.
 class DurababbleStreamConsumerTest < DurababbleTestCase
   def setup
     @durababble_backend = durababble_store_backends.first
@@ -18,10 +17,13 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     @durababble_store = Durababble::Store.connect(database_url:, schema:)
     @durababble_store.migrate!
     @servers = []
+    @object_hosts = []
   end
 
   def teardown
+    @object_hosts.each(&:stop!)
     @servers.each(&:stop)
+    @object_hosts = nil
     @servers = nil
     @durababble_store&.drop_schema!
     @durababble_store&.close
@@ -30,7 +32,15 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     @durababble_backend = nil
   end
 
-  test "a durable-object stream runs against a local state snapshot" do
+  test "a durable-object stream with no lease and no local host raises NoActiveLease after the pull timeout" do
+    # PR #2 unsoundness fix: a plain consumer (no `Durababble.local_stream_host`)
+    # MUST NOT fall back to a local snapshot: a worker can claim the unified
+    # object lease at any moment after the snapshot was read, leaving the
+    # consumer emitting from a frozen view while commands mutate state on the
+    # owner. Without a worker in this test, the activation upserted by
+    # `pull_object_owner` is never claimed; the consumer polls until the wait
+    # window elapses, then raises `NoActiveLease` instead of silently producing
+    # values from a divergent local state.
     object_class = Class.new(Durababble::DurableObject) do
       object_type "snapshot_log"
       expose_stream :entries
@@ -40,9 +50,44 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     end
     store.save_object_state(object_type: "snapshot_log", object_id: "log-1", state: ["x", "y", "z"])
 
+    with_stream_pull_tunables(timeout: 0.5, poll_interval: 0.05, reupsert_interval: 0.2) do
+      stream = object_class.at("log-1", store:).entries
+
+      assert_raises(Durababble::WorkflowRpc::NoActiveLease) { stream.to_a }
+    end
+  end
+
+  test "a durable-object stream with no lease bootstraps an owner via upsert_target_activation and routes remote" do
+    # PR #2: when no lease and no local host exists, the consumer asks the
+    # scheduler to activate the object via `upsert_target_activation` and polls
+    # `current_object_lease` until a worker claims it. Here we run a worker in
+    # the background so `process_object_activation` picks up the row, claims
+    # the per-object lease (PR #1's eager claim), and the consumer's poll then
+    # finds a holder to RPC. The stream is served from the worker's
+    # `StreamDispatcher` over a real loopback Rpc::Server.
+    object_class = Class.new(Durababble::DurableObject) do
+      object_type "pull_owner_log"
+      expose_stream :entries
+      def entries(&block)
+        ["a", "b", "c"].each { |entry| block.call(entry) }
+      end
+    end
+
+    server = start_dispatch_server(objects: [object_class])
+    # Pre-claim the object lease for the dispatcher's node so the consumer's
+    # first poll resolves immediately. This isolates the test from the
+    # worker-claim cadence and exercises only the consumer-side pull plumbing.
+    store.claim_object_lease(
+      worker_pool: "default",
+      object_type: object_class.object_type,
+      object_id: "log-1",
+      worker_id: server.node_id,
+      lease_seconds: 60,
+    )
+
     stream = object_class.at("log-1", store:).entries
 
-    assert_equal ["x", "y", "z"], stream.to_a
+    assert_equal(["a", "b", "c"], stream.to_a)
   end
 
   test "a workflow stream with no active lease runs against a local snapshot" do
@@ -131,7 +176,13 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     )
     task = Async::Task.current? || raise("start_dispatch_server requires an active Async task")
     server.start_async(parent: task)
-    dispatcher = Durababble::StreamDispatcher.new(store:, workflows:, objects:, node_id: server.node_id)
+    object_host = if objects.empty?
+      nil
+    else
+      Durababble::ObjectStreamHost.new(store:, worker_id: server.node_id, node_id: server.node_id, worker_pool: "default", lease_seconds: 60, renew_interval: 1.0)
+    end
+    dispatcher = Durababble::StreamDispatcher.new(store:, workflows:, objects:, node_id: server.node_id, object_stream_host: object_host, lease_seconds: 60)
+    @object_hosts << object_host if object_host
     @servers << server
     server
   end
@@ -140,6 +191,27 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
     current_owner = store.workflow(workflow_id)["locked_by"]
     store.release_worker_leases!(worker_id: current_owner) if current_owner
     store.claim_workflow(workflow_id:, worker_id: to, lease_seconds: 60)
+  end
+
+  # Temporarily override the consumer-pull tunables on `DurableObjectRef` so
+  # the unsoundness-fix test does not block for the full production timeout.
+  # Restores the originals in an ensure even if the test raises.
+  def with_stream_pull_tunables(timeout:, poll_interval:, reupsert_interval:)
+    klass = Durababble::DurableObjectRef
+    original_timeout = klass.send(:remove_const, :STREAM_PULL_TIMEOUT)
+    original_poll = klass.send(:remove_const, :STREAM_PULL_POLL_INTERVAL)
+    original_upsert = klass.send(:remove_const, :STREAM_PULL_REUPSERT_INTERVAL)
+    klass.const_set(:STREAM_PULL_TIMEOUT, timeout)
+    klass.const_set(:STREAM_PULL_POLL_INTERVAL, poll_interval)
+    klass.const_set(:STREAM_PULL_REUPSERT_INTERVAL, reupsert_interval)
+    yield
+  ensure
+    klass.send(:remove_const, :STREAM_PULL_TIMEOUT)
+    klass.const_set(:STREAM_PULL_TIMEOUT, original_timeout)
+    klass.send(:remove_const, :STREAM_PULL_POLL_INTERVAL)
+    klass.const_set(:STREAM_PULL_POLL_INTERVAL, original_poll)
+    klass.send(:remove_const, :STREAM_PULL_REUPSERT_INTERVAL)
+    klass.const_set(:STREAM_PULL_REUPSERT_INTERVAL, original_upsert)
   end
 
   def database_url

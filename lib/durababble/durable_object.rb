@@ -2,14 +2,17 @@
 # frozen_string_literal: true
 
 require "digest"
+require "securerandom"
 
 require_relative "durable_method_dsl"
 require_relative "child_workflow_reuse"
 require_relative "execution_context"
 require_relative "error_formatting"
+require_relative "worker_identity"
 
 module Durababble
   CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
+  class ObjectReadBlocked < Error; end
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -339,6 +342,46 @@ module Durababble
 
   class DurableObjectRef
     COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
+    TRANSIENT_ROUTE_ATTEMPTS = 2
+    TRANSIENT_OWNER_RELEASE_WAIT_SECONDS = 0.25
+    TRANSIENT_OWNER_RELEASE_POLL_INTERVAL = 0.005
+    LOCAL_QUERY_LEASE_SECONDS = 30
+
+    class TransientRequest
+      #: String
+      attr_reader :class_name, :worker_pool
+      #: String
+      attr_reader :durable_object_id
+
+      #: (class_name: String, object_id: String, method: String, worker_pool: String) -> void
+      def initialize(class_name:, object_id:, method:, worker_pool:)
+        @class_name = class_name
+        @durable_object_id = object_id
+        @method = method
+        @worker_pool = worker_pool
+      end
+
+      #: (String | Symbol) -> String?
+      def [](key)
+        case key.to_s
+        when "method"
+          @method
+        when "object_id"
+          @durable_object_id
+        end
+      end
+    end
+
+    # Tunables for `open_pulled_object_stream` (consumer-side activation pull).
+    # The poll interval is tight (25ms) so the consumer catches a worker's
+    # short-lived activation lease on an empty inbox. The re-upsert interval is
+    # ~10× the typical worker target-activation poll so a freshly-completed
+    # activation gets renewed before the next worker tick. The total wait of
+    # 10s bounds how long a consumer blocks before reporting that no worker
+    # could establish ownership.
+    STREAM_PULL_POLL_INTERVAL = 0.025
+    STREAM_PULL_REUPSERT_INTERVAL = 0.5
+    STREAM_PULL_TIMEOUT = 10.0
 
     #: (Object, String, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
     def initialize(object_class, durable_id, store:, worker_pool: nil, idempotency_key: nil)
@@ -415,8 +458,12 @@ module Durababble
     # itself a worker, the consumer self-routes to its own RPC server via
     # `Durababble.local_stream_host`; the server-side dispatcher then claims the
     # lease as part of `with_lease`, so the first opener becomes the owner.
-    # Plain consumers without a local host fall back to a local state snapshot
-    # (same semantics as exposed queries).
+    # When no lease and no local host exists (plain consumer / external caller),
+    # the consumer asks the scheduler to activate the object via
+    # `upsert_target_activation`, then polls for the lease to appear and routes
+    # remote once a worker has claimed it. A snapshot fallback would diverge
+    # from a worker that claims the lease concurrently, with no `StaleLease`
+    # terminal frame to recover from, so this lane never serves snapshots.
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> ResultStream
     def open_object_stream(method_name, args:, kwargs:)
       lease = @store.current_object_lease(@object_class.object_type, @durable_id)
@@ -426,7 +473,7 @@ module Durababble
         synthetic = { "worker_id" => host.worker_id, "worker_pool" => host.worker_pool }
         open_remote_object_stream(method_name, args:, kwargs:, lease: synthetic)
       else
-        open_local_object_stream(method_name, args:, kwargs:)
+        open_pulled_object_stream(method_name, args:, kwargs:)
       end
     end
 
@@ -495,25 +542,71 @@ module Durababble
       count
     end
 
-    # No live lease and no local host: run the `expose_stream` method against a
-    # local snapshot instance as the `ResultStream`'s producer task. Publishes
-    # the writer so `Durababble.stream_cancelled?` works inside the method body.
+    # No live lease and no local host: ask the scheduler to wake up a worker
+    # that will claim the per-object lease via `process_object_activation`, then
+    # poll `current_object_lease` until one appears, then route the stream
+    # remote. The lazy `ResultStream` producer block defers all of this until
+    # the consumer starts iterating, so an unconsumed stream costs nothing.
+    #
+    # The polling loop re-upserts the activation row periodically so a worker
+    # that completed (and de-queued) the activation between two polls re-claims
+    # on the next cycle: any single activation's lease window may be short on
+    # an empty inbox, and the consumer might miss it, but a repeating activation
+    # gives the next poll a fresh window to catch.
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> ResultStream
-    def open_local_object_stream(method_name, args:, kwargs:)
+    def open_pulled_object_stream(method_name, args:, kwargs:)
       object_class = @object_class
-      store = @store
       durable_id = @durable_id
-      worker_pool = @worker_pool
+      store = @store
+      ref_pool = @worker_pool
       ResultStream.new do |writer|
-        StreamExecutionContext.with_current(writer) do
-          state = DurableObject.state_from_store(store, object_type: object_class.object_type, object_id: durable_id)
-          object = object_class.new(durable_id:, state:, store:, worker_pool:) #: as untyped
-          object.instance_variable_set(:@__durababble_query_context, true)
-          ObjectQueryExecutionContext.with_current(object) do
-            emit = ->(value) { writer.emit(value) }
-            object.public_send(method_name, *args, **kwargs, &emit)
-          end
+        lease = pull_object_owner(store:, worker_pool: ref_pool, object_type: object_class.object_type, object_id: durable_id, writer:)
+        attempts = 0
+        emitted = 0
+        current = lease
+        begin
+          attempts += 1
+          emitted = run_object_remote_request(method_name, args:, kwargs:, lease: current, store:, writer:, object_class:, durable_id:, ref_pool:)
+        rescue WorkflowRpc::StaleLease, WorkflowRpc::NodeUnavailable
+          # Same bounded re-resolve as `open_remote_object_stream`: once a frame
+          # has been delivered, retry would double-emit. Otherwise fetch a fresh
+          # owner and try once more.
+          raise if emitted.positive? || attempts >= 2
+
+          refreshed = store.current_object_lease(object_class.object_type, durable_id)
+          raise unless refreshed
+
+          current = refreshed
+          retry
         end
+      end
+    end
+
+    # Bootstrap activation and poll for an owner. Returns a lease row once a
+    # worker has claimed the per-object lease, or raises `NoActiveLease` after
+    # the wait window elapses. Re-upserts periodically so the activation row
+    # stays pending across the wait. Exits early if the consumer cancelled.
+    #: (store: untyped, worker_pool: String, object_type: String, object_id: String, writer: untyped) -> Hash[String, Object?]
+    def pull_object_owner(store:, worker_pool:, object_type:, object_id:, writer:)
+      deadline = Time.now + STREAM_PULL_TIMEOUT
+      next_upsert_at = Time.now
+      loop do
+        raise WorkflowRpc::NoActiveLease, "stream cancelled before owner became available for #{object_type}/#{object_id}" if writer.cancelled?
+
+        if Time.now >= next_upsert_at
+          store.upsert_target_activation(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
+          next_upsert_at = Time.now + STREAM_PULL_REUPSERT_INTERVAL
+        end
+
+        lease = store.current_object_lease(object_type, object_id)
+        return lease if lease
+
+        if Time.now >= deadline
+          raise WorkflowRpc::NoActiveLease,
+            "no worker established ownership of #{object_type}/#{object_id} within #{STREAM_PULL_TIMEOUT}s"
+        end
+
+        sleep(STREAM_PULL_POLL_INTERVAL)
       end
     end
 
@@ -521,13 +614,138 @@ module Durababble
     def invoke_query(method_name, args:, kwargs:, block:)
       attributes = object_attributes(method_name:)
       Observability.trace("durababble.object.query", attributes) do
-        state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
-        object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
-        object.instance_variable_set(:@__durababble_query_context, true)
-        ObjectQueryExecutionContext.with_current(object) do
-          object.public_send(method_name, *args, **kwargs, &block)
+        attempts = 0
+        begin
+          if (lease = current_object_lease)
+            return invoke_owned_query(method_name, args:, kwargs:, block:, lease:) if current_runtime_owns?(lease)
+
+            begin
+              return invoke_remote_query(method_name, args:, kwargs:, lease:)
+            rescue WorkflowRpc::NodeUnavailable
+              refreshed = wait_for_object_lease_change(lease)
+              return invoke_claimed_local_query(method_name, args:, kwargs:, block:) unless refreshed
+
+              raise if same_lease_owner?(lease, refreshed)
+
+              raise WorkflowRpc::StaleLease, "durable object #{@object_class.object_type}/#{@durable_id} moved from #{lease.fetch("worker_id")} to #{refreshed.fetch("worker_id")}"
+            end
+          end
+
+          invoke_claimed_local_query(method_name, args:, kwargs:, block:)
+        rescue WorkflowRpc::NoActiveLease, WorkflowRpc::StaleLease
+          attempts += 1
+          retry if attempts < TRANSIENT_ROUTE_ATTEMPTS
+
+          raise
         end
       end
+    end
+
+    #: () -> Hash[String, Object?]?
+    def current_object_lease
+      @store.current_object_lease(@object_class.object_type, @durable_id)
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def current_runtime_owns?(lease)
+      worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
+      worker_id = worker_id #: as untyped
+      worker_id = worker_id.call if worker_id.respond_to?(:call)
+      !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
+    end
+
+    #: (Hash[String, Object?]) -> Hash[String, Object?]?
+    def wait_for_object_lease_change(previous)
+      deadline = Time.now + TRANSIENT_OWNER_RELEASE_WAIT_SECONDS
+      loop do
+        refreshed = current_object_lease
+        return refreshed unless same_lease_owner?(previous, refreshed)
+        return refreshed if Time.now >= deadline
+
+        sleep(TRANSIENT_OWNER_RELEASE_POLL_INTERVAL)
+      end
+    end
+
+    #: (Hash[String, Object?], Hash[String, Object?]?) -> bool
+    def same_lease_owner?(previous, refreshed)
+      !!(refreshed && refreshed.fetch("worker_id") == previous.fetch("worker_id"))
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, lease: Hash[String, Object?]) -> Object?
+    def invoke_owned_query(method_name, args:, kwargs:, block:, lease:)
+      worker_pool = lease_worker_pool(lease)
+      handler = @store.local_transient_handler if @store.respond_to?(:local_transient_handler)
+      handler = handler #: as untyped
+      if handler
+        return handler.call(
+          request: TransientRequest.new(class_name: @object_class.object_type, object_id: @durable_id, method: method_name.to_s, worker_pool:),
+          args: { "args" => args, "kwargs" => kwargs },
+        )
+      end
+
+      DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
+      invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], lease: Hash[String, Object?]) -> Object?
+    def invoke_remote_query(method_name, args:, kwargs:, lease:)
+      worker_id = lease.fetch("worker_id").to_s
+      worker_pool = lease_worker_pool(lease)
+      rpc_client_factory = @store.rpc_client_factory #: as untyped
+      client = rpc_client_factory.call(WorkerIdentity.address_for(worker_id))
+      client.call_transient(
+        worker_pool:,
+        class_name: @object_class.object_type,
+        durable_object_id: @durable_id,
+        method: method_name.to_s,
+        args: { "args" => args, "kwargs" => kwargs },
+      )
+    rescue Durababble::Rpc::Unavailable => e
+      raise WorkflowRpc::NodeUnavailable, e.message
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?) -> Object?
+    def invoke_claimed_local_query(method_name, args:, kwargs:, block:)
+      worker_id = local_query_worker_id
+      holder = @store.claim_object_lease(
+        worker_pool: @worker_pool,
+        object_type: @object_class.object_type,
+        object_id: @durable_id,
+        worker_id:,
+        lease_seconds: LOCAL_QUERY_LEASE_SECONDS,
+      )
+      raise WorkflowRpc::NoActiveLease, "durable object #{@object_class.object_type}/#{@durable_id} has no active owner" unless holder
+
+      worker_pool = lease_worker_pool(holder)
+      begin
+        DurableObjectTransientHandler.assert_read_gate_open!(@store, worker_pool:, object_type: @object_class.object_type, object_id: @durable_id)
+        invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+      ensure
+        @store.release_object_lease(object_type: @object_class.object_type, object_id: @durable_id, worker_id:)
+      end
+    end
+
+    #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, worker_pool: String) -> Object?
+    def invoke_local_query(method_name, args:, kwargs:, block:, worker_pool:)
+      state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
+      object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool:) #: as untyped
+      object.instance_variable_set(:@__durababble_query_context, true)
+      ObjectQueryExecutionContext.with_current(object) do
+        kwargs.empty? ? object.public_send(method_name, *args, &block) : object.public_send(method_name, *args, **kwargs, &block)
+      end
+    end
+
+    #: () -> String
+    def local_query_worker_id
+      worker_id = @store.local_worker_id if @store.respond_to?(:local_worker_id)
+      worker_id = worker_id #: as untyped
+      worker_id = worker_id.call if worker_id.respond_to?(:call)
+      worker_id&.to_s || "durababble-local-query-#{Process.pid}-#{SecureRandom.hex(6)}"
+    end
+
+    #: (Hash[String, Object?]) -> String
+    def lease_worker_pool(lease)
+      lease.fetch("worker_pool", @worker_pool).to_s
     end
 
     #: (Symbol, retry_policy: RetryPolicy, args: Array[Object?], kwargs: Hash[Symbol, Object?], ?idempotency_key: Object?) -> Object?
@@ -583,6 +801,115 @@ module Durababble
     end
   end
 
+  class DurableObjectTransientHandler
+    BLOCKING_READ_STATUSES = ["pending", "failed", "running", "dead_lettered"].freeze
+
+    class << self
+      #: (untyped, object_type: untyped, object_id: untyped, ?worker_pool: untyped) -> void
+      def assert_read_gate_open!(store, object_type:, object_id:, worker_pool: "default")
+        blocker = blocking_read_message(store, worker_pool:, object_type:, object_id:)
+        return unless blocker
+
+        raise ObjectReadBlocked, "durable object #{object_type}/#{object_id} transient read is blocked by #{blocker.fetch("status")} mailbox head #{blocker.fetch("id")}"
+      end
+
+      private
+
+      #: (untyped, worker_pool: untyped, object_type: untyped, object_id: untyped) -> untyped
+      def blocking_read_message(store, worker_pool:, object_type:, object_id:)
+        return unless store.respond_to?(:inbox_messages_for)
+
+        messages = store.inbox_messages_for(worker_pool:, target_kind: "object", target_type: object_type, target_id: object_id)
+        messages.find { |message| BLOCKING_READ_STATUSES.include?(message.fetch("status").to_s) }
+      end
+    end
+
+    #: (store: untyped, objects: untyped, node_id: untyped) -> void
+    def initialize(store:, objects:, node_id:)
+      @store = store
+      @objects = normalize_objects(objects)
+      @node_id = node_id
+    end
+
+    #: (request: untyped, args: untyped) -> untyped
+    def call(request:, args:)
+      object_type = request.class_name
+      object_id = durable_object_id(request)
+      method_name = request["method"].to_sym
+      worker_pool = worker_pool_for(request)
+      object_class = @objects.fetch(object_type) do
+        raise WorkflowRpc::UnknownCommand, "unknown durable object type #{object_type}"
+      end
+      unless object_class.exposed_queries.key?(method_name)
+        raise WorkflowRpc::UnknownCommand, "unknown durable object transient method #{object_type}##{method_name}"
+      end
+
+      assert_current_lease!(object_type:, object_id:)
+      self.class.assert_read_gate_open!(@store, worker_pool:, object_type:, object_id:)
+      result = invoke_query(object_class, worker_pool:, object_id:, method_name:, payload: args || {})
+      assert_current_lease!(object_type:, object_id:)
+      result
+    end
+
+    private
+
+    #: (untyped) -> untyped
+    def normalize_objects(objects)
+      case objects
+      when Hash
+        objects.transform_keys(&:to_s)
+      else
+        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
+      end
+    end
+
+    #: (object_type: untyped, object_id: untyped) -> void
+    def assert_current_lease!(object_type:, object_id:)
+      lease = @store.current_object_lease(object_type, object_id)
+      raise WorkflowRpc::NoActiveLease, "durable object #{object_type}/#{object_id} has no active owner" unless lease
+
+      expected = node_id
+      return if lease.fetch("worker_id") == expected
+
+      raise WorkflowRpc::StaleLease, "#{expected} no longer owns durable object #{object_type}/#{object_id}; current owner is #{lease.fetch("worker_id")}"
+    end
+
+    #: () -> untyped
+    def node_id
+      @node_id.respond_to?(:call) ? @node_id.call : @node_id
+    end
+
+    #: (untyped) -> String
+    def worker_pool_for(request)
+      return request.worker_pool.to_s if request.respond_to?(:worker_pool) && !request.worker_pool.to_s.empty?
+
+      "default"
+    end
+
+    #: (untyped) -> String
+    def durable_object_id(request)
+      request.respond_to?(:durable_object_id) ? request.durable_object_id.to_s : request["object_id"].to_s
+    end
+
+    #: (untyped, worker_pool: untyped, object_id: untyped, method_name: untyped, payload: untyped) -> untyped
+    def invoke_query(object_class, worker_pool:, object_id:, method_name:, payload:)
+      payload ||= {}
+      args = payload.fetch("args", [])
+      kwargs = symbolize_keys(payload.fetch("kwargs", {}))
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
+      object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:) #: as untyped
+      object.instance_variable_set(:@__durababble_query_context, true)
+      kwargs.empty? ? object.public_send(method_name, *args) : object.public_send(method_name, *args, **kwargs)
+    end
+
+    #: (untyped) -> Hash[Symbol, untyped]
+    def symbolize_keys(value)
+      return {} unless value.is_a?(Hash)
+
+      value.each_with_object({}) { |(key, val), acc| acc[key.to_sym] = val }
+    end
+  end
+
   class DurableObjectExecutor
     #: (store: Store, objects: Object, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def initialize(store:, objects:, worker_id:, lease_seconds:, worker_pool: "default")
@@ -619,14 +946,26 @@ module Durababble
       # The gated claim inside `claim_inbox_messages` acquires the unified object
       # lease as part of taking command rows; releasing it when drain returns hands
       # ownership back so another worker (or this one's stream lane on a future
-      # opener) can claim. If a streaming `ObjectStreamHost` is currently using the
-      # same lease, its renewal task will lose this row and the stream ends with
-      # `StaleLease`, which is the documented graceful-eviction behavior. Skipping
-      # this release would strand the lease for `lease_seconds` after the worker
-      # idles, blocking any other node from picking up the next command. Every
-      # Store implementation provides `release_object_lease`; the base no-op
-      # falls through cleanly when no lease was actually taken.
-      @store.release_object_lease(object_type:, object_id:, worker_id: @worker_id)
+      # opener) can claim. Skipping this release would strand the lease for
+      # `lease_seconds` after the worker idles, blocking any other node from
+      # picking up the next command. Every Store implementation provides
+      # `release_object_lease`; the base no-op falls through cleanly when no
+      # lease was actually taken.
+      #
+      # However, if an `ObjectStreamHost` on this process currently holds the
+      # SAME unified lease (because a `with_lease` refcount is keeping a stream
+      # RPC alive on this worker), releasing the row here would yank the lease
+      # out from under that stream and surface as a `StaleLease`. The host
+      # claimed via `Store#claim_object_lease` with this worker's id (idempotent
+      # when we already held it), so its refcount is the authoritative signal
+      # for "an in-flight stream still needs this lease": defer to it and let
+      # the host's own release run when refcount drops to zero.
+      host = Durababble.local_stream_host #: as ObjectStreamHost?
+      if host && host.worker_id == @worker_id && host.holds?(worker_pool: @worker_pool, object_type:, object_id:)
+        # Host's refcount drives release.
+      else
+        @store.release_object_lease(object_type:, object_id:, worker_id: @worker_id)
+      end
     end
 
     private
