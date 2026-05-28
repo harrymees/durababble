@@ -62,27 +62,51 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         install_sql_query_counter
 
         started_workflow = store.create_workflow(name: "query-count-step-start", input: {})
-        attempt_id = assert_sql_query_budget("record_step_started", mysql: 6, postgres: 6) do
-          store.record_step_started(workflow_id: started_workflow, command_id: 0, name: "step")
+        started_index = next_event_index(started_workflow)
+        attempt_id = assert_sql_query_budget("record_step_started", mysql: 4, postgres: 5) do
+          store.record_step_started(
+            workflow_id: started_workflow,
+            command_id: 0,
+            name: "step",
+            event_index: started_index,
+          )
         end
         refute_nil attempt_id
 
         completed_workflow = store.create_workflow(name: "query-count-step-complete", input: {})
-        store.record_step_started(workflow_id: completed_workflow, command_id: 0, name: "step")
-        assert_sql_query_budget("record_step_completed", mysql: 5, postgres: 5) do
-          store.record_step_completed(workflow_id: completed_workflow, command_id: 0, result: { "done" => true })
+        store.record_step_started(
+          workflow_id: completed_workflow,
+          command_id: 0,
+          name: "step",
+          event_index: next_event_index(completed_workflow),
+        )
+        completed_index = next_event_index(completed_workflow)
+        assert_sql_query_budget("record_step_completed", mysql: 3, postgres: 4) do
+          store.record_step_completed(
+            workflow_id: completed_workflow,
+            command_id: 0,
+            result: { "done" => true },
+            event_index: completed_index,
+          )
         end
         assert_hash_includes store.steps_for(completed_workflow).first, "status" => "completed", "result" => { "done" => true }
 
         wait_workflow = store.create_workflow(name: "query-count-record-wait", input: {})
-        store.record_step_started(workflow_id: wait_workflow, command_id: 0, name: "timer")
-        wait_id = assert_sql_query_budget("record_wait", mysql: 5, postgres: 5) do
+        store.record_step_started(
+          workflow_id: wait_workflow,
+          command_id: 0,
+          name: "timer",
+          event_index: next_event_index(wait_workflow),
+        )
+        wait_index = next_event_index(wait_workflow)
+        wait_id = assert_sql_query_budget("record_wait", mysql: 3, postgres: 4) do
           store.record_wait(
             workflow_id: wait_workflow,
             command_id: 0,
             name: "timer",
             wait_request: Durababble.wait_until(Time.utc(2026, 2, 1, 0, 0, 0), { "timer" => true }),
             suspend_workflow: false,
+            event_index: wait_index,
           )
         end
         refute_nil wait_id
@@ -186,6 +210,15 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
     queries.each_with_index.map do |sql, index|
       "#{index + 1}. #{sql.gsub(/\s+/, " ").strip}"
     end.join("\n")
+  end
+
+  # The lease holder always knows the next physical event_index in memory; the
+  # hot path supplies it so the append is a single plain INSERT. Computed here
+  # outside the measured block, mirroring WorkflowReplayHistory#allocate_event_index!.
+  def next_event_index(workflow_id)
+    events = store.workflow_history_for(workflow_id)
+    max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
+    max ? max + 1 : 0
   end
 
   def prepare_release_worker_leases_fixture

@@ -79,15 +79,15 @@ class DurababbleEngineTest < DurababbleTestCase
       @messages.first(limit)
     end
 
-    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:, event_index: nil)
       @completed << { message_id:, workflow_id:, result:, worker_id: }
     end
 
-    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:, event_index: nil)
       @failed << { message_id:, workflow_id:, error:, worker_id: }
     end
 
-    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:, event_index: nil)
       @failed << { message_id:, workflow_id:, error:, worker_id:, ready_at: }
     end
 

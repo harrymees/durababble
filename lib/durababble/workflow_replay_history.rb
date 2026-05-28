@@ -24,6 +24,14 @@ module Durababble
       @consumed_event_indexes = {}
       @resolution_index = 0
       events.each { |event| index_event(event) }
+      # The next physical event_index to hand out for an append. Seeded one past
+      # the highest recorded index so a fresh allocation can never collide with
+      # loaded history, and only ever advanced by allocate_event_index! as real
+      # appends happen. This is distinct from @event_count, which is a coarse
+      # size budget (it reserves ahead and counts remembered-but-unwritten
+      # events); the physical PK sequence must come from here.
+      max_event_index = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
+      @next_event_index = max_event_index ? max_event_index + 1 : 0
       @terminal_events = @terminal.values.sort_by { |event| event.fetch("event_index").to_i }
       @workflow_command_events.sort_by! { |event| event.fetch("event_index").to_i }
       # Scheduled events remembered mid-replay carry no "event_index", so the set of
@@ -110,6 +118,19 @@ module Durababble
     #: (Integer) -> void
     def reserve_events!(count)
       @event_count += count
+    end
+
+    # Hand out the next physical event_index for a workflow_history append and
+    # advance the counter. Callers must invoke this inside synchronize_store so
+    # allocation order matches the order appends hit the store, mirroring the
+    # legacy SQL MAX(event_index)+1 path it replaces. A rolled-back or skipped
+    # append leaves a harmless gap: replay orders by event_index and relies on
+    # PK uniqueness, not contiguity.
+    #: () -> Integer
+    def allocate_event_index!
+      index = @next_event_index
+      @next_event_index += 1
+      index
     end
 
     #: (workflow_id: String, next_command_id: Integer) -> void

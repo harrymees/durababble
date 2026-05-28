@@ -155,14 +155,26 @@ module DurababbleMysqlHotPathReport
 
   class ScenarioContext
     attr_reader :store, :options
+    attr_accessor :next_event_index
 
     def initialize(store:, options:)
       @store = store
       @options = options
+      @next_event_index = nil
     end
 
     def fixture_size
       @options.fetch(:fixture_size)
+    end
+
+    # Mirror the lease holder's in-memory bookkeeping: the next physical
+    # event_index is max(recorded)+1. Computed in setup (recording disabled) so
+    # the measured append can pass it as a plain INSERT parameter, exactly as the
+    # execution path does via WorkflowReplayHistory#allocate_event_index!.
+    def compute_next_event_index(workflow_id)
+      events = store.workflow_history_for(workflow_id)
+      max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
+      max ? max + 1 : 0
     end
 
     def worker(
@@ -1204,6 +1216,7 @@ module DurababbleMysqlHotPathReport
         workflow_names: [DEFAULT_WORKFLOW_NAME],
         worker_pool: DEFAULT_WORKER_POOL,
       )
+      context.next_event_index = context.compute_next_event_index("hot-path-step")
     end,
   ) do |context|
     context.store.record_step_started(
@@ -1211,6 +1224,7 @@ module DurababbleMysqlHotPathReport
       name: "report-step",
       command_id: 1,
       worker_id: DEFAULT_WORKER_ID,
+      event_index: context.next_event_index,
     )
   end
 
@@ -1231,7 +1245,9 @@ module DurababbleMysqlHotPathReport
         name: "report-step",
         command_id: 1,
         worker_id: DEFAULT_WORKER_ID,
+        event_index: context.compute_next_event_index("hot-path-step"),
       )
+      context.next_event_index = context.compute_next_event_index("hot-path-step")
     end,
   ) do |context|
     context.store.record_step_completed(
@@ -1239,6 +1255,7 @@ module DurababbleMysqlHotPathReport
       command_id: 1,
       result: { "ok" => true },
       worker_id: DEFAULT_WORKER_ID,
+      event_index: context.next_event_index,
     )
   end
 end

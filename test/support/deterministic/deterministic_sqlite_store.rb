@@ -248,30 +248,30 @@ module Durababble
         out
       end
 
-      #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
-      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+      #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?, ?event_index: Integer?) -> Object?
+      def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil, event_index: nil)
         out = super
         trace_event("step_scheduled", id: workflow_id, command_id:, name:)
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
-      def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?, ?event_index: Integer?) -> Object?
+      def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil, event_index: nil)
         attempt_id = super
         trace_event("step_started", id: workflow_id, command_id: normalize_command_id(command_id, position), name:)
         attempt_id
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
-      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?, ?event_index: Integer?) -> Object?
+      def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil, event_index: nil)
         out = super
         trace_event("step_completed", id: workflow_id, command_id: normalize_command_id(command_id, position), result:)
         fault_plan.after(:record_step_completed)
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?event_index: Integer?) -> Object?
+      def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil, event_index: nil)
         out = super
         trace_event("step_failed", id: workflow_id, command_id: normalize_command_id(command_id, position), error:, terminal:)
         out
@@ -282,22 +282,22 @@ module Durababble
       # so emit the "step_failed" trace here to keep the retry path's trace
       # coherent with the exhausted path. schedule_workflow_retry still traces
       # "workflow_retry_scheduled" from inside the transaction via its own wrapper.
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Object?) -> Object?
-      def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Object?, ?event_index: Integer?) -> Object?
+      def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil, event_index: nil)
         out = super
         trace_event("step_failed", id: workflow_id, command_id: normalize_command_id(command_id, position), error:, terminal: false)
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
-      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?event_index: Integer?) -> Object?
+      def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, event_index: nil)
         out = super
         trace_event("step_canceled", id: workflow_id, command_id: normalize_command_id(command_id, position), error:)
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
-      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?, ?event_index: Integer?) -> Object?
+      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil, event_index: nil)
         wait_id = super
         trace_event("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
@@ -338,8 +338,8 @@ module Durababble
       # durably delivered but before it moved on to the next command / cleaned up
       # its activation lease — recovery must resume the remaining mailbox without
       # re-delivering the committed command.
-      #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
-      def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+      #: (message_id: String, workflow_id: String, result: Object?, worker_id: String, ?event_index: Integer?) -> Object?
+      def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:, event_index: nil)
         out = super
         if out
           trace_event("workflow_command_completed", id: workflow_id, message_id:)

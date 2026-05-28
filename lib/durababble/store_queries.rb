@@ -1304,6 +1304,18 @@ module Durababble
       SQL
     end
 
+    # Append history at an event_index supplied by the lease holder (computed in
+    # Ruby from replayed history) instead of deriving it with MAX(event_index)+1.
+    # The single-lease invariant means the caller already holds the workflows row
+    # lock, so no self-join or FOR UPDATE re-lock is needed; PK uniqueness guards
+    # against any stray duplicate.
+    define(:pg_insert_workflow_history_at, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+      SQL
+    end
+
     define(:pg_workflow_history_for, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = $1 ORDER BY event_index"
     end
@@ -2063,6 +2075,13 @@ module Durababble
       SQL
     end
 
+    define(:mysql_insert_workflow_history_at, backend: :mysql, description: "Append a workflow replay history event at a Ruby-supplied event index.") do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      SQL
+    end
+
     define(:mysql_inserted_workflow_history_event_index, backend: :mysql, description: "Read the workflow history event index inserted by the previous statement.") do |store|
       "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
@@ -2208,6 +2227,13 @@ module Durababble
         SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
         FROM #{table(store, "workflow_history")}
         WHERE workflow_id = ?
+      SQL
+    end
+
+    define(:sqlite_insert_workflow_history_at, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       SQL
     end
 

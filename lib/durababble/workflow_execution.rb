@@ -66,6 +66,7 @@ module Durababble
         timer_due: ->(wake_at) { timer_due?(wake_at) },
         complete_due_wait: ->(future, command_id, reserved_history_event: false) { complete_due_wait_timer!(future, command_id, reserved_history_event:) },
         retry_run_at: ->(delay) { retry_run_at(delay) },
+        allocate_history_event_index: -> { @replay_history.allocate_event_index! },
         crash: ->(point) { crash!(point) },
       )
       register_workflow_task(root_task)
@@ -735,6 +736,7 @@ module Durababble
         kwargs: shape.fetch("kwargs"),
         metadata: shape.reject { |key, _value| ["name", "args", "kwargs"].include?(key) },
         worker_id: @worker_id,
+        event_index: @replay_history.allocate_event_index!,
       )
       crash!(:step_scheduled)
       @replay_history.remember_scheduled(command_id, step_name: name, shape:)
@@ -781,6 +783,7 @@ module Durababble
           suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
           next_run_at:,
+          event_index: @replay_history.allocate_event_index!,
         )
         @replay_history.remember_step_waiting(command_id, name:, wait_request:)
       end
@@ -867,6 +870,7 @@ module Durababble
           command_id:,
           result:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
         @replay_history.remember_step_completed(command_id, payload: result, reserved_history_event:)
       end
@@ -1061,6 +1065,7 @@ module Durababble
           workflow_id: @workflow_id,
           result:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     rescue StandardError => e
@@ -1126,6 +1131,7 @@ module Durababble
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     end
@@ -1153,6 +1159,7 @@ module Durababble
           error:,
           worker_id: @worker_id,
           ready_at: retry_run_at(delay),
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     end

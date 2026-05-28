@@ -6,8 +6,8 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, remember_wait: Proc, next_run_at_for_wait: Proc, timer_due: Proc, complete_due_wait: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, remember_wait:, next_run_at_for_wait:, timer_due:, complete_due_wait:, retry_run_at:, crash:)
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, remember_wait: Proc, next_run_at_for_wait: Proc, timer_due: Proc, complete_due_wait: Proc, retry_run_at: Proc, allocate_history_event_index: Proc, crash: Proc) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, remember_wait:, next_run_at_for_wait:, timer_due:, complete_due_wait:, retry_run_at:, allocate_history_event_index:, crash:)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -25,6 +25,7 @@ module Durababble
       @timer_due = timer_due
       @complete_due_wait = complete_due_wait
       @retry_run_at = retry_run_at
+      @allocate_history_event_index = allocate_history_event_index
       @crash = crash
     end
 
@@ -34,7 +35,7 @@ module Durababble
       @root_task.async(transient: true) do |task|
         raise_if_cancel_requested!
         synchronize_store do
-          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name, worker_id: @worker_id)
+          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name, worker_id: @worker_id, event_index: allocate_history_event_index!)
         end
         crash!(:step_started)
 
@@ -50,7 +51,7 @@ module Durababble
           end
 
           assert_workflow_lease!
-          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output, worker_id: @worker_id) }
+          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output, worker_id: @worker_id, event_index: allocate_history_event_index!) }
           Observability.count("durababble.workflow.step.successes", attempt_attributes)
           crash!(:step_completed)
           raise_if_cancel_requested!
@@ -92,6 +93,7 @@ module Durababble
           suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
           next_run_at:,
+          event_index: allocate_history_event_index!,
         )
         @remember_wait.call(command_id, step.name, wait_request)
       end
@@ -134,6 +136,7 @@ module Durababble
           command_id:,
           error: "#{error.class}: #{error.message}",
           worker_id: @worker_id,
+          event_index: allocate_history_event_index!,
         )
       end
     end
@@ -165,6 +168,7 @@ module Durababble
           error: message,
           worker_id: @worker_id,
           run_at:,
+          event_index: allocate_history_event_index!,
         )
       end
       crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
@@ -181,6 +185,7 @@ module Durababble
           terminal: true,
           error_class: fallback_error.class.name,
           error_message: fallback_error.message,
+          event_index: allocate_history_event_index!,
         )
       end
       crash_or(:step_failed_recorded, fallback_error)
@@ -237,6 +242,15 @@ module Durababble
     #: () { -> Object? } -> Object?
     def synchronize_store(&block)
       @synchronize_store.call(&block)
+    end
+
+    # Pull the next physical event_index from the workflow's replay history. Must
+    # be invoked inside synchronize_store so the order indexes are handed out
+    # matches the order appends reach the store, exactly as the legacy SQL
+    # MAX(event_index)+1 did under the same lock.
+    #: () -> Integer
+    def allocate_history_event_index!
+      @allocate_history_event_index.call
     end
 
     #: () -> void
