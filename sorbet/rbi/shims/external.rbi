@@ -9,6 +9,11 @@ end
 module Async
   class TimeoutError < StandardError; end
 
+  # `Async::Stop` (raised into a task by `#stop`) descends from `Async::Cancel`,
+  # which descends from `Exception` and is deliberately not a `StandardError`.
+  class Cancel < Exception; end
+  class Stop < Cancel; end
+
   class Scheduler
     def interrupt; end
     def terminate; end
@@ -21,18 +26,31 @@ module Async
   end
 
   class Queue
+    class ClosedError < StandardError; end
+
     def initialize; end
     def push(value); end
+    def enqueue(item); end
     def dequeue(timeout: nil); end
     def empty?; end
+    def close; end
+    def closed?; end
   end
 
   class Task
     def self.current; end
     def self.current?; end
-    def async(&blk); end
+    def async(*args, **kwargs, &blk); end
     def wait; end
+    def stop(later = false); end
+    def running?; end
+    def reactor; end
+    def transient?; end
     def with_timeout(duration, exception = nil, message = nil, &blk); end
+  end
+
+  class LimitedQueue < Queue
+    def initialize(limit = nil); end
   end
 
   module HTTP
@@ -65,6 +83,7 @@ module Async
     class Client
       def initialize(http_client); end
       def stub(interface, service_name); end
+      def call(request); end
       def close; end
     end
 
@@ -82,6 +101,7 @@ end
 module Protocol
   module GRPC
     class Error < StandardError
+      def self.for(status_code, message = nil, metadata: {}); end
       def status_code; end
     end
 
@@ -94,12 +114,58 @@ module Protocol
 
     class Interface
       def self.rpc(name, request, response); end
+      def self.stream(message_class); end
+      def initialize(name); end
+      def path(method_name); end
+    end
+
+    module Body
+      class ReadableBody
+        def self.wrap(message, **options); end
+        def read; end
+        def close(error = nil); end
+      end
+
+      class WritableBody
+        def initialize(**options); end
+        def write(message, **options); end
+        def close_write(error = nil); end
+      end
+    end
+
+    module Metadata
+      def self.assign_status!(headers, status:, message: nil, error: nil); end
+      def self.extract_status(headers); end
+      def self.extract_message(headers); end
+    end
+
+    module Methods
+      def self.build_headers(metadata: {}, timeout: nil, content_type: nil); end
+    end
+
+    module Status
+      OK = 0
+      INTERNAL = 13
+      UNAUTHENTICATED = 16
     end
   end
 
   module HTTP
+    class Request
+      def self.[](method, path, headers = nil, body = nil); end
+    end
+
     class Response
       def self.[](status, headers = nil, body = nil); end
+      def close(error = nil); end
+      def headers; end
+      def stream; end
+    end
+
+    module Body
+      class Writable
+        class Closed < StandardError; end
+      end
     end
 
     module Middleware
@@ -108,7 +174,9 @@ module Protocol
   end
 
   module HTTP2
-    class Error < StandardError; end
+    class Error < StandardError
+      CANCEL = 8
+    end
   end
 end
 

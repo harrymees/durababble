@@ -177,6 +177,33 @@ module Durababble
         end
       end
 
+      # One message in a streaming-result RPC. The gRPC transport supplies the
+      # stream framing; this value only discriminates application values from a
+      # terminal application error.
+      class StreamFrame
+        include WireMessage
+
+        #: Symbol
+        attr_reader :kind
+        #: Object?
+        attr_reader :value
+        #: RemoteError?
+        attr_reader :error
+
+        #: (?kind: Symbol, ?value: Object?, ?error: RemoteError?) -> void
+        def initialize(kind: :value, value: nil, error: nil)
+          @kind = kind
+          @value = value
+          @error = error
+        end
+
+        #: () -> bool
+        def value? = @kind == :value
+
+        #: () -> bool
+        def error? = @kind == :error
+      end
+
       # Discriminated response mirroring the former protobuf `oneof result`.
       # Exactly one of `ok`/`err`/`not_running`/`moved` is populated; `#result`
       # reports which, matching the protobuf oneof accessor.

@@ -7,6 +7,7 @@ Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?
 Fiber.attr_accessor(:durababble_step_context) unless Fiber.method_defined?(:durababble_step_context)
 Fiber.attr_accessor(:durababble_object_command_context) unless Fiber.method_defined?(:durababble_object_command_context)
 Fiber.attr_accessor(:durababble_object_query_context) unless Fiber.method_defined?(:durababble_object_query_context)
+Fiber.attr_accessor(:durababble_stream_writer) unless Fiber.method_defined?(:durababble_stream_writer)
 Fiber.attr_accessor(:durababble_workflow_query_context) unless Fiber.method_defined?(:durababble_workflow_query_context)
 
 module Durababble
@@ -81,6 +82,31 @@ module Durababble
     end
   end
 
+  # Points at the active streaming-result writer (a `ResultStream::Writer` for a
+  # local snapshot producer, or an `Rpc::StreamWriter`/lease-checking wrapper for
+  # a server-side producer). The exposed_stream method body runs in the same
+  # fiber as the producer, so `Durababble.stream_cancelled?` can read it to learn
+  # whether the consumer has gone away.
+  module StreamExecutionContext
+    class << self
+      #: () -> untyped
+      def current
+        fiber = Fiber.current #: as untyped
+        fiber.durababble_stream_writer
+      end
+
+      #: (untyped) { () -> Object? } -> Object?
+      def with_current(writer, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_stream_writer
+        fiber.durababble_stream_writer = writer
+        block.call
+      ensure
+        fiber.durababble_stream_writer = previous
+      end
+    end
+  end
+
   module WorkflowQueryContext
     class << self
       #: () -> bool
@@ -129,16 +155,19 @@ module Durababble
       query_context = WorkflowQueryContext.current
       object_context = ObjectCommandExecutionContext.current
       object_query_context = ObjectQueryExecutionContext.current
+      stream_writer = StreamExecutionContext.current
       if task.transient?
         execution = WorkflowExecutionContext.current
-        return super(&block) unless execution || step_context || query_context || object_context || object_query_context
+        return super(&block) unless execution || step_context || query_context || object_context || object_query_context || stream_writer
 
         return super do
           WorkflowExecutionContext.with_current(nil) do
             StepExecutionContext.with_current(step_context) do
               WorkflowQueryContext.with_current(query_context) do
                 ObjectCommandExecutionContext.with_current(object_context) do
-                  ObjectQueryExecutionContext.with_current(object_query_context) { block.call }
+                  ObjectQueryExecutionContext.with_current(object_query_context) do
+                    StreamExecutionContext.with_current(stream_writer) { block.call }
+                  end
                 end
               end
             end
@@ -147,7 +176,7 @@ module Durababble
       end
 
       execution = WorkflowExecutionContext.current
-      return super(&block) unless execution || step_context || query_context || object_context || object_query_context
+      return super(&block) unless execution || step_context || query_context || object_context || object_query_context || stream_writer
 
       workflow_task = self #: as untyped
       execution&.register_workflow_task(workflow_task)
@@ -156,7 +185,9 @@ module Durababble
           StepExecutionContext.with_current(step_context) do
             WorkflowQueryContext.with_current(query_context) do
               ObjectCommandExecutionContext.with_current(object_context) do
-                ObjectQueryExecutionContext.with_current(object_query_context) { block.call }
+                ObjectQueryExecutionContext.with_current(object_query_context) do
+                  StreamExecutionContext.with_current(stream_writer) { block.call }
+                end
               end
             end
           end
