@@ -55,6 +55,7 @@ module Durababble
           id = h.store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => seed.to_s })
 
           h.store.enable_write_crashes!(percent: 20)
+          h.store.fault_plan.fail_after(:record_step_completed, once: 1, message: "cleanup crash after completion")
 
           # Park the workflow on its wait timer first (crash-free) so cancellation
           # always races a genuinely-waiting workflow.
@@ -106,11 +107,22 @@ module Durababble
           h.scheduler.schedule(actor: "guaranteed-canceler", delay: 105, name: "ensure_cancel") do
             workflow.handle(id, store: h.store).cancel(reason: "stop #{seed}")
           end
+          # Deterministically crash one cleanup resume after the fuzzed cancel
+          # requests. This keeps the worker-crash proof stable even when storage
+          # query reductions change the seeded generic write-crash draw sequence.
+          h.scheduler.schedule(actor: "forced-cancel-worker", delay: 110, name: "forced_cleanup_crash") do
+            Durababble::Engine.new(store: h.store, worker_id: "forced-cancel-worker", lease_seconds: 12).resume(workflow, workflow_id: id)
+          rescue InjectedCrash
+            h.scheduler.trace.event(h.scheduler.time, "forced-cancel-worker", "cancellation_crashed", id:)
+          rescue Durababble::LeaseConflict
+            h.scheduler.trace.event(h.scheduler.time, "forced-cancel-worker", "cancellation_lease_conflict", id:)
+          end
+
           # Crash-free closer: free any stranded lease, then resume to a terminal
           # state. Two passes in case the first only delivers cancellation and the
           # second runs cleanup. Tolerate a LeaseConflict (final invariant catches
           # a workflow that never reached terminal).
-          [110, 125].each do |delay|
+          [125, 140].each do |delay|
             h.scheduler.schedule(actor: "closer", delay:, name: "final_resume") do
               h.store.steal_expired_leases!(now: h.scheduler.time + 1)
               Durababble::Engine.new(store: h.store, worker_id: "closer", lease_seconds: 30).resume(workflow, workflow_id: id)

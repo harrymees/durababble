@@ -249,11 +249,12 @@ module Durababble
     #: (untyped, untyped, ?unique: bool) -> untyped
     def create_postgres_index(name, definition, unique: false)
       index_name = postgres_index_name(name)
-      exists = execute_params(<<~SQL, [schema, index_name]).first
+      legacy_index_name = legacy_postgres_index_name(name)
+      exists = execute_params(<<~SQL, [schema, index_name, legacy_index_name]).first
         SELECT 1
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'i'
+        WHERE n.nspname = $1 AND c.relname IN ($2, $3) AND c.relkind = 'i'
         LIMIT 1
       SQL
       return if exists
@@ -263,6 +264,11 @@ module Durababble
 
     #: (untyped) -> untyped
     def postgres_index_name(name)
+      name.to_s
+    end
+
+    #: (untyped) -> untyped
+    def legacy_postgres_index_name(name)
       logical = name.to_s
       max_identifier_length = 63
       return logical if schema.to_s == "public"

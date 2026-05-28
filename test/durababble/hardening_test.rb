@@ -54,14 +54,14 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_equal "completed", run.status
   end
 
-  test "does not rewrite an unexpired workflow lease already owned by the same worker" do
+  test "refreshes an unexpired workflow lease already owned by the same worker" do
     workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 1 })
     first_claim = store.claim_runnable_workflow(worker_id: "owner", lease_seconds: 60)
 
     second_claim = store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 3_600)
 
     assert_equal workflow_id, second_claim.fetch("id")
-    assert_equal first_claim.fetch("locked_until"), second_claim.fetch("locked_until")
+    assert_operator Time.parse(second_claim.fetch("locked_until").to_s), :>, Time.parse(first_claim.fetch("locked_until").to_s) + 3_000
   end
 
   test "does not leave a stale running attempt when retrying a step that crashed after start" do

@@ -95,21 +95,11 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_access_types: ["const"],
           max_rows_examined_per_scan: 1,
         },
-        "workflow lease count probe" => {
-          sql: query_sql(:count_workflow_leases, index: mysql_index_name("workflows", "worker_lease")),
-          params: ["other"],
-          expected_key_fragment: "workflows_worker_lease",
-        },
         "workflow lease release probe" => {
           sql: query_sql(:release_workflow_leases, index: mysql_index_name("workflows", "worker_lease")),
           params: ["other"],
           expected_key_fragment: "workflows_worker_lease",
           expected_access_types: ["range"],
-        },
-        "outbox lease count probe" => {
-          sql: query_sql(:count_outbox_leases, index: mysql_index_name("outbox", "worker_lease")),
-          params: ["owner"],
-          expected_key_fragment: "outbox_worker_lease",
         },
         "outbox lease release probe" => {
           sql: query_sql(:release_outbox_leases, index: mysql_index_name("outbox", "worker_lease")),
@@ -117,21 +107,11 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_key_fragment: "outbox_worker_lease",
           expected_access_types: ["range"],
         },
-        "inbox lease count probe" => {
-          sql: query_sql(:count_inbox_leases, index: mysql_index_name("inbox", "worker_lease")),
-          params: ["owner"],
-          expected_key_fragment: "inbox_worker_lease",
-        },
         "inbox lease release probe" => {
           sql: query_sql(:release_inbox_leases, index: mysql_index_name("inbox", "worker_lease")),
           params: ["owner"],
           expected_key_fragment: "inbox_worker_lease",
           expected_access_types: ["range"],
-        },
-        "target activation lease count probe" => {
-          sql: query_sql(:count_target_activation_leases, index: mysql_index_name("target_activations", "worker_lease")),
-          params: ["owner"],
-          expected_key_fragment: "target_activations_worker_lease",
         },
         "target activation lease release probe" => {
           sql: query_sql(:release_target_activation_leases, index: mysql_index_name("target_activations", "worker_lease")),

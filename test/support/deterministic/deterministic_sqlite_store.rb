@@ -200,7 +200,7 @@ module Durababble
         # Re-affirming a lease we already hold is not a fresh claim; mirror
         # VirtualYugabyte and only trace the pending/expired -> running edge so
         # the per-seed workflow_claimed count stays stable.
-        already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+        already_owned = workflow_lease_owned_before_claim?(workflow_id:, worker_id:, worker_pool:)
         claimed = super
         trace_event("workflow_claimed", id: workflow_id, worker: worker_id) if claimed && !already_owned
         claimed
@@ -702,6 +702,20 @@ module Durababble
       def wrote?(result)
         result = result #: as untyped
         result.respond_to?(:affected_rows) && result.affected_rows.to_i.positive?
+      end
+
+      #: (workflow_id: String, worker_id: String, worker_pool: String) -> bool
+      def workflow_lease_owned_before_claim?(workflow_id:, worker_id:, worker_pool:)
+        row = execute_store_query(:workflow, [workflow_id]).first
+        return false unless row
+
+        locked_until = row["locked_until"]
+        return false unless locked_until
+
+        row.fetch("worker_pool") == worker_pool &&
+          row.fetch("status") == "running" &&
+          row["locked_by"] == worker_id &&
+          locked_until.to_i >= current_time
       end
 
       #: (Symbol) -> void

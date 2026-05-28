@@ -1110,14 +1110,20 @@ module Durababble
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
       execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      event_index = execute_store_query(:next_workflow_history_event_index, [workflow_id]).first.fetch("event_index").to_i
-      execute_store_query(:insert_workflow_history, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
-      event_index
+      result = execute_store_query(:insert_workflow_history, [workflow_id, kind, command_id, name, attempt_id, dump_serialized(payload), error, workflow_id])
+      inserted_workflow_history_event_index(result, workflow_id:)
     end
 
     #: (message_id: String, error: String) -> Object?
     def dead_letter_inbox_message_without_transaction(message_id:, error:)
       raise NotImplementedError
+    end
+
+    #: (untyped, workflow_id: String) -> Integer
+    def inserted_workflow_history_event_index(result, workflow_id:)
+      row = result.first
+      row ||= execute_store_query(:inserted_workflow_history_event_index, [workflow_id]).first
+      row.fetch("event_index").to_i
     end
 
     #: (Hash[String, Object?]) -> Object?

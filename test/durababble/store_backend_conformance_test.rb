@@ -47,6 +47,26 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "step completion and failure APIs return inserted workflow history indexes with #{backend.name}" do
+      with_durababble_store(backend, "history_indexes") do |store|
+        completed_workflow_id = store.create_workflow(name: "history-completed", input: {})
+        store.record_step_started(workflow_id: completed_workflow_id, command_id: 0, name: "step")
+
+        completed_index = store.record_step_completed(workflow_id: completed_workflow_id, command_id: 0, result: { "ok" => true })
+
+        assert_equal 1, completed_index
+        assert_equal [0, 1], store.workflow_history_for(completed_workflow_id).map { |event| event.fetch("event_index") }
+
+        failed_workflow_id = store.create_workflow(name: "history-failed", input: {})
+        store.record_step_started(workflow_id: failed_workflow_id, command_id: 0, name: "step")
+
+        failed_index = store.record_step_failed(workflow_id: failed_workflow_id, command_id: 0, error: "boom")
+
+        assert_equal 1, failed_index
+        assert_equal [0, 1], store.workflow_history_for(failed_workflow_id).map { |event| event.fetch("event_index") }
+      end
+    end
+
     test "enqueues explicit workflow ids and rejects duplicate ids without side effects with #{backend.name}" do
       with_durababble_store(backend, "explicit_workflow_id") do |store|
         workflow_id = "wf-explicit-#{SecureRandom.hex(4)}"
@@ -1413,6 +1433,65 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "same-owner workflow claims refresh live leases with #{backend.name}" do
+      with_durababble_store(backend, "claim_lease_refresh") do |store|
+        {
+          claim_workflow: "targeted-claim-refresh",
+          claim_workflow_for_activation: "activation-claim-refresh",
+        }.each do |claim_method, workflow_name|
+          workflow_id = store.enqueue_workflow(name: workflow_name, input: {})
+
+          first = store.public_send(claim_method, workflow_id:, worker_id: "owner", lease_seconds: 5)
+          before = workflow_lease_time(first.fetch("locked_until"))
+
+          refreshed = store.public_send(claim_method, workflow_id:, worker_id: "owner", lease_seconds: 60)
+          after = workflow_lease_time(refreshed.fetch("locked_until"))
+
+          assert_operator after, :>, before + 30, "#{claim_method} should extend the live lease held by the same worker"
+          assert_hash_includes store.workflow(workflow_id), "status" => "running", "locked_by" => "owner"
+          assert_nil store.public_send(claim_method, workflow_id:, worker_id: "intruder", lease_seconds: 60)
+        end
+      end
+    end
+
+    test "mysql targeted workflow claims skip locked rows under contention with #{backend.name}" do
+      skip("MySQL-specific SKIP LOCKED behavior") unless backend.mysql?
+
+      with_durababble_store(backend, "targeted_claim_contention") do |store|
+        workflow_ids = {
+          claim_workflow: store.enqueue_workflow(name: "targeted-contention", input: {}),
+          claim_workflow_for_activation: store.enqueue_workflow(name: "activation-contention", input: {}),
+        }
+        holder = Durababble::Store.connect(database_url: backend.database_url, schema:)
+        contender = Durababble::Store.connect(database_url: backend.database_url, schema:)
+
+        begin
+          contender.send(:execute, "SET SESSION innodb_lock_wait_timeout = 1")
+
+          workflow_ids.each do |claim_method, workflow_id|
+            holder.send(:transaction) do
+              holder.send(:execute_store_query, :lock_workflow_for_update, [workflow_id])
+
+              started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+              assert_nil(contender.public_send(claim_method, workflow_id:, worker_id: "contender", lease_seconds: 30))
+              elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+              assert_operator(elapsed, :<, 1.0, "#{claim_method} should skip a row locked by another transaction")
+            end
+
+            assert_hash_includes(
+              contender.public_send(claim_method, workflow_id:, worker_id: "contender", lease_seconds: 30),
+              "id" => workflow_id,
+              "locked_by" => "contender",
+            )
+          end
+        ensure
+          holder&.close
+          contender&.close
+        end
+      end
+    end
+
     test "rejects heartbeat attempts after a workflow lease expires with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "expired-heartbeat", input: {})
@@ -2174,6 +2253,13 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
     locked_until = locked_until.is_a?(Time) ? locked_until : Time.parse(locked_until.to_s)
     locked_until.to_f - Time.now.to_f
+  end
+
+  def workflow_lease_time(value)
+    return value.to_time if value.respond_to?(:to_time)
+    return Time.at(value.to_r / 1_000_000) if value.is_a?(Integer)
+
+    Time.parse(value.to_s)
   end
 
   # Backdate a row's locked_until to simulate a crashed owner without relying

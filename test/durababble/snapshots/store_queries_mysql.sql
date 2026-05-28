@@ -116,10 +116,6 @@ ORDER BY queue_available_at, created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
--- mysql_claim_workflow_already_owned
-SELECT * FROM `durababble_mysql_snapshot_workflows`
-WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
-
 -- mysql_claim_workflow_for_activation_lock
 SELECT id FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND worker_pool = ?
@@ -399,10 +395,15 @@ INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status
 
 -- mysql_insert_workflow_history
 INSERT INTO `durababble_mysql_snapshot_workflow_history` (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
+FROM `durababble_mysql_snapshot_workflow_history`
+WHERE workflow_id = ?
 
 -- mysql_insert_workflow_with_worker
 INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), NOW(6), NOW(6))
+
+-- mysql_inserted_workflow_history_event_index
+SELECT MAX(event_index) AS event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ?
 
 -- mysql_lock_fence_for_worker
 SELECT 1 FROM `durababble_mysql_snapshot_fences` WHERE workflow_id = ? AND `key` = ? AND locked_by = ? AND status = 'running'
@@ -479,9 +480,6 @@ UPDATE `durababble_mysql_snapshot_workflows`
 SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
 WHERE id = ? AND worker_pool = ?
   AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
-
--- mysql_next_workflow_history_event_index
-SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ?
 
 -- mysql_object_state
 SELECT state FROM `durababble_mysql_snapshot_durable_objects` WHERE object_type = ? AND object_id = ? AND state IS NOT NULL
