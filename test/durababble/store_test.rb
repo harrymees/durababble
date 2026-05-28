@@ -158,11 +158,32 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil shared_store.send(:observe_claim_latency, { "created_at" => "2024-01-01T00:00:00Z" }, "workflow")
   end
 
+  test "observe_claim_latency accepts timestamp values without to_time" do
+    created_at = Object.new
+    created_at.define_singleton_method(:to_s) { "2024-01-01T00:00:00Z" }
+
+    assert_nil shared_store.send(:observe_claim_latency, { "created_at" => created_at }, "workflow")
+  end
+
   test "record_wait_latency accepts serialized timestamps" do
     wait = {
       "kind" => "timer",
       "created_at" => "2024-01-01T00:00:00Z",
       "completed_at" => "2024-01-01T00:00:01Z",
+    }
+
+    assert_nil shared_store.send(:record_wait_latency, wait)
+  end
+
+  test "record_wait_latency accepts timestamp values without to_time" do
+    created_at = Object.new
+    created_at.define_singleton_method(:to_s) { "2024-01-01T00:00:00Z" }
+    completed_at = Object.new
+    completed_at.define_singleton_method(:to_s) { "2024-01-01T00:00:01Z" }
+    wait = {
+      "kind" => "timer",
+      "created_at" => created_at,
+      "completed_at" => completed_at,
     }
 
     assert_nil shared_store.send(:record_wait_latency, wait)
