@@ -398,6 +398,34 @@ module Durababble
       "SELECT * FROM #{table(store, "workflows")} WHERE id = $1"
     end
 
+    define(:pg_child_workflow_by_child_id_for_update, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE id = $1 AND child_origin_kind IS NOT NULL FOR UPDATE"
+    end
+
+    define(:pg_child_workflow_rows_for_parent, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE child_origin_kind = 'workflow' AND parent_workflow_id = $1 ORDER BY created_at ASC"
+    end
+
+    define(:pg_child_workflow_rows_for_object, backend: :postgres) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE child_origin_kind = 'object' AND parent_object_type = $1 AND parent_object_id = $2 ORDER BY created_at ASC"
+    end
+
+    define(:pg_insert_child_workflow, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflows")} (
+          id, name, worker_pool, status, input,
+          child_origin_kind, parent_workflow_id, parent_command_id,
+          parent_object_type, parent_object_id, parent_object_command_id,
+          child_cancellation_policy
+        ) VALUES (
+          $1, $2, $3, $4, $5::bytea,
+          $6, $7, $8,
+          $9, $10, $11,
+          $12
+        )
+      SQL
+    end
+
     define(:pg_steps_for, backend: :postgres) do |store|
       "SELECT * FROM #{table(store, "steps")} WHERE workflow_id = $1 ORDER BY position"
     end
@@ -672,6 +700,34 @@ module Durababble
 
     define(:mysql_workflow, backend: :mysql, description: "Read one workflow row by id after a claim or for runtime state.") do |store|
       "SELECT * FROM #{table(store, "workflows")} WHERE id = ?"
+    end
+
+    define(:mysql_child_workflow_by_child_id_for_update, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE id = ? AND child_origin_kind IS NOT NULL FOR UPDATE"
+    end
+
+    define(:mysql_child_workflow_rows_for_parent, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE child_origin_kind = 'workflow' AND parent_workflow_id = ? ORDER BY created_at ASC"
+    end
+
+    define(:mysql_child_workflow_rows_for_object, backend: :mysql) do |store|
+      "SELECT * FROM #{table(store, "workflows")} WHERE child_origin_kind = 'object' AND parent_object_type = ? AND parent_object_id = ? ORDER BY created_at ASC"
+    end
+
+    define(:mysql_insert_child_workflow, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflows")} (
+          id, name, worker_pool, status, input,
+          child_origin_kind, parent_workflow_id, parent_command_id,
+          parent_object_type, parent_object_id, parent_object_command_id,
+          child_cancellation_policy, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?,
+          ?, NOW(6), NOW(6)
+        )
+      SQL
     end
 
     define(:mysql_steps_for, backend: :mysql, description: "Read step rows for a workflow in command order.") do |store|

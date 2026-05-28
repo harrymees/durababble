@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "securerandom"
+require "digest"
 
 require_relative "durable_method_dsl"
 require_relative "execution_context"
@@ -40,8 +41,40 @@ module Durababble
         workflow_name
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?) -> String
-      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle)
+      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+
+        if (execution = WorkflowExecutionContext.current)
+          raise ArgumentError, "workflow child enqueue cannot specify store: or engine:" if store || engine
+
+          return execution.call_child_workflow_start(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+          )
+        end
+
+        if (object = ObjectCommandExecutionContext.current)
+          raise ArgumentError, "object-command workflow enqueue cannot specify store: or engine:" if store || engine
+
+          object = object #: as untyped
+          return object.start_workflow(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation: cancellation.nil? ? :abandon : cancellation,
+          )
+        end
+
+        raise ArgumentError, "idempotency_key: is only supported when enqueue is called from workflow execution or an object command" unless idempotency_key.nil?
+        raise ArgumentError, "cancellation: is only supported when enqueue is called from workflow execution or an object command" unless cancellation.nil?
+
         if worker_pool
           workflow_id = id || SecureRandom.uuid
           Durababble.store_for(store:, engine:).enqueue_workflow(name: workflow_name, input:, id: workflow_id, worker_pool:)
@@ -50,8 +83,40 @@ module Durababble
         end
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?) -> WorkflowRef
-      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (WorkflowRef | ChildWorkflowHandle)
+      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+
+        if (execution = WorkflowExecutionContext.current)
+          raise ArgumentError, "workflow child start cannot specify store: or engine:" if store || engine
+
+          return execution.call_child_workflow_start(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+          )
+        end
+
+        if (object = ObjectCommandExecutionContext.current)
+          raise ArgumentError, "object-command workflow start cannot specify store: or engine:" if store || engine
+
+          object = object #: as untyped
+          return object.start_workflow(
+            self,
+            input,
+            id:,
+            worker_pool:,
+            idempotency_key:,
+            cancellation: cancellation.nil? ? :abandon : cancellation,
+          )
+        end
+
+        raise ArgumentError, "idempotency_key: is only supported when start is called from workflow execution or an object command" unless idempotency_key.nil?
+        raise ArgumentError, "cancellation: is only supported when start is called from workflow execution or an object command" unless cancellation.nil?
+
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
           workflow_id = id || SecureRandom.uuid
@@ -176,6 +241,131 @@ module Durababble
       raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.wait_condition(timeout:, &block)
+    end
+
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
+    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel)
+      raise Error, "cannot start child workflows from an exposed query" if @__durababble_query_context
+
+      __durababble_execution__.call_child_workflow_start(
+        workflow_class,
+        input,
+        id:,
+        worker_pool:,
+        idempotency_key:,
+        cancellation_policy: cancellation,
+      )
+    end
+
+    alias_method :start_workflow, :start_child
+  end
+
+  class ChildWorkflowHandle
+    TERMINAL_FAILURE_ERRORS = {
+      "failed" => ChildWorkflowFailed,
+      "canceled" => ChildWorkflowCanceled,
+      "terminated" => ChildWorkflowTerminated,
+    }.freeze
+
+    #: (Class, String, store: Store, worker_pool: String, cancellation_policy: String) -> void
+    def initialize(workflow_class, workflow_id, store:, worker_pool:, cancellation_policy:)
+      @workflow_class = workflow_class #: as untyped
+      @workflow_id = workflow_id
+      @store = store #: as untyped
+      @worker_pool = worker_pool
+      @cancellation_policy = cancellation_policy
+    end
+
+    #: String
+    attr_reader :workflow_id
+    #: String
+    attr_reader :worker_pool
+    #: String
+    attr_reader :cancellation_policy
+
+    #: () -> WorkflowRef
+    def ref
+      @workflow_class.handle(@workflow_id, store: @store, worker_pool: @worker_pool)
+    end
+
+    #: () -> String
+    def status
+      if (execution = WorkflowExecutionContext.current)
+        return execution.call_child_workflow_observe(self).fetch("status").to_s
+      end
+
+      @store.observe_child_workflow(@workflow_id).fetch("status").to_s
+    end
+
+    #: () -> Object?
+    def result
+      if (execution = WorkflowExecutionContext.current)
+        return execution.await_child_workflow(self, poll_interval: 1, timeout: nil)
+      end
+
+      @store.observe_child_workflow(@workflow_id)["result"]
+    end
+
+    #: () -> String?
+    def error
+      if (execution = WorkflowExecutionContext.current)
+        error = execution.call_child_workflow_observe(self)["error"]
+        return error&.to_s
+      end
+
+      error = @store.observe_child_workflow(@workflow_id)["error"]
+      error&.to_s
+    end
+
+    #: (?poll_interval: Numeric, ?timeout: Numeric?) -> Object?
+    def await(poll_interval: 1, timeout: nil)
+      if (execution = WorkflowExecutionContext.current)
+        return execution.await_child_workflow(self, poll_interval:, timeout:)
+      end
+
+      deadline = timeout && Time.now + timeout
+      loop do
+        observed = @store.observe_child_workflow(@workflow_id)
+        return await_result_from(observed) if WorkflowStatus.terminal?(observed)
+        raise CommandTimeout, "timed out waiting for child workflow #{@workflow_id}" if deadline && Time.now >= deadline
+
+        sleep(poll_interval)
+      end
+    end
+
+    #: (?reason: Object?) -> Run
+    def cancel(reason: nil)
+      ref.cancel(reason:)
+    end
+
+    #: (?reason: Object?) -> Run
+    def terminate(reason: nil)
+      ref.terminate(reason:)
+    end
+
+    #: (Symbol, *Object?, **Object?) ?{ (Object?) -> Object? } -> Object?
+    def method_missing(method_name, *args, **kwargs, &block)
+      reference = ref #: as untyped
+      return reference.public_send(method_name, *args, **kwargs, &block) if reference.respond_to?(method_name)
+
+      super
+    end
+
+    #: (Symbol, ?bool) -> bool
+    def respond_to_missing?(method_name, include_private = false)
+      reference = ref #: as untyped
+      reference.respond_to?(method_name, include_private) || super
+    end
+
+    #: (Hash[String, Object?]) -> Object?
+    def await_result_from(observed)
+      status = observed.fetch("status")
+      return observed["result"] if status == "completed"
+
+      error_class = TERMINAL_FAILURE_ERRORS.fetch(status, ChildWorkflowError)
+      error = observed["error"]
+      message = error.to_s.empty? ? "child workflow #{@workflow_id} #{status}" : error.to_s
+      raise error_class, message
     end
   end
 

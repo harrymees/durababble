@@ -74,6 +74,10 @@ module Durababble
   class CommandTimeout < Error; end
   class IdempotencyKeyConflict < Error; end
   class WorkflowAlreadyExists < Error; end
+  class ChildWorkflowError < Error; end
+  class ChildWorkflowFailed < ChildWorkflowError; end
+  class ChildWorkflowCanceled < ChildWorkflowError; end
+  class ChildWorkflowTerminated < ChildWorkflowError; end
 
   class PayloadTooLarge < Error
     #: Symbol
@@ -394,6 +398,7 @@ module Durababble
 end
 
 require_relative "durababble/retry_policy"
+require_relative "durababble/child_workflow_reuse"
 require_relative "durababble/workflow"
 require_relative "durababble/workflow_query_registry"
 require_relative "durababble/durable_object"

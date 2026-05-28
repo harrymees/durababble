@@ -1,12 +1,15 @@
 # typed: true
 # frozen_string_literal: true
 
+require "digest"
+
 require_relative "durable_method_dsl"
+require_relative "child_workflow_reuse"
 require_relative "execution_context"
 require_relative "error_formatting"
 
 module Durababble
-  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key)
+  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -180,6 +183,7 @@ module Durababble
       @state_dirty = false
       @wakeup_changes = []
       @__durababble_query_context = false
+      @__durababble_child_workflow_sequence = 0
     end
 
     #: () -> Object?
@@ -240,10 +244,83 @@ module Durababble
       true
     end
 
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
+    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon)
+      raise Error, "cannot start workflows from an exposed query" if @__durababble_query_context
+      raise Error, "durable object workflow starts can only be scheduled from object commands" unless command_context
+
+      workflow_class = workflow_class #: as untyped
+      context = command_context #: as CommandContext
+      child_workflow_name = workflow_class.workflow_name
+      child_worker_pool = worker_pool || @worker_pool
+      start_sequence = next_child_workflow_sequence
+      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{start_sequence}"
+      resolved_id = id || generated_child_workflow_id(start_sequence:, idempotency_key: resolved_key)
+      policy = normalize_child_cancellation_policy(cancellation)
+      store = @store #: as Store
+      link = store.start_child_workflow(
+        origin_kind: "object",
+        parent_object_type: self.class.object_type,
+        parent_object_id: durable_id,
+        parent_object_command_id: context.command_id,
+        parent_object_worker_id: context.worker_id,
+        child_workflow_name:,
+        child_workflow_id: resolved_id,
+        input:,
+        worker_pool: child_worker_pool,
+        cancellation_policy: policy,
+      )
+      ChildWorkflowReuse.validate!(
+        link,
+        origin_kind: "object",
+        parent_object_type: self.class.object_type,
+        parent_object_id: durable_id,
+        parent_object_command_id: context.command_id,
+        child_workflow_name:,
+        child_workflow_id: resolved_id,
+        input:,
+        worker_pool: child_worker_pool,
+        cancellation_policy: policy,
+      )
+      ChildWorkflowHandle.new(
+        workflow_class,
+        link.fetch("child_workflow_id").to_s,
+        store:,
+        worker_pool: link.fetch("worker_pool").to_s,
+        cancellation_policy: link.fetch("cancellation_policy").to_s,
+      )
+    end
+
     #: () -> bool
     def state_dirty? = @state_dirty
 
     private
+
+    #: () -> Integer
+    def next_child_workflow_sequence
+      @__durababble_child_workflow_sequence += 1
+    end
+
+    #: (start_sequence: Integer, idempotency_key: String) -> String
+    def generated_child_workflow_id(start_sequence:, idempotency_key:)
+      context = command_context #: as CommandContext
+      digest = Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
+        "object_type" => self.class.object_type,
+        "object_id" => durable_id,
+        "command_id" => context.command_id,
+        "start_sequence" => start_sequence,
+        "idempotency_key" => idempotency_key,
+      }))
+      "child-#{digest[0, 48]}"
+    end
+
+    #: (Symbol | String) -> String
+    def normalize_child_cancellation_policy(policy)
+      normalized = policy.to_s
+      return normalized if ["request_cancel", "abandon"].include?(normalized)
+
+      raise ArgumentError, "unknown child workflow cancellation policy: #{policy.inspect}"
+    end
 
     #: (Object?) -> String
     def coerce_wake_name(name)
@@ -330,7 +407,9 @@ module Durababble
         state = DurableObject.state_from_store(@store, object_type: @object_class.object_type, object_id: @durable_id)
         object = @object_class.new(durable_id: @durable_id, state:, store: @store, worker_pool: @worker_pool) #: as untyped
         object.instance_variable_set(:@__durababble_query_context, true)
-        object.public_send(method_name, *args, **kwargs, &block)
+        ObjectQueryExecutionContext.with_current(object) do
+          object.public_send(method_name, *args, **kwargs, &block)
+        end
       end
     end
 
@@ -468,7 +547,9 @@ module Durababble
       Observability.trace("durababble.object.command", attributes) do
         object = build_object(object_class, object_id:, message:)
         args, kwargs = object_args(message)
-        result = object.public_send(method_name, *args, **kwargs)
+        result = ObjectCommandExecutionContext.with_current(object) do
+          object.public_send(method_name, *args, **kwargs)
+        end
         complete_message(object, message, result:, attributes:)
         Observability.count("durababble.object.command.successes", attributes)
         result
@@ -483,7 +564,9 @@ module Durababble
     def dispatch_wake(object_class, object_id:, message:)
       object = build_object(object_class, object_id:, message:)
       result = if object.respond_to?(:on_wake)
-        object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
+        ObjectCommandExecutionContext.with_current(object) do
+          object.public_send(:on_wake, name: message.fetch("method_name"), payload: message.fetch("payload"))
+        end
       end
       complete_message(object, message, result:)
     rescue LeaseConflict
@@ -502,6 +585,7 @@ module Durababble
         command_id: message.fetch("id"),
         attempt_number: message.fetch("attempts").to_i,
         idempotency_key: "durababble:v1:object:#{object_class.object_type}:#{object_id}:command:#{message.fetch("id")}",
+        worker_id: @worker_id,
       )
       object_class.new(durable_id: object_id, state:, store: @store, command_context: context, worker_pool:) #: as untyped
     end

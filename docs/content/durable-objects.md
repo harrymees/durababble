@@ -131,6 +131,34 @@ channel.append({ "from" => "harry", "body" => "ship it" })
 channel.recent
 ```
 
+## Starting Workflows From Objects
+
+Durable object commands can start workflows with the workflow class API: `ImportFile.enqueue(...)` or `ImportFile.start(...)`. This is command-only because starting a workflow mutates durable state; exposed queries and code outside an object command cannot use it.
+
+```ruby
+class ImportCoordinator < Durababble::DurableObject
+  object_type "import_coordinator"
+
+  def initialize_state
+    { "child_id" => nil }
+  end
+
+  expose_command def begin_import(file_id)
+    child = ImportFile.enqueue({ "file_id" => file_id }, cancellation: :abandon)
+    schedule_wake(name: "check-import", at: Time.now + 60, payload: { "child_id" => child.workflow_id })
+    update_state(current_state.merge("child_id" => child.workflow_id))
+    child.workflow_id
+  end
+
+  def on_wake(name:, payload:)
+    child = ImportFile.handle(payload.fetch("child_id"))
+    update_state(current_state.merge("status" => child.status, "result" => child.result)) if child.status == "completed"
+  end
+end
+```
+
+The object command records the workflow as object-origin work using the durable mailbox command id, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
+
 ## Alarms
 
 Object commands can schedule persisted, named wakeups for the object with `schedule_wake(name:, at:, payload: nil)`. Each `name` addresses an independent wake, so one object can hold several outstanding wakes at once — a TTL sweep, a retry, and a daily flush can all be pending against the same id. Calling `schedule_wake` again with the same `name` before it fires replaces that wake's time and payload while leaving the other names untouched. `cancel_wake(name:)` removes a single named wake, and `cancel_all_wakes` removes every pending wake for the object. Scheduling and cancellation are committed with the command, so a failed or retried command does not leave behind an unrelated process-local timer.

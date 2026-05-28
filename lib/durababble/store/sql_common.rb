@@ -511,6 +511,71 @@ module Durababble
       end
     end
 
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil)
+      result = transaction do
+        fence_child_workflow_origin!(
+          origin_kind:,
+          parent_workflow_id:,
+          parent_worker_id:,
+          parent_object_type:,
+          parent_object_id:,
+          parent_object_command_id:,
+          parent_object_worker_id:,
+        )
+        begin
+          transaction do
+            insert_child_workflow_without_transaction(
+              origin_kind:,
+              parent_workflow_id:,
+              parent_command_id:,
+              parent_object_type:,
+              parent_object_id:,
+              parent_object_command_id:,
+              child_workflow_name:,
+              child_workflow_id:,
+              input:,
+              worker_pool:,
+              cancellation_policy:,
+            )
+          end
+        rescue ActiveRecord::RecordNotUnique
+          existing = child_workflow_by_child_id_for_update(child_workflow_id)
+          unless existing
+            raise WorkflowAlreadyExists, "workflow #{child_workflow_id} already exists"
+          end
+
+          next child_workflow_row(decode_row(existing))
+        end
+        created = child_workflow_by_child_id_for_update(child_workflow_id)
+        raise KeyError, "child workflow not found after insert: #{child_workflow_id}" unless created
+
+        child_workflow_row(decode_row(created))
+      end
+      result #: as Hash[String, Object?]
+    end
+
+    #: (String) -> Hash[String, Object?]
+    def observe_child_workflow(child_workflow_id)
+      result = transaction do
+        row = child_workflow_by_child_id_for_update(child_workflow_id)
+        raise KeyError, "child workflow not found: #{child_workflow_id}" unless row
+
+        child_workflow_row(decode_row(row))
+      end
+      result #: as Hash[String, Object?]
+    end
+
+    #: (parent_workflow_id: String) -> Array[Hash[String, Object?]]
+    def child_workflow_rows_for_parent(parent_workflow_id:)
+      execute_store_query(:child_workflow_rows_for_parent, [parent_workflow_id]).map { |row| child_workflow_row(decode_row(row)) }
+    end
+
+    #: (parent_object_type: String, parent_object_id: String) -> Array[Hash[String, Object?]]
+    def child_workflow_rows_for_object(parent_object_type:, parent_object_id:)
+      execute_store_query(:child_workflow_rows_for_object, [parent_object_type, parent_object_id]).map { |row| child_workflow_row(decode_row(row)) }
+    end
+
     #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
     def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
       transaction do
@@ -687,6 +752,26 @@ module Durababble
       return if lock_owned_workflow_for_update(workflow_id:, worker_id:)
 
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
+    end
+
+    #: (origin_kind: String, parent_workflow_id: String?, parent_worker_id: String?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, parent_object_worker_id: String?) -> void
+    def fence_child_workflow_origin!(origin_kind:, parent_workflow_id:, parent_worker_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, parent_object_worker_id:)
+      case origin_kind
+      when "workflow"
+        raise ArgumentError, "workflow-origin child starts require parent_workflow_id" unless parent_workflow_id
+        raise ArgumentError, "workflow-origin child starts require parent_worker_id" unless parent_worker_id
+
+        raise LeaseConflict, "workflow #{parent_workflow_id} lease expired or moved before child workflow start" unless lock_owned_workflow_for_update(workflow_id: parent_workflow_id, worker_id: parent_worker_id)
+      when "object"
+        raise ArgumentError, "object-origin child starts require parent_object_command_id" unless parent_object_command_id
+        raise ArgumentError, "object-origin child starts require parent_object_worker_id" unless parent_object_worker_id
+
+        command = lock_inbox_message_for_completion(message_id: parent_object_command_id, worker_id: parent_object_worker_id)
+        matches_target = command && command.fetch("target_kind", nil) == "object" && command.fetch("target_type", nil) == parent_object_type && command.fetch("target_id", nil) == parent_object_id
+        raise LeaseConflict, "object command #{parent_object_command_id} lease expired or moved before child workflow start" unless matches_target
+      else
+        raise ArgumentError, "unknown child workflow origin kind: #{origin_kind.inspect}"
+      end
     end
 
     #: (Hash[String, Object?], worker_id: String?) -> void
@@ -1115,6 +1200,40 @@ module Durababble
         mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
         claimed_inbox_row(head, worker_id:, lease_seconds:, now:)
       end
+    end
+
+    #: (String) -> Hash[String, Object?]?
+    def child_workflow_by_child_id_for_update(child_workflow_id)
+      execute_store_query(:child_workflow_by_child_id_for_update, [child_workflow_id]).first
+    end
+
+    #: (Hash[String, Object?]) -> Hash[String, Object?]
+    def child_workflow_row(row)
+      row.merge(
+        "origin_kind" => row["child_origin_kind"],
+        "child_workflow_id" => row.fetch("id"),
+        "child_workflow_name" => row.fetch("name"),
+        "cancellation_policy" => row["child_cancellation_policy"],
+      )
+    end
+
+    #: (origin_kind: String, parent_workflow_id: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String) -> Object?
+    def insert_child_workflow_without_transaction(origin_kind:, parent_workflow_id:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:)
+      params = [
+        child_workflow_id,
+        child_workflow_name,
+        worker_pool,
+        "pending",
+        dump_workflow_input(name: child_workflow_name, input:),
+        origin_kind,
+        parent_workflow_id,
+        parent_command_id,
+        parent_object_type,
+        parent_object_id,
+        parent_object_command_id,
+        cancellation_policy,
+      ]
+      execute_store_query(:insert_child_workflow, params)
     end
   end
 end

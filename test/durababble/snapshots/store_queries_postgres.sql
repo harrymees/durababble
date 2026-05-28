@@ -35,6 +35,15 @@ UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2
 -- pg_cancel_workflow_with_worker
 UPDATE "durababble_pg_snapshot"."workflows" SET status = 'canceled', result = $2::bytea, error = $3, cancel_reason = COALESCE(cancel_reason, $3), cancel_requested_at = COALESCE(cancel_requested_at, now()), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() WHERE id = $1 AND status = 'running' AND locked_by = $4 AND locked_until >= now()
 
+-- pg_child_workflow_by_child_id_for_update
+SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 AND child_origin_kind IS NOT NULL FOR UPDATE
+
+-- pg_child_workflow_rows_for_object
+SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE child_origin_kind = 'object' AND parent_object_type = $1 AND parent_object_id = $2 ORDER BY created_at ASC
+
+-- pg_child_workflow_rows_for_parent
+SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE child_origin_kind = 'workflow' AND parent_workflow_id = $1 ORDER BY created_at ASC
+
 -- pg_claim_expired_fence
 UPDATE "durababble_pg_snapshot"."fences"
 SET locked_by = $1, locked_until = now() + ($2::int * interval '1 second'), result = NULL, error = NULL, completed_at = NULL
@@ -307,6 +316,19 @@ ORDER BY sequence
 SELECT * FROM "durababble_pg_snapshot"."inbox"
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 ORDER BY sequence
+
+-- pg_insert_child_workflow
+INSERT INTO "durababble_pg_snapshot"."workflows" (
+  id, name, worker_pool, status, input,
+  child_origin_kind, parent_workflow_id, parent_command_id,
+  parent_object_type, parent_object_id, parent_object_command_id,
+  child_cancellation_policy
+) VALUES (
+  $1, $2, $3, $4, $5::bytea,
+  $6, $7, $8,
+  $9, $10, $11,
+  $12
+)
 
 -- pg_insert_fence
 INSERT INTO "durababble_pg_snapshot"."fences" (workflow_id, key, status, locked_by, locked_until)

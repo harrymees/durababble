@@ -33,6 +33,13 @@ module Durababble
           cancel_reason TEXT,
           cancel_requested_at INTEGER,
           cancel_delivered_at INTEGER,
+          child_origin_kind TEXT,
+          parent_workflow_id TEXT,
+          parent_command_id INTEGER,
+          parent_object_type TEXT,
+          parent_object_id TEXT,
+          parent_object_command_id TEXT,
+          child_cancellation_policy TEXT,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           queue_available_at INTEGER GENERATED ALWAYS AS (

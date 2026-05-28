@@ -43,6 +43,15 @@ SET status = 'canceled', result = ?, error = ?, cancel_reason = COALESCE(cancel_
   cancel_requested_at = COALESCE(cancel_requested_at, NOW(6)), locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 
+-- mysql_child_workflow_by_child_id_for_update
+SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ? AND child_origin_kind IS NOT NULL FOR UPDATE
+
+-- mysql_child_workflow_rows_for_object
+SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE child_origin_kind = 'object' AND parent_object_type = ? AND parent_object_id = ? ORDER BY created_at ASC
+
+-- mysql_child_workflow_rows_for_parent
+SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE child_origin_kind = 'workflow' AND parent_workflow_id = ? ORDER BY created_at ASC
+
 -- mysql_claim_expired_fence
 UPDATE `durababble_mysql_snapshot_fences`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), result = NULL, error = NULL, completed_at = NULL
@@ -329,6 +338,19 @@ ORDER BY sequence
 SELECT * FROM `durababble_mysql_snapshot_inbox`
 WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
 ORDER BY sequence
+
+-- mysql_insert_child_workflow
+INSERT INTO `durababble_mysql_snapshot_workflows` (
+  id, name, worker_pool, status, input,
+  child_origin_kind, parent_workflow_id, parent_command_id,
+  parent_object_type, parent_object_id, parent_object_command_id,
+  child_cancellation_policy, created_at, updated_at
+) VALUES (
+  ?, ?, ?, ?, ?,
+  ?, ?, ?,
+  ?, ?, ?,
+  ?, NOW(6), NOW(6)
+)
 
 -- mysql_insert_fence
 INSERT IGNORE INTO `durababble_mysql_snapshot_fences` (workflow_id, `key`, status, locked_by, locked_until)

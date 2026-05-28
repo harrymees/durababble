@@ -27,6 +27,13 @@ module Durababble
           cancel_reason text,
           cancel_requested_at timestamptz,
           cancel_delivered_at timestamptz,
+          child_origin_kind text,
+          parent_workflow_id text,
+          parent_command_id integer,
+          parent_object_type text,
+          parent_object_id text,
+          parent_object_command_id text,
+          child_cancellation_policy text,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now()
         )

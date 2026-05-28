@@ -24,6 +24,13 @@ module Durababble
           cancel_reason TEXT,
           cancel_requested_at DATETIME(6),
           cancel_delivered_at DATETIME(6),
+          child_origin_kind VARCHAR(32),
+          parent_workflow_id VARCHAR(191),
+          parent_command_id INT,
+          parent_object_type VARCHAR(191),
+          parent_object_id VARCHAR(191),
+          parent_object_command_id VARCHAR(191),
+          child_cancellation_policy VARCHAR(32),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           queue_available_at DATETIME(6) GENERATED ALWAYS AS (

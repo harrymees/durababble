@@ -44,6 +44,42 @@ class DurababbleConfigurationTest < DurababbleTestCase
     end
   end
 
+  test "payload limits read environment overrides and reject unknown surfaces" do
+    with_config(:@payload_limits, {}) do
+      with_env("DURABABBLE_MAX_STEP_OUTPUT_BYTES", "321") do
+        assert_equal 321, Durababble.payload_limits.fetch(:step_output)
+      end
+    end
+
+    error = assert_raises(ArgumentError) do
+      Durababble.enforce_payload_limit!(surface: :unknown_surface, bytesize: 1)
+    end
+    assert_match(/unknown payload limit surface: unknown_surface/, error.message)
+  end
+
+  test "payload-too-large messages omit the context suffix when no context is present" do
+    error = Durababble::PayloadTooLarge.new(:workflow_input, bytesize: 2, max_bytes: 1)
+
+    assert_nil(error.context)
+    assert_equal("workflow input payload is 2 bytes, exceeding max 1 bytes", error.message)
+  end
+
+  test "default engine setter can clear the configured default store" do
+    previous_engine = Durababble.default_engine
+    previous_store = Durababble.default_store
+
+    Durababble.default_engine = nil
+
+    assert_nil(Durababble.default_engine)
+    assert_nil(Durababble.default_store)
+  ensure
+    if previous_engine
+      Durababble.default_engine = previous_engine
+    else
+      Durababble.default_store = previous_store
+    end
+  end
+
   test "warn_workflow_history_events stays silent below the warning threshold" do
     with_config(:@workflow_history_warning_events, 100) do
       refute Durababble.warn_workflow_history_events(workflow_id: "wf", history_events: 10, max_history_events: 1_000)
@@ -85,6 +121,14 @@ class DurababbleConfigurationTest < DurababbleTestCase
   end
 
   private
+
+  def with_env(key, value)
+    previous = ENV.fetch(key, nil)
+    value.nil? ? ENV.delete(key) : ENV[key] = value
+    yield
+  ensure
+    previous.nil? ? ENV.delete(key) : ENV[key] = previous
+  end
 
   def with_isolation_level(level)
     previous = ActiveSupport::IsolatedExecutionState.isolation_level

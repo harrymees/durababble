@@ -131,6 +131,18 @@ module Durababble
   class WorkflowAlreadyExists < Error
   end
 
+  class ChildWorkflowError < Error
+  end
+
+  class ChildWorkflowFailed < ChildWorkflowError
+  end
+
+  class ChildWorkflowCanceled < ChildWorkflowError
+  end
+
+  class ChildWorkflowTerminated < ChildWorkflowError
+  end
+
   class CancellationError < Error
     attr_reader workflow_id: String?
     attr_reader reason: serialized_payload
@@ -171,6 +183,7 @@ module Durababble
     attr_reader command_id: String
     attr_reader attempt_number: Integer
     attr_reader idempotency_key: String
+    attr_reader worker_id: String
   end
 
   class Heartbeat
@@ -284,12 +297,16 @@ module Durababble
     def retry_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
     def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String) -> Object?
     def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
+    def start_child_workflow: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: serialized_payload, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> workflow_row
+    def observe_child_workflow: (String child_workflow_id) -> workflow_row
+    def child_workflow_rows_for_parent: (parent_workflow_id: String) -> Array[workflow_row]
+    def child_workflow_rows_for_object: (parent_object_type: String, parent_object_id: String) -> Array[workflow_row]
   end
 
   class Workflow[Input, Output, Dispatch = Object]
     def self.workflow_name: (?String value) -> String
-    def self.enqueue: (Input input, ?id: String?, ?store: Store, ?engine: Engine, ?worker_pool: String?) -> String
-    def self.start: (Input input, ?id: String?, ?store: Store, ?engine: Engine, ?worker_pool: String?) -> workflow_handle[Input, Output, Dispatch]
+    def self.enqueue: (Input input, ?id: String?, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle[Input, Output])
+    def self.start: (Input input, ?id: String?, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (workflow_handle[Input, Output, Dispatch] | ChildWorkflowHandle[Input, Output])
     def self.at: (String workflow_id, ?store: Store, ?engine: Engine, ?worker_pool: String?) -> workflow_handle[Input, Output, Dispatch]
     def self.handle: (String workflow_id, ?store: Store, ?engine: Engine, ?worker_pool: String?) -> workflow_handle[Input, Output, Dispatch]
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
@@ -304,6 +321,26 @@ module Durababble
     def sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
     def sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
+    def start_child: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
+    def start_workflow: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
+  end
+
+  class ChildWorkflowHandle[Input, Output]
+    attr_reader workflow_id: String
+    attr_reader worker_pool: String
+    attr_reader cancellation_policy: String
+
+    def initialize: (singleton(Workflow) workflow_class, String workflow_id, store: Store, worker_pool: String, cancellation_policy: String) -> void
+    def ref: () -> WorkflowRef[Input, Output]
+    def status: () -> String
+    def result: () -> Output?
+    def error: () -> String?
+    def await: (?poll_interval: Numeric, ?timeout: Numeric?) -> Output?
+    def cancel: (?reason: serialized_payload) -> Run[serialized_payload]
+    def terminate: (?reason: serialized_payload) -> Run[serialized_payload]
+    def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
+    def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
+    def await_result_from: (workflow_row observed) -> Output?
   end
 
   class WorkflowRef[Input, Output]
@@ -346,6 +383,7 @@ module Durababble
     def schedule_wake: (name: String, at: Time, ?payload: serialized_payload) -> Time
     def cancel_wake: (name: String) -> bool
     def cancel_all_wakes: () -> bool
+    def start_workflow: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
     def state_dirty?: () -> bool
     def wakeup_changes: () -> Array[ObjectWakeupChange]
   end
@@ -434,6 +472,9 @@ module Durababble
     def call_step: (Workflow[serialized_payload, serialized_payload] instance, method_name: Symbol, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) { () -> serialized_payload } -> serialized_payload
     def call_wait: (WaitRequest wait_request, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload
     def call_handle_rpc: (target_kind: String, target_type: String, target_id: String, method_name: Symbol, rpc_kind: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload], ?retry_policy: RetryPolicy?) { (idempotency_key: String, args: Array[serialized_payload], kwargs: Hash[Symbol, serialized_payload]) -> serialized_payload } -> serialized_payload
+    def call_child_workflow_start: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, cancellation_policy: Symbol | String, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?) -> ChildWorkflowHandle[ChildInput, ChildOutput]
+    def call_child_workflow_observe: [ChildInput, ChildOutput] (ChildWorkflowHandle[ChildInput, ChildOutput] handle, ?await_deadline: Time?) -> workflow_row
+    def await_child_workflow: [ChildInput, ChildOutput] (ChildWorkflowHandle[ChildInput, ChildOutput] handle, poll_interval: Numeric, timeout: Numeric?) -> ChildOutput?
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def timer_after: (Numeric duration) -> Time
     def validate_replay_complete!: () -> void

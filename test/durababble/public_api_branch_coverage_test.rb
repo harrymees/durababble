@@ -239,6 +239,23 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  test "rejects child-only workflow options outside workflow or object execution" do
+    input = { "plain" => "plain", "keyword" => "keyword" }
+
+    assert_raises_matching(ArgumentError, /idempotency_key/) do
+      BranchTestWorkflow.enqueue(input, idempotency_key: "enqueue-once")
+    end
+    assert_raises_matching(ArgumentError, /cancellation/) do
+      BranchTestWorkflow.enqueue(input, cancellation: :abandon)
+    end
+    assert_raises_matching(ArgumentError, /idempotency_key/) do
+      BranchTestWorkflow.start(input, idempotency_key: "start-once")
+    end
+    assert_raises_matching(ArgumentError, /cancellation/) do
+      BranchTestWorkflow.start(input, cancellation: :abandon)
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "covers durable object query, command, retry, and missing methods with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_object") do |store|
