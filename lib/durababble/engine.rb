@@ -100,11 +100,12 @@ module Durababble
     end
 
     # Runs a workflow to a terminal-or-suspension boundary and returns a Run
-    # snapshot. The happy path drives the workflow inside the reactor and
-    # snapshots the persisted result; each rescue maps one boundary outcome
-    # (suspended, retry scheduled, lease lost, canceled, failed) onto the right
-    # persisted state. `attributes` is computed before the trace block so it is
-    # always available to the rescue handlers.
+    # snapshot. The happy path drives the workflow inside the reactor; a
+    # successful COMPLETE returns the Run mirror built by the terminal write
+    # (no re-read), otherwise it falls back to reading the persisted row. Each
+    # rescue maps one boundary outcome (suspended, retry scheduled, lease lost,
+    # canceled, failed) onto the right persisted state. `attributes` is computed
+    # before the trace block so it is always available to the rescue handlers.
     #: (untyped, workflow_id: untyped, ?initial_input: untyped, ?claimed_next_run_at: untyped) -> untyped
     def execute(workflow_class, workflow_id:, initial_input: nil, claimed_next_run_at: nil)
       # Deferred boot check: at workflow execution time the host's initializers have run
@@ -114,8 +115,8 @@ module Durababble
       Durababble.assert_fiber_isolation!
       attributes = execute_attributes(workflow_class, workflow_id)
       Observability.trace("durababble.workflow.execute", attributes) do
-        drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at:)
-        snapshot(workflow_id)
+        terminal_run = drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at:)
+        terminal_run || snapshot(workflow_id)
       end
     rescue WorkflowSuspended => e
       persist_workflow_suspension(workflow_id, next_run_at: e.next_run_at)
@@ -133,10 +134,11 @@ module Durababble
     # owned here so the ensure can always break its reference back to the
     # execution, and errors raised inside the reactor are surfaced to the
     # boundary rescues via root_error rather than escaping the Async task.
-    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped, ?claimed_next_run_at: untyped) -> void
+    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped, ?claimed_next_run_at: untyped) -> untyped
     def drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at: nil)
       workflow = nil #: untyped
       root_error = nil #: StandardError?
+      terminal_run = nil #: untyped
       root = Async do |root_task|
         history, history_warning_logged = load_workflow_history(workflow_id, attributes)
         workflow = workflow_class.new
@@ -156,13 +158,15 @@ module Durababble
         )
         workflow.__durababble_execution__ = execution
         result = run_workflow_body(workflow, execution, workflow_class, workflow_id:, initial_input:)
-        persist_terminal_state(execution, workflow_id:, result:, attributes:)
+        terminal_run = persist_terminal_state(execution, workflow_id:, result:, attributes:)
         crash!(:workflow_completed)
       rescue StandardError => e
         root_error = e
       end
       root.wait
       raise root_error if root_error
+
+      terminal_run
     ensure
       workflow.__durababble_execution__ = nil if workflow
     end
@@ -190,7 +194,12 @@ module Durababble
       end
     end
 
-    #: (untyped, workflow_id: untyped, result: untyped, attributes: untyped) -> void
+    # Returns a Run mirroring the row this transaction just made terminal on the
+    # COMPLETE path, so the caller can skip a redundant re-read: complete_workflow
+    # raises unless it set status='completed', result=<result>, error=NULL, and the
+    # serializer round-trips result faithfully. The CANCEL path returns nil because
+    # its persisted error/reason isn't reconstructable here; the caller re-reads.
+    #: (untyped, workflow_id: untyped, result: untyped, attributes: untyped) -> untyped
     def persist_terminal_state(execution, workflow_id:, result:, attributes:)
       WorkflowExecutionContext.with_current(execution) do
         execution.validate_replay_complete!
@@ -198,12 +207,13 @@ module Durababble
           if execution.cancellation_delivered?
             @store.cancel_workflow(workflow_id, reason: cancellation_reason(workflow_id), result:, worker_id: @worker_id)
             Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
+            nil
           else
             @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
             Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
+            Run.new(id: workflow_id, status: "completed", result:, error: nil)
           end
         end
-        nil
       end
     end
 
