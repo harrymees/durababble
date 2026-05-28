@@ -388,13 +388,18 @@ module Durababble
     end
 
     # Tunables for `open_pulled_object_stream` (consumer-side activation pull).
-    # The poll interval is tight (25ms) so the consumer catches a worker's
-    # short-lived activation lease on an empty inbox. The re-upsert interval is
+    # The initial poll interval is tight (25ms) so the consumer catches a
+    # worker's short-lived activation lease on an empty inbox; it then backs off
+    # exponentially (×2) up to a 0.5s cap, with full jitter, so a crowd of
+    # consumers waiting on the same unowned object de-synchronizes instead of
+    # hammering `current_object_lease` in lockstep. The re-upsert interval is
     # ~10× the typical worker target-activation poll so a freshly-completed
     # activation gets renewed before the next worker tick. The total wait of
     # 10s bounds how long a consumer blocks before reporting that no worker
     # could establish ownership.
     STREAM_PULL_POLL_INTERVAL = 0.025
+    STREAM_PULL_POLL_MAX_INTERVAL = 0.5
+    STREAM_PULL_POLL_BACKOFF_FACTOR = 2.0
     STREAM_PULL_REUPSERT_INTERVAL = 0.5
     STREAM_PULL_TIMEOUT = 10.0
 
@@ -605,6 +610,7 @@ module Durababble
     def pull_object_owner(store:, worker_pool:, object_type:, object_id:, writer:)
       deadline = Time.now + STREAM_PULL_TIMEOUT
       next_upsert_at = Time.now
+      attempt = 0
       loop do
         raise WorkflowRpc::NoActiveLease, "stream cancelled before owner became available for #{object_type}/#{object_id}" if writer.cancelled?
 
@@ -621,7 +627,12 @@ module Durababble
             "no worker established ownership of #{object_type}/#{object_id} within #{STREAM_PULL_TIMEOUT}s"
         end
 
-        sleep(STREAM_PULL_POLL_INTERVAL)
+        # Back off exponentially (jittered) so a crowd of consumers waiting on
+        # the same unowned object spreads its `current_object_lease` polls out
+        # instead of hammering in lockstep. Never sleep past the deadline.
+        attempt += 1
+        delay = Backoff.exponential(attempt, step: STREAM_PULL_POLL_INTERVAL, factor: STREAM_PULL_POLL_BACKOFF_FACTOR, max: STREAM_PULL_POLL_MAX_INTERVAL)
+        sleep(delay.clamp(0.0, deadline - Time.now))
       end
     end
 

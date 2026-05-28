@@ -37,5 +37,16 @@ module Durababble
       base = max if max && base > max
       jittered(base, jitter:)
     end
+
+    # Jittered, exponentially growing delay for in-process poll loops. `attempt`
+    # is 1-based; the pre-jitter delay is `step * (factor ** (attempt - 1))`,
+    # optionally capped at `max` before jitter is applied. Use this over `linear`
+    # when a crowd polling the same shared row should taper its frequency fast.
+    #: (Integer, step: Numeric, ?factor: Float, ?max: Numeric?, ?jitter: Float) -> Float
+    def exponential(attempt, step:, factor: 2.0, max: nil, jitter: DEFAULT_JITTER)
+      base = step * (factor**(attempt - 1))
+      base = max if max && base > max
+      jittered(base, jitter:)
+    end
   end
 end
