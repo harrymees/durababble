@@ -102,6 +102,7 @@ module DurababbleMinitestHelper
   #: (untyped, String, at: Object?) -> void
   def make_workflow_timer_due(store, workflow_id, at:)
     store.make_workflow_due!(workflow_id, now: Time.now - 60)
+    set_store_current_time(store, at) if at
   end
 
   #: (untyped, Object?) { -> untyped } -> untyped
@@ -109,10 +110,16 @@ module DurababbleMinitestHelper
     return yield unless now
 
     original_current_time = store.method(:current_time)
-    store.define_singleton_method(:current_time) { now }
+    set_store_current_time(store, now)
     yield
   ensure
     store.define_singleton_method(:current_time) { original_current_time.call } if original_current_time
+  end
+
+  #: (untyped, Object?) -> void
+  def set_store_current_time(store, now)
+    value = store.send(:timestamp_or_nil, now)
+    store.define_singleton_method(:current_time) { value }
   end
 
   #: () -> String
