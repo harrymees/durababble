@@ -359,6 +359,10 @@ SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
 FROM `durababble_mysql_snapshot_workflow_history`
 WHERE workflow_id = ?
 
+-- mysql_insert_workflow_history_at
+INSERT INTO `durababble_mysql_snapshot_workflow_history` (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+
 -- mysql_insert_workflow_with_worker
 INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), NOW(6), NOW(6))
 

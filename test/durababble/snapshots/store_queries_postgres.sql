@@ -350,6 +350,10 @@ FROM "durababble_pg_snapshot"."workflow_history"
 WHERE workflow_id = $8
 RETURNING event_index
 
+-- pg_insert_workflow_history_at
+INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+
 -- pg_insert_workflow_with_worker
 INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))
 
