@@ -12,7 +12,7 @@ SET status = 'canceled', error = 'workflow cancellation requested', updated_at =
 WHERE workflow_id = ? AND status IN ('scheduled', 'running', 'waiting')
 
 -- mysql_cancel_pending_waits_for_workflow
-UPDATE `durababble_mysql_snapshot_waits`
+UPDATE `durababble_mysql_snapshot_waits` FORCE INDEX (durababble_mysql_snapshot_waits_workflow_status_idx)
 SET status = 'canceled', completed_at = NOW(6)
 WHERE workflow_id = ? AND status = 'pending'
 
@@ -184,7 +184,7 @@ SET status = 'completed', result = ?, error = NULL, locked_by = NULL, locked_unt
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 
 -- mysql_count_expired_workflow_leases
-SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflows` WHERE status = 'running' AND locked_until < ?
+SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_expired_lease_idx) WHERE status = 'running' AND locked_until < ?
 
 -- mysql_count_inbox_leases
 SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_inbox` FORCE INDEX (<index>) WHERE status = 'running' AND locked_by = ?
@@ -531,7 +531,7 @@ ON DUPLICATE KEY UPDATE
   updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
 
 -- mysql_steal_expired_leases
-UPDATE `durababble_mysql_snapshot_workflows`
+UPDATE `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_expired_lease_idx)
 SET status = CASE
     WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
     ELSE 'pending'
@@ -565,7 +565,7 @@ WHERE workflow_id = ? AND position = ? AND status = 'running'
 UPDATE `durababble_mysql_snapshot_workflows`
 SET status = CASE
     WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-    WHEN EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_waits` WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
+    WHEN EXISTS (SELECT 1 FROM `durababble_mysql_snapshot_waits` FORCE INDEX (durababble_mysql_snapshot_waits_workflow_status_idx) WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
     ELSE 'pending'
   END,
   locked_by = NULL, locked_until = NULL, updated_at = NOW(6)

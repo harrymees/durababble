@@ -35,7 +35,7 @@ module Durababble
             END
           ) STORED,
           INDEX #{quote_column_name(index_name("workflows", "claim"))} (worker_pool, queue_available_at, created_at),
-          INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (worker_pool, status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (status, locked_until, created_at),
           INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
         )
       SQL
@@ -135,6 +135,7 @@ module Durababble
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           completed_at DATETIME(6),
           INDEX #{quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
+          INDEX #{quote_column_name(index_name("waits", "workflow_status"))} (workflow_id, status),
           INDEX #{quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
           INDEX #{quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
