@@ -975,7 +975,7 @@ module Durababble
 
     define(:pg_complete_workflow, backend: :postgres) do |store|
       # [DURABABBLE-WF-1] Unfenced completion still rejects terminal rows and live durable work.
-        "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() " \
+      "UPDATE #{table(store, "workflows")} SET status = 'completed', result = $2::bytea, error = NULL, locked_by = NULL, locked_until = NULL, next_run_at = NULL, updated_at = now() " \
         "WHERE id = $1 " \
         "AND status <> 'waiting' " \
         "AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL)) " \

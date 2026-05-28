@@ -1166,9 +1166,7 @@ module DurababbleMysqlHotPathReport
   register_scenario(
     "claim_outbox",
     description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("claim_outbox"),
-    setup: lambda do |context|
-      context.seed_outbox_messages
-    end,
+    setup: lambda(&:seed_outbox_messages),
   ) do |context|
     context.store.claim_outbox(worker_id: "analysis-worker", lease_seconds: 60)
   end

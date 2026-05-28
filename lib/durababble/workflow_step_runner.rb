@@ -97,7 +97,7 @@ module Durababble
       end
       crash!(:wait_recorded)
       if due_timer
-        @complete_due_wait.call(future(command_id), command_id, true)
+        @complete_due_wait.call(future(command_id), command_id, reserved_history_event: true)
         return
       end
 

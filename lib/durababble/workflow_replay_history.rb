@@ -185,7 +185,7 @@ module Durababble
       }
     end
 
-    #: (Integer, payload: Object?) -> void
+    #: (Integer, payload: Object?, ?reserved_history_event: bool) -> void
     def remember_step_completed(command_id, payload:, reserved_history_event: false)
       @terminal[command_id] = {
         "kind" => "step_completed",
@@ -273,7 +273,9 @@ module Durababble
         }
       end
 
-      schedule_wait = recorded_schedule(event.fetch("command_id").to_i)&.fetch("payload", {})&.fetch("wait", nil)
+      command_id = event.fetch("command_id").to_s.to_i
+      schedule_payload = recorded_schedule(command_id)&.fetch("payload", nil)
+      schedule_wait = schedule_payload["wait"] if schedule_payload.is_a?(Hash)
       schedule_wait = schedule_wait #: as untyped
       {
         "kind" => schedule_wait&.fetch("kind", nil),
@@ -285,12 +287,13 @@ module Durababble
 
     #: (Hash[String, Object?]) -> bool
     def interrupted_wait_condition?(event)
-      schedule = recorded_schedule(event.fetch("command_id").to_i)
+      schedule = recorded_schedule(event.fetch("command_id").to_s.to_i)
       return false unless schedule&.fetch("name", nil).to_s == "wait_condition"
+
       event_index = event["event_index"]
       return false unless event_index
 
-      @workflow_command_events.any? { |workflow_command| workflow_command.fetch("event_index").to_i > event_index.to_i }
+      @workflow_command_events.any? { |workflow_command| workflow_command.fetch("event_index").to_s.to_i > event_index.to_s.to_i }
     end
 
     #: (WaitRequest) -> Hash[String, Object?]

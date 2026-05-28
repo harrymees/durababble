@@ -19,7 +19,7 @@ module Durababble
             end
           end
           h.scheduler.schedule(actor: "worker", delay: 40, name: "resume") { resume_workflow_once(h, actor: "worker", workflow: h.workflows.fetch("waiting"), workflow_id: id) }
-          h.check("wait completed once") { h.store.workflow_history_for(id).count { |event| event.fetch("kind") == "step_completed" && event.fetch("command_id") == 0 } == 1 }
+          h.check("wait completed once") { h.store.workflow_history_for(id).one? { |event| event.fetch("kind") == "step_completed" && event.fetch("command_id") == 0 } }
           h.check("workflow completed after timer wake") { h.store.workflow(id).fetch("status") == "completed" }
         end
       end

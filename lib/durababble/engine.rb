@@ -206,7 +206,7 @@ module Durababble
       end
     end
 
-    #: (untyped) -> untyped
+    #: (untyped, ?next_run_at: Object?) -> untyped
     def persist_workflow_suspension(workflow_id, next_run_at: nil)
       suspended = WorkflowDeterminism.allow_host_operations do
         @store.suspend_workflow(workflow_id:, worker_id: @worker_id, next_run_at:)

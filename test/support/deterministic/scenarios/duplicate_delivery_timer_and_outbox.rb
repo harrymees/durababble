@@ -39,7 +39,7 @@ module Durababble
           end
           h.check("duplicate network delivery occurred") { h.scheduler.trace.to_s.include?("network.duplicate") }
           h.check("wait completed once despite duplicate timer delivery") do
-            h.store.workflow_history_for(workflow_id).count { |event| event.fetch("kind") == "step_completed" && event.fetch("command_id") == 0 } == 1
+            h.store.workflow_history_for(workflow_id).one? { |event| event.fetch("kind") == "step_completed" && event.fetch("command_id") == 0 }
           end
           h.check("outbox message was idempotent despite duplicate producer delivery") do
             h.store.summary.fetch(:processed_outbox) == 1

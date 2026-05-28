@@ -764,7 +764,7 @@ module Durababble
       @step_runner.dispatch(command_id, step:, attributes:, &block)
     end
 
-    #: (untyped, name: untyped, wait_request: untyped) -> void
+    #: (untyped future, Integer command_id, name: String, wait_request: WaitRequest) -> void
     def record_wait_command!(future, command_id, name:, wait_request:)
       suspend_workflow = suspend_workflow_immediately?
       due_timer = wait_request.kind == "timer" && wait_request.wake_at && timer_due?(wait_request.wake_at)
@@ -832,7 +832,7 @@ module Durababble
       earliest_time([@replay_history.earliest_unresolved_timer_wake_at, wait_request.wake_at].compact)
     end
 
-    #: (Integer) -> void
+    #: (untyped future, Integer command_id, ?reserved_history_event: bool) -> void
     def complete_due_wait_timer!(future, command_id, reserved_history_event: false)
       # [DURABABBLE-WAIT-1] Due workflow timers complete only while this worker
       # holds the workflow lease; timer readiness is represented by the
@@ -841,6 +841,7 @@ module Durababble
       return unless wait
 
       return unless wait_ready?(wait)
+
       cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
       if cancellation
         future.reject(cancellation_error_from(cancellation))
@@ -888,7 +889,7 @@ module Durababble
       comparable_time(wake_at) <= comparable_time(now)
     end
 
-    #: (Object) -> Object
+    #: (Object) -> untyped
     def comparable_time(value)
       return value unless value.is_a?(String)
 
@@ -928,10 +929,10 @@ module Durababble
       end
     end
 
-    #: () -> void
+    #: (?interrupt_on_command: bool) -> void
     def deliver_recorded_resolutions!(interrupt_on_command: false)
       @replay_history.deliver_resolutions(@futures) do |event, future|
-        command_id = event.fetch("command_id").to_i
+        command_id = event.fetch("command_id").to_s.to_i
         case event.fetch("kind")
         when "step_completed"
           future.resolve(event.fetch("payload"))

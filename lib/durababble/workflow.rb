@@ -39,6 +39,7 @@ module Durababble
   end
 
   class StepRetryScheduled < Error; end
+
   class WorkflowSuspended < Error
     #: Object?
     attr_reader :next_run_at
@@ -49,6 +50,7 @@ module Durababble
       super(message)
     end
   end
+
   class WorkflowCommandDelivered < Error; end
 
   class Workflow

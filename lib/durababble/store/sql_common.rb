@@ -105,13 +105,14 @@ module Durababble
 
     #: (Hash[String, Object?]) -> Hash[String, Object?]?
     def wait_row_from_history_event(event)
-      command_id = event["command_id"]
-      return unless command_id
+      command_id_value = event["command_id"]
+      return unless command_id_value
 
       wait = wait_payload_from_history_event(event)
       return unless wait
 
-      command_id = command_id.to_i
+      command_id = command_id_value.to_s.to_i
+      workflow_id = event.fetch("workflow_id").to_s
       status = case event.fetch("kind")
       when "step_waiting"
         "pending"
@@ -123,8 +124,8 @@ module Durababble
         return
       end
       {
-        "id" => "#{event.fetch("workflow_id")}:#{command_id}",
-        "workflow_id" => event.fetch("workflow_id"),
+        "id" => "#{workflow_id}:#{command_id}",
+        "workflow_id" => workflow_id,
         "position" => command_id,
         "command_id" => command_id,
         "kind" => wait["kind"],
@@ -153,8 +154,11 @@ module Durababble
         }
       end
 
-      waiting_event = workflow_history_for(event.fetch("workflow_id")).find do |candidate|
-        candidate.fetch("kind") == "step_waiting" && candidate["command_id"].to_i == event["command_id"].to_i
+      workflow_id = event.fetch("workflow_id").to_s
+      command_id = event.fetch("command_id").to_s.to_i
+
+      waiting_event = workflow_history_for(workflow_id).find do |candidate|
+        candidate.fetch("kind") == "step_waiting" && candidate["command_id"].to_s.to_i == command_id
       end
       waiting_payload = waiting_event&.fetch("payload", nil)
       if waiting_payload.is_a?(Hash) && waiting_payload["wait"].is_a?(Hash)
@@ -167,8 +171,8 @@ module Durababble
         }
       end
 
-      scheduled = workflow_history_for(event.fetch("workflow_id")).find do |candidate|
-        candidate.fetch("kind") == "step_scheduled" && candidate["command_id"].to_i == event["command_id"].to_i
+      scheduled = workflow_history_for(workflow_id).find do |candidate|
+        candidate.fetch("kind") == "step_scheduled" && candidate["command_id"].to_s.to_i == command_id
       end
       scheduled_payload = scheduled&.fetch("payload", nil)
       wait = scheduled_payload["wait"] if scheduled_payload.is_a?(Hash)
@@ -263,12 +267,12 @@ module Durababble
     #: (String) -> Array[Hash[String, Object?]]
     def waits_for(workflow_id)
       rows = {}
-      step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_i, step.fetch("status")] }
+      step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_s.to_i, step.fetch("status")] }
       workflow_history_for(workflow_id).each do |event|
         row = wait_row_from_history_event(event)
         next unless row
 
-        if row.fetch("status") == "pending" && step_statuses[row.fetch("command_id").to_i] == "canceled"
+        if row.fetch("status") == "pending" && step_statuses[row.fetch("command_id").to_s.to_i] == "canceled"
           row = row.merge(
             "status" => "canceled",
             "completed_at" => nil,
