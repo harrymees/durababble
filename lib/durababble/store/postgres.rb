@@ -22,6 +22,7 @@ module Durababble
 
     #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
+      Store.validate_positive_lease_seconds!(lease_seconds)
       return if workflow_names&.empty?
 
       # [DURABABBLE-LEASE-1] Queue selection and lease assignment commit as one locked update
@@ -39,6 +40,7 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      Store.validate_positive_lease_seconds!(lease_seconds)
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
@@ -48,6 +50,7 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+      Store.validate_positive_lease_seconds!(lease_seconds)
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
@@ -57,6 +60,7 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
+      Store.validate_positive_lease_seconds!(lease_seconds)
       # [DURABABBLE-LEASE-2] Heartbeats only extend an unexpired lease held by this worker.
       result = execute_store_query(:heartbeat_workflow, [workflow_id, worker_id, lease_seconds])
       if result.affected_rows.to_i.positive?
@@ -157,6 +161,7 @@ module Durababble
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+      Store.validate_positive_lease_seconds!(lease_seconds)
       command_id = normalize_command_id(command_id, position)
       renewed = transaction do
         workflow = execute_store_query(:heartbeat_step_workflow, [workflow_id, worker_id, lease_seconds]).first
@@ -245,6 +250,7 @@ module Durababble
 
     #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+      Store.validate_positive_lease_seconds!(lease_seconds)
       if worker_id
         execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_seconds, workflow_id, worker_pool])
       else
@@ -402,6 +408,7 @@ module Durababble
 
     #: (worker_id: String, lease_seconds: Integer) -> Object?
     def claim_outbox(worker_id:, lease_seconds:)
+      Store.validate_positive_lease_seconds!(lease_seconds)
       row = retry_serialization_failures do
         transaction do
           candidates = []
@@ -452,15 +459,13 @@ module Durababble
 
     #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
+      Store.validate_positive_lease_seconds!(lease_seconds)
       return if target_kinds&.empty? || target_types&.empty?
 
       filter_sql, filter_params = target_activation_filter(target_kinds:, target_types:, offset: 3)
       row = retry_serialization_failures do
         transaction do
-          candidates = []
-          candidates.concat(execute_store_query(:claim_pending_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
-          candidates.concat(execute_store_query(:claim_expired_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).to_a)
-          candidate = candidates.min_by { |candidate_row| Time.parse(candidate_row.fetch("created_at").to_s) }
+          candidate = execute_store_query(:claim_target_activation, [worker_pool, timestamp(now)] + filter_params, filter_sql:).first
           next nil unless candidate
 
           execute_store_query(:claim_selected_target_activation, [worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id"), worker_id, lease_seconds]).first
@@ -535,37 +540,10 @@ module Durababble
       execute_store_query(:upsert_target_activation, [worker_pool, target_kind, target_type, target_id, ready_timestamp])
     end
 
-    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?now: Time) -> Object?
-    def reconcile_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, now: Time.now)
-      if target_kind == "workflow" && (terminal_error = terminal_workflow_target_error(worker_pool:, workflow_id: target_id))
-        dead_letter_terminal_workflow_inbox_without_transaction(
-          target_type:,
-          target_id:,
-          error: terminal_error,
-        )
-        delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
-        return
-      end
-
-      head = execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
-
-      if head && !InboxStatus.dead_lettered?(head)
-        ready_at = target_activation_ready_at_for(head, now:)
-        set_target_activation_pending_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, ready_at:)
-      else
-        delete_target_activation_without_transaction(worker_pool:, target_kind:, target_type:, target_id:)
-      end
-    end
-
-    #: (worker_pool: String, workflow_id: String) -> String?
-    def terminal_workflow_target_error(worker_pool:, workflow_id:)
+    #: (worker_pool: String, workflow_id: Object?) -> Hash[String, Object?]?
+    def terminal_workflow_target_row_for_update(worker_pool:, workflow_id:)
       row = execute_params("SELECT status, error FROM #{table("workflows")} WHERE worker_pool = $1 AND id = $2 FOR UPDATE", [worker_pool, workflow_id]).first
-      return unless row && WorkflowStatus.terminal?(row)
-
-      status = row.fetch("status")
-      error = row["error"]
-      suffix = error.to_s.empty? ? "" : ": #{error}"
-      "workflow #{workflow_id} is terminal #{status}#{suffix}"
+      row&.transform_values(&:itself)
     end
 
     #: (target_type: String, target_id: String, error: String) -> Object?

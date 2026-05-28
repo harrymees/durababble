@@ -79,17 +79,16 @@ module Durababble
       @migrate = migrate
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
-      # @mutex guards the lifecycle state shared between the control thread and
-      # the host thread (@stopping, @thread, @deliveries). @wakeups is a
-      # thread-safe queue used purely to interrupt the polling fiber's idle
-      # sleep; it is signaled cross-thread by the RPC server (enqueue_delivery)
-      # and by shutdown. Thread::Queue#pop cooperates with the async reactor —
-      # it parks the fiber instead of pinning the host thread.
+      # @mutex guards the lifecycle state shared between the control path and
+      # the runtime owner (@stopping, @thread/@task, @deliveries). @wakeups is
+      # only a hint channel to interrupt the polling fiber's idle sleep.
       @mutex = Mutex.new
       @wakeups = Thread::Queue.new
       @deliveries = []
       @stopping = false
       @thread = nil
+      @task = nil
+      @raise_loop_errors = false
       @last_error = nil
       @consecutive_errors = 0
       @rpc_server = nil
@@ -105,33 +104,7 @@ module Durababble
       @mutex.synchronize do
         return self if running?
 
-        Durababble.assert_fiber_isolation!
-        @stopping = false
-        @last_error = nil
-        @consecutive_errors = 0
-        @deliveries.clear
-        @wakeups.clear
-        Observability.count(
-          "durababble.worker.runtime.starts",
-          "durababble.worker.pool" => @worker_pool,
-          "durababble.worker.id" => @worker_id,
-        )
-        start_rpc_server
-        worker = begin
-          Worker.new(
-            store: @store,
-            workflows: @workflows,
-            objects: @objects,
-            worker_id: @worker_id,
-            lease_seconds: @lease_seconds,
-            migrate: @migrate,
-            worker_pool: @worker_pool,
-            workflow_query_registry: @workflow_query_registry,
-          )
-        rescue StandardError
-          stop_rpc_server
-          raise
-        end
+        worker = prepare_start_locked(async_parent: nil, raise_loop_errors: false)
         # The scheduler runs as fibers inside one async reactor. A non-blocking
         # background service still needs one host thread to drive the reactor,
         # but the worker logic fans out cooperatively up to @concurrency and is
@@ -141,14 +114,24 @@ module Durababble
       self
     end
 
+    #: (?parent: Object) -> Object
+    def start_async(parent: Async::Task.current)
+      @mutex.synchronize do
+        return @task if running? && @task
+
+        worker = prepare_start_locked(async_parent: parent, raise_loop_errors: true)
+        @task = parent.async { |task| run_loop(task, worker) }
+      end
+    end
+
     #: (?timeout: Numeric) -> Symbol
     def shutdown(timeout: DEFAULT_SHUTDOWN_TIMEOUT)
-      thread = @mutex.synchronize do
+      thread, task = @mutex.synchronize do
         @stopping = true
-        @thread
+        [@thread, @task]
       end
       @wakeups.push(:stop)
-      unless thread
+      unless thread || task
         stop_rpc_server
         return :stopped
       end
@@ -157,7 +140,7 @@ module Durababble
         "durababble.worker.pool" => @worker_pool,
         "durababble.worker.id" => @worker_id,
       }
-      if thread.join(timeout)
+      if thread ? thread.join(timeout) : wait_for_task_stop(task, timeout:)
         stop_rpc_server
         Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "stopped"))
         return :stopped
@@ -174,13 +157,16 @@ module Durababble
 
     #: (?timeout: Numeric?) -> Thread?
     def wait(timeout: nil)
-      thread = @mutex.synchronize { @thread }
-      timeout ? thread&.join(timeout) : thread&.join
+      thread, task = @mutex.synchronize { [@thread, @task] }
+      return timeout ? thread&.join(timeout) : thread&.join if thread
+      return unless task
+
+      wait_for_task_stop(task, timeout:) ? task : nil
     end
 
     #: () -> bool
     def running?
-      @thread&.alive? || false
+      @thread&.alive? || @task&.running? || false
     end
 
     #: () -> void
@@ -191,10 +177,41 @@ module Durababble
 
     private
 
-    #: () -> untyped
-    def start_rpc_server
+    #: (async_parent: Object?, raise_loop_errors: bool) -> Worker
+    def prepare_start_locked(async_parent:, raise_loop_errors:)
+      Durababble.assert_fiber_isolation!
+      @stopping = false
+      @last_error = nil
+      @consecutive_errors = 0
+      @deliveries.clear
+      clear_wakeups
+      @raise_loop_errors = raise_loop_errors
+      Observability.count(
+        "durababble.worker.runtime.starts",
+        "durababble.worker.pool" => @worker_pool,
+        "durababble.worker.id" => @worker_id,
+      )
+      start_rpc_server(parent: async_parent)
+      Worker.new(
+        store: @store,
+        workflows: @workflows,
+        objects: @objects,
+        worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
+        migrate: @migrate,
+        worker_pool: @worker_pool,
+        workflow_query_registry: @workflow_query_registry,
+      )
+    rescue StandardError
+      stop_rpc_server
+      @raise_loop_errors = false
+      raise
+    end
+
+    #: (?parent: Object?) -> untyped
+    def start_rpc_server(parent: nil)
       transient_handler = DurableObjectTransientHandler.new(store: @store, objects: @objects, node_id: -> { @worker_id })
-      @rpc_server = Rpc::Server.new(
+      server = Rpc::Server.new(
         node_id: nil,
         store: @store,
         worker_pool: @worker_pool,
@@ -209,7 +226,8 @@ module Durababble
         deliver_message: method(:enqueue_delivery),
         stream_handler: method(:handle_stream),
         evict_lease: method(:handle_evict_lease),
-      ).start
+      )
+      @rpc_server = parent ? server.start_async(parent:) : server.start
       @rpc_address = @rpc_server.address
       # The server assigns its `node_id` during `start`, so it is non-nil here.
       node_id = @rpc_server.node_id #: as String
@@ -291,6 +309,25 @@ module Durababble
       @stream_dispatcher = nil
       @object_stream_host = nil
       server.stop
+    end
+
+    #: (untyped, timeout: Numeric?) -> bool
+    def wait_for_task_stop(task, timeout:)
+      return false unless task
+
+      deadline = timeout && Time.now + timeout
+      while task.running?
+        return false if deadline && Time.now >= deadline
+
+        sleep_interval = deadline ? [0.005, deadline - Time.now].min : 0.005
+        sleep(sleep_interval) if sleep_interval.positive?
+      end
+      true
+    end
+
+    #: () -> void
+    def clear_wakeups
+      @wakeups.pop(timeout: 0) until @wakeups.empty?
     end
 
     #: () -> Hash[String, Object]
@@ -378,11 +415,18 @@ module Durababble
           record_worker_error(e)
         rescue StandardError => e
           record_worker_error(e)
+          raise if @raise_loop_errors
+
           await_work(task)
         end
       end
     ensure
-      @mutex.synchronize { @thread = nil if Thread.current == @thread }
+      stop_rpc_server
+      @mutex.synchronize do
+        @thread = nil if Thread.current == @thread
+        @task = nil if defined?(Async::Task) && Async::Task.current.equal?(@task)
+        @raise_loop_errors = false unless @thread || @task
+      end
     end
 
     #: (untyped, untyped, Hash[Array[String], untyped]) -> bool
@@ -481,7 +525,7 @@ module Durababble
     rescue Async::TimeoutError
       nil
     ensure
-      @wakeups.clear
+      clear_wakeups
     end
 
     #: (untyped) -> void
@@ -490,7 +534,7 @@ module Durababble
     rescue Async::TimeoutError
       nil
     ensure
-      @wakeups.clear
+      clear_wakeups
     end
 
     # Surface unexpected polling failures so a worker that is silently spinning

@@ -1375,12 +1375,45 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: "expired-heartbeat", input: {})
 
         assert_hash_includes(
-          store.claim_workflow(workflow_id:, worker_id: "zombie", lease_seconds: -1),
+          store.claim_workflow(workflow_id:, worker_id: "zombie", lease_seconds: 1),
           "locked_by" => "zombie",
         )
+        sleep(1.1)
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
         assert_equal 0, store.heartbeat(workflow_id:, worker_id: "zombie", lease_seconds: 30).affected_rows
         assert_equal false, store.workflow_owned?(workflow_id:, worker_id: "zombie")
+      end
+    end
+
+    test "rejects non-positive workflow outbox activation and inbox leases with #{backend.name}" do
+      with_durababble_store(backend, "lease_validation") do |store|
+        workflow_id = store.enqueue_workflow(name: "lease-validation", input: {})
+        store.enqueue_outbox(workflow_id:, topic: "events", payload: {}, key: "lease-validation")
+        command_id = store.enqueue_inbox_message(
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "lease-validation",
+          message_kind: "ask",
+          method_name: "increment",
+          payload: { "method_name" => "increment", "args" => [], "kwargs" => {} },
+        )
+
+        [
+          -> { store.create_workflow(name: "invalid-create", input: {}, worker_id: "owner", lease_seconds: 0) },
+          -> { store.mark_workflow_running(workflow_id, worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_runnable_workflow(worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_workflow_for_activation(workflow_id:, worker_id: "owner", lease_seconds: 0) },
+          -> { store.heartbeat(workflow_id:, worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_target_activation(worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_outbox(worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_inbox_messages(target_kind: "object", target_type: "counter", target_id: "lease-validation", worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_next_workflow_command(worker_pool: "default", workflow_name: "lease-validation", workflow_id:, worker_id: "owner", lease_seconds: 0) },
+          -> { store.claim_object_command(command_id:, worker_id: "owner", lease_seconds: 0) },
+          -> { store.heartbeat_step(workflow_id:, worker_id: "owner", lease_seconds: 0, cursor: {}) },
+        ].each do |operation|
+          assert_raises_matching(ArgumentError, /lease_seconds must be a positive Numeric/, &operation)
+        end
       end
     end
 
@@ -1422,7 +1455,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.workflow(completion_id), "status" => "completed", "locked_by" => nil, "result" => { "done" => true }
 
         failure_id = store.enqueue_workflow(name: "fenced-fail", input: {})
-        store.claim_workflow(workflow_id: failure_id, worker_id: "owner", lease_seconds: -1)
+        store.claim_workflow(workflow_id: failure_id, worker_id: "owner", lease_seconds: 1)
+        sleep(1.1)
         assert_raises(Durababble::LeaseConflict) do
           store.fail_workflow(failure_id, error: "late failure", worker_id: "owner")
         end

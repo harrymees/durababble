@@ -47,14 +47,6 @@ ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
--- pg_claim_expired_target_activation
-SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM "durababble_pg_snapshot"."target_activations"
-WHERE worker_pool = $1 AND status = 'running' AND locked_until < $2::timestamptz
-  <filter_sql>
-ORDER BY ready_at, created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
 -- pg_claim_object_lease
 INSERT INTO "durababble_pg_snapshot"."durable_objects"
   (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
@@ -72,14 +64,6 @@ RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_un
 SELECT id, created_at FROM "durababble_pg_snapshot"."outbox"
 WHERE status = 'pending'
 ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
--- pg_claim_pending_target_activation
-SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM "durababble_pg_snapshot"."target_activations"
-WHERE worker_pool = $1 AND status = 'pending' AND ready_at <= $2::timestamptz
-  <filter_sql>
-ORDER BY ready_at, created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
@@ -114,6 +98,18 @@ UPDATE "durababble_pg_snapshot"."target_activations"
 SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 RETURNING *
+
+-- pg_claim_target_activation
+SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM "durababble_pg_snapshot"."target_activations"
+WHERE worker_pool = $1
+  AND (CASE
+  WHEN status = 'pending' THEN ready_at
+  WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END) <= $2::timestamptz
+  <filter_sql>
+LIMIT 1
+FOR UPDATE SKIP LOCKED
 
 -- pg_claim_workflow_already_owned
 SELECT * FROM "durababble_pg_snapshot"."workflows"

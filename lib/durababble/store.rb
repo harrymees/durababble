@@ -423,8 +423,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, workflow_name: String, method_name: String, payload: Object?, ?idempotency_key: String?) -> String
-    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil)
+    #: (workflow_id: String, workflow_name: String, method_name: String, payload: Object?, ?idempotency_key: String?, ?max_attempts: Integer?) -> String
+    def enqueue_workflow_command(workflow_id:, workflow_name:, method_name:, payload:, idempotency_key: nil, max_attempts: nil)
       raise NotImplementedError
     end
 
@@ -445,6 +445,11 @@ module Durababble
 
     #: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
     def retry_object_command(command_id:, error:, worker_id:, ready_at:)
+      raise NotImplementedError
+    end
+
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
       raise NotImplementedError
     end
 

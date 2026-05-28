@@ -242,12 +242,19 @@ module Durababble
           locked_until INTEGER,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
+          queue_available_at INTEGER GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN ready_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
           PRIMARY KEY (target_kind, target_type, target_id)
         )
       SQL
       execute(<<~SQL)
-        CREATE INDEX IF NOT EXISTS #{index_name("target_activations", "queue")}
-        ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)
+        CREATE INDEX IF NOT EXISTS #{index_name("target_activations", "claim")}
+        ON #{table("target_activations")} (worker_pool, target_kind, target_type, queue_available_at, created_at)
       SQL
     end
   end

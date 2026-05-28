@@ -6,6 +6,7 @@ require "async"
 Fiber.attr_accessor(:durababble_workflow_execution) unless Fiber.method_defined?(:durababble_workflow_execution)
 Fiber.attr_accessor(:durababble_step_context) unless Fiber.method_defined?(:durababble_step_context)
 Fiber.attr_accessor(:durababble_stream_writer) unless Fiber.method_defined?(:durababble_stream_writer)
+Fiber.attr_accessor(:durababble_workflow_query_context) unless Fiber.method_defined?(:durababble_workflow_query_context)
 
 module Durababble
   StepContext = Data.define(:workflow_id, :step_index, :attempt_number, :idempotency_key, :heartbeat)
@@ -84,30 +85,55 @@ module Durababble
     end
   end
 
+  module WorkflowQueryContext
+    class << self
+      #: () -> bool
+      def current
+        fiber = Fiber.current #: as untyped
+        !!fiber.durababble_workflow_query_context
+      end
+
+      #: (bool) { () -> Object? } -> Object?
+      def with_current(context, &block)
+        fiber = Fiber.current #: as untyped
+        previous = fiber.durababble_workflow_query_context
+        fiber.durababble_workflow_query_context = context
+        block.call
+      ensure
+        fiber.durababble_workflow_query_context = previous
+      end
+    end
+  end
+
   module AsyncTaskWorkflowContextPatch
     #: () { () -> Object? } -> Object?
     def schedule(&block)
       task = self #: as untyped
       step_context = StepExecutionContext.current
+      query_context = WorkflowQueryContext.current
       if task.transient?
         execution = WorkflowExecutionContext.current
-        return super(&block) unless execution || step_context
+        return super(&block) unless execution || step_context || query_context
 
         return super do
           WorkflowExecutionContext.with_current(nil) do
-            StepExecutionContext.with_current(step_context) { block.call }
+            StepExecutionContext.with_current(step_context) do
+              WorkflowQueryContext.with_current(query_context) { block.call }
+            end
           end
         end
       end
 
       execution = WorkflowExecutionContext.current
-      return super(&block) unless execution || step_context
+      return super(&block) unless execution || step_context || query_context
 
       workflow_task = self #: as untyped
       execution&.register_workflow_task(workflow_task)
       super do
         WorkflowExecutionContext.with_current(execution) do
-          StepExecutionContext.with_current(step_context) { block.call }
+          StepExecutionContext.with_current(step_context) do
+            WorkflowQueryContext.with_current(query_context) { block.call }
+          end
         end
       ensure
         execution&.unregister_workflow_task(workflow_task)

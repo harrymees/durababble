@@ -585,18 +585,9 @@ module Durababble
 
       #: () -> Server
       def start
-        return self if @thread
+        return self if @thread || @task
 
-        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
-        @bound = http_endpoint.bound
-        @port = @bound.sockets.first.local_address.ip_port
-        # Fence the node identity to the bound address so a recycled host:port
-        # (a new worker reusing a dead one's address) presents a distinct
-        # `node_id`; `expected_worker_id` checks then reject stale callers.
-        @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
-        service = build_service
-        app = ->(request) { route(service, request) }
-        server = Async::HTTP::Server.new(app, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+        server = build_http_server
 
         # The socket is already bound/listening (above, on this thread); the
         # reactor thread only runs the accept loop. Hand the scheduler back
@@ -612,12 +603,22 @@ module Durababble
         self
       end
 
+      #: (?parent: Object) -> Server
+      def start_async(parent: Async::Task.current)
+        return self if @thread || @task
+
+        server = build_http_server
+        @task = parent.async { server.run }
+        self
+      end
+
       # Interrupt the reactor and join its thread, bounding the wait by
       # `@stop_drain_timeout` so a wedged in-flight request/stream cannot block
-      # shutdown forever; if the drain times out we log and abandon the thread.
+      # shutdown forever; if the drain times out we log and abandon it.
       #: () -> void
       def stop
         @scheduler&.interrupt
+        @task&.stop
         if @thread && !@thread.join(@stop_drain_timeout)
           Durababble.logger&.warn(
             "Durababble::Rpc::Server#stop timed out after #{@stop_drain_timeout}s " \
@@ -627,6 +628,7 @@ module Durababble
       ensure
         @bound&.close
         @thread = nil
+        @task = nil
         @scheduler = nil
         @bound = nil
         @port = nil
@@ -638,6 +640,17 @@ module Durababble
       end
 
       private
+
+      #: () -> Async::HTTP::Server
+      def build_http_server
+        http_endpoint = Async::HTTP::Endpoint.parse("http://#{@host}:#{@requested_port}")
+        @bound = http_endpoint.bound
+        @port = @bound.sockets.first.local_address.ip_port
+        @node_id ||= WorkerIdentity.generate(address:, id: @identity_id)
+        service = build_service
+        app = ->(request) { route(service, request) }
+        Async::HTTP::Server.new(app, @bound, protocol: http_endpoint.protocol, scheme: http_endpoint.scheme)
+      end
 
       #: () -> Service
       def build_service

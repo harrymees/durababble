@@ -144,6 +144,13 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         end
         assert_equal [inbox_claim_command_id], inbox_messages.map { |message| message.fetch("id") }
 
+        target_activation_command_id = enqueue_object_command("target-activation-claim-object", object_type: "query-count-target")
+        target_activation = assert_sql_query_budget("claim_target_activation", mysql: 3, postgres: 2) do
+          store.claim_target_activation(worker_id: "target-activation-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["query-count-target"])
+        end
+        assert_hash_includes target_activation, "target_kind" => "object", "target_type" => "query-count-target", "target_id" => "target-activation-claim-object", "status" => "running"
+        assert_hash_includes store.inbox_message(target_activation_command_id), "status" => "pending"
+
         completed = assert_sql_query_budget("complete_object_command", mysql: 6, postgres: 6) do
           store.complete_object_command(
             command_id: inbox_claim_command_id,
@@ -201,9 +208,9 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
     store.claim_target_activation(worker_id: "release-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["counter"])
   end
 
-  def enqueue_object_command(object_id)
+  def enqueue_object_command(object_id, object_type: "counter")
     store.enqueue_object_command(
-      object_type: "counter",
+      object_type:,
       object_id:,
       method_name: "increment",
       args: [1],

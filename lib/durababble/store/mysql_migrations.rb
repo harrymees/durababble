@@ -235,9 +235,15 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN ready_at
+              WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
           PRIMARY KEY (target_kind, target_type, target_id),
-          INDEX #{quote_column_name(index_name("target_activations", "queue"))} (worker_pool, status, ready_at, created_at),
-          INDEX #{quote_column_name(index_name("target_activations", "expired"))} (worker_pool, status, locked_until, created_at),
+          INDEX #{quote_column_name(index_name("target_activations", "claim"))} (worker_pool, target_kind, target_type, queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("target_activations", "worker_lease"))} (status, locked_by)
         )
       SQL

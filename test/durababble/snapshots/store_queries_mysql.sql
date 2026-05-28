@@ -55,14 +55,6 @@ ORDER BY created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
--- mysql_claim_expired_target_activation
-SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM `durababble_mysql_snapshot_target_activations` FORCE INDEX (durababble_mysql_snapshot_target_activations_expired_idx)
-WHERE worker_pool = ? AND status = 'running' AND locked_until < ?
-  <filter_sql>
-ORDER BY ready_at, created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
 -- mysql_claim_object_lease
 UPDATE `durababble_mysql_snapshot_durable_objects`
 SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
@@ -73,14 +65,6 @@ WHERE object_type = ? AND object_id = ?
 SELECT id, created_at FROM `durababble_mysql_snapshot_outbox`
 WHERE status = 'pending'
 ORDER BY created_at
-LIMIT 1
-FOR UPDATE SKIP LOCKED
-
--- mysql_claim_pending_target_activation
-SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM `durababble_mysql_snapshot_target_activations`
-WHERE worker_pool = ? AND status = 'pending' AND ready_at <= ?
-  <filter_sql>
-ORDER BY ready_at, created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
@@ -112,6 +96,14 @@ WHERE id = ? AND worker_pool = ?
     OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
     OR (status = 'running' AND locked_until < NOW(6))
   )
+
+-- mysql_claim_target_activation
+SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM `durababble_mysql_snapshot_target_activations` FORCE INDEX (durababble_mysql_snapshot_target_activations_claim_idx)
+WHERE worker_pool = ?
+  AND queue_available_at <= ?
+  <filter_sql>
+LIMIT 1
+FOR UPDATE SKIP LOCKED
 
 -- mysql_claim_workflow_already_owned
 SELECT * FROM `durababble_mysql_snapshot_workflows`

@@ -639,7 +639,8 @@ module Durababble
       end
 
       method_name, args, kwargs = workflow_command_call_shape(message)
-      unless @workflow_class.exposed_commands.key?(method_name)
+      retry_policy = @workflow_class.exposed_commands[method_name]
+      unless retry_policy
         fail_workflow_command_message(message, "Durababble::WorkflowRpc::UnknownCommand: #{method_name}")
         return
       end
@@ -656,7 +657,7 @@ module Durababble
         )
       end
     rescue StandardError => e
-      fail_workflow_command_message(message, "#{e.class}: #{e.message}")
+      handle_workflow_command_error(message, retry_policy:, error: e)
     end
 
     #: (Hash[String, Object?]) -> void
@@ -718,6 +719,33 @@ module Durababble
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,
+        )
+      end
+    end
+
+    #: (Hash[String, Object?], retry_policy: RetryPolicy?, error: StandardError) -> void
+    def handle_workflow_command_error(message, retry_policy:, error:)
+      serialized_error = "#{error.class}: #{error.message}"
+      attempt_value = message.fetch("attempts") #: as untyped
+      attempt_number = attempt_value.to_i
+      if retry_policy&.retryable?(error, attempt_number:)
+        retry_workflow_command_message(message, serialized_error, retry_policy.delay_for_attempt(attempt_number))
+      else
+        fail_workflow_command_message(message, serialized_error)
+      end
+    end
+
+    #: (Hash[String, Object?], String, Numeric) -> void
+    def retry_workflow_command_message(message, error, delay)
+      reserve_workflow_command_history_event!
+      message_id = message.fetch("id").to_s
+      synchronize_store do
+        @store.retry_workflow_command(
+          message_id:,
+          workflow_id: @workflow_id,
+          error:,
+          worker_id: @worker_id,
+          ready_at: retry_run_at(delay),
         )
       end
     end
