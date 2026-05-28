@@ -123,7 +123,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         cancellation: :abandon,
       )
       timer_task = Async { sleep_until(input.fetch("timer_at"), { "timer" => true }) }
-      child_result = handle.await(poll_interval: input.fetch("poll_interval"))
+      child_result = handle.await(poll_interval: 0)
       { "child" => child_result, "timer" => timer_task.wait }
     end
   end
@@ -326,7 +326,6 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
             "child" => { "value" => "ok" },
             "child_id" => "child-future-timer",
             "timer_at" => timer_at,
-            "poll_interval" => 7200,
           },
         )
         worker = worker_for(backend, store, workflows: [ParentTimerAndChildWorkflow, ChildEchoWorkflow])

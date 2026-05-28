@@ -148,7 +148,7 @@ module Durababble
       command_id unless futures[command_id]
     end
 
-    #: (Integer) -> Hash[String, Object?]?
+    #: (Integer) -> wait_metadata?
     def waiting_timer(command_id)
       event = @terminal[command_id]
       return unless event&.fetch("kind") == "step_waiting"
@@ -160,7 +160,7 @@ module Durababble
       wait
     end
 
-    #: (Integer) -> Hash[String, Object?]?
+    #: (Integer) -> wait_metadata?
     def waiting_timer_or_child_workflow(command_id)
       event = @terminal[command_id]
       return unless event&.fetch("kind") == "step_waiting"
@@ -260,7 +260,7 @@ module Durababble
       payload.is_a?(Hash) && payload["retrying"] == true
     end
 
-    #: (Hash[String, Object?]) -> Hash[String, Object?]
+    #: (wait_history_event) -> wait_metadata
     def waiting_event_payload(event)
       payload = event.fetch("payload")
       if payload.is_a?(Hash) && payload["wait"].is_a?(Hash)
@@ -296,7 +296,7 @@ module Durababble
       @workflow_command_events.any? { |workflow_command| workflow_command.fetch("event_index").to_s.to_i > event_index.to_s.to_i }
     end
 
-    #: (WaitRequest) -> Hash[String, Object?]
+    #: (WaitRequest) -> wait_event_payload
     def step_waiting_payload(wait_request)
       {
         "context" => wait_request.context,

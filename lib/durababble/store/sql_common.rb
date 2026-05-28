@@ -103,15 +103,15 @@ module Durababble
       end
     end
 
-    #: (Hash[String, Object?]) -> Hash[String, Object?]?
-    def wait_snapshot_from_history_event(event)
+    #: (wait_history_event, Hash[Integer, wait_metadata]) -> wait_snapshot?
+    def wait_snapshot_from_history_event(event, wait_metadata_by_command_id)
       command_id_value = event["command_id"]
       return unless command_id_value
 
-      wait = wait_payload_from_history_event(event)
+      command_id = command_id_value.to_s.to_i
+      wait = wait_payload_from_history_event(event, wait_metadata_by_command_id)
       return unless wait
 
-      command_id = command_id_value.to_s.to_i
       workflow_id = event.fetch("workflow_id").to_s
       status = case event.fetch("kind")
       when "step_waiting"
@@ -136,8 +136,8 @@ module Durababble
       }
     end
 
-    #: (Hash[String, Object?]) -> Hash[String, Object?]?
-    def wait_payload_from_history_event(event)
+    #: (wait_history_event, Hash[Integer, wait_metadata]) -> wait_metadata?
+    def wait_payload_from_history_event(event, wait_metadata_by_command_id)
       payload = event["payload"]
       return unless payload.is_a?(Hash)
 
@@ -151,29 +151,9 @@ module Durababble
         }
       end
 
-      workflow_id = event.fetch("workflow_id").to_s
       command_id = event.fetch("command_id").to_s.to_i
-
-      waiting_event = workflow_history_for(workflow_id).find do |candidate|
-        candidate.fetch("kind") == "step_waiting" && candidate["command_id"].to_s.to_i == command_id
-      end
-      waiting_payload = waiting_event&.fetch("payload", nil)
-      if waiting_payload.is_a?(Hash) && waiting_payload["wait"].is_a?(Hash)
-        wait = waiting_payload.fetch("wait") #: as untyped
-        return {
-          "kind" => wait["kind"],
-          "event_key" => wait["event_key"],
-          "wake_at" => wait["wake_at"],
-          "context" => waiting_payload["context"] || wait["context"],
-        }
-      end
-
-      scheduled = workflow_history_for(workflow_id).find do |candidate|
-        candidate.fetch("kind") == "step_scheduled" && candidate["command_id"].to_s.to_i == command_id
-      end
-      scheduled_payload = scheduled&.fetch("payload", nil)
-      wait = scheduled_payload["wait"] if scheduled_payload.is_a?(Hash)
-      return unless wait.is_a?(Hash)
+      wait = wait_metadata_by_command_id[command_id]
+      return unless wait
 
       {
         "kind" => wait["kind"],
@@ -183,7 +163,38 @@ module Durababble
       }
     end
 
-    #: (WaitRequest) -> Hash[String, Object?]
+    #: (Array[Hash[String, Object?]]) -> Hash[Integer, wait_metadata]
+    def wait_metadata_index(history)
+      history.each_with_object({}) do |event, index|
+        next unless ["step_scheduled", "step_waiting"].include?(event.fetch("kind"))
+
+        command_id_value = event["command_id"]
+        next unless command_id_value
+
+        wait = wait_metadata_from_payload(event["payload"])
+        next unless wait
+
+        index[command_id_value.to_s.to_i] = wait
+      end
+    end
+
+    #: (Object?) -> wait_metadata?
+    def wait_metadata_from_payload(payload)
+      return unless payload.is_a?(Hash)
+
+      wait = payload["wait"]
+      return unless wait.is_a?(Hash)
+
+      wait = wait #: as untyped
+      {
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => payload["context"] || wait["context"],
+      }
+    end
+
+    #: (WaitRequest) -> wait_event_payload
     def wait_payload(wait_request)
       {
         "context" => wait_request.context,
@@ -263,12 +274,14 @@ module Durababble
 
     # Diagnostic/test view reconstructed from workflow history and step state.
     # Runtime wake/claim paths must not call this; they use workflows.next_run_at.
-    #: (String) -> Array[Hash[String, Object?]]
+    #: (String) -> Array[wait_snapshot]
     def wait_snapshots_for(workflow_id)
       snapshots = {}
       step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_s.to_i, step.fetch("status")] }
-      workflow_history_for(workflow_id).each do |event|
-        snapshot = wait_snapshot_from_history_event(event)
+      history = workflow_history_for(workflow_id)
+      wait_metadata_by_command_id = wait_metadata_index(history)
+      history.each do |event|
+        snapshot = wait_snapshot_from_history_event(event, wait_metadata_by_command_id)
         next unless snapshot
 
         if snapshot.fetch("status") == "pending" && step_statuses[snapshot.fetch("command_id").to_s.to_i] == "canceled"

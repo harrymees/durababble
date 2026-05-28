@@ -86,6 +86,11 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
           )
         end
         refute_nil wait_id
+
+        assert_sql_query_budget("wait_snapshots_for", mysql: 2, postgres: 2) do
+          snapshots = store.wait_snapshots_for(wait_workflow)
+          assert_equal ["pending"], snapshots.map { |wait| wait.fetch("status") }
+        end
       end
     end
 
