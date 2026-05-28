@@ -3,6 +3,11 @@ module Async
     class Client
     end
   end
+
+  module GRPC
+    class Client
+    end
+  end
 end
 
 module Durababble
