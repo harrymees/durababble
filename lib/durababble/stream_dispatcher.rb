@@ -56,7 +56,7 @@ module Durababble
 
       if @object_stream_host
         @object_stream_host.with_lease(worker_pool:, object_type:, object_id:, lease_seconds: @lease_seconds) do |entry|
-          run_object_producer(object_class:, object_id:, request:, args:, writer:, entry:)
+          run_object_producer(object_class:, object_id:, worker_pool:, request:, args:, writer:, entry:)
           # Eviction with no in-flight emit must still surface as `StaleLease`
           # rather than as a clean end, so the consumer can reconnect onto the
           # new owner instead of believing the stream finished.
@@ -64,15 +64,14 @@ module Durababble
         end
       else
         assert_object_lease!(object_type:, object_id:)
-        run_object_producer(object_class:, object_id:, request:, args:, writer:, entry: nil)
+        run_object_producer(object_class:, object_id:, worker_pool:, request:, args:, writer:, entry: nil)
         assert_object_lease!(object_type:, object_id:)
       end
     end
 
-    #: (object_class: untyped, object_id: String, request: Rpc::Messages::TransientRequest, args: Hash[String, untyped]?, writer: untyped, entry: ObjectStreamHost::Entry?) -> void
-    def run_object_producer(object_class:, object_id:, request:, args:, writer:, entry:)
-      state = @store.object_state(object_type: object_class.object_type, object_id:)
-      worker_pool = request.worker_pool.to_s.empty? ? "default" : request.worker_pool
+    #: (object_class: untyped, object_id: String, worker_pool: String, request: Rpc::Messages::TransientRequest, args: Hash[String, untyped]?, writer: untyped, entry: ObjectStreamHost::Entry?) -> void
+    def run_object_producer(object_class:, object_id:, worker_pool:, request:, args:, writer:, entry:)
+      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
       object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:)
       object.instance_variable_set(:@__durababble_query_context, true)
       lease_writer = entry ? ObjectStreamLeaseWriter.new(writer, entry:) : writer
@@ -166,7 +165,7 @@ module Durababble
     def symbolize_keys(value)
       return {} unless value.is_a?(Hash)
 
-      value.each_with_object({}) { |(key, val), acc| acc[key.to_sym] = val }
+      value.transform_keys(&:to_sym)
     end
 
     #: (untyped) { (untyped) -> untyped } -> Hash[String, untyped]

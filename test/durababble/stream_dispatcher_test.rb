@@ -41,8 +41,8 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       @object_releases = []
     end
 
-    def object_state(object_type:, object_id:)
-      @object_state
+    def object_state_entry(object_type:, object_id:)
+      @object_state.nil? ? Durababble::Store::NO_OBJECT_STATE : @object_state
     end
 
     def current_workflow_lease(_workflow_id)

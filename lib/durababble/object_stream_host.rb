@@ -283,21 +283,37 @@ module Durababble
         break if @mutex.synchronize { @stopping }
 
         snapshot = @mutex.synchronize { @entries.dup }
-        snapshot.each do |key, entry|
-          next if entry.lost
+        next if snapshot.empty?
 
-          renewed = @store.renew_object_lease(
-            object_type: key[0],
-            object_id: key[1],
-            worker_id: @worker_id,
-            lease_seconds: @lease_seconds,
-          )
-          entry.lost = true unless renewed
+        with_dedicated_store_connection do |store|
+          snapshot.each do |key, entry|
+            next if entry.lost
+
+            renewed = store.renew_object_lease(
+              object_type: key[0],
+              object_id: key[1],
+              worker_id: @worker_id,
+              lease_seconds: @lease_seconds,
+            )
+            entry.lost = true unless renewed
+          end
         end
       end
     rescue StandardError => err
       logger = Durababble.logger #: as untyped
       logger&.error("ObjectStreamHost: renewal loop crashed: #{err.class}: #{err.message}")
+    end
+
+    # Renewal writes run on a connection dedicated to this task so they do not
+    # contend with the worker loop's reactor connection (see `WorkerRuntime`).
+    # Falls back to the store directly for doubles that don't implement it.
+    #: () { (untyped) -> void } -> void
+    def with_dedicated_store_connection(&block)
+      if @store.respond_to?(:with_dedicated_connection)
+        @store.with_dedicated_connection(&block)
+      else
+        block.call(@store)
+      end
     end
 
     #: (object_type: String, object_id: String) -> [String, String]
