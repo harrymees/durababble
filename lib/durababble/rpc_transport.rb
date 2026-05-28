@@ -383,58 +383,26 @@ module Durababble
 
       #: () -> Server
       def start
-        return self if @thread || @task
-
-        server = build_http_server
-
-        # The socket is already bound/listening (above, on this thread); the
-        # reactor thread only runs the accept loop. Hand the scheduler back
-        # through a Queue so `stop` can interrupt it thread-safely.
-        #
-        # The rescue only covers the *startup handshake* — failures that escape
-        # the `Async { }` block synchronously, before `ready << Fiber.scheduler`
-        # is reached (e.g. `Async {}` itself failing to install a reactor —
-        # vanishingly rare but otherwise silent). Without it `ready.pop` would
-        # block forever and `start` would never return. Once the scheduler is
-        # published, `Async { }` returns and any later `server.run` failure is
-        # captured by Async's task supervisor (logged as a warning) rather than
-        # bubbling here — at that point `start` has already handed control back
-        # to the caller, so it's the reactor's problem, not ours.
-        ready = Thread::Queue.new
-        @thread = Thread.new do
-          Async do
-            ready << Fiber.scheduler
-            server.run
-          end
-        rescue StandardError => e
-          ready << e
-        end
-        result = ready.pop
-        raise result if result.is_a?(StandardError)
-
-        @scheduler = result
-        self
+        start_async(parent: current_async_task!("Durababble::Rpc::Server#start"))
       end
 
       #: (?parent: Object) -> Server
-      def start_async(parent: Async::Task.current)
-        return self if @thread || @task
+      def start_async(parent: nil)
+        parent ||= current_async_task!("Durababble::Rpc::Server#start_async")
+        return self if @task
 
+        async_parent = parent #: as untyped
         server = build_http_server
-        @task = parent.async { server.run }
+        @task = async_parent.async(transient: true, finished: false) { server.run.wait }
         self
       end
 
       #: () -> void
       def stop
-        @scheduler&.interrupt
         @task&.stop
-        @thread&.join
       ensure
         @bound&.close
-        @thread = nil
         @task = nil
-        @scheduler = nil
         @bound = nil
         @port = nil
       end
@@ -445,6 +413,13 @@ module Durababble
       end
 
       private
+
+      #: (String) -> Object
+      def current_async_task!(operation)
+        Async::Task.current
+      rescue RuntimeError
+        raise ConfigurationError, "#{operation} must be called from inside a running Async reactor; pass parent: from your application's Async supervisor"
+      end
 
       #: () -> Async::HTTP::Server
       def build_http_server
