@@ -80,16 +80,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # The fuzz sweep (every scenario × 100 seeds) dominates wall time and was
-    # pushing a single job past the 20-minute cap. Shard the seed space across
-    # parallel jobs via DST_FUZZ_SEEDS so each shard covers every scenario over a
-    # slice of seeds; together they exercise the full 1..100 range. Split into
-    # five shards (20 seeds each) as the scenario count grows, keeping each
-    # shard comfortably under the cap.
+    # The fuzz sweep (every scenario × N seeds) dominates wall time. Shard the
+    # seed space across parallel jobs via DST_FUZZ_SEEDS so each shard covers
+    # every scenario over a slice of seeds; together they exercise the full
+    # 1..350 range.
+    #
+    # Shards are sized so a shard runs about as long as — but always a little
+    # less than — the slowest sibling job (test (mysql), ~190-205s), maximizing
+    # fuzz coverage without DST becoming the critical path. Per-shard wall time
+    # is ~22s fixed + ~1.8s/seed, so 70 seeds/shard lands at ~150s; even a worst
+    # case contention spike stays under the ~190s mysql floor. Bump the seed
+    # count per shard (and re-split the range) if test (mysql) gets slower or
+    # the DST shards start finishing well under it again.
     strategy:
       fail-fast: false
       matrix:
-        seeds: ["1..20", "21..40", "41..60", "61..80", "81..100"]
+        seeds: ["1..70", "71..140", "141..210", "211..280", "281..350"]
 
     steps:
       - uses: actions/checkout@v4
