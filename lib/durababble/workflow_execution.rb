@@ -372,7 +372,12 @@ module Durababble
       loop do
         deliver_workflow_commands_at_safe_point!
         if scheduled_history_for_next_command?
-          next if wait_condition_command_delivered?(timeout, deadline)
+          if wait_condition_command_delivered?(timeout, deadline)
+            raise_if_cancel_requested!
+            return true if block.call
+
+            next
+          end
 
           return !!block.call if timeout
 
@@ -382,7 +387,12 @@ module Durababble
         raise_if_cancel_requested!
         return true if block.call
 
-        next if wait_condition_command_delivered?(timeout, deadline)
+        if wait_condition_command_delivered?(timeout, deadline)
+          raise_if_cancel_requested!
+          return true if block.call
+
+          next
+        end
 
         return !!block.call if timeout
       end
