@@ -86,9 +86,15 @@ module Durababble
       # boundary so backends never see one.
       #: (Numeric) -> void
       def validate_positive_lease_seconds!(lease_seconds)
-        return if lease_seconds > 0
+        return if lease_seconds.finite? && lease_seconds.positive?
 
         raise ArgumentError, "lease_seconds must be a positive Numeric, got #{lease_seconds.inspect}"
+      end
+
+      #: (Numeric) -> Integer
+      def lease_microseconds(lease_seconds)
+        validate_positive_lease_seconds!(lease_seconds)
+        (lease_seconds * 1_000_000).ceil
       end
 
       private
@@ -192,6 +198,11 @@ module Durababble
 
     #: () -> Time
     def current_time = Time.now
+
+    #: (Numeric) -> Integer
+    def lease_duration_microseconds(lease_seconds)
+      Store.lease_microseconds(lease_seconds)
+    end
 
     #: () -> Store
     def migrate!

@@ -137,11 +137,11 @@ module Durababble
 
       sql = sql.gsub(/\s*FORCE INDEX \([^)]*\)/i, "")
       sql = sql.gsub(/INSERT IGNORE INTO/i, "INSERT OR IGNORE INTO")
-      # The integer clock counts microseconds, so a SECOND interval must be
-      # scaled by #seconds_scale. Without this, a 30s lease would expire 30µs
-      # later. The deterministic store runs a 1-tick == 1-second clock and
-      # overrides #seconds_scale to 1.
+      # The integer clock counts microseconds. Older query text accepted lease
+      # durations in seconds and scaled them here; lease queries now bind integer
+      # microseconds directly, so MICROSECOND intervals add the bind unchanged.
       scale = seconds_scale
+      sql = sql.gsub(/DATE_ADD\(\s*NOW\(6\)\s*,\s*INTERVAL\s+(.+?)\s+MICROSECOND\)/i) { "(dura_now() + (#{::Regexp.last_match(1)}))" }
       sql = sql.gsub(/DATE_ADD\(\s*NOW\(6\)\s*,\s*INTERVAL\s+(.+?)\s+SECOND\)/i) { "(dura_now() + (#{::Regexp.last_match(1)}) * #{scale})" }
       sql = sql.gsub(/NOW\(6\)/i, "dura_now()")
       sql = sql.gsub(/\bLEAST\(/i, "MIN(")

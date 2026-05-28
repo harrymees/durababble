@@ -149,6 +149,48 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
       end
     end
 
+    test "wait_condition timeout does not roll forward after command wakeups with #{backend.name}" do
+      with_durababble_store(backend, "workflow_wait_condition_fixed_deadline") do |store|
+        store.migrate!
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "wait-condition-fixed-deadline"
+
+          def execute(_input)
+            @pokes = 0
+            ready = wait_condition(timeout: 10) { false }
+            { "ready" => ready, "pokes" => @pokes }
+          end
+
+          expose_command def poke
+            @pokes += 1
+            { "pokes" => @pokes }
+          end
+        end
+        worker = Durababble::Worker.new(store:, workflows: { workflow.workflow_name => workflow }, worker_id: "condition-deadline-worker", migrate: false)
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
+
+        assert_equal(:worked, worker.tick)
+        first_wait = store.waits_for(workflow_id).fetch(0)
+        first_wake_at = wait_wake_at(first_wait)
+
+        sleep(0.2)
+        store.enqueue_workflow_command(
+          workflow_id:,
+          workflow_name: workflow.workflow_name,
+          method_name: "poke",
+          payload: { "method" => "poke", "args" => [], "kwargs" => {} },
+        )
+        assert_equal(:worked, worker.tick)
+
+        rearmed_wait = store.waits_for(workflow_id)
+          .select { |wait| wait.fetch("status") == "pending" }
+          .max_by { |wait| wait.fetch("position").to_i }
+        refute_nil rearmed_wait
+        assert_equal(1, rearmed_wait.fetch("position").to_i)
+        assert_in_delta(first_wake_at.to_f, wait_wake_at(rearmed_wait).to_f, 0.01)
+      end
+    end
+
     test "direct waits let already-started async sibling work finish before suspension with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_async") do |store|
         store.migrate!
@@ -186,5 +228,10 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_equal [{ "id" => "async", "released" => true }, { "sibling" => "async" }], completed.result
       end
     end
+  end
+
+  def wait_wake_at(wait)
+    value = wait.fetch("wake_at")
+    value.is_a?(Time) ? value : Time.parse(value.to_s)
   end
 end
