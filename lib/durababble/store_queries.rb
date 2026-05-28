@@ -1399,7 +1399,7 @@ module Durababble
         UPDATE #{table(store, "workflows")}
         SET status = CASE
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
-            WHEN EXISTS (SELECT 1 FROM #{table(store, "waits")} WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
+            WHEN EXISTS (SELECT 1 FROM #{table(store, "waits")} FORCE INDEX (#{index_name(store, "waits", "workflow_status")}) WHERE workflow_id = ? AND status = 'pending') THEN 'waiting'
             ELSE 'pending'
           END,
           locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
@@ -1531,12 +1531,12 @@ module Durababble
     end
 
     define(:mysql_count_expired_workflow_leases, backend: :mysql) do |store|
-      "SELECT COUNT(*) AS count FROM #{table(store, "workflows")} WHERE status = 'running' AND locked_until < ?"
+      "SELECT COUNT(*) AS count FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")}) WHERE status = 'running' AND locked_until < ?"
     end
 
     define(:mysql_steal_expired_leases, backend: :mysql) do |store|
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
+        UPDATE #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "expired_lease")})
         SET status = CASE
             WHEN cancel_requested_at IS NOT NULL THEN 'canceling'
             ELSE 'pending'
@@ -1789,7 +1789,7 @@ module Durababble
 
     define(:mysql_cancel_pending_waits_for_workflow, backend: :mysql) do |store|
       <<~SQL.chomp
-        UPDATE #{table(store, "waits")}
+        UPDATE #{table(store, "waits")} FORCE INDEX (#{index_name(store, "waits", "workflow_status")})
         SET status = 'canceled', completed_at = NOW(6)
         WHERE workflow_id = ? AND status = 'pending'
       SQL
