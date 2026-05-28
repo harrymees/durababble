@@ -28,8 +28,8 @@ class DurababbleEngineTest < DurababbleTestCase
     def initialize(workflow_status: "waiting", messages: nil)
       @workflow_status = workflow_status
       @messages = messages || [
-        { "id" => "msg-1", "message_kind" => "workflow_command", "method_name" => "fail_first", "payload" => { "method" => "fail_first", "args" => [], "kwargs" => {} } },
-        { "id" => "msg-2", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} } },
+        { "id" => "msg-1", "message_kind" => "workflow_command", "method_name" => "fail_first", "payload" => { "method" => "fail_first", "args" => [], "kwargs" => {} }, "attempts" => 1 },
+        { "id" => "msg-2", "message_kind" => "workflow_command", "method_name" => "second", "payload" => { "method" => "second", "args" => [], "kwargs" => {} }, "attempts" => 1 },
       ]
       @claim_limits = []
       @completed = []
@@ -85,6 +85,10 @@ class DurababbleEngineTest < DurababbleTestCase
 
     def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
       @failed << { message_id:, workflow_id:, error:, worker_id: }
+    end
+
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
+      @failed << { message_id:, workflow_id:, error:, worker_id:, ready_at: }
     end
 
     def complete_workflow(workflow_id, result:, worker_id: nil)

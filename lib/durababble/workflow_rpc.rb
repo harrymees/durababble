@@ -241,12 +241,18 @@ module Durababble
           end
           handler = handler #: as untyped
           result = handler.call(payload.fetch("payload", {}))
-          assert_current_lease!(workflow_id)
+          assert_current_lease!(workflow_id) unless query_payload?(payload)
           result
         end
       end
 
       private
+
+      #: (Hash[String, Object?]) -> bool
+      def query_payload?(payload)
+        payload_value = payload["payload"]
+        payload_value.is_a?(Hash) && payload_value["rpc_kind"] == "workflow_query"
+      end
 
       #: (String) -> void
       def assert_current_lease!(workflow_id)
