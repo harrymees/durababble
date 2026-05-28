@@ -4,6 +4,16 @@
 module Durababble
   class MysqlStore < SqlStore
     include MysqlMigrations
+    include ActiveRecord::Sanitization::ClassMethods
+
+    private :disallow_raw_sql!,
+      :sanitize_sql,
+      :sanitize_sql_array,
+      :sanitize_sql_for_assignment,
+      :sanitize_sql_for_conditions,
+      :sanitize_sql_for_order,
+      :sanitize_sql_hash_for_assignment,
+      :sanitize_sql_like
 
     # Retry budget for transactions that hit a retryable error (deadlock /
     # lock-wait timeout). Backoff grows linearly per attempt and is jittered.
@@ -745,7 +755,7 @@ module Durababble
     def execute_store_query_sql(sql, params)
       with_connection do |active_record_connection|
         if trilogy_connection?(active_record_connection)
-          sanitized_sql = sanitizer_class(active_record_connection).send(:sanitize_sql_array, [sql, *params])
+          sanitized_sql = sanitize_sql_array([sql, *params])
           active_record_connection.exec_query(sanitized_sql, "Durababble SQL")
         else
           active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
@@ -849,22 +859,6 @@ module Durababble
     #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> bool
     def trilogy_connection?(active_record_connection)
       active_record_connection.adapter_name.to_s.downcase.include?("trilogy")
-    end
-
-    #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> Class
-    def sanitizer_class(active_record_connection)
-      sanitizer_classes_by_connection_id[active_record_connection.object_id] ||= Class.new do
-        extend ActiveRecord::Sanitization::ClassMethods
-
-        define_singleton_method(:with_connection) do |&block|
-          block.call(active_record_connection)
-        end
-      end
-    end
-
-    #: () -> Hash[Integer, Class]
-    def sanitizer_classes_by_connection_id
-      @sanitizer_classes_by_connection_id ||= {}
     end
   end
 end
