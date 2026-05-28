@@ -6,8 +6,8 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, retry_run_at:, crash:)
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, remember_wait: Proc, next_run_at_for_wait: Proc, timer_due: Proc, complete_due_wait: Proc, retry_run_at: Proc, crash: Proc) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, remember_wait:, next_run_at_for_wait:, timer_due:, complete_due_wait:, retry_run_at:, crash:)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -20,6 +20,10 @@ module Durababble
       @assert_workflow_lease = assert_workflow_lease
       @suspend_workflow_immediately = suspend_workflow_immediately
       @defer_workflow_suspension = defer_workflow_suspension
+      @remember_wait = remember_wait
+      @next_run_at_for_wait = next_run_at_for_wait
+      @timer_due = timer_due
+      @complete_due_wait = complete_due_wait
       @retry_run_at = retry_run_at
       @crash = crash
     end
@@ -77,23 +81,27 @@ module Durababble
     def record_wait(command_id, step:, wait_request:)
       step = step #: as untyped
       suspend_workflow = @suspend_workflow_immediately.call
+      due_timer = wait_request.kind == "timer" && wait_request.wake_at && @timer_due.call(wait_request.wake_at)
+      next_run_at = @next_run_at_for_wait.call(wait_request)
       synchronize_store do
         @store.record_wait(
           workflow_id: @workflow_id,
           command_id:,
           name: step.name,
           wait_request:,
-          suspend_workflow:,
+          suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
+          next_run_at:,
         )
+        @remember_wait.call(command_id, step.name, wait_request)
       end
       crash!(:wait_recorded)
-      if suspend_workflow
-        error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}")
-        future(command_id).reject(error)
-      else
-        @defer_workflow_suspension.call(command_id)
+      if due_timer
+        @complete_due_wait.call(future(command_id), command_id, reserved_history_event: true)
+        return
       end
+
+      @defer_workflow_suspension.call(command_id)
     end
 
     # Control-flow errors are rejected onto the future unchanged; only an

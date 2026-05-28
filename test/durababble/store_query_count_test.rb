@@ -76,7 +76,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         wait_workflow = store.create_workflow(name: "query-count-record-wait", input: {})
         store.record_step_started(workflow_id: wait_workflow, command_id: 0, name: "timer")
-        wait_id = assert_sql_query_budget("record_wait", mysql: 6, postgres: 6) do
+        wait_id = assert_sql_query_budget("record_wait", mysql: 5, postgres: 5) do
           store.record_wait(
             workflow_id: wait_workflow,
             command_id: 0,
@@ -87,19 +87,10 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         end
         refute_nil wait_id
 
-        due_workflow = store.create_workflow(name: "query-count-wake-timer", input: {})
-        store.record_step_started(workflow_id: due_workflow, command_id: 0, name: "timer")
-        store.record_wait(
-          workflow_id: due_workflow,
-          command_id: 0,
-          name: "timer",
-          wait_request: Durababble.wait_until(Time.utc(2026, 1, 1, 0, 0, 0), { "timer" => true }),
-        )
-        completed = assert_sql_query_budget("wake_due_timers", mysql: 9, postgres: 8) do
-          store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 1))
+        assert_sql_query_budget("wait_snapshots_for", mysql: 2, postgres: 2) do
+          snapshots = store.wait_snapshots_for(wait_workflow)
+          assert_equal ["pending"], snapshots.map { |wait| wait.fetch("status") }
         end
-        assert_equal 1, completed
-        assert_hash_includes store.workflow(due_workflow), "status" => "pending"
       end
     end
 
@@ -116,7 +107,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         claim_outbox_workflow = store.enqueue_workflow(name: "query-count-claim-outbox", input: {})
         claim_outbox_id = store.enqueue_outbox(workflow_id: claim_outbox_workflow, topic: "events", payload: { "ok" => true }, key: "query-count-claim-outbox")
-        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 4, postgres: 3) do
+        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 3, postgres: 1) do
           store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed_outbox, "id" => claim_outbox_id, "status" => "processing"

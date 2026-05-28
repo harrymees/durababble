@@ -213,7 +213,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     assert_equal 1, result.summary.fetch(:completed_workflows)
     assert_includes result.trace, "network.drop"
     assert_includes result.trace, "heal"
-    assert_includes result.trace, "wait_completed"
+    assert_includes result.trace, "step_completed"
   end
 
   test "models internal RPC timeout, connection error, EOF, and remote error faults" do
@@ -348,7 +348,7 @@ class DurababbleDeterministicTest < DurababbleTestCase
     )
 
     assert_equal "running", store.workflow(workflow_id).fetch("status")
-    assert_equal 1, store.wake_due_timers(now: scheduler.time + 11)
+    store.record_step_completed(workflow_id:, command_id: 0, result: { "started" => true })
     assert_equal "running", store.workflow(workflow_id).fetch("status")
 
     store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
@@ -437,7 +437,8 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     assert_empty result.violations
     assert_includes result.trace, "network.duplicate"
-    assert_equal 1, result.trace.scan("wait_completed").length
+    workflow_id = result.trace[/enqueue_workflow id="([^"]+)" name="waiting"/, 1]
+    assert_equal 1, result.trace.scan(/step_completed command_id=0 id="#{Regexp.escape(workflow_id)}"/).length
     assert_equal 1, result.summary.fetch(:processed_outbox)
   end
 

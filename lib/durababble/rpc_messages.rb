@@ -11,7 +11,40 @@ module Durababble
     # dispatch, the deterministic harness, and `decode_transient_response` are
     # unchanged except for the `Proto` -> `Messages` namespace.
     module Messages
+      # `async-grpc` expects request/response classes to expose protobuf-like
+      # `#encode` and `.decode` methods. Durababble's RPC contract is still
+      # Ruby-to-Ruby Paquito value objects, so those hooks simply wrap the
+      # existing serializer and let the gRPC layer provide framing/statuses.
+      module WireMessage
+        #: () -> String
+        def encode
+          message = self #: as Object
+          Rpc.dump(message)
+        end
+
+        module ClassMethods
+          #: (String) -> Object
+          def decode(bytes)
+            expected_class = self #: as Class
+            message = Rpc.load(bytes)
+            return message if message.is_a?(expected_class)
+
+            Kernel.raise TypeError, "expected #{expected_class}, got #{message.class}"
+          end
+        end
+
+        class << self
+          #: (Class) -> void
+          def included(base)
+            base.extend(ClassMethods)
+          end
+        end
+      end
+      private_constant :WireMessage
+
       class AwakenBatchRequest
+        include WireMessage
+
         #: String
         attr_reader :worker_pool
         #: Array[String]
@@ -24,10 +57,14 @@ module Durababble
         end
       end
 
-      class AwakenBatchResponse; end
+      class AwakenBatchResponse
+        include WireMessage
+      end
 
       # Shared shape for the lease-eviction and message-delivery requests.
       class TargetRequest
+        include WireMessage
+
         #: String
         attr_reader :worker_pool
         #: String
@@ -52,12 +89,20 @@ module Durababble
       end
 
       class EvictLeaseRequest < TargetRequest; end
-      class EvictLeaseResponse; end
+
+      class EvictLeaseResponse
+        include WireMessage
+      end
 
       class DeliverMessageRequest < TargetRequest; end
-      class DeliverMessageResponse; end
+
+      class DeliverMessageResponse
+        include WireMessage
+      end
 
       class TransientRequest
+        include WireMessage
+
         #: String
         attr_reader :worker_pool
         #: String
@@ -100,6 +145,8 @@ module Durababble
       end
 
       class LeaseMoved
+        include WireMessage
+
         #: String
         attr_reader :new_rpc_address
         #: String
@@ -113,6 +160,8 @@ module Durababble
       end
 
       class RemoteError
+        include WireMessage
+
         #: String
         attr_reader :klass
         #: String
@@ -132,6 +181,8 @@ module Durababble
       # Exactly one of `ok`/`err`/`not_running`/`moved` is populated; `#result`
       # reports which, matching the protobuf oneof accessor.
       class TransientResponse
+        include WireMessage
+
         #: String?
         attr_reader :ok
         #: RemoteError?

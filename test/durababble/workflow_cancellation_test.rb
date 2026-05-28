@@ -53,7 +53,7 @@ class DurababbleWorkflowCancellationTest < DurababbleTestCase
         assert_equal "waiting", waiting.status
 
         workflow.handle(workflow_id, store:).cancel(reason: "no longer needed")
-        assert_equal "canceled", store.waits_for(workflow_id).first.fetch("status")
+        assert_equal "canceled", store.wait_snapshots_for(workflow_id).first.fetch("status")
         run = Durababble::Engine.new(store:).resume(workflow, workflow_id:)
         woken = store.wake_due_timers(now: Time.now + 3601)
 

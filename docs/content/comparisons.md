@@ -37,7 +37,7 @@ Active Job continuations are a useful fit when the thing you have is still funda
 
 Durababble aims at a larger durable-execution surface:
 
-- **Durable state model.** Active Job continuations persist progress with the job payload and the queue backend. Durababble persists workflows, steps, waits, attempts, cancellations, fences, outbox records, durable objects, and object inboxes in application database tables.
+- **Durable state model.** Active Job continuations persist progress with the job payload and the queue backend. Durababble persists workflows, workflow history, steps, attempts, wait state, cancellations, fences, outbox records, durable objects, and object inboxes in application database tables.
 - **Side-effect boundaries.** Active Job continuation steps are about resuming job progress. Durababble steps also persist return values, retry attempts, idempotency keys, and replay history so completed side effects are reused rather than re-executed.
 - **Waits and external signals.** Active Job continuations can resume interrupted jobs, but they are not a workflow wait or command system. Durababble has durable timer waits and workflow commands for "pause until time/event/human approval" shapes.
 - **Addressability.** Active Job continuations are still jobs. Durababble workflows have handles, cancellation, status/result lookup, and RPC-style commands; durable objects add long-lived id-addressed state for carts, accounts, sessions, channels, and similar entities.
@@ -49,7 +49,7 @@ Use Active Job continuations when you want an incremental Rails-native way to ma
 
 Temporal is the canonical durable execution platform: Temporal Server, a worker fleet, multi-language SDKs, deterministic replay, signals, child workflows, schedules, and a dashboard. It is the right answer for organizations that want a durable execution product, not a library.
 
-Durababble takes the same core idea — replay completed steps from durable history, persist waits and retries — and trims it to fit inside an existing Rails-or-similar Ruby app:
+Durababble takes the same core idea — replay completed steps from durable history, persist waits/retries, and claim due work from SQL — and trims it to fit inside an existing Rails-or-similar Ruby app:
 
 - **No separate server.** Durababble is a gem. The durable state lives in tables you already operate (MySQL/MariaDB or Postgres/Yugabyte). There is no Temporal Server to deploy, scale, upgrade, or back up separately.
 - **Ruby-shaped API.** Workflows and durable objects are ordinary Ruby classes, steps are method-decorated checkpoints, and `step_context.idempotency_key` is what you pass to external APIs. Temporal's Ruby story is comparatively thin; Durababble is Ruby-native.

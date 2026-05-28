@@ -18,7 +18,7 @@ module Durababble
     #   all_workflows -> { workflow_id => row }
     #   all_steps     -> { workflow_id => { position => step_row } }   (missing key -> {})
     #   all_attempts  -> { workflow_id => [attempt_row, ...] }          (insertion order; missing key -> [])
-    #   all_waits     -> { wait_id => wait_row }
+    #   all_waits     -> { wait_id => wait_snapshot }
     #   all_outbox    -> { outbox_id => message_row }
     #   all_fences    -> [ fence_row, ... ]   each with "workflow_id","key","status",
     #                                         and (where the backend models leases)

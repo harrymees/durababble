@@ -3,43 +3,49 @@
 
 require_relative "../test_helper"
 require "async"
+require "async/queue"
+require "async/http/endpoint"
+require "async/grpc"
 require "timeout"
 
 class DurababbleRpcTransportTest < DurababbleTestCase
   TestTransientResponse = Struct.new(:result, :ok, :err, :moved, keyword_init: true)
   TestRemoteError = Struct.new(:klass, :message, keyword_init: true)
 
-  # Injected via `http_client:` to exercise the transport's error translation
-  # without a live server: its `#post` raises the transport-level failure.
-  class FailingHttpClient
+  # Injected via `grpc_client:` to exercise transport error translation without
+  # a live server.
+  class FailingGrpcClient
     def initialize(error)
       @error = error
     end
 
-    def post(_path, _headers, _body)
+    def stub(_interface, _service_name)
+      self
+    end
+
+    def public_send(_method, _request, **_options)
       raise @error
     end
 
     def close; end
   end
 
-  StubHttpResponse = Struct.new(:status, :body) do
-    def read = body
-  end
+  class RecordingGrpcClient
+    attr_reader :calls
 
-  # Injected via `http_client:` to drive `Client#handle_response` status
-  # branches (and `error_message`'s empty-body default) without a live server.
-  class StubHttpClient
-    def initialize(status:, body:)
-      @status = status
-      @body = body
+    def initialize(response)
+      @response = response
+      @calls = []
     end
 
-    def post(_path, _headers, _body)
-      StubHttpResponse.new(@status, @body)
+    def stub(_interface, _service_name)
+      self
     end
 
-    def close; end
+    def public_send(method, request, **options)
+      @calls << [method, request, options]
+      @response
+    end
   end
 
   def setup
@@ -51,13 +57,24 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   end
 
   def teardown
-    Durababble::Rpc.shutdown_http_clients!
+    Durababble::Rpc.shutdown_grpc_clients!
     @durababble_store&.drop_schema!
     @durababble_store&.close
     @durababble_store = nil
     @durababble_schema = nil
     @durababble_backend = nil
     @workflow_id = nil
+  end
+
+  test "rpc messages are grpc-compatible envelopes around Paquito payloads" do
+    request = Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default", workflow_ids: ["wf-1"])
+    decoded = Durababble::Rpc::Messages::AwakenBatchRequest.decode(request.encode)
+
+    assert_equal("default", decoded.worker_pool)
+    assert_equal(["wf-1"], decoded.workflow_ids)
+    assert_raises(TypeError) do
+      Durababble::Rpc::Messages::AwakenBatchRequest.decode(Durababble::Rpc::Messages::AwakenBatchResponse.new.encode)
+    end
   end
 
   test "serves the full four-method RPC contract over localhost" do
@@ -248,7 +265,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       Errno::ECONNREFUSED.new("connection reset"),
       SocketError.new("getaddrinfo: nodename nor servname provided"),
     ].each do |error|
-      client = Durababble::Rpc::Client.new(address: "node-a", http_client: FailingHttpClient.new(error))
+      client = Durababble::Rpc::Client.new(address: "node-a", grpc_client: FailingGrpcClient.new(error))
 
       assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /#{Regexp.escape(error.message)}/) do
         client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
@@ -256,20 +273,64 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
   end
 
-  test "treats HTTP/2 protocol errors as unavailable but re-raises unexpected errors" do
-    http2_client = Durababble::Rpc::Client.new(
-      address: "node-a",
-      http_client: FailingHttpClient.new(Protocol::HTTP2::Error.new("stream reset")),
+  test "uses local timeout without sending grpc timeout metadata" do
+    grpc_client = RecordingGrpcClient.new(
+      Durababble::Rpc::Messages::TransientResponse.new(ok: Durababble::Rpc.dump({ "ok" => true })),
     )
-    assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /stream reset/) do
-      http2_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+    client = Durababble::Rpc::Client.new(address: "node-a", timeout: 1.5, grpc_client:)
+
+    assert_equal({ "ok" => true }, client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
+
+    assert_equal(1, grpc_client.calls.length)
+    method, _request, options = grpc_client.calls.first
+    assert_equal(:call_transient, method)
+    refute_includes(options, :timeout)
+
+    assert_raises(ArgumentError) do
+      Durababble::Rpc::Client.new(address: "node-a", http_client: Object.new)
     end
+  end
+
+  test "maps grpc statuses to typed transport errors but re-raises unexpected errors" do
+    unavailable_client = Durababble::Rpc::Client.new(
+      address: "node-a",
+      grpc_client: FailingGrpcClient.new(Protocol::GRPC::Unavailable.new("peer unavailable")),
+    )
+    assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /peer unavailable/) do
+      unavailable_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+    end
+
+    deadline_client = Durababble::Rpc::Client.new(
+      address: "node-a",
+      grpc_client: FailingGrpcClient.new(Protocol::GRPC::DeadlineExceeded.new("deadline exceeded")),
+    )
+    assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /deadline exceeded/) do
+      deadline_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+    end
+
+    unauthenticated_client = Durababble::Rpc::Client.new(
+      address: "node-a",
+      grpc_client: FailingGrpcClient.new(Protocol::GRPC::Unauthenticated.new("bad peer")),
+    )
+    assert_raises_matching(Durababble::Rpc::Unauthenticated, /bad peer/) do
+      unauthenticated_client.awaken_batch(worker_pool: "default", workflow_ids: [])
+    end
+
+    internal_client = Durababble::Rpc::Client.new(
+      address: "node-a",
+      grpc_client: FailingGrpcClient.new(Protocol::GRPC::Internal.new("handler exploded")),
+    )
+    error = assert_raises(Durababble::Rpc::Error) do
+      internal_client.awaken_batch(worker_pool: "default", workflow_ids: [])
+    end
+    refute_kind_of(Durababble::Rpc::Unavailable, error)
+    assert_match(/handler exploded/, error.message)
 
     # A non-transport StandardError is not a connectivity failure: it must
     # propagate unchanged rather than be masked as node-unavailable.
     surprising_client = Durababble::Rpc::Client.new(
       address: "node-a",
-      http_client: FailingHttpClient.new(ArgumentError.new("unexpected")),
+      grpc_client: FailingGrpcClient.new(ArgumentError.new("unexpected")),
     )
     assert_raises_matching(ArgumentError, /unexpected/) do
       surprising_client.awaken_batch(worker_pool: "default", workflow_ids: [])
@@ -446,14 +507,14 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       assert_equal(2, calls.length)
 
       # Prove the receiving node re-checks the limit even when a peer skips the
-      # client-side guard: POST a pre-serialized, oversized TransientRequest
-      # straight at the server (bypassing Client#call_transient's Rpc.dump
-      # enforcement). The server raises PayloadTooLarge, which surfaces as an
+      # client-side guard: invoke the raw gRPC method with a pre-serialized,
+      # oversized TransientRequest, bypassing Client#call_transient's Rpc.dump
+      # enforcement. The server raises PayloadTooLarge, which surfaces as an
       # `err` frame rather than running the handler.
       raw_args = Durababble::Rpc::SERIALIZER.dump(args)
       raw_request = Durababble::Rpc::Messages::TransientRequest.new(worker_pool: "default", method: "status", args: raw_args)
       response = with_payload_limit(:rpc_argument, size - 1) do
-        post_raw_transient(server.address, raw_request)
+        raw_grpc_call_transient(server.address, raw_request)
       end
       assert_equal("Durababble::PayloadTooLarge", response.err.klass)
       assert_equal(2, calls.length)
@@ -667,23 +728,18 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     assert_equal "Durababble::WorkflowRpc::UnknownCommand", remote_error.err.klass
   end
 
-  test "answers 404 for unknown paths and 500 (Rpc::Error, NOT retried) when a handler raises" do
+  test "answers non-grpc requests with 404 and grpc handler raises as Rpc::Error without retry" do
     store = self.store
     with_rpc_server(
       node_id: "node-a",
       store:,
       awaken_batch: ->(**_event) { raise "handler exploded" },
     ) do |server|
-      status, = raw_rpc_post(server.address, "/durababble/v1/does_not_exist", { "anything" => true })
+      status, = raw_http_post(server.address, "/durababble/v1/does_not_exist", "not grpc")
       assert_equal(404, status)
 
-      # The raw POST proves the wire-level status code (500, not 503).
-      raise_status, raise_body = raw_rpc_post(server.address, "/durababble/v1/awaken_batch", Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default"))
-      assert_equal(500, raise_status)
-      assert_match(/handler exploded/, raise_body)
-
-      # And the client-side mapping: unexpected handler raises become Rpc::Error
-      # (NOT Rpc::Unavailable / NodeUnavailable), so the router will not retry.
+      # Unexpected handler raises become Rpc::Error (NOT Rpc::Unavailable /
+      # NodeUnavailable), so the router will not retry.
       client = Durababble::Rpc::Client.new(address: server.address)
       error = assert_raises(Durababble::Rpc::Error) do
         client.awaken_batch(worker_pool: "default", workflow_ids: [])
@@ -693,34 +749,113 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
   end
 
-  test "maps unexpected status codes and empty error bodies to typed client errors" do
-    not_found = Durababble::Rpc::Client.new(address: "node-a", http_client: StubHttpClient.new(status: 404, body: ""))
+  test "reroutes workflow RPC after local deadline while original owner changes" do
+    store = self.store
+    claim_as("node-a")
+    original_started = Async::Queue.new
+    original_release = Async::Queue.new
+    assertions_ran = false
+
+    with_rpc_server(
+      node_id: "node-b",
+      store:,
+      workflow_handlers: { "status" => ->(_payload) { { "owner" => "node-b" } } },
+    ) do |node_b|
+      with_rpc_server(
+        node_id: "node-a",
+        store:,
+        workflow_handlers: {
+          "status" => lambda do |_payload|
+            move_lease_to("node-b")
+            original_started << true
+            original_release.pop
+            { "owner" => "node-a" }
+          end,
+        },
+      ) do |node_a|
+        router = Durababble::WorkflowRpc::Router.new(
+          store:,
+          rpc_clients: {
+            "node-a" => Durababble::Rpc::WorkflowClient.new(address: node_a.address, timeout: 0.1),
+            "node-b" => Durababble::Rpc::WorkflowClient.new(address: node_b.address, timeout: 1.0),
+          },
+          retry_on_stale: true,
+        )
+
+        response = Timeout.timeout(5) do
+          router.request(workflow_id:, command: "status", payload: {})
+        end
+        Timeout.timeout(5) { original_started.pop }
+        assert_equal({ "owner" => "node-b" }, response)
+        assertions_ran = true
+      ensure
+        original_release << true
+      end
+    end
+    assert_equal(true, assertions_ran)
+  end
+
+  test "grpc deadline exceeded remains retryable when peer supplied a deadline" do
+    store = self.store
+    claim_as("node-a")
+    release = Async::Queue.new
+    assertions_ran = false
+
+    with_rpc_server(
+      node_id: "node-b",
+      store:,
+      workflow_handlers: { "status" => ->(_payload) { { "owner" => "node-b" } } },
+    ) do |node_b|
+      with_rpc_server(
+        node_id: "node-a",
+        store:,
+        workflow_handlers: {
+          "status" => lambda do |_payload|
+            move_lease_to("node-b")
+            release.pop
+            { "owner" => "node-a" }
+          end,
+        },
+      ) do |node_a|
+        raw_request = Durababble::Rpc::Messages::TransientRequest.new(
+          worker_pool: "default",
+          workflow_id:,
+          method: "status",
+          args: Durababble::Rpc.dump({}),
+          expected_worker_id: "node-a",
+        )
+
+        assert_raises(Protocol::GRPC::DeadlineExceeded) do
+          raw_grpc_call_transient(node_a.address, raw_request, timeout: 0.05)
+        end
+
+        router = Durababble::WorkflowRpc::Router.new(
+          store:,
+          rpc_clients: {
+            "node-a" => Durababble::Rpc::WorkflowClient.new(address: node_a.address, timeout: 0.1),
+            "node-b" => Durababble::Rpc::WorkflowClient.new(address: node_b.address, timeout: 1.0),
+          },
+          retry_on_stale: true,
+        )
+        assert_equal({ "owner" => "node-b" }, router.request(workflow_id:, command: "status", payload: {}))
+        assertions_ran = true
+      ensure
+        release << true
+      end
+    end
+    assert_equal(true, assertions_ran)
+  end
+
+  test "maps other grpc statuses to non-retryable client errors" do
+    not_found = Durababble::Rpc::Client.new(address: "node-a", grpc_client: FailingGrpcClient.new(Protocol::GRPC::NotFound.new("missing")))
     error = assert_raises(Durababble::Rpc::Error) do
       not_found.awaken_batch(worker_pool: "default", workflow_ids: [])
     end
-    assert_match(/status 404/, error.message)
-
-    unauthorized = Durababble::Rpc::Client.new(address: "node-a", http_client: StubHttpClient.new(status: 401, body: ""))
-    assert_raises_matching(Durababble::Rpc::Unauthenticated, /not authorized/) do
-      unauthorized.awaken_batch(worker_pool: "default", workflow_ids: [])
-    end
-
-    unavailable = Durababble::Rpc::Client.new(address: "node-a", http_client: StubHttpClient.new(status: 503, body: ""))
-    assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /unavailable/) do
-      unavailable.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
-    end
-
-    # 500 surfaces as Rpc::Error (not Unavailable), so call_transient does NOT
-    # rewrite it as NodeUnavailable — that's the no-retry contract.
-    exploded = Durababble::Rpc::Client.new(address: "node-a", http_client: StubHttpClient.new(status: 500, body: ""))
-    error = assert_raises(Durababble::Rpc::Error) do
-      exploded.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
-    end
     refute_kind_of(Durababble::Rpc::Unavailable, error)
-    assert_match(/handler raised on the peer/, error.message)
+    assert_match(/missing/, error.message)
   end
 
-  test "caches HTTP/2 clients per address and lets the caller shut them down" do
+  test "caches grpc clients per address and lets the caller shut them down" do
     store = self.store
     claim_as("node-a")
     with_rpc_server(
@@ -731,31 +866,31 @@ class DurababbleRpcTransportTest < DurababbleTestCase
       address = server.address
 
       # No cache to start with.
-      Durababble::Rpc.shutdown_http_clients!
-      refute(Durababble::Rpc.http_client_cached?(address))
+      Durababble::Rpc.shutdown_grpc_clients!
+      refute(Durababble::Rpc.grpc_client_cached?(address))
 
       # First call populates the per-thread cache; subsequent constructors of
-      # Rpc::Client wrappers reuse the same cached Async::HTTP::Client across
+      # Rpc::Client wrappers reuse the same cached Async::GRPC::Client across
       # back-to-back calls.
       client_one = Durababble::Rpc::Client.new(address:)
       assert_equal({ "ok" => true }, client_one.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-      assert(Durababble::Rpc.http_client_cached?(address))
-      cached = Durababble::Rpc.http_client_for(address)
+      assert(Durababble::Rpc.grpc_client_cached?(address))
+      cached = Durababble::Rpc.grpc_client_for(address)
 
       client_two = Durababble::Rpc::Client.new(address:)
       assert_equal({ "ok" => true }, client_two.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-      assert_same(cached, Durababble::Rpc.http_client_for(address), "second wrapper must hit the same cached HTTP/2 client")
+      assert_same(cached, Durababble::Rpc.grpc_client_for(address), "second wrapper must hit the same cached gRPC client")
 
       # Different scheme/address is a separate cache entry.
       scheme_client = Durababble::Rpc::Client.new(address: "http://#{address}")
       assert_equal({ "ok" => true }, scheme_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-      assert(Durababble::Rpc.http_client_cached?("http://#{address}"))
-      refute_same(cached, Durababble::Rpc.http_client_for("http://#{address}"))
+      assert(Durababble::Rpc.grpc_client_cached?("http://#{address}"))
+      refute_same(cached, Durababble::Rpc.grpc_client_for("http://#{address}"))
 
       # Explicit shutdown is idempotent and clears the cache.
-      Durababble::Rpc.shutdown_http_clients!
-      refute(Durababble::Rpc.http_client_cached?(address))
-      Durababble::Rpc.shutdown_http_clients! # second call is a no-op
+      Durababble::Rpc.shutdown_grpc_clients!
+      refute(Durababble::Rpc.grpc_client_cached?(address))
+      Durababble::Rpc.shutdown_grpc_clients! # second call is a no-op
     end
   end
 
@@ -815,24 +950,28 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     store.complete_workflow(workflow_id, result: {})
   end
 
-  # POSTs an already-serialized request straight at the server's call_transient
-  # path over async-http, bypassing Client#call_transient (and its client-side
-  # byte-limit guard). Returns the decoded TransientResponse value object.
-  def post_raw_transient(address, request)
-    _status, body = raw_rpc_post(address, Durababble::Rpc::PATHS.fetch(:call_transient), request)
-    Durababble::Rpc.load(body)
-  end
-
-  # Raw async-http POST of a Paquito-dumped value to an arbitrary path. Returns
-  # [status, raw_body]; lets tests reach the server's routing/error paths
-  # (e.g. unknown paths) that Client never exercises.
-  def raw_rpc_post(address, path, value)
-    endpoint = Async::HTTP::Endpoint.parse("http://#{address}")
-    body = Durababble::Rpc.dump(value)
+  # Invokes the gRPC service directly with a pre-built TransientRequest,
+  # bypassing Client#call_transient and its client-side byte-limit guard.
+  def raw_grpc_call_transient(address, request, timeout: nil)
+    endpoint = Async::HTTP::Endpoint.parse("http://#{address}", protocol: Async::HTTP::Protocol::HTTP2)
     Sync do
       client = Async::HTTP::Client.new(endpoint, protocol: Async::HTTP::Protocol::HTTP2)
       begin
-        response = client.post(path, Durababble::Rpc::OCTET_HEADERS, [body])
+        grpc_client = Async::GRPC::Client.new(client)
+        grpc_client.stub(Durababble::Rpc::Interface, Durababble::Rpc::SERVICE_NAME).call_transient(request, timeout:)
+      ensure
+        client.close
+      end
+    end
+  end
+
+  # Raw non-gRPC POST to exercise the dispatcher fallback path.
+  def raw_http_post(address, path, body)
+    endpoint = Async::HTTP::Endpoint.parse("http://#{address}", protocol: Async::HTTP::Protocol::HTTP2)
+    Sync do
+      client = Async::HTTP::Client.new(endpoint, protocol: Async::HTTP::Protocol::HTTP2)
+      begin
+        response = client.post(path, { "content-type" => "text/plain" }, [body])
         [response.status, response.read]
       ensure
         client.close

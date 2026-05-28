@@ -184,7 +184,7 @@ Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or te
 
 ## Sleeping
 
-A workflow can park itself without keeping a worker thread busy. `sleep_until(time, context)` and `wait_until(time, context)` are timer waits: the workflow resumes at or after the given time. Under the hood, Durababble stores the wait, releases the worker lease, and wakes the workflow when the timer is due.
+A workflow can park itself without keeping a worker thread busy. `sleep_until(time, context)` and `wait_until(time, context)` are timer waits: the workflow resumes at or after the given time. Under the hood, Durababble stores wait history, releases the worker lease, and makes the workflow claimable through its `next_run_at` when the timer is due.
 
 Timer waits are useful for reminders, delayed retries that are part of business logic, cooling-off periods, scheduled followups, or "do not continue before this time" gates:
 
@@ -242,9 +242,7 @@ worker = Durababble::Worker.new(
   migrate: false,
 )
 worker.run_until_idle
-send_at = store.workflow(reminder.workflow_id).fetch("input").fetch("send_at")
-store.wake_due_timers(now: send_at + 1)
-worker.run_until_idle
+resume_waiting_workflow(store, SendReminderAfterDelay, reminder.workflow_id)
 
 {
   "status" => reminder.status,
@@ -448,7 +446,7 @@ Replay is intentionally strict. If deployed code reaches a different completed s
 
 ### Workflow History Length
 
-Every durable boundary leaves history behind: workflow rows, step rows, attempts, waits, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. A workflow that never ends accumulates an ever-growing event log, and as that log grows replay takes longer and system performance suffers.
+Every durable boundary leaves history behind: workflow rows, step rows, attempts, wait history, retries, cancellation metadata, fences, and outbox rows. That history is what makes replay honest, but it also means workflows should usually be finite processes rather than permanent entities. A workflow that never ends accumulates an ever-growing event log, and as that log grows replay takes longer and system performance suffers.
 
 Prefer durable objects for long-lived identities, and split very large jobs into a workflow per bounded batch or phase:
 

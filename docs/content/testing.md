@@ -50,7 +50,7 @@ worker.run_until_idle
 raise "bad persisted state" unless Cart.at("cart-1", store:).items == ["sku-1"]
 ```
 
-Use a synchronous handle command such as `Cart.at("cart-1", store:).add_item("sku-1")` when a worker is already running and the caller needs the command result; otherwise the call waits for completion. For scheduled wakes, enqueue the command that calls `schedule_wake`, run the worker, call `store.wake_due_timers(now: due_time)`, then run the worker again.
+Use a synchronous handle command such as `Cart.at("cart-1", store:).add_item("sku-1")` when a worker is already running and the caller needs the command result; otherwise the call waits for completion. For durable-object scheduled wakes, enqueue the command that calls `schedule_wake`, run the worker, call `store.wake_due_timers(now: due_time)`, then run the worker again.
 
 For fuller examples, see `test/durababble/durable_object_test.rb`, `test/examples/chat_room_test.rb`, and `test/examples/agent_loop_test.rb`.
 
@@ -106,7 +106,7 @@ raise "workflow did not complete" unless handle.status == "completed"
 raise "unexpected result" unless handle.result == { "payment_id" => "pay_card_123" }
 ```
 
-`run_until_idle` drains currently runnable work and then stops. If the workflow parks on a timer, call `store.wake_due_timers(now: later_time)` and run the worker again. If the workflow waits for a command, send it through the workflow handle and run the worker until the status or result changes.
+`run_until_idle` drains currently runnable work and then stops. If the workflow parks on a timer, advance the store/database clock or otherwise make the workflow row's `next_run_at` due, then run the worker again so the normal workflow claim path resumes it. If the workflow waits for a command, send it through the workflow handle and run the worker until the status or result changes.
 
 For fuller examples, see `test/durababble/workflow_test.rb`, `test/durababble/workflow_wait_test.rb`, `test/durababble/workflow_cancellation_test.rb`, and the end-to-end tests under `test/examples/`.
 

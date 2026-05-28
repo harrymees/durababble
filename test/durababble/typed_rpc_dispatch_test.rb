@@ -62,6 +62,13 @@ class TypedRpcDispatchTest < DurababbleTestCase
     save_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::Store", "save_object_state")
     assert_includes(save_output, "-> ::Durababble::serialized_payload")
     refute_includes(save_output, "-> void")
+
+    wait_snapshots_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::Store", "wait_snapshots_for")
+    assert_includes(wait_snapshots_output, "-> ::Array[::Durababble::wait_snapshot]")
+    refute_includes(wait_snapshots_output, "Hash[::String, ::Object?")
+
+    waiting_timer_output = assert_rbs_success(*RBS_LOAD_PATH, "method", "Durababble::WorkflowReplayHistory", "waiting_timer")
+    assert_includes(waiting_timer_output, "-> ::Durababble::wait_metadata?")
   end
 
   private

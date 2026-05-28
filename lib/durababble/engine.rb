@@ -61,7 +61,7 @@ module Durababble
           raise LeaseConflict, "workflow #{workflow_id} is leased by another worker"
         end
 
-        execute(workflow_class, workflow_id:, initial_input: owned_claim.fetch("input"))
+        execute(workflow_class, workflow_id:, initial_input: owned_claim.fetch("input"), claimed_next_run_at: claimed_next_run_at(current, owned_claim))
       end
     end
 
@@ -105,8 +105,8 @@ module Durababble
     # (suspended, retry scheduled, lease lost, canceled, failed) onto the right
     # persisted state. `attributes` is computed before the trace block so it is
     # always available to the rescue handlers.
-    #: (untyped, workflow_id: untyped, ?initial_input: untyped) -> untyped
-    def execute(workflow_class, workflow_id:, initial_input: nil)
+    #: (untyped, workflow_id: untyped, ?initial_input: untyped, ?claimed_next_run_at: untyped) -> untyped
+    def execute(workflow_class, workflow_id:, initial_input: nil, claimed_next_run_at: nil)
       # Deferred boot check: at workflow execution time the host's initializers have run
       # and ActiveSupport::IsolatedExecutionState.isolation_level should be :fiber. Running
       # the Async reactor below with :thread isolation would share one AR connection across
@@ -114,11 +114,11 @@ module Durababble
       Durababble.assert_fiber_isolation!
       attributes = execute_attributes(workflow_class, workflow_id)
       Observability.trace("durababble.workflow.execute", attributes) do
-        drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:)
+        drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at:)
         snapshot(workflow_id)
       end
-    rescue WorkflowSuspended
-      persist_workflow_suspension(workflow_id)
+    rescue WorkflowSuspended => e
+      persist_workflow_suspension(workflow_id, next_run_at: e.next_run_at)
     rescue StepRetryScheduled
       snapshot(workflow_id)
     rescue LeaseConflict
@@ -133,8 +133,8 @@ module Durababble
     # owned here so the ensure can always break its reference back to the
     # execution, and errors raised inside the reactor are surfaced to the
     # boundary rescues via root_error rather than escaping the Async task.
-    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped) -> void
-    def drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:)
+    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped, ?claimed_next_run_at: untyped) -> void
+    def drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at: nil)
       workflow = nil #: untyped
       root_error = nil #: StandardError?
       root = Async do |root_task|
@@ -152,6 +152,7 @@ module Durababble
           worker_pool: @worker_pool,
           crash_after: @crash_after,
           history_warning_logged:,
+          claimed_next_run_at:,
         )
         workflow.__durababble_execution__ = execution
         result = run_workflow_body(workflow, execution, workflow_class, workflow_id:, initial_input:)
@@ -206,10 +207,10 @@ module Durababble
       end
     end
 
-    #: (untyped) -> untyped
-    def persist_workflow_suspension(workflow_id)
+    #: (untyped, ?next_run_at: Object?) -> untyped
+    def persist_workflow_suspension(workflow_id, next_run_at: nil)
       suspended = WorkflowDeterminism.allow_host_operations do
-        @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+        @store.suspend_workflow(workflow_id:, worker_id: @worker_id, next_run_at:)
       end
       unless suspended
         row = WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id) }
@@ -253,6 +254,14 @@ module Durababble
     #: (untyped) -> untyped
     def initial_context(workflow_id)
       WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id).fetch("input") }
+    end
+
+    #: (untyped, untyped) -> Object?
+    def claimed_next_run_at(current, owned_claim)
+      current_next_run_at = current["next_run_at"] if current.fetch("status", nil) == "waiting"
+      return current_next_run_at if current_next_run_at
+
+      owned_claim["claimed_next_run_at"] if owned_claim.fetch("claimed_status", nil) == "waiting"
     end
 
     #: (untyped, untyped, untyped) { () -> untyped } -> untyped

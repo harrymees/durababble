@@ -333,8 +333,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, ?worker_id: String?) -> bool
-    def suspend_workflow(workflow_id:, worker_id: nil)
+    #: (workflow_id: String, ?worker_id: String?, ?next_run_at: Object?) -> bool
+    def suspend_workflow(workflow_id:, worker_id: nil, next_run_at: nil)
       raise NotImplementedError
     end
 
@@ -393,8 +393,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+    #: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
       raise NotImplementedError
     end
 

@@ -33,6 +33,7 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency("activerecord", ">= 7.1", "< 9.0")
   spec.add_dependency("async", "~> 2.24")
+  spec.add_dependency("async-grpc", "~> 0.7")
   spec.add_dependency("async-http", "~> 0.90")
   spec.add_dependency("bigdecimal", "~> 3.2")
   spec.add_dependency("concurrent-ruby", "~> 1.3")

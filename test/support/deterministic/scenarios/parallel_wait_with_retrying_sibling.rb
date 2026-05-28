@@ -78,15 +78,12 @@ module Durababble
             end
           end
 
-          # Fire the timer past the parked wait's wake_at (500), then resume so the
-          # parked branch completes and the workflow finishes.
-          h.scheduler.schedule(actor: "timer", delay: 550, name: "wake") { h.store.wake_due_timers(now: h.store.current_time + 1000) }
+          # Resume after the parked wait's wake_at (500), so the parked branch
+          # completes under the workflow lease and the workflow finishes.
           h.scheduler.schedule(actor: "worker-c", delay: 560, name: "final_resume") do
             next if ["completed", "failed", "canceled"].include?(h.store.workflow(id).fetch("status"))
 
-            Durababble::Engine.new(store: h.store, worker_id: "worker-c", lease_seconds: 30).resume(workflow, workflow_id: id)
-          rescue Durababble::LeaseConflict
-            h.scheduler.trace.event(h.scheduler.time, "worker-c", "final_resume_yield", id:)
+            resume_workflow_once(h, actor: "worker-c", workflow:, workflow_id: id, lease_seconds: 30, yield_event: "final_resume_yield")
           end
 
           h.check("workflow completes") { h.store.workflow(id).fetch("status") == "completed" }

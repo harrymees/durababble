@@ -7,7 +7,7 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
   durababble_store_backends.each do |backend|
     test "does not recreate a timer wait after crashing immediately after persistence with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
-        wake_at = Time.utc(2026, 2, 1, 12, 0, 0)
+        wake_at = Time.now + 3600
         workflow = durababble_test_workflow("durable-timer-checkpoint") do
           test_step("sleep") do |ctx|
             Durababble.wait_until(wake_at, ctx.merge("slept" => true))
@@ -29,23 +29,22 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           ).resume(workflow, workflow_id:)
         end
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "locked_by" => nil
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
-        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-        run = Durababble::Engine.new(store:, worker_id: "recover").resume(workflow, workflow_id:)
+        run = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "recover")
 
         assert_equal "completed", run.status
         assert_equal({ "id" => "timer-crash", "slept" => true, "done" => true }, run.result)
-        assert_equal 1, store.waits_for(workflow_id).length
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal 1, store.wait_snapshots_for(workflow_id).length
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
 
     test "keeps repeated durable waits from the same step method distinct by position with #{backend.name}" do
       with_durababble_store(backend, "durable_wait_recovery") do |store|
-        first_wake = Time.utc(2026, 3, 1, 0, 0, 0)
-        second_wake = Time.utc(2026, 3, 2, 0, 0, 0)
+        first_wake = Time.now + 3600
+        second_wake = Time.now + 7200
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "durable-repeated-waits"
 
@@ -78,15 +77,15 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
 
-        assert_equal 1, store.wake_due_timers(now: first_wake + 1)
-        assert_equal :worked, worker.tick
+        make_workflow_timer_due(store, workflow_id, at: first_wake)
+        assert_equal :worked, with_store_current_time(store, first_wake + 1) { worker.tick }
         assert_equal(
           [["0", "pause_until", "completed"], ["1", "pause_until", "waiting"]],
           store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
 
-        assert_equal 1, store.wake_due_timers(now: second_wake + 1)
-        assert_equal :worked, worker.tick
+        make_workflow_timer_due(store, workflow_id, at: second_wake)
+        assert_equal :worked, with_store_current_time(store, second_wake + 1) { worker.tick }
 
         assert_hash_includes(
           store.workflow(workflow_id),
@@ -97,7 +96,7 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           [["0", "pause_until", "completed"], ["1", "pause_until", "completed"]],
           store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
-        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end

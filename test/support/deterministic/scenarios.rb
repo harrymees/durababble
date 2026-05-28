@@ -273,6 +273,19 @@ module Durababble
         end
       end
 
+      #: (untyped, actor: String, workflow: Class, workflow_id: String, ?lease_seconds: Numeric, ?crashable: bool, ?yield_event: String, ?crash_event: String) -> untyped
+      def resume_workflow_once(h, actor:, workflow:, workflow_id:, lease_seconds: Engine::DEFAULT_LEASE_SECONDS, crashable: false, yield_event: "workflow_resume_yield", crash_event: "workflow_resume_crashed")
+        action = lambda do
+          Engine.new(store: h.store, worker_id: actor, lease_seconds:)
+            .resume(workflow, workflow_id:)
+        end
+        crashable ? h.store.crashable { action.call } : action.call
+      rescue WorkflowSuspended, StepRetryScheduled, LeaseConflict => e
+        h.scheduler.trace.event(h.scheduler.time, actor, yield_event, error: e.class.name, id: workflow_id)
+      rescue InjectedCrash => e
+        h.scheduler.trace.event(h.scheduler.time, actor, crash_event, error: e.message, id: workflow_id)
+      end
+
       #: (untyped, untyped) { (untyped) -> untyped } -> untyped
       def run(seed, scenario, &block)
         trace = Trace.new

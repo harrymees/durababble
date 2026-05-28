@@ -558,8 +558,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] },
         )
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "raw-resume-worker").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "raw-resume-worker")
 
         assert_equal "completed", completed.status
         assert_equal [{ "id" => "raw-w1", "released" => true }, { "sibling" => "raw-w1" }], completed.result
@@ -666,8 +665,7 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }.sort_by(&:first),
         )
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "resume-worker").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "resume-worker")
 
         assert_equal "completed", completed.status
         assert_equal [{ "id" => "w2", "released" => true }, { "sibling" => "w2" }], completed.result
@@ -715,13 +713,13 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "window" })
         first = Durababble::Engine.new(store:, worker_id: "window-worker").resume(workflow, workflow_id:)
 
-        assert_equal [1], wake_counts
-        assert_equal "pending", first.status
+        assert_equal [0], wake_counts
+        assert_equal "waiting", first.status
 
-        completed = Durababble::Engine.new(store:, worker_id: "window-resume").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "window-resume")
 
         assert_equal "completed", completed.status
-        assert_equal [{ "id" => "window", "released" => true }, { "wakes" => 1 }], completed.result
+        assert_equal [{ "id" => "window", "released" => true }, { "wakes" => 0 }], completed.result
       end
     end
 

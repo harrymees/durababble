@@ -112,7 +112,7 @@ Workflow code may use durable timer waits directly from orchestration code throu
 
 Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
 
-`wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, persist wait rows, and resume the waiting workflow fiber when the timer completion is recorded. Durable sleeps are implemented as timer waits and must survive process exit.
+`wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, park the workflow with the earliest unresolved timer in `workflows.next_run_at`, and resume under the normal workflow claim path when the timer is due. Durable sleeps are implemented as timer waits and must survive process exit.
 
 ### Durable objects
 
@@ -177,7 +177,7 @@ In-workflow handle RPCs are durable commands for replay purposes. The command sh
 
 Workflow replay is driven by an append-only per-workflow command history. Latest-state tables such as `steps` are query caches and recovery aids, not the replay source of truth.
 
-Replay is bounded by a configurable maximum number of per-workflow `workflow_history` rows. The count includes every replay/history fact for that workflow: step schedules, starts, completions, failures, wait records, timer completions, workflow command completion/failure records, child-workflow records, and patch markers. It does not count latest-state or recovery helper rows in `steps`, `step_attempts`, `waits`, `inbox`, or `outbox`, except where those operations append a workflow-history fact. The engine checks the count before loading full replay payloads and checks projected growth before scheduling a new durable command. Durababble also has a lower warning threshold, defaulting to `8_000` events, that logs through `Durababble.logger` without stopping the run. If an open workflow exceeds the hard bound, the engine raises `Durababble::WorkflowHistoryLimitExceeded`, records that typed error on the workflow row, clears the lease and retry deadline, and returns a terminal failed run so workers do not repeatedly replay the same oversized history. Terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming the target, so an oversized terminal workflow does not leave runnable task rows behind. Terminal workflows are returned without applying the replay bound so completed results and terminal errors remain inspectable.
+Replay is bounded by a configurable maximum number of per-workflow `workflow_history` rows. The count includes every replay/history fact for that workflow: step schedules, starts, completions, failures, wait records, timer completions, workflow command completion/failure records, child-workflow records, and patch markers. It does not count latest-state or recovery helper rows in `steps`, `step_attempts`, `inbox`, or `outbox`, except where those operations append a workflow-history fact. The engine checks the count before loading full replay payloads and checks projected growth before scheduling a new durable command. Durababble also has a lower warning threshold, defaulting to `8_000` events, that logs through `Durababble.logger` without stopping the run. If an open workflow exceeds the hard bound, the engine raises `Durababble::WorkflowHistoryLimitExceeded`, records that typed error on the workflow row, clears the lease and retry deadline, and returns a terminal failed run so workers do not repeatedly replay the same oversized history. Terminal workflow target activations dead-letter pending workflow-command inbox work instead of re-arming the target, so an oversized terminal workflow does not leave runnable task rows behind. Terminal workflows are returned without applying the replay bound so completed results and terminal errors remain inspectable.
 
 Step scheduling, step execution starts, and terminal outcomes are distinct durable facts. A schedule record stores command id and full replay-relevant command shape before any local or remote executor starts the side effect. A start record stores that an executor began a concrete attempt. Success, wait, cancellation, and non-retrying failure records resolve the command's workflow future. Retryable failure records are diagnostic history for the failed attempt and must not be treated as terminal replay events.
 
@@ -282,7 +282,7 @@ If `fetch_profile(2)` completes before `fetch_profile(1)` and schedules `score_p
 
 ### Waits and commands
 
-Timer waits persist a wake time and Paquito context, suspend the workflow only after a safe activation boundary, and resume when the wake time is due.
+Timer waits persist their wake time and Paquito context in workflow history, set `workflows.next_run_at` to the earliest unresolved timer when the workflow parks, and resume when the normal workflow claim path finds that due row.
 
 A step wait is a terminal command-resolution record, but releasing the workflow lease to `waiting` happens only after the workflow activation reaches a safe suspension point. If one branch records a wait while sibling workflow fibers have already scheduled process-local steps, those sibling steps may finish and commit before the workflow row is released.
 
@@ -297,7 +297,7 @@ Synchronous workflow command APIs are durable asks. The caller waits for the inb
 Cancellation is cooperative execution, not hard termination.
 
 - `Workflow.handle(workflow_id).cancel(reason:)` records the first durable cancellation reason and request timestamp. Duplicate requests return the current run and preserve the first reason.
-- Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become claimable immediately. Pending waits are marked canceled so late timer wakes cannot resume the canceled wait.
+- Pending, waiting, and retry-backoff workflows move to `canceling`, clear `next_run_at`, and become claimable immediately. Waiting step/attempt state is marked canceled so a later timer claim cannot resume canceled work.
 - Running workflows keep their active lease. Cancellation is observed at deterministic yield points: before a new durable command starts, when replay reaches a completed command boundary, after a step completes, and when a running step heartbeats.
 - Delivery raises `Durababble::CancellationError` with the durable reason and workflow id. Cleanup steps run as ordinary durable steps under the same command-history replay model as all other workflow work.
 - If workflow code catches cancellation and returns after cleanup, the engine records the workflow as `canceled` and stores the cleanup result. Re-raising `CancellationError` also records `canceled`.
@@ -309,11 +309,11 @@ Cancellation is cooperative execution, not hard termination.
 Termination is an operator hard stop, not cancellation with stronger wording.
 
 - `Workflow.handle(workflow_id).terminate(reason: nil)` durably marks a non-terminal workflow `terminated` as soon as the store can commit that terminal state. The terminal run has `status == "terminated"`, `result == nil`, and `error` set to the supplied reason or `"workflow terminated"` when no reason is supplied.
-- Duplicate termination calls are idempotent. If the workflow is already `terminated`, later calls return the same terminal run and preserve the first durable reason. If the workflow is already `completed`, `failed`, or `canceled`, termination is a no-op that returns the existing terminal run without changing result, error, cancellation metadata, history, waits, or commands.
+- Duplicate termination calls are idempotent. If the workflow is already `terminated`, later calls return the same terminal run and preserve the first durable reason. If the workflow is already `completed`, `failed`, or `canceled`, termination is a no-op that returns the existing terminal run without changing result, error, cancellation metadata, history, wait state, or commands.
 - Termination does not deliver `Durababble::CancellationError`, does not set cancellation metadata, and does not run workflow cleanup. A workflow already in `canceling` can still be terminated; if termination commits first, cleanup is skipped and the final state is `terminated`.
-- When termination wins, the store clears the workflow lease and retry deadline, records a termination history event, cancels pending waits, marks live scheduled/running/waiting step and attempt rows as canceled with a termination error, dead-letters queued or running workflow-command inbox rows, and removes pending workflow target activations.
+- When termination wins, the store clears the workflow lease and retry deadline, records a termination history event, marks live scheduled/running/waiting step and attempt rows as canceled with a termination error, dead-letters queued or running workflow-command inbox rows, and removes pending workflow target activations.
 - A running Ruby step body is not asynchronously interrupted mid-frame. After termination commits, later step heartbeats, waits, step completions/failures, workflow completion/failure/cancellation writes, and workflow command completions are fenced by the missing running lease or the terminal workflow row and cannot revive the workflow.
-- Late timer wakes for terminated workflows are ignored because only pending waits for running/waiting workflows can complete. New workflow commands after termination fail instead of being buffered for a future run, and already queued commands complete with a terminal error rather than executing user code.
+- Late timer claims for terminated workflows are ignored because only non-terminal waiting workflows with due `next_run_at` can resume. New workflow commands after termination fail instead of being buffered for a future run, and already queued commands complete with a terminal error rather than executing user code.
 - Race rule: the first durable terminal write wins. Completion, failure, cancellation, and termination are mutually exclusive terminal outcomes; once any one commits, the others return or observe the persisted terminal run without changing it. Recovery and replay treat `terminated` as terminal and never claim, replay, or resume it.
 
 ### Workflow code evolution
@@ -407,7 +407,6 @@ Durababble persists the following logical entities. Physical table names may be 
 | `workflow_history` | Append-only ordered replay records for workflow commands, completions, timers, and markers | `(workflow_id, record_index)`, command id lookup |
 | `steps` | Latest logical workflow command state for query/result caching | `(workflow_id, command_id)` |
 | `step_attempts` | Append-only attempt history for step execution and waits | Attempt id, workflow id, command id, status |
-| `waits` | Durable timer waits | Wait id, workflow id, due time/status |
 | `leases` | Pool-scoped ownership for workflow and object targets, including the owner worker identity | `(worker_pool, target_kind, target_class, target_id)` |
 | `inbox` | Durable asks, tells, wakes, and workflow command messages | Target identity, sequence, status, message id |
 | `mailbox_sequences` | Per-target monotonic mailbox sequence allocation | Target identity |
@@ -439,7 +438,7 @@ Query-shape and transaction requirements:
 - Mutable latest-state rows are not the replay source. Replay uses ordered schedule history; deterministic scheduling uses history-ordered future resolution records; execution recovery uses distinct attempt start/completion records.
 - Wait rows and `step_waiting` history can be committed before the workflow row is released to `waiting` when an activation still has sibling workflow fibers to drain. Timer wake queries only make externally visible progress once the workflow is durably suspended or otherwise ready for that activation.
 - Explicit idempotency rows cover workflow starts and any public durable operation not deduped by the inbox itself.
-- Queue/recovery indexes cover workflow claims, due retries, expired workflow leases, timer waits, step-attempt lookup, outbox claims, and mailbox status scans.
+- Queue/recovery indexes cover workflow claims, due retries/timers through `workflows.next_run_at`, expired workflow leases, step-attempt lookup, outbox claims, and mailbox status scans.
 - Worker lease release, cancellation wait cleanup, and durable-object command paths have explicit indexes and query-plan coverage where they can become hot at scale.
 - New production Store SQL must be added to `Durababble::StoreQueries`; each new registered query must be covered by plan assertions, benchmark coverage, backend conformance coverage, or an explicit uncovered-query list entry reviewed in the query-plan suite.
 - High-risk transactional pieces such as `enqueue_message`, target-head drain/advance, sleep-to-inbox conversion, and object state plus message completion may be implemented with database functions to reduce lock-order drift, provided the common backend contract is preserved.
@@ -485,18 +484,18 @@ Routing keeps hot ids on the pod that already has them in memory:
 
 ## Inter-node RPC
 
-Remote intranode/inter-pod communication uses HTTP/2 (via `async-http`), one path per RPC method, with Paquito/Marshal value-object payloads (Ruby-to-Ruby — durababble does not carry cross-language interop, so it does not pay the protobuf tax). Each pod runs a dedicated `Durababble::Rpc::Server` (an `Async::HTTP::Server` on a reactor thread), bound to `rpc_host:rpc_port`. The transport is currently cleartext h2c with no built-in peer authentication; an optional `authorize:` hook on `Rpc::Server` runs at the application layer. Production hardening (mTLS / SPIFFE identity, ideally provided by the deployment's service mesh) is target work — see [Cluster RPC § Transport Security](content/cluster-rpc.md#transport-security).
+Remote intranode/inter-pod communication uses gRPC over HTTP/2 (via `async-grpc`), with Paquito/Marshal value-object payloads inside gRPC messages (Ruby-to-Ruby — durababble does not carry cross-language interop, so it does not pay the protobuf schema tax). Each pod runs a dedicated `Durababble::Rpc::Server` (an `Async::HTTP::Server` with an `Async::GRPC::Dispatcher` on a reactor thread), bound to `rpc_host:rpc_port`. The transport is currently cleartext h2c with no built-in peer authentication; an optional `authorize:` hook on `Rpc::Server` runs at the application layer. Production hardening (mTLS / SPIFFE identity, ideally provided by the deployment's service mesh) is target work — see [Cluster RPC § Transport Security](content/cluster-rpc.md#transport-security).
 
 The four-method service shape is part of the runtime contract:
 
-| Method | Path | Request | Response |
-| --- | --- | --- | --- |
-| `AwakenBatch` | `POST /durababble/v1/awaken_batch` | `Messages::AwakenBatchRequest` | `Messages::AwakenBatchResponse` |
-| `EvictLease` | `POST /durababble/v1/evict_lease` | `Messages::EvictLeaseRequest` | `Messages::EvictLeaseResponse` |
-| `DeliverMessage` | `POST /durababble/v1/deliver_message` | `Messages::DeliverMessageRequest` | `Messages::DeliverMessageResponse` |
-| `CallTransient` | `POST /durababble/v1/call_transient` | `Messages::TransientRequest` | `Messages::TransientResponse` |
+| Method | Request | Response |
+| --- | --- | --- |
+| `AwakenBatch` | `Messages::AwakenBatchRequest` | `Messages::AwakenBatchResponse` |
+| `EvictLease` | `Messages::EvictLeaseRequest` | `Messages::EvictLeaseResponse` |
+| `DeliverMessage` | `Messages::DeliverMessageRequest` | `Messages::DeliverMessageResponse` |
+| `CallTransient` | `Messages::TransientRequest` | `Messages::TransientResponse` |
 
-All bodies are `Durababble::Rpc.dump`/`Rpc.load` (Paquito with a single-byte version prefix wrapping Marshal). The `Messages` value-object fields (see `lib/durababble/rpc_messages.rb`):
+All message bodies are `Durababble::Rpc.dump`/`Rpc.load` (Paquito with a single-byte version prefix wrapping Marshal). The `Messages` value-object fields (see `lib/durababble/rpc_messages.rb`):
 
 - `AwakenBatchRequest { worker_pool, workflow_ids }`
 - `EvictLeaseRequest { worker_pool, target_kind, target_class, target_id, expected_worker_id }` (target_kind: `"object" | "workflow"`; target_class empty for workflows)
@@ -516,7 +515,7 @@ RPC semantics:
 - Receivers reject stale in-flight messages unless they still own the target before and after handler execution.
 - Auxiliary test transports must not be used for production intranode communication.
 
-**Retry policy (only known errors are retried).** Routing layers retry only typed routing failures (`NodeUnavailable` for transport-level unavailability — connection refused / timeout / HTTP/2 stream reset / server-returned 503; `StaleLease` for a moved lease; `NoActiveLease` for an unowned workflow). An unexpected raise inside a handler is returned as HTTP 500 and surfaces on the client as `Rpc::Error` (deliberately not a subclass of `Rpc::Unavailable`); the router does **not** retry. The rationale is to avoid amplifying load against a peer that has just hit an unforeseen bug — a stampede caused by automatic retries can compound a single bad node into a cluster-wide failure.
+**Retry policy (only known errors are retried).** Routing layers retry only typed routing failures (`NodeUnavailable` for transport-level unavailability — connection refused / timeout / HTTP/2 stream reset / gRPC `Unavailable` / gRPC `DeadlineExceeded`; `StaleLease` for a moved lease; `NoActiveLease` for an unowned workflow). An unexpected raise inside a handler is returned as gRPC `Internal` and surfaces on the client as `Rpc::Error` (deliberately not a subclass of `Rpc::Unavailable`); the router does **not** retry. The rationale is to avoid amplifying load against a peer that has just hit an unforeseen bug — a stampede caused by automatic retries can compound a single bad node into a cluster-wide failure.
 
 ## Configuration, limits, and operations
 
@@ -605,14 +604,14 @@ Observability requirements:
 | Workflow future resolution is deterministic | Step completions, failures, timer fires, workflow command deliveries, and child completions resume workflow fibers in history order. | Continuation fanout replay specs |
 | Step attempts are append-only | Every started attempt and terminal attempt state remains inspectable. | Guarantee matrix |
 | Timer wait attempts complete once | Wait completion updates attempts from `waiting` to `completed` without losing payload. | Wait-attempt spec |
-| Timer waits survive process exit | Timer wait rows store wake time and serialized context. | Timer wait tests |
+| Timer waits survive process exit | Workflow history stores the timer wake time/context, and `workflows.next_run_at` stores the earliest unresolved wake for queue claims. | Timer wait tests |
 | Side effects can be fenced by key | A fence records `running` before yielding and exposes operator-visible recovery for abandoned owners. | Fence concurrency spec plus owner-crash spec |
 | Outbox delivery is durable and leased | Outbox rows are unique by key, claimable, acknowledgeable, and reclaimable after expiry. | Outbox specs |
 | Workflow commands wake and run promptly | Command enqueue wakes the active owner or leaves a durable target activation; no workflow-side broadcast wait is required. | Workflow command mailbox specs plus RPC wakeup specs |
 | Synchronous durable commands return results | Ask rows store serialized result/error and caller retries with the same idempotency key reattach. | Workflow/object ask specs |
 | Inbox is not a second global polling queue | Workers poll coalesced target activations and target owners drain inbox rows for their own target. | Query-plan and mailbox specs |
-| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus HTTP/2 RPC transport spec plus DST scenarios |
-| Inter-pod RPC uses full four-method HTTP/2 service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` over async-http with an optional application-layer authorize hook. | RPC transport integration/contract tests plus DST response scenarios |
+| Workflow RPCs route to active lease holder | RPC routing validates owner before/after handling, refreshes ownership after transport failures, and reroutes. | Workflow RPC spec plus gRPC transport spec plus DST scenarios |
+| Inter-pod RPC uses full four-method gRPC service | Runtime RPC serves `AwakenBatch`, `EvictLease`, `CallTransient`, and `DeliverMessage` over async-grpc with an optional application-layer authorize hook. | RPC transport integration/contract tests plus DST response scenarios |
 | Multi-row state transitions are transactional | Step start/finish/failure, wait transitions, inbox enqueue, mailbox advancement, and state/result writes commit atomically where required. | Implementation plus regression suite |
 | Runtime values are Paquito bytes | Runtime payloads use Paquito bytes in `bytea` / `LONGBLOB`, not JSONB. | Payload storage specs |
 | MySQL/MariaDB honors common store semantics | MySQL/MariaDB and PostgreSQL/YSQL satisfy the same store behavior contract. | Backend conformance spec |
@@ -640,7 +639,7 @@ Observability requirements:
 | After child workflow start commits, before parent awaits | Parent replay reattaches to the existing child workflow row and does not create a duplicate child workflow. |
 | While parent is waiting on a child | The parent remains suspended through a durable wait, the child continues in its worker pool, and parent replay observes the child terminal result/error when it wakes. |
 | After cancellation cleanup step completes, before canceled terminal write | Completed cleanup step is skipped and workflow finishes `canceled` on recovery. |
-| While waiting when cancellation is requested | Wait row/attempt are marked canceled; cleanup runs on next claim and late timer wakes are ignored. |
+| While waiting when cancellation is requested | Waiting step/attempt state is marked canceled, cleanup runs on next claim, and late timer claims are ignored. |
 | After outbox insert, before delivery | Outbox message remains claimable exactly once at a time. |
 | After outbox claim, before ack | Expired outbox lease can be reclaimed by another sender. |
 | During lease-routed workflow RPC | Receiver rejects stale/moved/shutdown/no-owner states; caller refreshes or fails by policy. |
@@ -698,7 +697,7 @@ These constraints are part of the contract:
 - No streams API without a concrete consumer requirement.
 - No automatic cross-pool routing; relocation/failover is explicit.
 - No silent payload spill to blob storage; oversized values fail loudly.
-- No production RPC transport other than the four-method HTTP/2 service over `async-http`.
+- No production RPC transport other than the four-method gRPC service over `async-grpc`.
 - No runtime loading or validation of user RBS.
 - MySQL/MariaDB support is required for the common public contract.
 - Worker registry misses are avoided by claiming only workflow/object classes present in the supplied registry. Enqueuing a workflow name with no corresponding worker pool leaves it pending until an appropriate pool starts.

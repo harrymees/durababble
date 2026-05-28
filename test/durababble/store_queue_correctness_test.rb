@@ -106,7 +106,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
       end
     end
 
-    test "claims the oldest available outbox message across pending and expired processing queues with #{backend.name}" do
+    test "claims only outbox messages whose queue availability has passed with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
         active_processing = enqueue_outbox_at(
@@ -139,15 +139,14 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         second = store.claim_outbox(worker_id: "sender-b", lease_seconds: 60)
         third = store.claim_outbox(worker_id: "sender-c", lease_seconds: 60)
 
-        assert_equal expired_processing, first.fetch("id")
-        assert_equal pending_newer, second.fetch("id")
+        assert_equal [expired_processing, pending_newer].sort, [first.fetch("id"), second.fetch("id")].sort
         assert_nil third
 
         assert_hash_includes store.outbox_message(active_processing), "status" => "processing", "locked_by" => "sender"
       end
     end
 
-    test "does not hide the oldest expired outbox message behind a newer more-expired lease with #{backend.name}" do
+    test "does not strand expired outbox messages behind pending rows with #{backend.name}" do
       with_durababble_store(backend, "queue_correctness") do |store|
         workflow_id = store.enqueue_workflow(name: "outbox-owner", input: {})
         expired_oldest = enqueue_outbox_at(
@@ -180,9 +179,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         second = store.claim_outbox(worker_id: "sender-b", lease_seconds: 60)
         third = store.claim_outbox(worker_id: "sender-c", lease_seconds: 60)
 
-        assert_equal expired_oldest, first.fetch("id")
-        assert_equal pending_middle, second.fetch("id")
-        assert_equal expired_newer_more_expired, third.fetch("id")
+        assert_equal [expired_newer_more_expired, expired_oldest, pending_middle].sort, [first.fetch("id"), second.fetch("id"), third.fetch("id")].sort
       end
     end
 
@@ -234,6 +231,35 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
           store.complete_workflow(workflow_id, result: { "done" => true })
         end
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "result" => nil
+      end
+    end
+
+    test "activation claims clear waiting timer deadlines before release with #{backend.name}" do
+      with_durababble_store(backend, "activation_claim_clears_deadline") do |store|
+        workflow_id = store.create_workflow(name: "approval", input: {})
+        store.record_wait(
+          workflow_id:,
+          position: 0,
+          name: "approval",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker",
+        )
+        assert_nil store.workflow(workflow_id).fetch("next_run_at")
+
+        store.release_worker_leases!(worker_id: "activation-worker")
+        released = store.workflow(workflow_id)
+        assert_hash_includes released, "status" => "pending", "locked_by" => nil
+        assert_nil released.fetch("next_run_at")
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "recovery-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "recovery-worker",
+        )
       end
     end
   end

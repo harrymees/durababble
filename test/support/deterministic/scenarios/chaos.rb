@@ -17,7 +17,9 @@ module Durababble
             name = h.scheduler.rng.chance(25) ? "waiting" : "counter"
             input = name == "waiting" ? { "id" => "w#{i}" } : { "count" => i }
             h.network.send(source: "client-#{i}", target: "db", type: "enqueue") { h.store.enqueue_workflow(name:, input:) }
-            h.scheduler.schedule(actor: "timer-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "wake_due_timers") { h.store.wake_due_timers(now: h.store.current_time + 100) }
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 80 + h.scheduler.rng.int(200), name: "timer_tick") do
+              h.scheduler.trace.event(h.scheduler.time, "timer-#{i}", "timer_tick")
+            end
           end
           # Crash workers mid-resume between durable writes (not just whole-tick
           # skips), so every inter-write window is exercised under chaos. The
