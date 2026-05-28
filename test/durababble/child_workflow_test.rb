@@ -174,6 +174,18 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
     end
   end
 
+  class ObjectRetryShapeStarter < Durababble::DurableObject
+    object_type "child_workflow_object_retry_shape_starter"
+
+    expose_command retry: { maximum_attempts: 2, schedule: [0] }
+    def start_child_then_retry_with_changed_input
+      handle = ChildEchoWorkflow.enqueue({ "value" => "attempt-#{command_context.attempt_number}" })
+      raise "retry after child start" if command_context.attempt_number == 1
+
+      handle.workflow_id
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "parent starts child and awaits success durably with #{backend.name}" do
       with_durababble_store(backend, "child_workflow_success") do |store|
@@ -395,6 +407,20 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
             .sort,
         )
         assert_equal([{ "echo" => "same-shape" }, { "echo" => "same-shape" }], child_ids.map { |child_id| store.workflow(child_id).fetch("result") })
+      end
+    end
+
+    test "durable object retry reuses implicit child id and rejects changed shape with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_object_retry_shape") do |store|
+        message_id = ObjectRetryShapeStarter.tell("starter-retry-shape", :start_child_then_retry_with_changed_input, store:)
+        run_workers_until_idle(backend, store, workflows: [ChildEchoWorkflow], objects: [ObjectRetryShapeStarter])
+        message = store.inbox_message(message_id)
+        child_rows = store.child_workflow_rows_for_object(parent_object_type: ObjectRetryShapeStarter.object_type, parent_object_id: "starter-retry-shape")
+
+        assert_hash_includes message, "status" => "dead_lettered", "attempts" => 2
+        assert_match(/already used for a different child workflow/, message.fetch("error"))
+        assert_equal 1, child_rows.length
+        assert_equal({ "value" => "attempt-1" }, child_rows.first.fetch("input"))
       end
     end
 

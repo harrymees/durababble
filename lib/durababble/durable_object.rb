@@ -254,8 +254,8 @@ module Durababble
       child_workflow_name = workflow_class.workflow_name
       child_worker_pool = worker_pool || @worker_pool
       start_sequence = next_child_workflow_sequence
-      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{start_sequence}:#{child_workflow_name}"
-      resolved_id = id || generated_child_workflow_id(child_workflow_name:, input:, worker_pool: child_worker_pool, idempotency_key: resolved_key)
+      resolved_key = idempotency_key || "#{context.idempotency_key}:child-workflow:#{start_sequence}"
+      resolved_id = id || generated_child_workflow_id(start_sequence:, idempotency_key: resolved_key)
       policy = normalize_child_cancellation_policy(cancellation)
       store = @store #: as Store
       link = store.start_child_workflow(
@@ -301,16 +301,14 @@ module Durababble
       @__durababble_child_workflow_sequence += 1
     end
 
-    #: (child_workflow_name: String, input: Object?, worker_pool: String, idempotency_key: String) -> String
-    def generated_child_workflow_id(child_workflow_name:, input:, worker_pool:, idempotency_key:)
+    #: (start_sequence: Integer, idempotency_key: String) -> String
+    def generated_child_workflow_id(start_sequence:, idempotency_key:)
       context = command_context #: as CommandContext
       digest = Digest::SHA256.hexdigest(Store::SERIALIZER.dump({
         "object_type" => self.class.object_type,
         "object_id" => durable_id,
         "command_id" => context.command_id,
-        "child_workflow_name" => child_workflow_name,
-        "input" => input,
-        "worker_pool" => worker_pool,
+        "start_sequence" => start_sequence,
         "idempotency_key" => idempotency_key,
       }))
       "child-#{digest[0, 48]}"
