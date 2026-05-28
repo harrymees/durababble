@@ -76,7 +76,7 @@ RETURNING outbox.*
 
 -- pg_claim_runnable_workflow
 WITH candidate AS (
-  SELECT id FROM "durababble_pg_snapshot"."workflows"
+  SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at FROM "durababble_pg_snapshot"."workflows"
   WHERE worker_pool = $1
     AND (CASE
   WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
@@ -93,7 +93,7 @@ UPDATE "durababble_pg_snapshot"."workflows" AS workflows
 SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
 FROM candidate
 WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
-RETURNING workflows.*
+RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
 
 -- pg_claim_selected_target_activation
 UPDATE "durababble_pg_snapshot"."target_activations"

@@ -101,12 +101,7 @@ module Durababble
         return
       end
 
-      if suspend_workflow
-        error = WorkflowSuspended.new("workflow #{@workflow_id} suspended at command #{command_id}", next_run_at:)
-        future(command_id).reject(error)
-      else
-        @defer_workflow_suspension.call(command_id)
-      end
+      @defer_workflow_suspension.call(command_id)
     end
 
     # Control-flow errors are rejected onto the future unchanged; only an

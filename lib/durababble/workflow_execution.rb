@@ -21,8 +21,8 @@ module Durababble
     #: Store
     attr_reader :store
 
-    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, history: Array[Hash[String, Object?]], root_task: Object, workflow_class: Class, workflow: Object, worker_pool: String, ?crash_after: Symbol?, ?history_warning_logged: bool) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false)
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, history: Array[Hash[String, Object?]], root_task: Object, workflow_class: Class, workflow: Object, worker_pool: String, ?crash_after: Symbol?, ?history_warning_logged: bool, ?claimed_next_run_at: Object?) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false, claimed_next_run_at: nil)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -39,6 +39,7 @@ module Durababble
       @workflow_task_count = 0
       @step_contexts = {}
       @deferred_suspension_command_ids = {}
+      @claimed_next_run_at = claimed_next_run_at
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
       @history_warning_logged = history_warning_logged
@@ -787,11 +788,7 @@ module Durababble
         return
       end
 
-      if suspend_workflow
-        reject_wait_for_suspension(command_id)
-      else
-        defer_workflow_suspension(command_id)
-      end
+      defer_workflow_suspension(command_id)
     end
 
     #: () -> bool
@@ -866,7 +863,14 @@ module Durababble
       wake_at = wait["wake_at"]
       return true if wait.fetch("kind", nil) == "child_workflow" && child_workflow_wait_ready?(wait)
 
-      !!(wake_at && timer_due?(wake_at))
+      !!(wake_at && (timer_due?(wake_at) || claimed_wake_due?(wake_at)))
+    end
+
+    #: (Object) -> bool
+    def claimed_wake_due?(wake_at)
+      return false unless @claimed_next_run_at
+
+      comparable_time(wake_at) <= comparable_time(@claimed_next_run_at)
     end
 
     #: (Hash[String, Object?]) -> bool

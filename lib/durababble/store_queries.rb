@@ -132,7 +132,7 @@ module Durababble
       workflows = table(store, "workflows")
       <<~SQL.chomp
         WITH candidate AS (
-          SELECT id FROM #{workflows}
+          SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at FROM #{workflows}
           WHERE worker_pool = $1
             AND (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) <= now()
             #{name_filter}
@@ -143,7 +143,7 @@ module Durababble
         SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
         FROM candidate
         WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
-        RETURNING workflows.*
+        RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
       SQL
     end
 
@@ -482,7 +482,7 @@ module Durababble
 
     define(:mysql_claim_runnable_workflow, backend: :mysql, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_sql:|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
+        SELECT id, created_at, status AS claimed_status, next_run_at AS claimed_next_run_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
         WHERE worker_pool = ?
           AND queue_available_at <= NOW(6)
           #{name_sql}

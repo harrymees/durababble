@@ -48,6 +48,8 @@ module Durababble
         next unless updated.affected_rows == 1
 
         claimed = workflow(candidate.fetch("id"))
+        claimed["claimed_status"] = candidate["claimed_status"]
+        claimed["claimed_next_run_at"] = candidate["claimed_next_run_at"]
         observe_claim_latency(claimed, "workflow")
         claimed
       end

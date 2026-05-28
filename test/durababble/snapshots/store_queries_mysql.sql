@@ -65,7 +65,7 @@ LIMIT 1
 FOR UPDATE SKIP LOCKED
 
 -- mysql_claim_runnable_workflow
-SELECT id, created_at FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_claim_idx)
+SELECT id, created_at, status AS claimed_status, next_run_at AS claimed_next_run_at FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_claim_idx)
 WHERE worker_pool = ?
   AND queue_available_at <= NOW(6)
   <name_sql>
