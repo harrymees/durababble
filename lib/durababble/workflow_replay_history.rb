@@ -158,9 +158,21 @@ module Durababble
       wait
     end
 
+    #: (Integer) -> Hash[String, Object?]?
+    def waiting_timer_or_child_workflow(command_id)
+      event = @terminal[command_id]
+      return unless event&.fetch("kind") == "step_waiting"
+      return if interrupted_wait_condition?(event)
+
+      wait = waiting_event_payload(event)
+      return unless ["timer", "child_workflow"].include?(wait.fetch("kind", nil))
+
+      wait
+    end
+
     #: () -> Object?
     def earliest_unresolved_timer_wake_at
-      @terminal.keys.filter_map { |command_id| waiting_timer(command_id)&.fetch("wake_at", nil) }.min_by { |wake_at| comparable_time(wake_at) }
+      @terminal.keys.filter_map { |command_id| waiting_timer_or_child_workflow(command_id)&.fetch("wake_at", nil) }.min_by { |wake_at| comparable_time(wake_at) }
     end
 
     #: (Integer, name: String, wait_request: WaitRequest) -> void

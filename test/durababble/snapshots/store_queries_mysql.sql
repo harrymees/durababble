@@ -634,6 +634,16 @@ INSERT INTO `durababble_mysql_snapshot_steps` (workflow_id, position, name, stat
 VALUES (?, ?, ?, 'waiting', ?, NOW(6), NOW(6))
 ON DUPLICATE KEY UPDATE status = 'waiting', result = VALUES(result), error = NULL, updated_at = NOW(6)
 
+-- mysql_wake_parent_workflow_if_child_terminal
+UPDATE `durababble_mysql_snapshot_workflows` AS parent
+JOIN `durababble_mysql_snapshot_workflows` AS child
+  ON child.parent_workflow_id = parent.id
+SET parent.next_run_at = ?, parent.updated_at = ?
+WHERE child.id = ?
+  AND child.child_origin_kind = 'workflow'
+  AND (child.status IN ('completed', 'canceled', 'terminated') OR (child.status = 'failed' AND child.next_run_at IS NULL))
+  AND parent.status = 'waiting'
+
 -- mysql_workflow
 SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ?
 

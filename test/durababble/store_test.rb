@@ -1070,7 +1070,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, pg_fenced_workflow_updates.length
     assert pg_fenced_workflow_updates.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
 
@@ -1080,7 +1080,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_unfenced_store.cancel_workflow("wf", reason: "stop")
     pg_unfenced_store.fail_workflow("wf", error: "boom")
 
-    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, pg_unfenced_workflow_updates.length
     assert pg_unfenced_workflow_updates.none? { |sql, _params| sql.include?("AND locked_by =") }
 
@@ -1090,7 +1090,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, mysql_fenced_workflow_updates.length
     assert mysql_fenced_workflow_updates.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
 
@@ -1100,7 +1100,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
     mysql_unfenced_store.fail_workflow("wf", error: "boom")
 
-    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, mysql_unfenced_workflow_updates.length
     assert mysql_unfenced_workflow_updates.none? { |sql| sql.include?("AND locked_by =") }
 

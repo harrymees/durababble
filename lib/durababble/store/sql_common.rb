@@ -194,6 +194,11 @@ module Durababble
       }
     end
 
+    #: (String) -> Object?
+    def wake_parent_workflow_if_child_terminal(workflow_id)
+      raise NotImplementedError
+    end
+
     #: (String) -> Hash[String, Object?]
     def workflow(workflow_id)
       row = execute_store_query(:workflow, [workflow_id]).first
@@ -778,6 +783,7 @@ module Durababble
         else
           cancel_live_workflow_dependents(workflow_id)
         end
+        wake_parent_workflow_if_child_terminal(workflow_id)
         result
       end
     end

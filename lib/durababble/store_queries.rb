@@ -795,6 +795,20 @@ module Durababble
       "UPDATE #{table(store, "workflows")} SET next_run_at = CASE WHEN status = 'waiting' THEN $2::timestamptz ELSE NULL END, updated_at = $2::timestamptz WHERE id = $1"
     end
 
+    define(:pg_wake_parent_workflow_if_child_terminal, backend: :postgres) do |store|
+      workflows = table(store, "workflows")
+      <<~SQL.chomp
+        UPDATE #{workflows} AS parent
+        SET next_run_at = $2::timestamptz, updated_at = $2::timestamptz
+        FROM #{workflows} AS child
+        WHERE child.id = $1
+          AND child.child_origin_kind = 'workflow'
+          AND child.parent_workflow_id = parent.id
+          AND (child.status IN ('completed', 'canceled', 'terminated') OR (child.status = 'failed' AND child.next_run_at IS NULL))
+          AND parent.status = 'waiting'
+      SQL
+    end
+
     define(:pg_request_workflow_cancellation, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
@@ -1434,6 +1448,20 @@ module Durababble
 
     define(:mysql_make_workflow_due, backend: :mysql) do |store|
       "UPDATE #{table(store, "workflows")} SET next_run_at = CASE WHEN status = 'waiting' THEN ? ELSE NULL END, updated_at = ? WHERE id = ?"
+    end
+
+    define(:mysql_wake_parent_workflow_if_child_terminal, backend: :mysql) do |store|
+      workflows = table(store, "workflows")
+      <<~SQL.chomp
+        UPDATE #{workflows} AS parent
+        JOIN #{workflows} AS child
+          ON child.parent_workflow_id = parent.id
+        SET parent.next_run_at = ?, parent.updated_at = ?
+        WHERE child.id = ?
+          AND child.child_origin_kind = 'workflow'
+          AND (child.status IN ('completed', 'canceled', 'terminated') OR (child.status = 'failed' AND child.next_run_at IS NULL))
+          AND parent.status = 'waiting'
+      SQL
     end
 
     define(:mysql_request_workflow_cancellation, backend: :mysql) do |store|
@@ -2125,6 +2153,22 @@ module Durababble
         VALUES (?, ?, ?, ?, 'pending', ?)
         ON CONFLICT(target_kind, target_type, target_id) DO UPDATE SET status = 'pending', ready_at = excluded.ready_at, locked_by = NULL, locked_until = NULL, updated_at = dura_now()
         WHERE worker_pool = excluded.worker_pool
+      SQL
+    end
+
+    define(:sqlite_wake_parent_workflow_if_child_terminal, backend: :sqlite) do |store|
+      workflows = table(store, "workflows")
+      <<~SQL.chomp
+        UPDATE #{workflows}
+        SET next_run_at = ?, updated_at = ?
+        WHERE id = (
+          SELECT child.parent_workflow_id
+          FROM #{workflows} AS child
+          WHERE child.id = ?
+            AND child.child_origin_kind = 'workflow'
+            AND (child.status IN ('completed', 'canceled', 'terminated') OR (child.status = 'failed' AND child.next_run_at IS NULL))
+        )
+          AND status = 'waiting'
       SQL
     end
 

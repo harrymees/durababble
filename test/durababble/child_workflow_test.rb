@@ -195,7 +195,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         assert_equal "completed", run.fetch("status")
         assert_equal({ "child_id" => "child-success", "result" => { "echo" => "ok" } }, run.fetch("result"))
         assert_equal(
-          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "sleep", "child_workflow:workflow:observe"],
+          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "child_workflow:workflow:await", "child_workflow:workflow:observe"],
           store.steps_for(workflow_id).map { |step| step.fetch("name") },
         )
         assert_hash_includes(
@@ -225,7 +225,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
           run.fetch("result"),
         )
         assert_equal(
-          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "sleep", "child_workflow:workflow:observe"],
+          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "child_workflow:workflow:await", "child_workflow:workflow:observe"],
           store.steps_for(workflow_id).map { |step| step.fetch("name") },
         )
       end
@@ -290,9 +290,10 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
 
         worker.run_until_idle(max_ticks: 20)
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_equal 1, store.wake_due_timers(now: Time.now + 60)
+        wake_at = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
 
-        worker.run_until_idle(max_ticks: 20)
+        with_store_current_time(store, wake_at) { worker.run_until_idle(max_ticks: 20) }
         run = store.workflow(workflow_id)
 
         assert_equal "failed", run.fetch("status")
@@ -542,7 +543,10 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       run = store.workflow(workflow_id)
       return run if Durababble::WorkflowStatus.terminal?(run)
 
-      store.wake_due_timers(now: Time.now + 3600)
+      if (wake_at = run["next_run_at"])
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
+        with_store_current_time(store, wake_at) { worker.run_until_idle(max_ticks: 20) }
+      end
     end
     raise "workflow #{workflow_id} did not finish"
   end

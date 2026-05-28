@@ -16,6 +16,8 @@ require_relative "workflow"
 
 module Durababble
   class WorkflowExecution
+    CHILD_WORKFLOW_AWAIT_PARK_SECONDS = 10 * 365 * 24 * 60 * 60
+
     #: Store
     attr_reader :store
 
@@ -322,18 +324,17 @@ module Durababble
     #: (ChildWorkflowHandle, poll_interval: Numeric, timeout: Numeric?) -> Object?
     def await_child_workflow(handle, poll_interval:, timeout:)
       deadline = child_workflow_await_deadline(timeout)
-      await_time = (deadline && timeout ? deadline - timeout : nil) #: as Time?
+      await_time = if deadline && timeout
+        deadline - timeout
+      else
+        WorkflowDeterminism.allow_host_operations { @store.current_time }
+      end
       loop do
         observed = call_child_workflow_observe(handle, await_deadline: deadline)
         return handle.await_result_from(observed) if WorkflowStatus.terminal?(observed)
 
         if deadline && await_time && await_time >= deadline
           raise CommandTimeout, "timed out waiting for child workflow #{handle.workflow_id}"
-        end
-
-        unless deadline
-          Durababble.sleep(poll_interval, "child_workflow_id" => handle.workflow_id)
-          next
         end
 
         current_time = await_time #: as Time
@@ -480,20 +481,18 @@ module Durababble
       WorkflowDeterminism.allow_host_operations { @store.current_time + timeout }
     end
 
-    #: (ChildWorkflowHandle, poll_interval: Numeric, current_time: Time, deadline: Time) -> Time
+    #: (ChildWorkflowHandle, poll_interval: Numeric, current_time: Time, deadline: Time?) -> Time
     def wait_for_child_workflow_poll(handle, poll_interval:, current_time:, deadline:)
       wait_request = recorded_child_workflow_await_wait_request || begin
-        poll_wake_at = current_time + poll_interval
-        wake_at = [poll_wake_at, deadline].min #: as Time
+        wake_at = child_workflow_poll_wake_at(current_time:, poll_interval:, deadline:)
         WaitRequest.new(
-          kind: "timer",
+          kind: "child_workflow",
           wake_at:,
           event_key: nil,
           context: {
             "child_workflow_id" => handle.workflow_id,
-            "child_workflow_deadline_at" => deadline,
             "child_workflow_wake_at" => wake_at,
-          },
+          }.tap { |context| context["child_workflow_deadline_at"] = deadline if deadline },
         )
       end
       result = call_wait(
@@ -504,6 +503,18 @@ module Durababble
       )
       context = result.is_a?(Hash) ? result : wait_request.context
       context.fetch("child_workflow_wake_at") #: as Time
+    end
+
+    #: (current_time: Time, poll_interval: Numeric, deadline: Time?) -> Time?
+    def child_workflow_poll_wake_at(current_time:, poll_interval:, deadline:)
+      unless poll_interval.positive?
+        return deadline if deadline
+
+        return current_time + CHILD_WORKFLOW_AWAIT_PARK_SECONDS
+      end
+
+      poll_wake_at = current_time + poll_interval
+      deadline ? [poll_wake_at, deadline].min : poll_wake_at
     end
 
     #: (Hash[String, Object?]?) -> Time?
@@ -816,7 +827,7 @@ module Durababble
 
     #: (WaitRequest) -> Object?
     def next_run_at_for_wait(wait_request)
-      return unless wait_request.kind == "timer"
+      return unless ["timer", "child_workflow"].include?(wait_request.kind)
 
       earliest_time([@replay_history.earliest_unresolved_timer_wake_at, wait_request.wake_at].compact)
     end
@@ -826,11 +837,10 @@ module Durababble
       # [DURABABBLE-WAIT-1] Due workflow timers complete only while this worker
       # holds the workflow lease; timer readiness is represented by the
       # workflow row's next_run_at claim path, not by a separate wait scan.
-      wait = @replay_history.waiting_timer(command_id)
+      wait = @replay_history.waiting_timer_or_child_workflow(command_id)
       return unless wait
 
-      wake_at = wait["wake_at"]
-      return unless wake_at && timer_due?(wake_at)
+      return unless wait_ready?(wait)
       cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
       if cancellation
         future.reject(cancellation_error_from(cancellation))
@@ -848,6 +858,28 @@ module Durababble
         @replay_history.remember_step_completed(command_id, payload: result, reserved_history_event:)
       end
       future.resolve(result)
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def wait_ready?(wait)
+      wake_at = wait["wake_at"]
+      return true if wait.fetch("kind", nil) == "child_workflow" && child_workflow_wait_ready?(wait)
+
+      !!(wake_at && timer_due?(wake_at))
+    end
+
+    #: (Hash[String, Object?]) -> bool
+    def child_workflow_wait_ready?(wait)
+      context = wait.fetch("context", {})
+      return false unless context.is_a?(Hash)
+
+      child_workflow_id = context["child_workflow_id"]
+      return false unless child_workflow_id
+
+      child = synchronize_store { @store.observe_child_workflow(child_workflow_id.to_s) }
+      WorkflowStatus.terminal?(child)
+    rescue KeyError
+      false
     end
 
     #: (Object) -> bool
@@ -907,7 +939,7 @@ module Durababble
           cancellation = synchronize_store { @store.workflow_cancellation(@workflow_id) }
           if cancellation
             future.reject(cancellation_error_from(cancellation))
-          elsif @replay_history.waiting_timer(command_id)
+          elsif @replay_history.waiting_timer_or_child_workflow(command_id)
             @replay_history.forget_waiting_timer(command_id) if interrupt_on_command
             next if interrupt_on_command
 

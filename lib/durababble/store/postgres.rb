@@ -102,6 +102,11 @@ module Durababble
       execute_store_query(:make_workflow_due, [workflow_id, timestamp(now)])
     end
 
+    #: (String) -> Object?
+    def wake_parent_workflow_if_child_terminal(workflow_id)
+      execute_store_query(:wake_parent_workflow_if_child_terminal, [workflow_id, timestamp(current_time)])
+    end
+
     #: (workflow_id: String, reason: String) -> Object?
     def request_workflow_cancellation(workflow_id:, reason:)
       transaction do
@@ -138,6 +143,7 @@ module Durababble
         execute_store_query(:terminate_workflow, [workflow_id, dump_serialized(nil), error])
         terminate_workflow_dependents(workflow_id, error:)
         append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error })
+        wake_parent_workflow_if_child_terminal(workflow_id)
 
         workflow(workflow_id)
       end
@@ -261,6 +267,7 @@ module Durababble
         end
         require_workflow_completion_update!(update, workflow_id:, worker_id:)
         cancel_live_workflow_dependents(workflow_id)
+        wake_parent_workflow_if_child_terminal(workflow_id)
         update
       end
     end

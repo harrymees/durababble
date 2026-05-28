@@ -628,6 +628,16 @@ VALUES ($1, $2, $3, 'waiting', $4::bytea, now(), now())
 ON CONFLICT (workflow_id, position) DO UPDATE
   SET status = 'waiting', result = $4::bytea, error = NULL, updated_at = now()
 
+-- pg_wake_parent_workflow_if_child_terminal
+UPDATE "durababble_pg_snapshot"."workflows" AS parent
+SET next_run_at = $2::timestamptz, updated_at = $2::timestamptz
+FROM "durababble_pg_snapshot"."workflows" AS child
+WHERE child.id = $1
+  AND child.child_origin_kind = 'workflow'
+  AND child.parent_workflow_id = parent.id
+  AND (child.status IN ('completed', 'canceled', 'terminated') OR (child.status = 'failed' AND child.next_run_at IS NULL))
+  AND parent.status = 'waiting'
+
 -- pg_workflow
 SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1
 
