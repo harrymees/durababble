@@ -257,6 +257,16 @@ module Durababble
       row.fetch("count").to_s.to_i
     end
 
+    # The next event_index for an out-of-band writer (e.g. admin termination)
+    # that holds no replayed history in memory and so can't allocate from the
+    # in-memory counter. Reads back only the highest-indexed row rather than the
+    # whole history; next_event_index_after turns it into max+1 (or 0 when none).
+    #: (String) -> Integer
+    def next_workflow_history_index_for(workflow_id)
+      rows = execute_store_query(:last_workflow_history_for, [workflow_id]).to_a
+      WorkflowReplayHistory.next_event_index_after(rows)
+    end
+
     #: (?now: Time, ?batch_size: Integer) -> Integer
     def wake_due_timers(now: Time.now, batch_size: TIMER_WAKE_BATCH_SIZE)
       batch_size = Integer(batch_size)

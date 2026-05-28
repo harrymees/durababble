@@ -1303,6 +1303,10 @@ module Durababble
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = $1 ORDER BY event_index"
     end
 
+    define(:pg_last_workflow_history_for, backend: :postgres) do |store|
+      "SELECT event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = $1 ORDER BY event_index DESC LIMIT 1"
+    end
+
     define(:pg_workflow_history_count_for, backend: :postgres) do |store|
       "SELECT COUNT(*) AS count FROM #{table(store, "workflow_history")} WHERE workflow_id = $1"
     end
@@ -2054,6 +2058,10 @@ module Durababble
 
     define(:mysql_workflow_history_for, backend: :mysql, description: "Read workflow history events in replay order.") do |store|
       "SELECT * FROM #{table(store, "workflow_history")} WHERE workflow_id = ? ORDER BY event_index"
+    end
+
+    define(:mysql_last_workflow_history_for, backend: :mysql, description: "Read the highest-indexed history row for out-of-band index allocation.") do |store|
+      "SELECT event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ? ORDER BY event_index DESC LIMIT 1"
     end
 
     define(:mysql_workflow_history_count_for, backend: :mysql, description: "Count workflow history events for the replay guard.") do |store|

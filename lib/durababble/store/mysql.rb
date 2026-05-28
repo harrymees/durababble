@@ -171,9 +171,10 @@ module Durababble
         execute_store_query(:terminate_workflow, [dump_serialized(nil), error, workflow_id])
         terminate_workflow_dependents(workflow_id, error:)
         # Admin termination is rare and has no replayed history in memory, so
-        # read back the next index under the lock we already hold here rather
-        # than forcing every hot-path caller to pay for a SQL read-back.
-        termination_index = WorkflowReplayHistory.next_event_index_after(workflow_history_for(workflow_id))
+        # read back the next index (one indexed row, not the whole history)
+        # under the lock we already hold here rather than forcing every hot-path
+        # caller to pay for a SQL read-back.
+        termination_index = next_workflow_history_index_for(workflow_id)
         append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error }, event_index: termination_index)
         wake_parent_workflow_if_child_terminal(workflow_id)
 

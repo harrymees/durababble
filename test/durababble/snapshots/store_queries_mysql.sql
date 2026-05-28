@@ -360,6 +360,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 -- mysql_insert_workflow_with_worker
 INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), NOW(6), NOW(6))
 
+-- mysql_last_workflow_history_for
+SELECT event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ? ORDER BY event_index DESC LIMIT 1
+
 -- mysql_lock_fence_for_worker
 SELECT 1 FROM `durababble_mysql_snapshot_fences` WHERE workflow_id = ? AND `key` = ? AND locked_by = ? AND status = 'running'
 

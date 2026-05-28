@@ -350,6 +350,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
 -- pg_insert_workflow_with_worker
 INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))
 
+-- pg_last_workflow_history_for
+SELECT event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1 ORDER BY event_index DESC LIMIT 1
+
 -- pg_lock_inbox_message
 SELECT * FROM "durababble_pg_snapshot"."inbox" WHERE id = $1 FOR UPDATE
 
