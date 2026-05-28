@@ -9,10 +9,11 @@ module Durababble
   # instance, then invokes the `expose_stream` method, forwarding each yielded
   # value to the RPC writer.
   #
-  # Both lanes re-check the lease before every emit and once up front: if this
-  # node has lost the lease the dispatcher raises `StaleLease`, which the server
-  # turns into a terminal error frame so the consumer re-raises it. Workflow
-  # streams use `current_workflow_lease`; object streams hold the unified
+  # Both lanes re-check the lease before every emit, once up front, and after the
+  # stream method returns: if this node has lost the lease the dispatcher raises
+  # `StaleLease`, which the server turns into a terminal error frame so the
+  # consumer re-raises it. Workflow streams use `current_workflow_lease`; object
+  # streams hold the unified
   # `durable_objects` lease through an `ObjectStreamHost` (refcounted on this
   # node, renewed in a background thread). When no host is wired the dispatcher
   # still requires the current object lease to belong to this node; it never
@@ -90,6 +91,7 @@ module Durababble
       instance.instance_variable_set(:@__durababble_ref_workflow_id, workflow_id)
       lease_writer = LeaseCheckingWriter.new(writer, store: @store, workflow_id:, node_id: @node_id)
       invoke_stream(instance, request:, args:, writer: lease_writer)
+      assert_workflow_lease_still_held!(workflow_id)
     end
 
     #: (untyped, request: Rpc::Messages::TransientRequest, args: Hash[String, untyped]?, writer: untyped) -> void
@@ -127,6 +129,14 @@ module Durababble
       return if lease.fetch("worker_id") == @node_id
 
       raise WorkflowRpc::StaleLease, "#{@node_id} does not own workflow #{workflow_id}; current owner is #{lease.fetch("worker_id")}"
+    end
+
+    #: (String) -> void
+    def assert_workflow_lease_still_held!(workflow_id)
+      lease = @store.current_workflow_lease(workflow_id)
+      return if lease && lease.fetch("worker_id") == @node_id
+
+      raise WorkflowRpc::StaleLease, "#{@node_id} no longer owns workflow #{workflow_id}"
     end
 
     #: (object_type: String, object_id: String) -> void

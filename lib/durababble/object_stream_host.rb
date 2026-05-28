@@ -47,6 +47,7 @@ module Durababble
       @lease_seconds = lease_seconds
       @renew_interval = (renew_interval || [1.0, lease_seconds / 3.0].max).to_f
       @entries = {} #: Hash[[String, String, String], Entry]
+      @claims_in_progress = {} #: Hash[[String, String, String], bool]
       @mutex = Mutex.new
       @stopping = false
       @renewal_thread = nil #: Thread?
@@ -124,48 +125,65 @@ module Durababble
 
     private
 
-    # Atomically resolve refcount → 1 (claim the store lease) vs refcount > 1
-    # (share existing). Raises `StaleLease` if the store reports a different
-    # current holder, since this host cannot stream on a lease it doesn't own.
+    # Resolve refcount > 0 (share an already-claimed entry) vs no entry (prove
+    # ownership in the store, then publish the entry). Only one in-process claim
+    # attempt per key runs at a time, so a concurrent opener never shares a
+    # provisional entry and never races a sibling claim/release window.
     #: ([String, String, String], seconds: Integer) -> Entry
     def acquire(key, seconds:)
-      claim_needed = false #: bool
-      entry = nil #: Entry?
+      loop do
+        claim_needed = false #: bool
+        existing = @mutex.synchronize do
+          entry = @entries[key]
+          if entry
+            entry.refcount += 1
+            entry
+          elsif @claims_in_progress[key]
+            nil
+          else
+            @claims_in_progress[key] = true
+            claim_needed = true
+            nil
+          end
+        end
+        return existing if existing
+
+        if claim_needed
+          begin
+            holder = @store.claim_object_lease(
+              worker_pool: key[0],
+              object_type: key[1],
+              object_id: key[2],
+              worker_id: @worker_id,
+              lease_seconds: seconds,
+            )
+            unless holder && holder["worker_id"].to_s == @worker_id
+              raise WorkflowRpc::StaleLease, "object lease for #{key.join("/")} held by #{holder&.dig("worker_id") || "(none)"}"
+            end
+
+            return publish_claimed_entry(key)
+          ensure
+            @mutex.synchronize { @claims_in_progress.delete(key) }
+          end
+        end
+
+        sleep(0.001)
+      end
+    end
+
+    #: ([String, String, String]) -> Entry
+    def publish_claimed_entry(key)
       @mutex.synchronize do
-        existing = @entries[key]
-        if existing.nil?
-          existing = Entry.new(refcount: 0, lost: false)
-          @entries[key] = existing
-          claim_needed = true
-        end
-        existing.refcount += 1
-        entry = existing
-      end
-
-      acquired = entry #: as Entry
-      if claim_needed
-        begin
-          holder = @store.claim_object_lease(
-            worker_pool: key[0],
-            object_type: key[1],
-            object_id: key[2],
-            worker_id: @worker_id,
-            lease_seconds: seconds,
-          )
-          unless holder && holder["worker_id"].to_s == @worker_id
-            raise WorkflowRpc::StaleLease, "object lease for #{key.join("/")} held by #{holder&.dig("worker_id") || "(none)"}"
-          end
-
+        entry = @entries[key]
+        if entry
+          entry.refcount += 1
+        else
+          entry = Entry.new(refcount: 1, lost: false)
+          @entries[key] = entry
           ensure_renewal_thread!
-        rescue StandardError
-          @mutex.synchronize do
-            acquired.refcount -= 1
-            @entries.delete(key) if acquired.refcount.zero?
-          end
-          raise
         end
+        entry
       end
-      acquired
     end
 
     #: ([String, String, String]) -> void

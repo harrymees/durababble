@@ -1,6 +1,7 @@
 # typed: false
 # frozen_string_literal: true
 
+require "async"
 require_relative "../test_helper"
 
 # Unit coverage for `ObjectStreamHost`'s refcounted claim/renew/release lifecycle
@@ -86,6 +87,57 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
     block_release << :go
     inner.join
     assert_equal(1, store.releases.size)
+  ensure
+    host&.stop!
+  end
+
+  test "does not let a concurrent opener run while the first claim is still pending" do
+    store = FakeLeaseStore.new(holder: "someone-else")
+    claim_started = Async::Condition.new
+    release_claim = Async::Condition.new
+    state = { claim_started: false, release_claim: false }
+    store.define_singleton_method(:claim_object_lease) do |**kwargs|
+      @claims << kwargs
+      if @claims.size == 1
+        state[:claim_started] = true
+        claim_started.signal
+        release_claim.wait until state[:release_claim]
+      end
+      { "worker_id" => @holder, "worker_pool" => kwargs.fetch(:worker_pool), "object_type" => kwargs.fetch(:object_type), "object_id" => kwargs.fetch(:object_id) }
+    end
+
+    host = build_host(store:)
+    second_producer_started = false
+    first_error = nil
+    second_error = nil
+
+    Async do |task|
+      first = task.async do
+        host.with_lease(worker_pool: "default", object_type: "counter", object_id: "c1") {}
+      rescue StandardError => err
+        first_error = err
+      end
+
+      second = task.async do
+        claim_started.wait until state[:claim_started]
+        host.with_lease(worker_pool: "default", object_type: "counter", object_id: "c1") do
+          second_producer_started = true
+        end
+      rescue StandardError => err
+        second_error = err
+      end
+
+      sleep(0.01)
+      state[:release_claim] = true
+      release_claim.signal
+      first.wait
+      second.wait
+    end
+
+    assert_instance_of(Durababble::WorkflowRpc::StaleLease, first_error)
+    assert_instance_of(Durababble::WorkflowRpc::StaleLease, second_error)
+    refute(second_producer_started, "a stream producer ran before this host held the object lease")
+    assert_operator(store.claims.size, :>=, 2, "each opener must prove ownership instead of sharing a pending claim")
   ensure
     host&.stop!
   end

@@ -30,6 +30,7 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
   # Minimal store double exposing only what the dispatcher touches. Counts lease
   # lookups so a test can assert the per-emit re-check is throttled.
   class FakeStreamStore
+    attr_writer :workflow_lease
     attr_reader :lease_lookup_count, :object_claims, :object_releases
 
     def initialize(object_state: nil, workflow_lease: nil, object_lease_holder: "node-a")
@@ -241,6 +242,30 @@ class DurababbleStreamDispatcherTest < DurababbleTestCase
       .call(request: workflow_stream_request, args: empty_args, writer:)
 
     assert_equal [{ "step" => 1 }, { "step" => 2 }], writer.values
+  end
+
+  test "raises StaleLease when workflow ownership is lost after the final emit" do
+    store = FakeStreamStore.new(workflow_lease: { "worker_id" => "node-a" })
+    workflow_class = Class.new(Durababble::Workflow) do
+      workflow_name "dispatcher_final_emit_stale"
+      expose_stream :progress
+      define_method(:progress) do |&block|
+        block.call({ "step" => 1 })
+        store.workflow_lease = { "worker_id" => "node-b" }
+      end
+    end
+    request = Durababble::Rpc::Messages::TransientRequest.new(
+      workflow_id: "wf-1",
+      class_name: "dispatcher_final_emit_stale",
+      method: "progress",
+    )
+    writer = CapturingWriter.new
+
+    assert_raises(Durababble::WorkflowRpc::StaleLease) do
+      dispatcher(workflows: [workflow_class], store:, node_id: "node-a")
+        .call(request:, args: empty_args, writer:)
+    end
+    assert_equal [{ "step" => 1 }], writer.values
   end
 
   test "throttles the per-emit lease re-check rather than querying on every quack" do
