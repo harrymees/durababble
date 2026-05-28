@@ -403,7 +403,7 @@ Workflows can expose an RPC surface for other members of the Durababble cluster 
 
 RPCs are done by getting a workflow handle for your workflow, and then calling Ruby methods on the handle itself. A caller does not need a Ruby object in the same process as the worker; it needs the workflow id, the workflow class, and a store.
 
-There are two kinds of RPCs you can expose: simple RPCs, and command RPCs.
+There are two kinds of RPCs you can expose: simple RPCs, and command RPCs. See [Simple RPCs vs Command RPCs](cluster-rpc.md#simple-rpcs-vs-command-rpcs) for how the two compare on cost, durability, transactionality, and ordering.
 
 Simple RPCs are transient queries. They route to the workflow's current active lease owner through `CallTransient`, run against the live workflow instance, and fail with the same not-running, stale-lease, or unavailable-owner errors as transient gRPC routing when no active owner can serve the query. They are not recorded durably, cannot use `idempotency_key:`, cannot call workflow steps or waits, and do not warm or start an inactive workflow.
 

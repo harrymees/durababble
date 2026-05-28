@@ -90,7 +90,7 @@ object_result
 
 Durable objects can expose methods to callers. You first expose a method on the durable object, and then using a handle to the object, you can call that method from any other process in the system.
 
-There are two kinds of methods that can be exposed: simple RPCs, and command RPCs.
+There are two kinds of methods that can be exposed: simple RPCs, and command RPCs. The two make opposite cost-versus-guarantees trade-offs — see [Simple RPCs vs Command RPCs](cluster-rpc.md#simple-rpcs-vs-command-rpcs) for a side-by-side comparison.
 
 Simple RPCs are run in parallel and are not expected to ever mutate state on the object. They are not recorded durably, and so they can be lost. Use simple RPCs for reads, for things you need to be really cheap, or for situations where the object is the "owner" of another resource under the hood that does not record durable state in the durable object itself.
 

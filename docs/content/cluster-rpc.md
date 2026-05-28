@@ -44,6 +44,22 @@ flowchart TB
 
 Every worker runs a gRPC server over HTTP/2 (via `async-grpc`) and can dial every other worker. The SQL store is shared, but only the **lease table** is consulted on the request path — to look up which worker currently owns the target. The payload itself never touches the database.
 
+## Simple RPCs vs Command RPCs
+
+Both kinds of call land on the same owning worker, but they make opposite trade-offs. A **simple RPC** (the `expose` path) is an ephemeral, in-memory call tuned for cost. A **command RPC** (the `expose_command` durable-command path) is a persisted, inbox-backed message tuned for guarantees. Choose between them by asking whether losing the call would matter.
+
+|  | Simple RPC (`expose`) | Command RPC (`expose_command`) |
+| --- | --- | --- |
+| **Cost per call** | One lease lookup, then a direct gRPC call — the payload never touches SQL. | Two database writes and one read: an inbox insert, the consuming read, and a result update. |
+| **Performance** | gRPC-over-HTTP/2 latency straight to the lease holder; no orchestration hop. | Bounded by SQL round-trips and by serial per-recipient processing. |
+| **Durability** | None — the call lives only in worker memory and is lost on a crash. | Durable — persisted to the inbox before it is acknowledged, so it survives crashes. |
+| **Delivery / reliability** | Best-effort. Retried only on typed routing failures (`NodeUnavailable`, `StaleLease`, `NoActiveLease`) to ride out transport blips; an owner that is down just drops the call. | Guaranteed once submitted. Retried until completion and processed exactly once per inbox row. |
+| **Transactionality** | None; a simple RPC must not mutate durable state. | Transactional — the state change, the command result, and the message completion commit together in one store transaction. |
+| **Concurrency** | Run concurrently against the live instance. | Run serially per recipient. |
+| **Ordering** | No ordering guarantee. | Totally ordered per recipient by the mailbox sequence those database writes assign. |
+
+The rule of thumb: reach for a simple RPC when the answer is "whatever is true right now" and a dropped call is harmless — a status check, a live counter, a cursor read. Reach for a command RPC when the call has to land and has to change durable state — `credit`, `append`, `note`, `close`. Simple RPCs keep the cheap, high-volume traffic off the database; command RPCs pay the write cost precisely because the message must survive. The [retry semantics](#retry-semantics) below cover exactly which failures each path will and won't retry.
+
 ## Why Not Run Everything Through The Database
 
 Temporal-shaped durable execution platforms tend to route all cross-node traffic through their own control plane, which in turn writes to a backing store. That model is uniform and tidy, but it has costs that show up at scale:
