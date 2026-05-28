@@ -78,6 +78,7 @@ module Durababble
                   workflow_id:,
                   result: { "ok" => message.fetch("id") },
                   worker_id: "recovery-worker",
+                  event_index: h.next_event_index(workflow_id),
                 )
                 delivered << message.fetch("id")
               end

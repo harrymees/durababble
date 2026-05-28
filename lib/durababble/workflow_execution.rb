@@ -56,18 +56,7 @@ module Durababble
         root_task: @root_task,
         futures: @futures,
         step_contexts: @step_contexts,
-        synchronize_store: ->(&block) { synchronize_store(&block) },
-        raise_if_cancel_requested: -> { raise_if_cancel_requested! },
-        assert_workflow_lease: -> { assert_workflow_lease! },
-        suspend_workflow_immediately: -> { suspend_workflow_immediately? },
-        defer_workflow_suspension: ->(command_id) { defer_workflow_suspension(command_id) },
-        remember_wait: ->(command_id, name, wait_request) { @replay_history.remember_step_waiting(command_id, name:, wait_request:) },
-        next_run_at_for_wait: ->(wait_request) { next_run_at_for_wait(wait_request) },
-        timer_due: ->(wake_at) { timer_due?(wake_at) },
-        complete_due_wait: ->(future, command_id, reserved_history_event: false) { complete_due_wait_timer!(future, command_id, reserved_history_event:) },
-        retry_run_at: ->(delay) { retry_run_at(delay) },
-        allocate_history_event_index: -> { @replay_history.allocate_event_index! },
-        crash: ->(point) { crash!(point) },
+        execution: self,
       )
       register_workflow_task(root_task)
     end
@@ -419,6 +408,19 @@ module Durababble
     #: () -> void
     def validate_replay_complete!
       @replay_history.validate_complete!(workflow_id: @workflow_id, next_command_id: @next_command_id)
+    end
+
+    # Allocates the next physical history event index from the in-memory replay
+    # counter. The step runner calls this so every append it writes is a single
+    # plain insert with a Ruby-supplied index.
+    #: () -> Integer
+    def allocate_history_event_index!
+      @replay_history.allocate_event_index!
+    end
+
+    #: (Integer, name: String, wait_request: WaitRequest) -> void
+    def remember_step_waiting(command_id, name:, wait_request:)
+      @replay_history.remember_step_waiting(command_id, name:, wait_request:)
     end
 
     private
@@ -1324,5 +1326,22 @@ module Durababble
     def crash!(point)
       raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end
+
+    # Operations the WorkflowStepRunner drives back through its owning execution.
+    # Defined private above for internal callers; re-exported here so the step
+    # runner can invoke them on the execution instead of being handed a bag of
+    # lambdas.
+    public(
+      :synchronize_store,
+      :raise_if_cancel_requested!,
+      :assert_workflow_lease!,
+      :suspend_workflow_immediately?,
+      :defer_workflow_suspension,
+      :next_run_at_for_wait,
+      :timer_due?,
+      :complete_due_wait_timer!,
+      :retry_run_at,
+      :crash!,
+    )
   end
 end

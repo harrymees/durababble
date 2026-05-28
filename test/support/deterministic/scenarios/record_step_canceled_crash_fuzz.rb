@@ -24,8 +24,8 @@ module Durababble
           # exactly one history entry against exactly one canceled attempt.
           workflow_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 1000)
-          h.store.record_step_scheduled(workflow_id:, command_id: 0, name: "work", args: [])
-          h.store.record_step_started(workflow_id:, command_id: 0, name: "work")
+          h.store.record_step_scheduled(workflow_id:, command_id: 0, name: "work", args: [], event_index: h.next_event_index(workflow_id))
+          h.store.record_step_started(workflow_id:, command_id: 0, name: "work", event_index: h.next_event_index(workflow_id))
 
           h.store.enable_write_crashes!(percent: 25)
 
@@ -43,7 +43,7 @@ module Durababble
               h.store.crashable do
                 next if already_canceled.call
 
-                h.store.record_step_canceled(workflow_id:, command_id: 0, error: "workflow cancellation requested")
+                h.store.record_step_canceled(workflow_id:, command_id: 0, error: "workflow cancellation requested", event_index: h.next_event_index(workflow_id))
               end
             rescue InjectedCrash
               h.scheduler.trace.event(h.scheduler.time, "cancel-worker-#{w}", "record_cancel_crashed", id: workflow_id)
@@ -54,7 +54,7 @@ module Durababble
             h.store.enable_write_crashes!(percent: 0)
           end
           h.scheduler.schedule(actor: "closer", delay: 70, name: "ensure_canceled") do
-            h.store.record_step_canceled(workflow_id:, command_id: 0, error: "workflow cancellation requested") unless already_canceled.call
+            h.store.record_step_canceled(workflow_id:, command_id: 0, error: "workflow cancellation requested", event_index: h.next_event_index(workflow_id)) unless already_canceled.call
           end
 
           h.check("the running step is recorded canceled") do

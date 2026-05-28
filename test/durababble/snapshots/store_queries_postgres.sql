@@ -343,13 +343,6 @@ VALUES ($1, $2, $3, $4, 'running')
 -- pg_insert_workflow
 INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input) VALUES ($1, $2, $3, $4, $5::bytea)
 
--- pg_insert_workflow_history
-INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
-FROM "durababble_pg_snapshot"."workflow_history"
-WHERE workflow_id = $8
-RETURNING event_index
-
 -- pg_insert_workflow_history_at
 INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
 VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
@@ -390,9 +383,6 @@ SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
 
 -- pg_lock_workflow_for_update
 SELECT * FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
-
--- pg_lock_workflow_history_workflow
-SELECT id FROM "durababble_pg_snapshot"."workflows" WHERE id = $1 FOR UPDATE
 
 -- pg_mailbox_sequence_for_update
 SELECT worker_pool, last_sequence

@@ -353,21 +353,12 @@ VALUES (?, ?, ?, ?, 'running')
 -- mysql_insert_workflow
 INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status, input, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NOW(6), NOW(6))
 
--- mysql_insert_workflow_history
-INSERT INTO `durababble_mysql_snapshot_workflow_history` (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
-FROM `durababble_mysql_snapshot_workflow_history`
-WHERE workflow_id = ?
-
 -- mysql_insert_workflow_history_at
 INSERT INTO `durababble_mysql_snapshot_workflow_history` (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 
 -- mysql_insert_workflow_with_worker
 INSERT INTO `durababble_mysql_snapshot_workflows` (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), NOW(6), NOW(6))
-
--- mysql_inserted_workflow_history_event_index
-SELECT MAX(event_index) AS event_index FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ?
 
 -- mysql_lock_fence_for_worker
 SELECT 1 FROM `durababble_mysql_snapshot_fences` WHERE workflow_id = ? AND `key` = ? AND locked_by = ? AND status = 'running'
@@ -405,9 +396,6 @@ SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 
 -- mysql_lock_workflow_for_update
 SELECT * FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
-
--- mysql_lock_workflow_history_workflow
-SELECT id FROM `durababble_mysql_snapshot_workflows` WHERE id = ? FOR UPDATE
 
 -- mysql_mailbox_sequence_for_update
 SELECT worker_pool, last_sequence

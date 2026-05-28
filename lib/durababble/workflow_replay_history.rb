@@ -15,6 +15,13 @@ module Durababble
       # the highest recorded index, or 0 when empty. The lease holder allocates
       # from here so appends are a single plain insert; hot-path reports and
       # query-count tests call it to mirror that allocation exactly.
+      #
+      # This is deliberately max+1, not events.length: a failed append still
+      # advances the in-memory counter (see allocate_event_index!), so a later
+      # committed append can leave a hole in the persisted indexes (e.g. a step's
+      # completion write fails transiently and a failure row commits at the next
+      # index instead). length would then return an index that already exists and
+      # collide on the (workflow_id, event_index) PK after reload.
       #: (Array[Hash[String, Object?]]) -> Integer
       def next_event_index_after(events)
         max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max

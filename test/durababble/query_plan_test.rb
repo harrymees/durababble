@@ -124,7 +124,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_insert_scheduled_step,
     :mysql_insert_step_attempt,
     :mysql_insert_workflow,
-    :mysql_insert_workflow_history,
     :mysql_insert_workflow_with_worker,
     :mysql_lock_fence_for_worker,
     :mysql_lock_inbox_message,
@@ -133,7 +132,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_lock_owned_workflow_for_update,
     :mysql_lock_target_activation_for_completion,
     :mysql_lock_workflow_for_update,
-    :mysql_lock_workflow_history_workflow,
     :mysql_mailbox_sequence_for_update,
     :mysql_make_workflow_due,
     :mysql_mark_inbox_row_running,
@@ -547,12 +545,12 @@ class DurababbleQueryPlanTest < DurababbleTestCase
         allowed_indexes: ["workflows_expired_lease_idx"],
       },
       "record_step_started" => {
-        call: -> { store.record_step_started(workflow_id: "running-owned", position: 1, name: "next") },
+        call: -> { store.record_step_started(workflow_id: "running-owned", position: 1, name: "next", event_index: 0) },
         allowed_indexes: ["workflows_pkey", "workflow_history_pkey", "step_attempts_workflow_position_status_started_idx", "steps_pkey"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "record_step_completed" => {
-        call: -> { store.record_step_completed(workflow_id: "running-owned", position: 0, result: { "ok" => true }) },
+        call: -> { store.record_step_completed(workflow_id: "running-owned", position: 0, result: { "ok" => true }, event_index: 0) },
         allowed_indexes: ["workflows_pkey", "workflow_history_pkey", "steps_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
         allow_post_filter_indexes: ["step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
@@ -568,6 +566,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
               event_key: nil,
               context: { "step" => 2 },
             ),
+            event_index: 0,
           )
         end,
         allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],

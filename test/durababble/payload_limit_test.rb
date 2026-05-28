@@ -68,20 +68,20 @@ class DurababblePayloadLimitTest < DurababbleTestCase
 
         with_payload_limit(:step_output, size + 1) do
           id = prepare_step(store, "payload-step-under")
-          store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
+          store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker", event_index: next_event_index(id, store:))
           assert_equal payload, store.steps_for(id).first.fetch("result")
         end
 
         with_payload_limit(:step_output, size) do
           id = prepare_step(store, "payload-step-at")
-          store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
+          store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker", event_index: next_event_index(id, store:))
           assert_equal payload, store.steps_for(id).first.fetch("result")
         end
 
         id = prepare_step(store, "payload-step-over")
         error = with_payload_limit(:step_output, size - 1) do
           assert_raises(Durababble::PayloadTooLarge) do
-            store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker")
+            store.record_step_completed(workflow_id: id, command_id: 0, result: payload, worker_id: "worker", event_index: next_event_index(id, store:))
           end
         end
         assert_limit_error(error, surface: :step_output, context: "workflow #{id} command 0")
@@ -242,8 +242,8 @@ class DurababblePayloadLimitTest < DurababbleTestCase
 
   def prepare_step(store, name)
     workflow_id = store.create_workflow(name:, input: {}, worker_id: "worker")
-    store.record_step_scheduled(workflow_id:, command_id: 0, name: "write", worker_id: "worker")
-    store.record_step_started(workflow_id:, command_id: 0, name: "write", worker_id: "worker")
+    store.record_step_scheduled(workflow_id:, command_id: 0, name: "write", worker_id: "worker", event_index: next_event_index(workflow_id, store:))
+    store.record_step_started(workflow_id:, command_id: 0, name: "write", worker_id: "worker", event_index: next_event_index(workflow_id, store:))
     workflow_id
   end
 

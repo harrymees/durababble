@@ -34,8 +34,8 @@ module Durababble
 
           stale_id = h.store.enqueue_workflow(name: "counter", input: { "count" => 1 }, id: "invalid-stale")
           h.store.claim_workflow(workflow_id: stale_id, worker_id: "stale-owner", lease_seconds: 5)
-          h.store.record_step_scheduled(workflow_id: stale_id, command_id: 0, name: "increment", worker_id: "stale-owner")
-          h.store.record_step_started(workflow_id: stale_id, command_id: 0, name: "increment", worker_id: "stale-owner")
+          h.store.record_step_scheduled(workflow_id: stale_id, command_id: 0, name: "increment", worker_id: "stale-owner", event_index: h.next_event_index(stale_id))
+          h.store.record_step_started(workflow_id: stale_id, command_id: 0, name: "increment", worker_id: "stale-owner", event_index: h.next_event_index(stale_id))
 
           object_type = "invalid-counter-object"
           object_id = "invalid-object"
@@ -74,9 +74,9 @@ module Durababble
           end
 
           stale_writes = [
-            ["record_step_completed", -> { h.store.record_step_completed(workflow_id: stale_id, command_id: 0, result: { "stale" => true }, worker_id: "stale-owner") }],
-            ["record_step_failed", -> { h.store.record_step_failed(workflow_id: stale_id, command_id: 0, error: "stale failure", worker_id: "stale-owner") }],
-            ["record_step_canceled", -> { h.store.record_step_canceled(workflow_id: stale_id, command_id: 0, error: "stale cancel", worker_id: "stale-owner") }],
+            ["record_step_completed", -> { h.store.record_step_completed(workflow_id: stale_id, command_id: 0, result: { "stale" => true }, worker_id: "stale-owner", event_index: h.next_event_index(stale_id)) }],
+            ["record_step_failed", -> { h.store.record_step_failed(workflow_id: stale_id, command_id: 0, error: "stale failure", worker_id: "stale-owner", event_index: h.next_event_index(stale_id)) }],
+            ["record_step_canceled", -> { h.store.record_step_canceled(workflow_id: stale_id, command_id: 0, error: "stale cancel", worker_id: "stale-owner", event_index: h.next_event_index(stale_id)) }],
             ["complete_workflow", -> { h.store.complete_workflow(stale_id, result: { "stale" => true }, worker_id: "stale-owner") }],
             ["fail_workflow", -> { h.store.fail_workflow(stale_id, error: "stale fail", worker_id: "stale-owner") }],
             ["cancel_workflow", -> { h.store.cancel_workflow(stale_id, reason: "stale cancel", worker_id: "stale-owner") }],
@@ -113,6 +113,7 @@ module Durababble
                   workflow_id: terminal_id,
                   result: { "unexpected" => message.fetch("id") },
                   worker_id:,
+                  event_index: h.next_event_index(terminal_id),
                 )
               end
               h.store.complete_target_activation(target_kind: "workflow", target_type: "counter", target_id: terminal_id, worker_id:)
@@ -236,7 +237,7 @@ module Durababble
           end
           h.scheduler.schedule(actor: "new-owner", delay: 115, name: "finish_stale_workflow") do
             h.store.claim_workflow(workflow_id: stale_id, worker_id: "new-owner", lease_seconds: 60)
-            h.store.record_step_completed(workflow_id: stale_id, command_id: 0, result: { "count" => 2 }, worker_id: "new-owner")
+            h.store.record_step_completed(workflow_id: stale_id, command_id: 0, result: { "count" => 2 }, worker_id: "new-owner", event_index: h.next_event_index(stale_id))
             h.store.complete_workflow(stale_id, result: { "count" => 2 }, worker_id: "new-owner")
           end
 

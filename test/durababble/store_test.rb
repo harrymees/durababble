@@ -489,8 +489,8 @@ class DurababbleStoreTest < DurababbleTestCase
 
       assert_hash_includes store.workflow(workflow_id), "status" => "running", "input" => { "count" => 1 }
 
-      store.record_step_started(workflow_id:, position: 0, name: "add_one")
-      store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 })
+      store.record_step_started(workflow_id:, position: 0, name: "add_one", event_index: next_event_index(workflow_id))
+      store.record_step_completed(workflow_id:, position: 0, result: { "count" => 2 }, event_index: next_event_index(workflow_id))
       store.complete_workflow(workflow_id, result: { "count" => 2 })
 
       workflow = store.workflow(workflow_id)
@@ -951,37 +951,35 @@ class DurababbleStoreTest < DurababbleTestCase
         sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
         sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
         sql_result,
-      ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
+      ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w", event_index: 0)
     end
     assert_raises(Durababble::LeaseConflict) do
       pg_store(ScriptedPgConnection.new(params_results: [
         sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
         sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
         sql_result,
-      ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+      ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w", event_index: 0)
     end
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "approve", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
       sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "owned" => 1 }]),
       sql_result,
-      sql_result([{ "event_index" => "0" }]),
       sql_result,
       sql_result,
       sql_result,
       sql_result,
-    ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w")
+    ])).complete_workflow_command(message_id: "msg", workflow_id: "wf", result: "ok", worker_id: "w", event_index: 0)
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "msg", "method_name" => "reject", "target_kind" => "workflow", "target_type" => "approval", "target_id" => "wf" }]),
       sql_result([{ "id" => "wf", "status" => "running", "next_run_at" => nil }]),
       sql_result([{ "owned" => 1 }]),
       sql_result,
-      sql_result([{ "event_index" => "1" }]),
       sql_result,
       sql_result,
       sql_result,
       sql_result,
-    ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w")
+    ])).fail_workflow_command(message_id: "msg", workflow_id: "wf", error: "boom", worker_id: "w", event_index: 1)
   end
 
   test "handles advisory target delivery retry and fallback branches" do

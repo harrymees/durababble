@@ -30,11 +30,11 @@ class DurababbleDstMutationTest < DurababbleTestCase
     # transaction. Drop the reschedule and the workflow is stranded running+leased
     # with a failed step; after the crash at :step_failed_recorded no reaper runs,
     # so the recovering worker hits LeaseConflict and the retry never completes.
-    mutation = proc do |workflow_id:, error:, worker_id:, command_id: nil, position: nil, **|
+    mutation = proc do |workflow_id:, error:, worker_id:, event_index:, command_id: nil, position: nil, **|
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:)
-        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false)
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, event_index:, terminal: false)
         true # BUG: never schedule the retry — workflow stays running + leased
       end
     end

@@ -212,12 +212,6 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
     end.join("\n")
   end
 
-  # Computed outside the measured block, mirroring how the lease holder allocates
-  # from replayed history so the append is a single plain insert.
-  def next_event_index(workflow_id)
-    Durababble::WorkflowReplayHistory.next_event_index_after(store.workflow_history_for(workflow_id))
-  end
-
   def prepare_release_worker_leases_fixture
     store.create_workflow(name: "query-count-release-workflow", input: {}, worker_id: "release-worker", lease_seconds: 30)
 

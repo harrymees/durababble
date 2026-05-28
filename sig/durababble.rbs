@@ -267,13 +267,13 @@ module Durababble
     def complete_workflow: (String workflow_id, result: serialized_payload, ?worker_id: String?) -> Object
     def cancel_workflow: (String workflow_id, reason: String?, ?result: serialized_payload, ?worker_id: String?) -> Object
     def fail_workflow: (String workflow_id, error: String, ?worker_id: String?) -> Object
-    def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?, ?event_index: Integer?) -> void
-    def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?event_index: Integer?) -> String
-    def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?event_index: Integer?) -> void
-    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?event_index: Integer?) -> void
-    def record_step_failed_and_schedule_retry: (workflow_id: String, error: String, run_at: Time, worker_id: String, ?command_id: Integer?, ?position: Integer?, ?event_index: Integer?) -> Object?
-    def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?event_index: Integer?) -> void
-    def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?, ?event_index: Integer?) -> String
+    def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, event_index: Integer, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
+    def record_step_started: (workflow_id: String, name: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
+    def record_step_completed: (workflow_id: String, result: serialized_payload, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_step_failed: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> void
+    def record_step_failed_and_schedule_retry: (workflow_id: String, error: String, run_at: Time, worker_id: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_canceled: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def wait_snapshots_for: (String workflow_id) -> Array[wait_snapshot]
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def workflow_history_count_for: (String workflow_id) -> Integer
@@ -307,9 +307,9 @@ module Durababble
     def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?, ?terminal: bool) -> Object?
     def retry_object_command: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
-    def retry_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time, ?event_index: Integer?) -> Object?
-    def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String, ?event_index: Integer?) -> Object?
-    def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ?event_index: Integer?) -> Object?
+    def retry_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time, event_index: Integer) -> Object?
+    def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String, event_index: Integer) -> Object?
+    def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, event_index: Integer) -> Object?
     def start_child_workflow: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: serialized_payload, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> workflow_row
     def observe_child_workflow: (String child_workflow_id) -> workflow_row
     def child_workflow_rows_for_parent: (parent_workflow_id: String) -> Array[workflow_row]

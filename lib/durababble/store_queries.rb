@@ -1290,20 +1290,6 @@ module Durababble
       SQL
     end
 
-    define(:pg_lock_workflow_history_workflow, backend: :postgres) do |store|
-      "SELECT id FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
-    end
-
-    define(:pg_insert_workflow_history, backend: :postgres) do |store|
-      <<~SQL.chomp
-        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
-        FROM #{table(store, "workflow_history")}
-        WHERE workflow_id = $8
-        RETURNING event_index
-      SQL
-    end
-
     # The single-lease invariant means the caller already holds the workflows row
     # lock, so no re-lock is needed; PK uniqueness guards against stray duplicates.
     define(:pg_insert_workflow_history_at, backend: :postgres) do |store|
@@ -2059,28 +2045,11 @@ module Durababble
       SQL
     end
 
-    define(:mysql_lock_workflow_history_workflow, backend: :mysql, description: "Lock the workflow row before appending history.") do |store|
-      "SELECT id FROM #{table(store, "workflows")} WHERE id = ? FOR UPDATE"
-    end
-
-    define(:mysql_insert_workflow_history, backend: :mysql, description: "Append a workflow replay history event.") do |store|
-      <<~SQL.chomp
-        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
-        FROM #{table(store, "workflow_history")}
-        WHERE workflow_id = ?
-      SQL
-    end
-
     define(:mysql_insert_workflow_history_at, backend: :mysql, description: "Append a workflow replay history event at a Ruby-supplied event index.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       SQL
-    end
-
-    define(:mysql_inserted_workflow_history_event_index, backend: :mysql, description: "Read the workflow history event index inserted by the previous statement.") do |store|
-      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     define(:mysql_workflow_history_for, backend: :mysql, description: "Read workflow history events in replay order.") do |store|
@@ -2218,24 +2187,11 @@ module Durababble
       SQL
     end
 
-    define(:sqlite_insert_workflow_history, backend: :sqlite) do |store|
-      <<~SQL.chomp
-        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
-        FROM #{table(store, "workflow_history")}
-        WHERE workflow_id = ?
-      SQL
-    end
-
     define(:sqlite_insert_workflow_history_at, backend: :sqlite) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       SQL
-    end
-
-    define(:sqlite_inserted_workflow_history_event_index, backend: :sqlite) do |store|
-      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     # No :sqlite_claim_object_lease override: the two-step
