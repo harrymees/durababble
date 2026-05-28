@@ -344,12 +344,12 @@ INSERT INTO `durababble_mysql_snapshot_workflows` (
   id, name, worker_pool, status, input,
   child_origin_kind, parent_workflow_id, parent_command_id,
   parent_object_type, parent_object_id, parent_object_command_id,
-  child_cancellation_policy
+  child_cancellation_policy, created_at, updated_at
 ) VALUES (
   ?, ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?
+  ?, NOW(6), NOW(6)
 )
 
 -- mysql_insert_fence
