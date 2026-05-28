@@ -484,7 +484,7 @@ module Durababble
 
     define(:mysql_claim_runnable_workflow, backend: :mysql, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_sql:|
       <<~SQL.chomp
-        SELECT id, created_at, status AS claimed_status, next_run_at AS claimed_next_run_at FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
+        SELECT * FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
         WHERE worker_pool = ?
           AND queue_available_at <= NOW(6)
           #{name_sql}

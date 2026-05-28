@@ -57,10 +57,23 @@ module Durababble
         updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_microseconds, candidate.fetch("id"), worker_pool])
         next unless updated.affected_rows == 1
 
-        claimed = workflow(candidate.fetch("id"))
-        claimed["claimed_status"] = candidate["claimed_status"]
-        claimed["claimed_next_run_at"] = candidate["claimed_next_run_at"]
-        observe_claim_latency(claimed, "workflow")
+        # This worker now holds the lease, so the post-update row is fully known
+        # in Ruby: we reconstruct it from the locked candidate snapshot instead of
+        # re-reading it. The overlaid columns mirror the lease UPDATE; locked_until
+        # and updated_at are Ruby approximations of the DB clock, which no consumer
+        # reads back off the claimed row (heartbeat/steal re-derive from NOW(6)).
+        claimed_status = candidate["status"]
+        claimed_next_run_at = candidate["next_run_at"]
+        observe_claim_latency(candidate, "workflow")
+        claimed = decode_row(candidate)
+        now = current_time
+        claimed["status"] = "running"
+        claimed["locked_by"] = worker_id
+        claimed["locked_until"] = now + (lease_microseconds / 1_000_000.0)
+        claimed["next_run_at"] = nil
+        claimed["updated_at"] = now
+        claimed["claimed_status"] = claimed_status
+        claimed["claimed_next_run_at"] = claimed_next_run_at
         claimed
       end
     end
