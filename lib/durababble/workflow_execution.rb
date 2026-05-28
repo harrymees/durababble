@@ -884,7 +884,7 @@ module Durababble
     def claimed_wake_due?(wake_at)
       return false unless @claimed_next_run_at
 
-      comparable_time(wake_at) <= comparable_time(@claimed_next_run_at)
+      comparable_time(wake_at, durable: true) <= comparable_time(@claimed_next_run_at, durable: true)
     end
 
     #: (Hash[String, Object?]) -> bool
@@ -904,14 +904,15 @@ module Durababble
     #: (Object) -> bool
     def timer_due?(wake_at)
       now = synchronize_store { @store.current_time }
-      comparable_time(wake_at) <= comparable_time(now)
+      comparable_time(wake_at, durable: true) <= comparable_time(now, durable: true)
     end
 
-    #: (Object) -> untyped
-    def comparable_time(value)
-      return value unless value.is_a?(String)
+    #: (Object, ?durable: bool) -> untyped
+    def comparable_time(value, durable: false)
+      time = value.is_a?(String) ? Time.parse(value) : value
+      return time unless durable && time.is_a?(Time)
 
-      Time.parse(value)
+      Time.at(time.to_i, time.usec, :usec).getlocal(time.utc_offset)
     end
 
     #: (Array[Object]) -> Object?

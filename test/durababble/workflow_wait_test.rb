@@ -67,6 +67,33 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
       end
     end
 
+    test "timer replay compares wakeups at durable timestamp precision with #{backend.name}" do
+      with_durababble_store(backend, "workflow_wait_timestamp_precision") do |store|
+        store.migrate!
+        wake_at = Time.at(Time.now.to_i + 3600, 123_456.789, :usec)
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "direct-wait-timestamp-precision"
+
+          define_method(:execute) do |input|
+            sleep_until(wake_at, input.merge("slept" => true))
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "precision" })
+
+        waiting = Durababble::Engine.new(store:, worker_id: "precision-wait").resume(workflow, workflow_id:)
+        assert_equal "waiting", waiting.status
+        row_wake_at = store.workflow(workflow_id).fetch("next_run_at")
+
+        make_workflow_timer_due(store, workflow_id, at: row_wake_at)
+        completed = with_store_current_time(store, row_wake_at) do
+          Durababble::Engine.new(store:, worker_id: "precision-resume").resume(workflow, workflow_id:)
+        end
+
+        assert_equal "completed", completed.status
+        assert_equal({ "id" => "precision", "slept" => true }, completed.result)
+      end
+    end
+
     test "cancellation cancels direct pending waits and ignores late timer wakeups with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_cancel") do |store|
         store.migrate!
