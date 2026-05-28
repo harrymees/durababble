@@ -342,12 +342,13 @@ module Durababble
           # client serves both `unary` and `open_stream`. We never close it
           # here: ownership belongs to the cache (or the test injecting it).
           client = @injected_client || Rpc.http_client_for(@address) #: as untyped
+          deadline_at = stream_deadline
           response = nil
           begin
-            response = task.with_timeout(@timeout) do
+            response = task.with_timeout(remaining_stream_timeout(deadline_at)) do
               client.post(PATHS.fetch(:call_transient_stream), OCTET_HEADERS, [Rpc.dump(request)])
             end
-            consume_stream(response, writer, task)
+            consume_stream(response, writer, task, deadline_at)
           rescue Async::TimeoutError, Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::EPIPE, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError, IOError => e
             raise WorkflowRpc::NodeUnavailable, e.message
           rescue Protocol::HTTP2::Error => e
@@ -378,14 +379,14 @@ module Durababble
         response&.close
       end
 
-      #: (untyped, ResultStream::Writer, untyped) -> void
-      def consume_stream(response, writer, task)
+      #: (untyped, ResultStream::Writer, untyped, Float) -> void
+      def consume_stream(response, writer, task, deadline_at)
         ensure_stream_ok!(response)
         buffer = FrameCodec::Buffer.new
         loop do
           break if writer.cancelled?
 
-          chunk = read_stream_chunk(response, task)
+          chunk = read_stream_chunk(response, task, deadline_at)
           next if chunk == :timeout
           break if chunk.nil?
 
@@ -398,13 +399,35 @@ module Durababble
       end
 
       # Reads the next body chunk, waking after `STREAM_POLL_TIMEOUT` so the loop
-      # can re-check cancellation even when the server is idle. A timeout is not
-      # an error: it returns the `:timeout` sentinel and the read is retried.
-      #: (untyped, untyped) -> (String | Symbol)?
-      def read_stream_chunk(response, task)
-        task.with_timeout(STREAM_POLL_TIMEOUT) { response.body&.read }
-      rescue Async::TimeoutError
-        :timeout
+      # can re-check cancellation even when the server is idle. Poll timeouts
+      # return the `:timeout` sentinel and are retried; the absolute stream
+      # deadline raises so callers see the same typed unavailability as unary RPCs.
+      #: (untyped, untyped, Float) -> (String | Symbol)?
+      def read_stream_chunk(response, task, deadline_at)
+        remaining = remaining_stream_timeout(deadline_at)
+        deadline_limited = remaining <= STREAM_POLL_TIMEOUT
+        read_timeout = deadline_limited ? remaining : STREAM_POLL_TIMEOUT
+
+        begin
+          task.with_timeout(read_timeout) { response.body&.read }
+        rescue Async::TimeoutError
+          raise if deadline_limited
+
+          :timeout
+        end
+      end
+
+      #: () -> Float
+      def stream_deadline
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) + @timeout.to_f
+      end
+
+      #: (Float) -> Float
+      def remaining_stream_timeout(deadline_at)
+        remaining = deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        raise Async::TimeoutError, "stream deadline exceeded after #{@timeout}s" unless remaining.positive?
+
+        remaining
       end
 
       #: (Object?, ResultStream::Writer) -> void
@@ -875,7 +898,7 @@ module Durababble
           "workflow_id" => request.workflow_id,
           "expected_worker_id" => expected_worker_id,
           "command" => request["method"],
-          "payload" => Rpc.load(request.args) || {},
+          "payload" => load_request_args(request, context: "CallTransient #{request["method"]} args") || {},
         }
         with_store do |store|
           WorkflowRpc::Handler.new(

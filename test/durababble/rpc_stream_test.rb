@@ -91,6 +91,21 @@ class DurababbleRpcStreamTest < DurababbleTestCase
     assert_raises(Durababble::WorkflowRpc::NodeUnavailable) { stream.each.to_a }
   end
 
+  test "times out an idle response body after headers arrive" do
+    server = start_stream_server(->(writer:, **) do
+      sleep(0.01) until writer.cancelled?
+    end)
+    client = Durababble::Rpc::Client.new(address: server.address, timeout: 0.2)
+
+    stream = client.call_transient_stream(worker_pool: "default", method: "tail", args: {})
+
+    Timeout.timeout(2) do
+      assert_raises(Durababble::WorkflowRpc::NodeUnavailable) { stream.each.to_a }
+    end
+  ensure
+    server&.stop
+  end
+
   test "resumes delivery after the server idles past the consumer poll window" do
     # The consumer's frame loop wakes every STREAM_POLL_TIMEOUT to re-check
     # cancellation, retrying the body read on each timeout. An idle gap several

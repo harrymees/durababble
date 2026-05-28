@@ -385,9 +385,17 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     args = { "body" => "x" * 64 }
     size = Durababble::Rpc::SERIALIZER.dump(args).bytesize
     calls = []
+    workflow_calls = []
+    claim_as("node-a")
     server = start_rpc_server(
       node_id: "node-a",
       store:,
+      workflow_handlers: {
+        "status" => lambda do |payload|
+          workflow_calls << payload
+          { "workflow" => true }
+        end,
+      },
       transient_handler: lambda do |request:, args:|
         calls << [request["method"], args]
         { "ok" => true }
@@ -432,6 +440,19 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
     assert_equal("Durababble::PayloadTooLarge", response.err.klass)
     assert_equal(2, calls.length)
+    assert_empty(workflow_calls)
+
+    raw_workflow_request = Durababble::Rpc::Messages::TransientRequest.new(
+      worker_pool: "default",
+      workflow_id:,
+      method: "status",
+      args: raw_args,
+    )
+    workflow_response = with_payload_limit(:rpc_argument, size - 1) do
+      post_raw_transient(server.address, raw_workflow_request)
+    end
+    assert_equal("Durababble::PayloadTooLarge", workflow_response.err.klass)
+    assert_empty(workflow_calls)
   ensure
     server&.stop
   end
