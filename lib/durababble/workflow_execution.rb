@@ -39,9 +39,11 @@ module Durababble
       @workflow_task_count = 0
       @step_contexts = {}
       @deferred_suspension_command_ids = {}
+      @deferred_suspension_check_scheduled = false
       @claimed_next_run_at = claimed_next_run_at
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
+      @claimed_due_wake_at = claimed_next_run_at ? @replay_history.earliest_unresolved_timer_wake_at : nil
       @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
       @delivering_workflow_command = false
@@ -95,7 +97,7 @@ module Durababble
 
       @blocked_workflow_tasks.delete(task)
       @workflow_task_count -= 1
-      reject_deferred_suspensions_if_quiescent!
+      schedule_deferred_suspension_check
       @futures.each_value(&:wake)
     end
 
@@ -106,7 +108,7 @@ module Durababble
 
       @blocked_workflow_tasks[task] = true
       @futures.each_value(&:wake)
-      reject_deferred_suspensions_if_quiescent!
+      schedule_deferred_suspension_check
       block.call
     ensure
       @blocked_workflow_tasks.delete(task) if task
@@ -799,7 +801,20 @@ module Durababble
     #: (Integer) -> void
     def defer_workflow_suspension(command_id)
       @deferred_suspension_command_ids[command_id] = true
-      reject_deferred_suspensions_if_quiescent!
+      schedule_deferred_suspension_check
+    end
+
+    #: () -> void
+    def schedule_deferred_suspension_check
+      return if @deferred_suspension_command_ids.empty?
+      return if @deferred_suspension_check_scheduled
+
+      @deferred_suspension_check_scheduled = true
+      @root_task.async(transient: true) do
+        Kernel.sleep(0)
+        @deferred_suspension_check_scheduled = false
+        reject_deferred_suspensions_if_quiescent!
+      end
     end
 
     #: () -> void
@@ -863,7 +878,7 @@ module Durababble
       wake_at = wait["wake_at"]
       return true if wait.fetch("kind", nil) == "child_workflow" && child_workflow_wait_ready?(wait)
 
-      !!(wake_at && (timer_due?(wake_at) || claimed_wake_due?(wake_at)))
+      !!(wake_at && (timer_due?(wake_at) || claimed_wake_due?(wake_at) || claimed_earliest_wake_due?(wake_at)))
     end
 
     #: (Object) -> bool
@@ -871,6 +886,13 @@ module Durababble
       return false unless @claimed_next_run_at
 
       comparable_time(wake_at) <= comparable_time(@claimed_next_run_at)
+    end
+
+    #: (Object) -> bool
+    def claimed_earliest_wake_due?(wake_at)
+      return false unless @claimed_due_wake_at
+
+      comparable_time(wake_at) == comparable_time(@claimed_due_wake_at)
     end
 
     #: (Hash[String, Object?]) -> bool
