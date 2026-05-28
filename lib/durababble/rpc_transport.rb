@@ -379,64 +379,58 @@ module Durababble
         @deliver_message = deliver_message
         @verify_deliver_message_owner = verify_deliver_message_owner
         @identity_id = identity_id
+        @reactor = nil
       end
+
+      class ReactorCallback
+        #: () { () -> Object? } -> void
+        def initialize(&block)
+          @block = block #: Proc?
+        end
+
+        #: () -> bool
+        def alive?
+          !@block.nil?
+        end
+
+        #: () -> Object?
+        def transfer
+          block = @block
+          @block = nil
+          block&.call #: as Object?
+        end
+      end
+      private_constant :ReactorCallback
 
       #: () -> Server
       def start
-        return self if @thread || @task
-
-        server = build_http_server
-
-        # The socket is already bound/listening (above, on this thread); the
-        # reactor thread only runs the accept loop. Hand the scheduler back
-        # through a Queue so `stop` can interrupt it thread-safely.
-        #
-        # The rescue only covers the *startup handshake* — failures that escape
-        # the `Async { }` block synchronously, before `ready << Fiber.scheduler`
-        # is reached (e.g. `Async {}` itself failing to install a reactor —
-        # vanishingly rare but otherwise silent). Without it `ready.pop` would
-        # block forever and `start` would never return. Once the scheduler is
-        # published, `Async { }` returns and any later `server.run` failure is
-        # captured by Async's task supervisor (logged as a warning) rather than
-        # bubbling here — at that point `start` has already handed control back
-        # to the caller, so it's the reactor's problem, not ours.
-        ready = Thread::Queue.new
-        @thread = Thread.new do
-          Async do
-            ready << Fiber.scheduler
-            server.run
-          end
-        rescue StandardError => e
-          ready << e
-        end
-        result = ready.pop
-        raise result if result.is_a?(StandardError)
-
-        @scheduler = result
-        self
+        start_async(parent: current_async_task!("Durababble::Rpc::Server#start"))
       end
 
       #: (?parent: Object) -> Server
-      def start_async(parent: Async::Task.current)
-        return self if @thread || @task
+      def start_async(parent: nil)
+        parent ||= current_async_task!("Durababble::Rpc::Server#start_async")
+        return self if @task
 
+        async_parent = parent #: as untyped
         server = build_http_server
-        @task = parent.async { server.run }
+        @task = async_parent.async(transient: true, finished: false) { server.run.wait }
+        @reactor = @task.reactor
         self
       end
 
       #: () -> void
       def stop
-        @scheduler&.interrupt
-        @task&.stop
-        @thread&.join
-      ensure
-        @bound&.close
-        @thread = nil
+        task = @task
+        reactor = @reactor || task&.reactor
+        bound = @bound #: as untyped
+
         @task = nil
-        @scheduler = nil
+        @reactor = nil
         @bound = nil
         @port = nil
+
+        stop_task(task, reactor, bound)
       end
 
       #: () -> String
@@ -445,6 +439,38 @@ module Durababble
       end
 
       private
+
+      #: (String) -> Object
+      def current_async_task!(operation)
+        Async::Task.current
+      rescue RuntimeError
+        raise ConfigurationError, "#{operation} must be called from inside a running Async reactor; pass parent: from your application's Async supervisor"
+      end
+
+      #: (Object?, Object?, Object?) -> void
+      def stop_task(task, reactor, bound)
+        bound = bound #: as untyped
+        unless task
+          bound&.close
+          return
+        end
+
+        task = task #: as untyped
+        reactor = reactor #: as untyped
+        if reactor && Fiber.scheduler.equal?(reactor)
+          task.stop
+          bound&.close
+        elsif reactor&.respond_to?(:unblock)
+          reactor.unblock(nil, ReactorCallback.new do
+            task.stop
+          ensure
+            bound&.close
+          end)
+        else
+          task.stop
+          bound&.close
+        end
+      end
 
       #: () -> Async::HTTP::Server
       def build_http_server

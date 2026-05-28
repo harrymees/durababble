@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require_relative "../test_helper"
+require "async"
 require "timeout"
 
 class DurababbleRpcTransportTest < DurababbleTestCase
@@ -60,189 +61,185 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   end
 
   test "serves the full four-method RPC contract over localhost" do
-    store = self.store
-    claim_as("node-a")
     events = []
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       workflow_handlers: { "status" => ->(payload) { { "seen" => payload.fetch("value") } } },
       awaken_batch: ->(**event) { events << [:awaken_batch, event] },
       evict_lease: ->(**event) { events << [:evict_lease, event] },
       deliver_message: ->(**event) { events << [:deliver_message, event] },
-    )
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      claim_as("node-a")
+      events = []
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_equal(true, client.awaken_batch(worker_pool: "default", workflow_ids: [workflow_id, "wf-2"]))
-    assert_equal(true, client.evict_lease(
-      worker_pool: "default",
-      target_kind: "workflow",
-      target_id: workflow_id,
-    ))
-    assert_equal(true, client.deliver_message(
-      worker_pool: "default",
-      target_kind: "object",
-      target_class: "Counter",
-      target_id: "counter-1",
-    ))
-    assert_equal(
-      { "seen" => 7 },
-      client.call_transient(
+      assert_equal(true, client.awaken_batch(worker_pool: "default", workflow_ids: [workflow_id, "wf-2"]))
+      assert_equal(true, client.evict_lease(
         worker_pool: "default",
-        workflow_id:,
-        method: "status",
-        args: { "value" => 7 },
-      ),
-    )
-    assert_equal(
-      [
-        [:awaken_batch, { worker_pool: "default", workflow_ids: [workflow_id, "wf-2"] }],
-        [:evict_lease, { worker_pool: "default", target_kind: "workflow", target_class: "", target_id: workflow_id }],
-        [:deliver_message, { worker_pool: "default", target_kind: "object", target_class: "Counter", target_id: "counter-1" }],
-      ],
-      events,
-    )
-  ensure
-    server&.stop
+        target_kind: "workflow",
+        target_id: workflow_id,
+      ))
+      assert_equal(true, client.deliver_message(
+        worker_pool: "default",
+        target_kind: "object",
+        target_class: "Counter",
+        target_id: "counter-1",
+      ))
+      assert_equal(
+        { "seen" => 7 },
+        client.call_transient(
+          worker_pool: "default",
+          workflow_id:,
+          method: "status",
+          args: { "value" => 7 },
+        ),
+      )
+      assert_equal(
+        [
+          [:awaken_batch, { worker_pool: "default", workflow_ids: [workflow_id, "wf-2"] }],
+          [:evict_lease, { worker_pool: "default", target_kind: "workflow", target_class: "", target_id: workflow_id }],
+          [:deliver_message, { worker_pool: "default", target_kind: "object", target_class: "Counter", target_id: "counter-1" }],
+        ],
+        events,
+      )
+    end
   end
 
   test "routes workflow RPC through real clients and reroutes when the lease moves" do
     store = self.store
+    assertions_ran = false
     claim_as("node-a")
     directory = Durababble::Rpc::NodeDirectory.new
-    node_b = start_rpc_server(
+    with_rpc_server(
       node_id: "node-b",
       store:,
       node_directory: directory,
       workflow_handlers: { "status" => ->(_payload) { { "owner" => "node-b" } } },
-    )
-    directory.register(node_id: "node-b", rpc_address: node_b.address)
-    node_a = start_rpc_server(
-      node_id: "node-a",
-      store:,
-      node_directory: directory,
-      workflow_handlers: {
-        "status" => lambda do |_payload|
-          move_lease_to("node-b")
-          { "should_not" => "escape" }
-        end,
-      },
-    )
-    directory.register(node_id: "node-a", rpc_address: node_a.address)
-    router = Durababble::WorkflowRpc::Router.new(
-      store:,
-      rpc_clients: {
-        "node-a" => Durababble::Rpc::WorkflowClient.new(address: node_a.address),
-        "node-b" => Durababble::Rpc::WorkflowClient.new(address: node_b.address),
-      },
-      retry_on_stale: true,
-    )
+    ) do |node_b|
+      directory.register(node_id: "node-b", rpc_address: node_b.address)
+      with_rpc_server(
+        node_id: "node-a",
+        store:,
+        node_directory: directory,
+        workflow_handlers: {
+          "status" => lambda do |_payload|
+            move_lease_to("node-b")
+            { "should_not" => "escape" }
+          end,
+        },
+      ) do |node_a|
+        directory.register(node_id: "node-a", rpc_address: node_a.address)
+        router = Durababble::WorkflowRpc::Router.new(
+          store:,
+          rpc_clients: {
+            "node-a" => Durababble::Rpc::WorkflowClient.new(address: node_a.address),
+            "node-b" => Durababble::Rpc::WorkflowClient.new(address: node_b.address),
+          },
+          retry_on_stale: true,
+        )
 
-    assert_equal({ "owner" => "node-b" }, router.request(workflow_id:, command: "status", payload: {}))
-  ensure
-    node_a&.stop
-    node_b&.stop
+        assert_equal({ "owner" => "node-b" }, router.request(workflow_id:, command: "status", payload: {}))
+        assertions_ran = true
+      end
+    end
+    assert_equal(true, assertions_ran)
   end
 
   test "rejects workflow RPCs addressed to a previous worker incarnation at a recycled address" do
     store = self.store
     ran = false
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: nil,
       store:,
       workflow_handlers: { "status" => ->(_payload) { ran = true } },
-    )
-    old_identity = "previous-worker@#{server.address}"
-    store.claim_workflow(workflow_id:, worker_id: old_identity, lease_seconds: 30)
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      old_identity = "previous-worker@#{server.address}"
+      store.claim_workflow(workflow_id:, worker_id: old_identity, lease_seconds: 30)
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_match(/\A[0-9a-f]{12}@#{Regexp.escape(server.address)}\z/, server.node_id)
-    assert_equal(server.address, Durababble::WorkerIdentity.address_for(old_identity))
-    assert_raises(Durababble::WorkflowRpc::StaleLease) do
-      client.call_transient(
-        worker_pool: "default",
-        workflow_id:,
-        method: "status",
-        args: {},
-        expected_worker_id: old_identity,
-      )
+      assert_match(/\A[0-9a-f]{12}@#{Regexp.escape(server.address)}\z/, server.node_id)
+      assert_equal(server.address, Durababble::WorkerIdentity.address_for(old_identity))
+      assert_raises(Durababble::WorkflowRpc::StaleLease) do
+        client.call_transient(
+          worker_pool: "default",
+          workflow_id:,
+          method: "status",
+          args: {},
+          expected_worker_id: old_identity,
+        )
+      end
+      assert_equal(false, ran)
     end
-    assert_equal(false, ran)
-  ensure
-    server&.stop
   end
 
   test "acknowledges workflow message wakeups without work when the lease moved away" do
     store = self.store
     claim_as("node-b")
     events = []
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       deliver_message: ->(**event) { events << event },
-    )
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_equal(true, client.deliver_message(
-      worker_pool: "default",
-      target_kind: "workflow",
-      target_id: workflow_id,
-    ))
-    assert_empty(events)
-  ensure
-    server&.stop
+      assert_equal(true, client.deliver_message(
+        worker_pool: "default",
+        target_kind: "workflow",
+        target_id: workflow_id,
+      ))
+      assert_empty(events)
+    end
   end
 
   test "returns typed workflow RPC errors over the wire" do
     store = self.store
     claim_as("node-a")
-    server = start_rpc_server(node_id: "node-a", store:, workflow_handlers: {})
-    client = Durababble::Rpc::Client.new(address: server.address)
+    with_rpc_server(node_id: "node-a", store:, workflow_handlers: {}) do |server|
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /missing/) do
-      client.call_transient(worker_pool: "default", workflow_id:, method: "missing", args: {})
-    end
-
-    complete_workflow
-    assert_raises_matching(Durababble::WorkflowRpc::WorkflowNotRunning, /completed/) do
-      client.call_transient(worker_pool: "default", workflow_id:, method: "missing", args: {})
-    end
-
-    terminal_workflows = [
-      ["canceled", "rpc-transport-canceled", ->(id) { store.cancel_workflow(id, reason: "user canceled") }],
-      ["failed", "rpc-transport-failed", ->(id) { store.fail_workflow(id, error: "fatal") }],
-    ]
-    terminal_workflows.each do |status, name, finish|
-      id = store.enqueue_workflow(name:, input: {})
-      finish.call(id)
-      error = assert_raises(Durababble::WorkflowRpc::WorkflowNotRunning) do
-        client.call_transient(worker_pool: "default", workflow_id: id, method: "missing", args: {})
+      assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /missing/) do
+        client.call_transient(worker_pool: "default", workflow_id:, method: "missing", args: {})
       end
-      refute_instance_of(Durababble::WorkflowRpc::NoActiveLease, error)
-      assert_match(/#{status}/, error.message)
+
+      complete_workflow
+      assert_raises_matching(Durababble::WorkflowRpc::WorkflowNotRunning, /completed/) do
+        client.call_transient(worker_pool: "default", workflow_id:, method: "missing", args: {})
+      end
+
+      terminal_workflows = [
+        ["canceled", "rpc-transport-canceled", ->(id) { store.cancel_workflow(id, reason: "user canceled") }],
+        ["failed", "rpc-transport-failed", ->(id) { store.fail_workflow(id, error: "fatal") }],
+      ]
+      terminal_workflows.each do |status, name, finish|
+        id = store.enqueue_workflow(name:, input: {})
+        finish.call(id)
+        error = assert_raises(Durababble::WorkflowRpc::WorkflowNotRunning) do
+          client.call_transient(worker_pool: "default", workflow_id: id, method: "missing", args: {})
+        end
+        refute_instance_of(Durababble::WorkflowRpc::NoActiveLease, error)
+        assert_match(/#{status}/, error.message)
+      end
     end
-  ensure
-    server&.stop
   end
 
   test "maps no active lease and unavailable nodes to typed routing failures" do
     store = self.store
-    server = start_rpc_server(node_id: "node-a", store:, workflow_handlers: {})
-    address = server.address
-    client = Durababble::Rpc::Client.new(address:)
+    address = nil
+    with_rpc_server(node_id: "node-a", store:, workflow_handlers: {}) do |server|
+      address = server.address
+      client = Durababble::Rpc::Client.new(address:)
 
-    assert_raises_matching(Durababble::WorkflowRpc::NoActiveLease, /not running/) do
-      client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+      assert_raises_matching(Durababble::WorkflowRpc::NoActiveLease, /not running/) do
+        client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+      end
     end
 
-    server.stop
-    server = nil
     client = Durababble::Rpc::Client.new(address:, timeout: 0.1)
     assert_raises(Durababble::WorkflowRpc::NodeUnavailable) do
       client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
     end
-  ensure
-    server&.stop
   end
 
   test "maps timeouts and transport failures to typed node-unavailable routing errors" do
@@ -283,15 +280,24 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     store = self.store
     server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0, pool_size: 2)
 
-    assert_same(server, server.start)
-    assert_same(server, server.start)
-    assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
-    assert_equal(true, Durababble::Rpc::Client.new(address: server.address).awaken_batch(worker_pool: "default", workflow_ids: []))
-
-    client = Durababble::Rpc::WorkflowClient.new(address: server.address)
-    assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /not_workflow_rpc/) do
-      client.request("not_workflow_rpc", {})
+    assert_raises_matching(Durababble::ConfigurationError, /inside a running Async reactor/) do
+      server.start
     end
+
+    Async do |task|
+      assert_same(server, server.start)
+      assert_same(server, server.start)
+      assert_same(server, server.start_async(parent: task))
+      assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
+      assert_equal(true, Durababble::Rpc::Client.new(address: server.address).awaken_batch(worker_pool: "default", workflow_ids: []))
+
+      client = Durababble::Rpc::WorkflowClient.new(address: server.address)
+      assert_raises_matching(Durababble::WorkflowRpc::UnknownCommand, /not_workflow_rpc/) do
+        client.request("not_workflow_rpc", {})
+      end
+    ensure
+      server.stop
+    end.wait
   ensure
     server&.stop
   end
@@ -304,112 +310,154 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     Timeout.timeout(5) { server.stop }
     assert_nil(server.port)
 
-    server.start
-    assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
-    Timeout.timeout(5) { server.stop }
-    # The reactor thread and bound socket are torn down and the port is cleared.
-    assert_nil(server.port)
-    # A second stop after teardown is still safe.
-    Timeout.timeout(5) { server.stop }
+    Async do
+      server.start
+      assert_match(/\A127\.0\.0\.1:\d+\z/, server.address)
+      Timeout.timeout(5) { server.stop }
+      # The Async accept task and bound socket are torn down and the port is cleared.
+      assert_nil(server.port)
+      # A second stop after teardown is still safe.
+      Timeout.timeout(5) { server.stop }
+    end.wait
   ensure
     server&.stop
+  end
+
+  test "stop can be invoked from a non-reactor control thread" do
+    store = self.store
+    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0)
+    started = Queue.new
+
+    reactor_thread = Thread.new do
+      Thread.current.report_on_exception = false
+      Async do |task|
+        server.start_async(parent: task)
+        started << server.address
+        server.instance_variable_get(:@task).wait
+      ensure
+        server.stop
+      end.wait
+    end
+
+    address = started.pop
+    assert_match(/\A127\.0\.0\.1:\d+\z/, address)
+    assert_equal(true, Durababble::Rpc::Client.new(address:).awaken_batch(worker_pool: "default", workflow_ids: []))
+
+    Timeout.timeout(5) { server.stop }
+    Timeout.timeout(5) { reactor_thread.join }
+    assert_equal(false, reactor_thread.alive?)
+    assert_nil(server.port)
+  ensure
+    server&.stop
+    if reactor_thread&.alive?
+      reactor_thread.kill
+      reactor_thread.join
+    end
+  end
+
+  test "nested rpc server helper waits for child assertions" do
+    with_rpc_server(node_id: "node-a", store:, workflow_handlers: {}) do
+      error = assert_raises(Minitest::Assertion) do
+        with_rpc_server(node_id: "node-b", store:, workflow_handlers: {}) do
+          flunk("nested failure must propagate through the helper")
+        end
+      end
+      assert_match(/nested failure/, error.message)
+    end
   end
 
   test "rejects unauthorized peers before running handlers" do
     store = self.store
     ran = false
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       workflow_handlers: { "status" => ->(_payload) { ran = true } },
       authorize: ->(_call) { false },
-    )
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_raises_matching(Durababble::Rpc::Unauthenticated, /not authorized/) do
-      client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+      assert_raises_matching(Durababble::Rpc::Unauthenticated, /not authorized/) do
+        client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+      end
+      assert_equal(false, ran)
     end
-    assert_equal(false, ran)
-  ensure
-    server&.stop
   end
 
   test "supports non-workflow transient handlers over the same transient method" do
     store = self.store
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       transient_handler: ->(request:, args:) { { "method" => request["method"], "args" => args } },
-    )
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    assert_equal(
-      { "method" => "balance", "args" => { "object" => "acct-1" } },
-      client.call_transient(
-        worker_pool: "default",
-        class_name: "Account",
-        durable_object_id: "acct-1",
-        method: "balance",
-        args: { "object" => "acct-1" },
-      ),
-    )
-  ensure
-    server&.stop
+      assert_equal(
+        { "method" => "balance", "args" => { "object" => "acct-1" } },
+        client.call_transient(
+          worker_pool: "default",
+          class_name: "Account",
+          durable_object_id: "acct-1",
+          method: "balance",
+          args: { "object" => "acct-1" },
+        ),
+      )
+    end
   end
 
   test "enforces RPC argument byte limits before sending or dispatching" do
     args = { "body" => "x" * 64 }
     size = Durababble::Rpc::SERIALIZER.dump(args).bytesize
     calls = []
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       transient_handler: lambda do |request:, args:|
         calls << [request["method"], args]
         { "ok" => true }
       end,
-    )
-    client = Durababble::Rpc::Client.new(address: server.address)
+    ) do |server|
+      client = Durababble::Rpc::Client.new(address: server.address)
 
-    with_payload_limit(:rpc_argument, size + 1) do
-      assert_equal(
-        { "ok" => true },
-        client.call_transient(worker_pool: "default", method: "status", args:),
-      )
-    end
-    assert_equal([["status", args]], calls)
-
-    with_payload_limit(:rpc_argument, size) do
-      assert_equal(
-        { "ok" => true },
-        client.call_transient(worker_pool: "default", method: "status", args:),
-      )
-    end
-    assert_equal([["status", args], ["status", args]], calls)
-
-    error = with_payload_limit(:rpc_argument, size - 1) do
-      assert_raises(Durababble::PayloadTooLarge) do
-        client.call_transient(worker_pool: "default", method: "status", args:)
+      with_payload_limit(:rpc_argument, size + 1) do
+        assert_equal(
+          { "ok" => true },
+          client.call_transient(worker_pool: "default", method: "status", args:),
+        )
       end
-    end
-    assert_equal(:rpc_argument, error.surface)
-    assert_match(/CallTransient status args/, error.message)
-    assert_equal(2, calls.length)
+      assert_equal([["status", args]], calls)
 
-    # Prove the receiving node re-checks the limit even when a peer skips the
-    # client-side guard: POST a pre-serialized, oversized TransientRequest
-    # straight at the server (bypassing Client#call_transient's Rpc.dump
-    # enforcement). The server raises PayloadTooLarge, which surfaces as an
-    # `err` frame rather than running the handler.
-    raw_args = Durababble::Rpc::SERIALIZER.dump(args)
-    raw_request = Durababble::Rpc::Messages::TransientRequest.new(worker_pool: "default", method: "status", args: raw_args)
-    response = with_payload_limit(:rpc_argument, size - 1) do
-      post_raw_transient(server.address, raw_request)
+      with_payload_limit(:rpc_argument, size) do
+        assert_equal(
+          { "ok" => true },
+          client.call_transient(worker_pool: "default", method: "status", args:),
+        )
+      end
+      assert_equal([["status", args], ["status", args]], calls)
+
+      error = with_payload_limit(:rpc_argument, size - 1) do
+        assert_raises(Durababble::PayloadTooLarge) do
+          client.call_transient(worker_pool: "default", method: "status", args:)
+        end
+      end
+      assert_equal(:rpc_argument, error.surface)
+      assert_match(/CallTransient status args/, error.message)
+      assert_equal(2, calls.length)
+
+      # Prove the receiving node re-checks the limit even when a peer skips the
+      # client-side guard: POST a pre-serialized, oversized TransientRequest
+      # straight at the server (bypassing Client#call_transient's Rpc.dump
+      # enforcement). The server raises PayloadTooLarge, which surfaces as an
+      # `err` frame rather than running the handler.
+      raw_args = Durababble::Rpc::SERIALIZER.dump(args)
+      raw_request = Durababble::Rpc::Messages::TransientRequest.new(worker_pool: "default", method: "status", args: raw_args)
+      response = with_payload_limit(:rpc_argument, size - 1) do
+        post_raw_transient(server.address, raw_request)
+      end
+      assert_equal("Durababble::PayloadTooLarge", response.err.klass)
+      assert_equal(2, calls.length)
     end
-    assert_equal("Durababble::PayloadTooLarge", response.err.klass)
-    assert_equal(2, calls.length)
-  ensure
-    server&.stop
   end
 
   test "decodes transport payloads and typed transient response branches" do
@@ -621,30 +669,28 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   test "answers 404 for unknown paths and 500 (Rpc::Error, NOT retried) when a handler raises" do
     store = self.store
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       awaken_batch: ->(**_event) { raise "handler exploded" },
-    )
+    ) do |server|
+      status, = raw_rpc_post(server.address, "/durababble/v1/does_not_exist", { "anything" => true })
+      assert_equal(404, status)
 
-    status, = raw_rpc_post(server.address, "/durababble/v1/does_not_exist", { "anything" => true })
-    assert_equal(404, status)
+      # The raw POST proves the wire-level status code (500, not 503).
+      raise_status, raise_body = raw_rpc_post(server.address, "/durababble/v1/awaken_batch", Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default"))
+      assert_equal(500, raise_status)
+      assert_match(/handler exploded/, raise_body)
 
-    # The raw POST proves the wire-level status code (500, not 503).
-    raise_status, raise_body = raw_rpc_post(server.address, "/durababble/v1/awaken_batch", Durababble::Rpc::Messages::AwakenBatchRequest.new(worker_pool: "default"))
-    assert_equal(500, raise_status)
-    assert_match(/handler exploded/, raise_body)
-
-    # And the client-side mapping: unexpected handler raises become Rpc::Error
-    # (NOT Rpc::Unavailable / NodeUnavailable), so the router will not retry.
-    client = Durababble::Rpc::Client.new(address: server.address)
-    error = assert_raises(Durababble::Rpc::Error) do
-      client.awaken_batch(worker_pool: "default", workflow_ids: [])
+      # And the client-side mapping: unexpected handler raises become Rpc::Error
+      # (NOT Rpc::Unavailable / NodeUnavailable), so the router will not retry.
+      client = Durababble::Rpc::Client.new(address: server.address)
+      error = assert_raises(Durababble::Rpc::Error) do
+        client.awaken_batch(worker_pool: "default", workflow_ids: [])
+      end
+      refute_kind_of(Durababble::Rpc::Unavailable, error)
+      assert_match(/handler exploded/, error.message)
     end
-    refute_kind_of(Durababble::Rpc::Unavailable, error)
-    assert_match(/handler exploded/, error.message)
-  ensure
-    server&.stop
   end
 
   test "maps unexpected status codes and empty error bodies to typed client errors" do
@@ -677,67 +723,78 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   test "caches HTTP/2 clients per address and lets the caller shut them down" do
     store = self.store
     claim_as("node-a")
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       workflow_handlers: { "status" => ->(_payload) { { "ok" => true } } },
-    )
-    address = server.address
+    ) do |server|
+      address = server.address
 
-    # No cache to start with.
-    Durababble::Rpc.shutdown_http_clients!
-    refute(Durababble::Rpc.http_client_cached?(address))
+      # No cache to start with.
+      Durababble::Rpc.shutdown_http_clients!
+      refute(Durababble::Rpc.http_client_cached?(address))
 
-    # First call populates the per-thread cache; subsequent constructors of
-    # Rpc::Client wrappers reuse the same cached Async::HTTP::Client across
-    # back-to-back calls.
-    client_one = Durababble::Rpc::Client.new(address:)
-    assert_equal({ "ok" => true }, client_one.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-    assert(Durababble::Rpc.http_client_cached?(address))
-    cached = Durababble::Rpc.http_client_for(address)
+      # First call populates the per-thread cache; subsequent constructors of
+      # Rpc::Client wrappers reuse the same cached Async::HTTP::Client across
+      # back-to-back calls.
+      client_one = Durababble::Rpc::Client.new(address:)
+      assert_equal({ "ok" => true }, client_one.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
+      assert(Durababble::Rpc.http_client_cached?(address))
+      cached = Durababble::Rpc.http_client_for(address)
 
-    client_two = Durababble::Rpc::Client.new(address:)
-    assert_equal({ "ok" => true }, client_two.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-    assert_same(cached, Durababble::Rpc.http_client_for(address), "second wrapper must hit the same cached HTTP/2 client")
+      client_two = Durababble::Rpc::Client.new(address:)
+      assert_equal({ "ok" => true }, client_two.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
+      assert_same(cached, Durababble::Rpc.http_client_for(address), "second wrapper must hit the same cached HTTP/2 client")
 
-    # Different scheme/address is a separate cache entry.
-    scheme_client = Durababble::Rpc::Client.new(address: "http://#{address}")
-    assert_equal({ "ok" => true }, scheme_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
-    assert(Durababble::Rpc.http_client_cached?("http://#{address}"))
-    refute_same(cached, Durababble::Rpc.http_client_for("http://#{address}"))
+      # Different scheme/address is a separate cache entry.
+      scheme_client = Durababble::Rpc::Client.new(address: "http://#{address}")
+      assert_equal({ "ok" => true }, scheme_client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}))
+      assert(Durababble::Rpc.http_client_cached?("http://#{address}"))
+      refute_same(cached, Durababble::Rpc.http_client_for("http://#{address}"))
 
-    # Explicit shutdown is idempotent and clears the cache.
-    Durababble::Rpc.shutdown_http_clients!
-    refute(Durababble::Rpc.http_client_cached?(address))
-    Durababble::Rpc.shutdown_http_clients! # second call is a no-op
-  ensure
-    server&.stop
+      # Explicit shutdown is idempotent and clears the cache.
+      Durababble::Rpc.shutdown_http_clients!
+      refute(Durababble::Rpc.http_client_cached?(address))
+      Durababble::Rpc.shutdown_http_clients! # second call is a no-op
+    end
   end
 
   test "accepts addresses with an explicit scheme" do
     store = self.store
     claim_as("node-a")
-    server = start_rpc_server(
+    with_rpc_server(
       node_id: "node-a",
       store:,
       workflow_handlers: { "status" => ->(_payload) { { "ok" => true } } },
-    )
-    client = Durababble::Rpc::Client.new(address: "http://#{server.address}")
+    ) do |server|
+      client = Durababble::Rpc::Client.new(address: "http://#{server.address}")
 
-    assert_equal(
-      { "ok" => true },
-      client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}),
-    )
-  ensure
-    server&.stop
+      assert_equal(
+        { "ok" => true },
+        client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {}),
+      )
+    end
   end
 
   private
 
   attr_reader :workflow_id
 
-  def start_rpc_server(**kwargs)
-    Durababble::Rpc::Server.new(**kwargs, port: 0, pool_size: 2).start
+  def with_rpc_server(**kwargs)
+    server = nil
+    runner = lambda do |task|
+      server = Durababble::Rpc::Server.new(**kwargs, port: 0, pool_size: 2)
+      server.start_async(parent: task)
+      yield server
+    ensure
+      server&.stop
+    end
+
+    if (task = Async::Task.current?)
+      runner.call(task)
+    else
+      Async(&runner)
+    end
   end
 
   def database_url
