@@ -59,7 +59,7 @@ WHERE object_type = ? AND object_id = ?
   AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
 
 -- mysql_claim_outbox
-SELECT id, created_at FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_claim_idx)
+SELECT * FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_claim_idx)
 WHERE queue_available_at <= NOW(6)
 LIMIT 1
 FOR UPDATE SKIP LOCKED
@@ -96,7 +96,7 @@ WHERE id = ? AND worker_pool = ?
   )
 
 -- mysql_claim_target_activation
-SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM `durababble_mysql_snapshot_target_activations` FORCE INDEX (durababble_mysql_snapshot_target_activations_claim_idx)
+SELECT * FROM `durababble_mysql_snapshot_target_activations` FORCE INDEX (durababble_mysql_snapshot_target_activations_claim_idx)
 WHERE worker_pool = ?
   AND queue_available_at <= ?
   <filter_sql>
@@ -105,7 +105,7 @@ LIMIT 1
 FOR UPDATE SKIP LOCKED
 
 -- mysql_claim_workflow_for_activation_lock
-SELECT id FROM `durababble_mysql_snapshot_workflows`
+SELECT * FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND worker_pool = ?
   AND (
     (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
@@ -122,7 +122,7 @@ SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW
 WHERE id = ? AND worker_pool = ?
 
 -- mysql_claim_workflow_lock
-SELECT id FROM `durababble_mysql_snapshot_workflows`
+SELECT * FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND worker_pool = ?
   AND (
     (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))

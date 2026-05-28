@@ -511,7 +511,7 @@ module Durababble
 
     define(:mysql_claim_workflow_lock, backend: :mysql, description: "Lock a target workflow row before a MySQL lease update.") do |store|
       <<~SQL.chomp
-        SELECT id FROM #{table(store, "workflows")}
+        SELECT * FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
@@ -643,7 +643,7 @@ module Durababble
 
     define(:mysql_claim_outbox, backend: :mysql, description: "Probe the unified outbox queue for one available message.") do |store|
       <<~SQL.chomp
-        SELECT id, created_at FROM #{table(store, "outbox")} FORCE INDEX (#{index_name(store, "outbox", "claim")})
+        SELECT * FROM #{table(store, "outbox")} FORCE INDEX (#{index_name(store, "outbox", "claim")})
         WHERE queue_available_at <= NOW(6)
         LIMIT 1
         FOR UPDATE SKIP LOCKED
@@ -1380,7 +1380,7 @@ module Durababble
 
     define(:mysql_claim_workflow_for_activation_lock, backend: :mysql, description: "Lock a workflow activation target before claiming it.") do |store|
       <<~SQL.chomp
-        SELECT id FROM #{table(store, "workflows")}
+        SELECT * FROM #{table(store, "workflows")}
         WHERE id = ? AND worker_pool = ?
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
@@ -1818,7 +1818,7 @@ module Durababble
 
     define(:mysql_claim_target_activation, backend: :mysql, description: "Probe the unified target activation queue for one claimable candidate in this worker pool.") do |store, filter_sql:|
       <<~SQL.chomp
-        SELECT worker_pool, target_kind, target_type, target_id, ready_at, created_at FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "claim")})
+        SELECT * FROM #{table(store, "target_activations")} FORCE INDEX (#{index_name(store, "target_activations", "claim")})
         WHERE worker_pool = ?
           AND queue_available_at <= ?
           #{filter_sql}

@@ -382,24 +382,22 @@ class DurababbleStoreTest < DurababbleTestCase
 
   test "mysql targeted workflow claims lock candidates with skip locked before updating" do
     results = [
-      sql_result([{ "id" => "wf-target" }]),
-      sql_result([], affected_rows: 1),
       sql_result([{
         "id" => "wf-target",
-        "status" => "running",
+        "status" => "pending",
         "input" => nil,
-        "locked_by" => "worker-a",
-        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+        "locked_by" => nil,
+        "locked_until" => nil,
       }]),
-      sql_result([{ "id" => "wf-activation" }]),
       sql_result([], affected_rows: 1),
       sql_result([{
         "id" => "wf-activation",
-        "status" => "running",
+        "status" => "waiting",
         "input" => nil,
-        "locked_by" => "worker-a",
-        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+        "locked_by" => nil,
+        "locked_until" => nil,
       }]),
+      sql_result([], affected_rows: 1),
     ]
     connection = ScriptedMysqlConnection.new { |_sql| results.shift || sql_result }
     store = mysql_store(connection, schema: "durababble_test")
@@ -407,7 +405,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "wf-target", store.claim_workflow(workflow_id: "wf-target", worker_id: "worker-a", lease_seconds: 9).fetch("id")
     assert_equal "wf-activation", store.claim_workflow_for_activation(workflow_id: "wf-activation", worker_id: "worker-a", lease_seconds: 9).fetch("id")
 
-    direct_lock_sql, direct_update_sql, _direct_read_sql, activation_lock_sql, activation_update_sql = connection.queries
+    direct_lock_sql, direct_update_sql, activation_lock_sql, activation_update_sql = connection.queries
     assert_includes direct_lock_sql, "FOR UPDATE SKIP LOCKED"
     assert_includes direct_lock_sql, "locked_by = 'worker-a'"
     assert_includes direct_update_sql, "UPDATE"

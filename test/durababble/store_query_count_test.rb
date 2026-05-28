@@ -34,7 +34,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes claimed, "id" => runnable_id, "status" => "running"
 
         targeted_id = store.enqueue_workflow(name: "query-count-targeted-claim", input: { "ok" => true })
-        targeted = assert_sql_query_budget("claim_workflow", mysql: 3, postgres: 2) do
+        targeted = assert_sql_query_budget("claim_workflow", mysql: 2, postgres: 2) do
           store.claim_workflow(workflow_id: targeted_id, worker_id: "target-worker", lease_seconds: 30)
         end
         assert_hash_includes targeted, "id" => targeted_id, "status" => "running"
@@ -131,7 +131,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         claim_outbox_workflow = store.enqueue_workflow(name: "query-count-claim-outbox", input: {})
         claim_outbox_id = store.enqueue_outbox(workflow_id: claim_outbox_workflow, topic: "events", payload: { "ok" => true }, key: "query-count-claim-outbox")
-        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 3, postgres: 1) do
+        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 2, postgres: 1) do
           store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed_outbox, "id" => claim_outbox_id, "status" => "processing"
@@ -161,7 +161,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_equal [inbox_claim_command_id], inbox_messages.map { |message| message.fetch("id") }
 
         target_activation_command_id = enqueue_object_command("target-activation-claim-object", object_type: "query-count-target")
-        target_activation = assert_sql_query_budget("claim_target_activation", mysql: 3, postgres: 2) do
+        target_activation = assert_sql_query_budget("claim_target_activation", mysql: 2, postgres: 2) do
           store.claim_target_activation(worker_id: "target-activation-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["query-count-target"])
         end
         assert_hash_includes target_activation, "target_kind" => "object", "target_type" => "query-count-target", "target_id" => "target-activation-claim-object", "status" => "running"
