@@ -16,16 +16,24 @@ module Durababble
       # from here so appends are a single plain insert; hot-path reports and
       # query-count tests call it to mirror that allocation exactly.
       #
-      # This is deliberately max+1, not events.length: a failed append still
-      # advances the in-memory counter (see allocate_event_index!), so a later
-      # committed append can leave a hole in the persisted indexes (e.g. a step's
-      # completion write fails transiently and a failure row commits at the next
-      # index instead). length would then return an index that already exists and
-      # collide on the (workflow_id, event_index) PK after reload.
+      # workflow_history_for loads rows ORDER BY event_index, so the last indexed
+      # row holds the highest index; scan back to it instead of over the whole
+      # array. In production every row carries an index, so the first step finds it
+      # (O(1)); the loop only walks past trailing rows in the legacy/synthetic case
+      # where some events lack a persisted index. This is deliberately last+1, not
+      # events.length: a failed append still advances the in-memory counter (see
+      # allocate_event_index!), so a committed append can leave a hole in the
+      # persisted indexes (e.g. a step's completion write fails transiently and a
+      # failure row commits at the next index instead). length would then return an
+      # index that already exists and collide on the (workflow_id, event_index) PK
+      # after reload.
       #: (Array[Hash[String, Object?]]) -> Integer
       def next_event_index_after(events)
-        max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
-        max ? max + 1 : 0
+        events.reverse_each do |event|
+          index = event["event_index"]
+          return index.to_s.to_i + 1 if index
+        end
+        0
       end
     end
 
