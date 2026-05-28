@@ -71,9 +71,20 @@ module Durababble
 
     #: (object_class: untyped, object_id: String, worker_pool: String, request: Rpc::Messages::TransientRequest, args: Hash[String, untyped]?, writer: untyped, entry: ObjectStreamHost::Entry?) -> void
     def run_object_producer(object_class:, object_id:, worker_pool:, request:, args:, writer:, entry:)
-      state = DurableObject.state_from_store(@store, object_type: object_class.object_type, object_id:)
-      object = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:)
-      object.instance_variable_set(:@__durababble_query_context, true)
+      object_type = object_class.object_type
+      state = DurableObject.state_from_store(@store, object_type:, object_id:)
+      # Inside `with_lease` the host owns the lease, so the stream observes the
+      # one warm resident instance (rebound for a query/stream context). Without
+      # a host the dispatcher serves a lease-asserted throwaway snapshot.
+      object = if @object_stream_host
+        resident = @object_stream_host.resident_instance(object_type:, object_id:, worker_pool:) #: as untyped
+        resident.__durababble_rebind!(state:, store: @store, worker_pool:, command_context: nil, query: true)
+        resident
+      else
+        built = object_class.new(durable_id: object_id, state:, store: @store, worker_pool:) #: as untyped
+        built.instance_variable_set(:@__durababble_query_context, true)
+        built
+      end
       lease_writer = entry ? ObjectStreamLeaseWriter.new(writer, entry:) : writer
       invoke_stream(object, request:, args:, writer: lease_writer)
     end

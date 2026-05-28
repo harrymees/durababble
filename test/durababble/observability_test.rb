@@ -225,6 +225,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
   class ObjectStore
     Result = Data.define(:affected_rows)
 
+    # Every store exposes these owner-routing hooks (set as a pair by the worker
+    # runtime); a nil pair means this process runs no worker, so queries claim a
+    # synthesized local worker id.
+    attr_accessor :local_worker_id, :local_transient_handler
+
     def initialize
       @state = {}
       @commands = {}
@@ -232,6 +237,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def migrate! = self
     def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
+
+    def current_object_lease(_object_type, _object_id) = nil
+
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds:)
+      _ = [object_type, object_id, lease_seconds]
+      { "worker_pool" => worker_pool, "worker_id" => worker_id }
+    end
 
     def object_state_entry(object_type:, object_id:)
       state = @state[[object_type, object_id]]
