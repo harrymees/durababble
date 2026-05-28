@@ -108,8 +108,20 @@ module Durababble
     #: (Object, method_name: Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) { () -> Object? } -> Object?
     def call_step(instance, method_name:, args:, kwargs:, &block)
       instance = instance #: as untyped
-      assert_workflow_task!("durable step #{method_name}")
       step = instance.class.step_definition(method_name)
+      call_step_command(step, instance:, args:, kwargs:, &block)
+    end
+
+    #: (Step, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object?
+    def call_step_object(step, args:, kwargs:)
+      call_step_command(step, instance: @workflow, args:, kwargs:) do
+        step.call_body(@workflow, args:, kwargs:)
+      end
+    end
+
+    #: (Step, instance: Object, args: Array[Object?], kwargs: Hash[Symbol, Object?]) { () -> Object? } -> Object?
+    def call_step_command(step, instance:, args:, kwargs:, &block)
+      assert_workflow_task!("durable step #{step.name}")
       shape = step_command_shape(step:, args:, kwargs:)
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
       command_id, future, scheduled_from_history = allocate_command(name: step.name, shape:)

@@ -313,6 +313,17 @@ module Durababble
       self.engine.store
     end
 
+    #: (String | Symbol, **Object?) { (*Object?, **Object?) -> Object? } -> Step
+    def step(name, **options, &block)
+      retry_policy = options.fetch(:retry_policy, options[:retry]) #: as RetryPolicy | Hash[Symbol, Object?] | nil
+      Step.new(name:, retry_policy: RetryPolicy.from(retry_policy), body: block)
+    end
+
+    #: () -> StepContext
+    def step_context
+      StepExecutionContext.current || raise(Error, "step_context is only available while a workflow step is executing")
+    end
+
     #: (Time, ?Object?) -> (WaitRequest | Object?)
     def wait_until(time, context = {})
       wait_request = WaitRequest.new(kind: "timer", wake_at: time, event_key: nil, context:)
