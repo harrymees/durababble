@@ -36,6 +36,12 @@ module Durababble
 
             items[h.scheduler.rng.int(items.length)]
           end
+          resume_random_workflow = lambda do |actor, workflow_id|
+            row = h.store.workflow(workflow_id)
+            return if ["completed", "failed", "canceled", "terminated"].include?(row.fetch("status"))
+
+            resume_workflow_once(h, actor:, workflow: h.workflows.fetch(row.fetch("name")), workflow_id:)
+          end
 
           safe = lambda do |actor, operation, &body|
             h.scheduler.trace.event(h.scheduler.time, actor, "random_operation", operation:)
@@ -64,7 +70,8 @@ module Durababble
                   workflow_id = pick.call(workflow_ids)
                   h.store.request_workflow_termination(workflow_id:, reason: "random terminate #{i}") if workflow_id
                 when "wake_timers"
-                  h.store.wake_due_timers(now: h.store.current_time + h.scheduler.rng.int(120))
+                  workflow_id = pick.call(workflow_ids)
+                  resume_random_workflow.call(actor, workflow_id) if workflow_id
                 when "steal_expired"
                   h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
                 when "enqueue_outbox"
@@ -117,7 +124,7 @@ module Durababble
               h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
             end
             h.scheduler.schedule(actor: "random-timer", delay: 85 + i * 30, name: "wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time + 120)
+              workflow_ids.each { |workflow_id| resume_random_workflow.call("random-timer", workflow_id) }
             end
           end
 

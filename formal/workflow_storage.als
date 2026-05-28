@@ -593,8 +593,9 @@ pred claimWorkflowForActivation[wf: Workflow, worker: Worker, t: Time, tnext: Ti
 
 pred suspendWorkflow[wf: Workflow, worker: Worker, t: Time, tnext: Time] {
   -- [DURABABBLE-WAIT-1] The owning worker re-suspends a running workflow back to
-  -- waiting (its pending waits remain) or pending, releasing the lease. This models
-  -- Store#suspend_workflow on the activation drain path.
+  -- waiting (with unresolved wait facts represented by history/step state) or
+  -- pending, releasing the lease. This models Store#suspend_workflow on the
+  -- activation drain path.
   liveWorkflowLease[wf, worker, t]
   workflowStatus[wf, t] = Running
   some workflowCancelRequestedAt[wf, t] implies workflowStatus[wf, tnext] = Canceling
@@ -1330,7 +1331,7 @@ assert inboxClaimsRequireExistingRows {
 
 /**
  * [DURABABBLE-WF-1] Completed/canceled workflows cannot retain unfinished step,
- * attempt, or wait rows. Failed rows are terminal when they have no retry
+ * attempt, or wait facts. Failed rows are terminal when they have no retry
  * deadline, but may retain diagnostic incomplete work.
  */
 assert terminalWorkflowsHaveNoIncompleteWork {

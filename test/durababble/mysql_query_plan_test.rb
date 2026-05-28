@@ -41,25 +41,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
           expected_key_fragment: "outbox_claim",
           expected_access_types: ["range"],
         },
-        "timer wait wake probe" => {
-          sql: query_sql(:complete_timer_waits, limit: 100),
-          params: [now],
-          expected_key_fragment: "waits_timer_pending",
-          expected_access_types: ["range", "eq_ref"],
-          max_rows_examined_per_scan: 5,
-        },
-        "workflow suspend pending wait probe" => {
-          sql: query_sql(:suspend_workflow),
-          params: ["running-active-1", "running-active-1", nil, nil],
-          expected_key_fragment: "waits_workflow_status",
-          expected_access_types: ["const", "ref"],
-        },
-        "cancel workflow pending waits probe" => {
-          sql: query_sql(:cancel_pending_waits_for_workflow),
-          params: ["running-active-1"],
-          expected_key_fragment: "waits_workflow_status",
-          expected_access_types: ["range"],
-        },
         "target activation claim probe" => {
           sql: query_sql(:claim_target_activation, filter_sql: "AND target_kind IN (?) AND target_type IN (?)"),
           params: ["default", now, "object", "counter"],
@@ -222,10 +203,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       ["status", "locked_until"]
     when "outbox_claim"
       ["queue_available_at"]
-    when "waits_timer_pending"
-      ["status", "kind", "wake_at"]
-    when "waits_workflow_status"
-      ["workflow_id", "status"]
     when "target_activations_claim"
       ["worker_pool", "target_kind", "target_type", "queue_available_at"]
     when "inbox_target"
@@ -304,7 +281,6 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
   def seed_mysql_plan_fixture
     empty = serialized_literal({})
     result = serialized_literal({ "done" => true })
-    wait_context = serialized_literal({ "waiting" => true })
     inbox_payload = serialized_literal({ "command" => true })
     outbox = serialized_literal({ "message" => true })
     now = Time.now.utc
@@ -313,15 +289,13 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
     1.upto(500) do |i|
       created_at = mysql_literal(now - i)
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, result, created_at, updated_at) VALUES ('completed-#{i}', 'demo', 'completed', #{empty}, #{result}, #{created_at}, #{created_at})")
-      execute("INSERT INTO #{table("workflows")} (id, name, status, input, created_at, updated_at) VALUES ('waiting-#{i}', 'demo', 'waiting', #{empty}, #{created_at}, #{created_at})")
+      waiting_next_run_at = i == 1 ? now - 60 : now + 3600
+      execute("INSERT INTO #{table("workflows")} (id, name, status, input, next_run_at, created_at, updated_at) VALUES ('waiting-#{i}', 'demo', 'waiting', #{empty}, #{mysql_literal(waiting_next_run_at)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, created_at, updated_at) VALUES ('pending-#{i}', 'demo', 'pending', #{empty}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, next_run_at, created_at, updated_at) VALUES ('failed-#{i}', 'demo', 'failed', #{empty}, #{mysql_literal(now - 60)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, next_run_at, created_at, updated_at) VALUES ('canceling-#{i}', 'demo', 'canceling', #{empty}, NULL, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-active-#{i}', 'demo', 'running', #{empty}, 'other', #{mysql_literal(now + 300)}, #{created_at}, #{created_at})")
       execute("INSERT INTO #{table("workflows")} (id, name, status, input, locked_by, locked_until, created_at, updated_at) VALUES ('running-expired-#{i}', 'demo', 'running', #{empty}, 'stale', #{mysql_literal(now - 300)}, #{created_at}, #{created_at})")
-      timer_wake_at = i == 1 ? now - 60 : now + 3600
-      execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('timer-wait-#{i}', 'waiting-#{i}', 0, 'timer', NULL, #{mysql_literal(timer_wake_at)}, #{wait_context}, 'pending', #{created_at})")
-      execute("INSERT INTO #{table("waits")} (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at) VALUES ('event-wait-#{i}', 'waiting-#{i}', 0, 'event', #{mysql_literal(i == 1 ? "target-event" : "other-event")}, NULL, #{wait_context}, 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, created_at) VALUES ('pending-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'pending-key-#{i}', 'pending', #{created_at})")
       execute("INSERT INTO #{table("outbox")} (id, workflow_id, topic, payload, `key`, status, locked_by, locked_until, created_at) VALUES ('processing-outbox-#{i}', 'waiting-#{i}', 'topic', #{outbox}, 'processing-key-#{i}', 'processing', 'owner', #{mysql_literal(now - 60)}, #{created_at})")
       activation_ready_at = i == 1 ? now - 60 : now + 3600

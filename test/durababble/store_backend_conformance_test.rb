@@ -261,31 +261,33 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
-    test "persists waits and wakes due timers once with #{backend.name}" do
+    test "persists waits and makes due timer workflows claimable with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.create_workflow(name: "timer", input: {})
+        due_at = Time.now + 3600
         wait_id = store.record_wait(
           workflow_id:,
           position: 0,
           name: "sleep",
-          wait_request: Durababble.wait_until(Time.utc(2026, 1, 1, 0, 0, 0), { "timer" => true }),
+          wait_request: Durababble.wait_until(due_at, { "timer" => true }),
         )
 
-        assert_equal 0, store.wake_due_timers(now: Time.utc(2025, 12, 31, 23, 59, 59))
+        assert_equal 0, store.wake_due_timers(now: due_at - 1)
         assert_hash_includes store.waits_for(workflow_id).first, "id" => wait_id, "status" => "pending"
 
-        assert_equal 1, store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 1))
-        assert_equal 0, store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 2))
-        assert_hash_includes store.workflow(workflow_id), "status" => "pending"
-        assert_hash_includes store.steps_for(workflow_id).first, "status" => "completed", "result" => { "timer" => true }
+        make_workflow_timer_due(store, workflow_id, at: due_at)
+        claimed = store.claim_runnable_workflow(worker_id: "timer-worker", lease_seconds: 60, workflow_names: ["timer"])
+        assert_equal workflow_id, claimed.fetch("id")
+        assert_hash_includes store.workflow(workflow_id), "status" => "running", "locked_by" => "timer-worker"
+        assert_hash_includes store.steps_for(workflow_id).first, "status" => "waiting", "result" => { "timer" => true }
       end
     end
 
-    test "drains due timers across bounded wake batches with #{backend.name}" do
+    test "claims due timer workflows across bounded worker polls with #{backend.name}" do
       with_durababble_store(backend, "timer_batches") do |store|
         first_workflow = store.create_workflow(name: "timer-batch", input: {})
         second_workflow = store.create_workflow(name: "timer-batch", input: {})
-        due_at = Time.utc(2026, 1, 1, 0, 0, 0)
+        due_at = Time.now + 3600
 
         [first_workflow, second_workflow].each_with_index do |workflow_id, index|
           store.record_wait(
@@ -294,11 +296,15 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
             name: "sleep",
             wait_request: Durababble.wait_until(due_at, { "timer" => index }),
           )
+          make_workflow_timer_due(store, workflow_id, at: due_at)
         end
 
-        assert_equal 2, store.wake_due_timers(now: due_at + 1, batch_size: 1)
-        assert_equal ["completed"], store.waits_for(first_workflow).map { |wait| wait.fetch("status") }
-        assert_equal ["completed"], store.waits_for(second_workflow).map { |wait| wait.fetch("status") }
+        first_claim = store.claim_runnable_workflow(worker_id: "timer-worker-a", lease_seconds: 60, workflow_names: ["timer-batch"])
+        second_claim = store.claim_runnable_workflow(worker_id: "timer-worker-b", lease_seconds: 60, workflow_names: ["timer-batch"])
+        assert_equal [first_workflow, second_workflow].sort, [first_claim.fetch("id"), second_claim.fetch("id")].sort
+        assert_nil store.claim_runnable_workflow(worker_id: "timer-worker-c", lease_seconds: 60, workflow_names: ["timer-batch"])
+        assert_equal ["pending"], store.waits_for(first_workflow).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.waits_for(second_workflow).map { |wait| wait.fetch("status") }
       end
     end
 
@@ -1672,7 +1678,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           store.complete_workflow(pending_wait_id, result: { "done" => true })
         end
         assert_hash_includes store.workflow(pending_wait_id), "status" => "waiting", "result" => nil
-        assert_equal ["pending"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
 
         cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
         store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")

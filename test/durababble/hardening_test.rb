@@ -170,7 +170,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_nil store.claim_outbox(worker_id: "late", lease_seconds: 60)
   end
 
-  test "wakes a waiting timer once under concurrent callers" do
+  test "claims a due waiting timer workflow once under concurrent callers" do
     workflow = durababble_test_workflow("waiting") do
       test_step("wait") { |ctx| Durababble.wait_until(Time.now + 3600, ctx.merge("woken" => true)) }
       test_step("done") { |ctx| ctx.merge("done" => true) }
@@ -178,11 +178,16 @@ class DurababbleHardeningTest < DurababbleTestCase
     workflow_id = store.enqueue_workflow(name: "waiting", input: { "id" => "x" })
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
 
-    woken = run_threads(8) do |_index, local|
-      local.wake_due_timers(now: Time.now + 3601)
+    due_at = store.workflow(workflow_id).fetch("next_run_at")
+    make_workflow_timer_due(store, workflow_id, at: due_at)
+    claims = run_threads(8) do |index, local|
+      local.claim_runnable_workflow(worker_id: "timer-worker-#{index}", lease_seconds: 60, workflow_names: [workflow.name])
     end
-    assert_equal 1, woken.sum
-    assert_equal "completed", Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:).status
+    claim = claims.compact.first
+    assert_equal [workflow_id], claims.compact.map { |row| row.fetch("id") }
+    assert_equal "completed", with_store_current_time(store, due_at) {
+      Durababble::Engine.new(store:, worker_id: claim.fetch("locked_by")).resume(workflow, workflow_id:, claimed: claim)
+    }.status
     assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
   end
 
@@ -195,8 +200,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
     assert_equal "waiting", store.step_attempts_for(workflow_id).first.fetch("status")
 
-    store.wake_due_timers(now: Time.now + 3601)
-    Durababble::Engine.new(store:, worker_id: "worker").resume(workflow, workflow_id:)
+    resume_waiting_workflow(store, workflow, workflow_id, worker_id: "worker")
 
     assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
   end

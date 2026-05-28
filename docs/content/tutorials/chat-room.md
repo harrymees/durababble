@@ -320,7 +320,7 @@ end
 
 The output includes the seeded chat messages, the "announcement queued" system message, and the final announcement. `WorkerRuntime` keeps one active work item per durable target identity inside the process, so two commands for the same room still run in order while unrelated workflow and object work can use the other concurrency slots. If the process dies after the scheduled message is recorded but before the announcement is posted, starting a worker again resumes from the persisted workflow history and the room's persisted mailbox state.
 
-For non-zero delays, something also needs to wake due timers. The full example's server runs a tiny timer loop around `store.wake_due_timers(now: Time.now)`; production deployments usually wire the same call into whichever scheduler or worker heartbeat owns timer advancement.
+For non-zero workflow delays, workers resume the announcement through the ordinary workflow poll path once its `next_run_at` is due. `store.wake_due_timers(now: Time.now)` is still the durable-object named-wake conversion path; production deployments usually wire both worker polling and object wake conversion into the runtime scheduler or worker heartbeat that owns timer advancement.
 
 ## Where To Go Next
 

@@ -89,6 +89,32 @@ module DurababbleMinitestHelper
     @durababble_store || Kernel.raise("Durababble store has not been configured for this test")
   end
 
+  #: (untyped, Class, String, ?worker_id: String) -> untyped
+  def resume_waiting_workflow(store, workflow, workflow_id, worker_id: "timer-resume")
+    row = store.workflow(workflow_id)
+    run_at = row["next_run_at"]
+    make_workflow_timer_due(store, workflow_id, at: run_at) if run_at
+    with_store_current_time(store, run_at) do
+      Durababble::Engine.new(store:, worker_id:).resume(workflow, workflow_id:)
+    end
+  end
+
+  #: (untyped, String, at: Object?) -> void
+  def make_workflow_timer_due(store, workflow_id, at:)
+    store.make_workflow_due!(workflow_id, now: Time.now)
+  end
+
+  #: (untyped, Object?) { -> untyped } -> untyped
+  def with_store_current_time(store, now)
+    return yield unless now
+
+    original_current_time = store.method(:current_time)
+    store.define_singleton_method(:current_time) { now }
+    yield
+  ensure
+    store.define_singleton_method(:current_time) { original_current_time.call } if original_current_time
+  end
+
   #: () -> String
   def schema
     @durababble_schema || Kernel.raise("Durababble schema has not been configured for this test")

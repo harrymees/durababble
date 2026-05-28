@@ -118,8 +118,23 @@ module Durababble
           workflow_ids = workflows.map do |name, id, input|
             [name, h.store.enqueue_workflow(name:, input:, id:)]
           end.to_h
+          terminal_statuses = ["completed", "failed", "canceled", "terminated"].freeze
 
           h.add_workers(["shape-worker-a", "shape-worker-b", "shape-worker-c"], ticks: 36, crash_percent: 10)
+
+          resume_generated_workflow = lambda do |actor, workflow_name, workflow_id|
+            row = h.store.workflow(workflow_id)
+            return if terminal_statuses.include?(row.fetch("status"))
+
+            resume_workflow_once(
+              h,
+              actor:,
+              workflow: h.workflows.fetch(workflow_name),
+              workflow_id:,
+              lease_seconds: 30,
+              yield_event: "generated_timer_resume_yield",
+            )
+          end
 
           h.scheduler.schedule(actor: "shape-client", delay: 5 + h.scheduler.rng.int(20), name: "signal_command_wait") do
             h.store.enqueue_workflow_command(
@@ -179,15 +194,14 @@ module Durababble
             h.scheduler.schedule(actor: "shape-command-worker-#{i}", delay: 20 + i * 18 + h.scheduler.rng.int(8), name: "deliver_commands") do
               deliver_commands.call("shape-command-worker-#{i}")
             end
-            h.scheduler.schedule(actor: "shape-timer-#{i}", delay: 35 + i * 20, name: "wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time + 90)
+            h.scheduler.schedule(actor: "shape-timer-#{i}", delay: 35 + i * 20, name: "claim_due_workflows") do
+              workflow_ids.each { |workflow_name, workflow_id| resume_generated_workflow.call("shape-timer-#{i}", workflow_name, workflow_id) }
             end
             h.scheduler.schedule(actor: "shape-reaper-#{i}", delay: 30 + i * 20, name: "steal_expired") do
               h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
             end
           end
 
-          terminal_statuses = ["completed", "failed", "canceled", "terminated"].freeze
           final_resume = lambda do |worker_id, workflow_name, workflow_id|
             return if terminal_statuses.include?(h.store.workflow(workflow_id).fetch("status"))
 
@@ -215,8 +229,8 @@ module Durababble
             h.store.request_workflow_termination(workflow_id: workflow_ids.fetch("generated-terminating"), reason: "generated terminate")
           end
           [230, 255, 280, 305].each_with_index do |delay, index|
-            h.scheduler.schedule(actor: "shape-final-timer-#{index}", delay:, name: "final_wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time + 1000)
+            h.scheduler.schedule(actor: "shape-final-timer-#{index}", delay:, name: "final_claim_due_workflows") do
+              workflow_ids.each { |workflow_name, workflow_id| resume_generated_workflow.call("shape-final-timer-#{index}", workflow_name, workflow_id) }
             end
             h.scheduler.schedule(actor: "shape-final-command-worker-#{index}", delay: delay + 5, name: "final_deliver_commands") do
               deliver_commands.call("shape-final-command-worker-#{index}")

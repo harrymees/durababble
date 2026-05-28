@@ -13,12 +13,12 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
       @termination_requests = 0
     end
 
-    def suspend_workflow(workflow_id:, worker_id: nil)
+    def suspend_workflow(workflow_id:, worker_id: nil, next_run_at: nil)
       if @termination_requests.zero?
         @termination_requests += 1
         @store.request_workflow_termination(workflow_id:, reason: @reason)
       end
-      @store.suspend_workflow(workflow_id:, worker_id:)
+      @store.suspend_workflow(workflow_id:, worker_id:, next_run_at:)
     end
 
     def method_missing(method_name, *args, **kwargs, &block)

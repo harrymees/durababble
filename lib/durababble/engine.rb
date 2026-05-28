@@ -117,8 +117,8 @@ module Durababble
         drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:)
         snapshot(workflow_id)
       end
-    rescue WorkflowSuspended
-      persist_workflow_suspension(workflow_id)
+    rescue WorkflowSuspended => e
+      persist_workflow_suspension(workflow_id, next_run_at: e.next_run_at)
     rescue StepRetryScheduled
       snapshot(workflow_id)
     rescue LeaseConflict
@@ -207,9 +207,9 @@ module Durababble
     end
 
     #: (untyped) -> untyped
-    def persist_workflow_suspension(workflow_id)
+    def persist_workflow_suspension(workflow_id, next_run_at: nil)
       suspended = WorkflowDeterminism.allow_host_operations do
-        @store.suspend_workflow(workflow_id:, worker_id: @worker_id)
+        @store.suspend_workflow(workflow_id:, worker_id: @worker_id, next_run_at:)
       end
       unless suspended
         row = WorkflowDeterminism.allow_host_operations { @store.workflow(workflow_id) }

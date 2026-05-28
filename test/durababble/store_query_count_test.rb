@@ -76,7 +76,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         wait_workflow = store.create_workflow(name: "query-count-record-wait", input: {})
         store.record_step_started(workflow_id: wait_workflow, command_id: 0, name: "timer")
-        wait_id = assert_sql_query_budget("record_wait", mysql: 6, postgres: 6) do
+        wait_id = assert_sql_query_budget("record_wait", mysql: 5, postgres: 5) do
           store.record_wait(
             workflow_id: wait_workflow,
             command_id: 0,
@@ -86,20 +86,6 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
           )
         end
         refute_nil wait_id
-
-        due_workflow = store.create_workflow(name: "query-count-wake-timer", input: {})
-        store.record_step_started(workflow_id: due_workflow, command_id: 0, name: "timer")
-        store.record_wait(
-          workflow_id: due_workflow,
-          command_id: 0,
-          name: "timer",
-          wait_request: Durababble.wait_until(Time.utc(2026, 1, 1, 0, 0, 0), { "timer" => true }),
-        )
-        completed = assert_sql_query_budget("wake_due_timers", mysql: 9, postgres: 8) do
-          store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 1))
-        end
-        assert_equal 1, completed
-        assert_hash_includes store.workflow(due_workflow), "status" => "pending"
       end
     end
 

@@ -417,8 +417,8 @@ module Durababble
             h.scheduler.schedule(actor: "generated-reaper-#{i}", delay: 28 + i * 22, name: "steal_expired") do
               h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
             end
-            h.scheduler.schedule(actor: "generated-timer-#{i}", delay: 40 + i * 20, name: "wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time + 140)
+            h.scheduler.schedule(actor: "generated-timer-#{i}", delay: 40 + i * 20, name: "claim_due_wait_primer") do
+              resume_workflow_once(h, actor: "generated-timer-#{i}", workflow: wait_workflow, workflow_id: wait_workflow_id)
             end
           end
 
@@ -447,8 +447,8 @@ module Durababble
             h.scheduler.schedule(actor: "generated-final-reaper-#{index}", delay:, name: "final_steal_expired") do
               h.store.steal_expired_leases!(now: h.scheduler.time + Engine::DEFAULT_LEASE_SECONDS + 1)
             end
-            h.scheduler.schedule(actor: "generated-final-timer-#{index}", delay: delay + 2, name: "final_wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time + 1000)
+            h.scheduler.schedule(actor: "generated-final-timer-#{index}", delay: delay + 2, name: "final_claim_due_wait_primer") do
+              resume_workflow_once(h, actor: "generated-final-timer-#{index}", workflow: wait_workflow, workflow_id: wait_workflow_id)
             end
             h.scheduler.schedule(actor: "generated-final-command-worker-#{index}", delay: delay + 4, name: "final_drain_commands") do
               drain_commands.call("generated-final-command-worker-#{index}", 30)

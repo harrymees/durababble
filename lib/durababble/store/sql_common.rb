@@ -103,6 +103,97 @@ module Durababble
       end
     end
 
+    #: (Hash[String, Object?]) -> Hash[String, Object?]?
+    def wait_row_from_history_event(event)
+      command_id = event["command_id"]
+      return unless command_id
+
+      wait = wait_payload_from_history_event(event)
+      return unless wait
+
+      command_id = command_id.to_i
+      status = case event.fetch("kind")
+      when "step_waiting"
+        "pending"
+      when "step_completed"
+        "completed"
+      when "step_canceled", "step_failed"
+        "canceled"
+      else
+        return
+      end
+      {
+        "id" => "#{event.fetch("workflow_id")}:#{command_id}",
+        "workflow_id" => event.fetch("workflow_id"),
+        "position" => command_id,
+        "command_id" => command_id,
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => wait["context"] || event["payload"],
+        "payload" => status == "completed" ? event["payload"] : nil,
+        "status" => status,
+        "created_at" => event["created_at"],
+        "completed_at" => status == "pending" ? nil : event["created_at"],
+      }
+    end
+
+    #: (Hash[String, Object?]) -> Hash[String, Object?]?
+    def wait_payload_from_history_event(event)
+      payload = event["payload"]
+      return unless payload.is_a?(Hash)
+
+      if payload["wait"].is_a?(Hash)
+        wait = payload.fetch("wait") #: as untyped
+        return {
+          "kind" => wait["kind"],
+          "event_key" => wait["event_key"],
+          "wake_at" => wait["wake_at"],
+          "context" => payload["context"] || wait["context"],
+        }
+      end
+
+      waiting_event = workflow_history_for(event.fetch("workflow_id")).find do |candidate|
+        candidate.fetch("kind") == "step_waiting" && candidate["command_id"].to_i == event["command_id"].to_i
+      end
+      waiting_payload = waiting_event&.fetch("payload", nil)
+      if waiting_payload.is_a?(Hash) && waiting_payload["wait"].is_a?(Hash)
+        wait = waiting_payload.fetch("wait") #: as untyped
+        return {
+          "kind" => wait["kind"],
+          "event_key" => wait["event_key"],
+          "wake_at" => wait["wake_at"],
+          "context" => waiting_payload["context"] || wait["context"],
+        }
+      end
+
+      scheduled = workflow_history_for(event.fetch("workflow_id")).find do |candidate|
+        candidate.fetch("kind") == "step_scheduled" && candidate["command_id"].to_i == event["command_id"].to_i
+      end
+      scheduled_payload = scheduled&.fetch("payload", nil)
+      wait = scheduled_payload["wait"] if scheduled_payload.is_a?(Hash)
+      return unless wait.is_a?(Hash)
+
+      {
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => payload,
+      }
+    end
+
+    #: (WaitRequest) -> Hash[String, Object?]
+    def wait_payload(wait_request)
+      {
+        "context" => wait_request.context,
+        "wait" => {
+          "kind" => wait_request.kind,
+          "event_key" => wait_request.event_key,
+          "wake_at" => wait_request.wake_at,
+        },
+      }
+    end
+
     #: (String) -> Hash[String, Object?]
     def workflow(workflow_id)
       row = execute_store_query(:workflow, [workflow_id]).first
@@ -157,11 +248,6 @@ module Durababble
       total = 0
       timestamp = timestamp_or_nil(now) || now
       loop do
-        completed = complete_timer_waits(timestamp, batch_size)
-        total += completed
-        break if completed < batch_size
-      end
-      loop do
         completed = complete_object_wakeups(timestamp, batch_size)
         total += completed
         break if completed < batch_size
@@ -169,21 +255,23 @@ module Durababble
       total
     end
 
-    # Flip every workflow whose timer just fired back to pending in a single statement.
-    # Called once per wake batch instead of once per wait to avoid an N+1 of single-row UPDATEs.
-    #: (Array[Hash[String, Object?]]) -> void
-    def mark_waits_workflows_pending(waits)
-      workflow_ids = waits.map { |wait| wait.fetch("workflow_id") }.uniq
-      return if workflow_ids.empty?
-
-      placeholders = workflow_ids.each_index.map { |index| placeholder(index + 1) }.join(", ")
-      execute_store_query(:mark_waits_workflows_pending, workflow_ids, placeholders:)
-    end
-
     #: (String) -> Array[Hash[String, Object?]]
     def waits_for(workflow_id)
-      execute_store_query(:waits_for_workflow, [workflow_id])
-        .map { |row| decode_row(row) }
+      rows = {}
+      step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_i, step.fetch("status")] }
+      workflow_history_for(workflow_id).each do |event|
+        row = wait_row_from_history_event(event)
+        next unless row
+
+        if row.fetch("status") == "pending" && step_statuses[row.fetch("command_id").to_i] == "canceled"
+          row = row.merge(
+            "status" => "canceled",
+            "completed_at" => nil,
+          )
+        end
+        rows[row.fetch("id")] = row
+      end
+      rows.values.sort_by { |row| row.fetch("position").to_i }
     end
 
     #: (String) -> Hash[String, Object?]?
@@ -676,7 +764,7 @@ module Durababble
 
     # Terminal workflow writes have one shared postcondition: if the update was
     # made by a leased worker it must still own the row, and the workflow must
-    # not strand live waits, steps, or attempts after becoming terminal. The
+    # not strand live waiting steps or attempts after becoming terminal. The
     # `failure_error` lets fail_workflow terminalize live steps/attempts as
     # "failed" (carrying the workflow's own error) while cancel/complete leave
     # them as "canceled".
@@ -696,26 +784,22 @@ module Durababble
 
     #: (String) -> Object?
     def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
     end
 
     #: (String) -> Object?
     def cancel_live_workflow_dependents(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
     end
 
-    # Terminalize live waits/steps/attempts on workflow failure. A step that was
+    # Terminalize live waiting steps/attempts on workflow failure. A step that was
     # actively running observed the failure and is marked 'failed' with the
     # workflow's error. Scheduled/waiting steps never observed it and are
-    # canceled, matching how an abandoned parked branch lands. Pending waits are
-    # canceled because a wait has no failure semantics.
+    # canceled, matching how an abandoned parked branch lands.
     #: (String, String) -> Object?
     def fail_live_workflow_dependents(workflow_id, error)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_fail_live_steps_for_workflow(workflow_id, error)
       execute_fail_live_step_attempts_for_workflow(workflow_id, error)
       # cancel_live_*_for_workflow filter on 'scheduled'/'waiting' (and 'running'
@@ -914,11 +998,6 @@ module Durababble
 
     #: (Time?) -> String?
     def timestamp_or_nil(time)
-      raise NotImplementedError
-    end
-
-    #: (Object?, Integer) -> Integer
-    def complete_timer_waits(now, batch_size)
       raise NotImplementedError
     end
 

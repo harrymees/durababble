@@ -10,7 +10,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
     test "ports a Temporal-style order workflow with activity retry and durable timer with #{backend.name}" do
       with_temporal_example_store(backend, "temporal_order") do |store|
         attempts = Hash.new(0)
-        wake_at = Time.utc(2026, 1, 1, 0, 0, 0)
+        wake_at = Time.now + 3600
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "temporal-order-fulfillment"
 
@@ -63,8 +63,8 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal 0, store.wake_due_timers(now: wake_at - 1)
 
-        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-        assert_equal :worked, worker.tick
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
+        assert_equal :worked, with_store_current_time(store, wake_at + 1) { worker.tick }
 
         result = store.workflow(workflow_id).fetch("result")
         assert_hash_includes(

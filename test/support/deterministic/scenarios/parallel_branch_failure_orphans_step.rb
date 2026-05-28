@@ -51,10 +51,10 @@ module Durababble
             h.scheduler.trace.event(h.scheduler.time, "worker-a", "resume_lease_conflict", id:)
           end
 
-          # A timer fires well after the failure; it must not resurrect the terminal
-          # workflow, and the wait it touches must already be terminalized.
-          h.scheduler.schedule(actor: "timer", delay: 50, name: "wake_due_timers") do
-            h.store.wake_due_timers(now: h.store.current_time + 4000)
+          # A late resume attempt must not resurrect the terminal workflow, and
+          # the wait it would have touched must already be terminalized.
+          h.scheduler.schedule(actor: "late-worker", delay: 50, name: "late_resume") do
+            resume_workflow_once(h, actor: "late-worker", workflow:, workflow_id: id)
           end
 
           h.check("workflow lands terminal failed") do

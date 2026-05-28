@@ -499,7 +499,6 @@ class DurababbleStoreTest < DurababbleTestCase
       assert_includes columns, ["steps", "result", "bytea"]
       assert_includes columns, ["steps", "heartbeat_cursor", "bytea"]
       assert_includes columns, ["step_attempts", "heartbeat_cursor", "bytea"]
-      assert_includes columns, ["waits", "context", "bytea"]
       assert_includes columns, ["outbox", "payload", "bytea"]
       refute columns.any? { |column| column.include?("jsonb") }
 
@@ -526,9 +525,6 @@ class DurababbleStoreTest < DurababbleTestCase
 
       assert_includes indexes, "workflows_claim_idx"
       assert_includes indexes, "workflows_expired_lease_idx"
-      assert_includes indexes, "waits_event_pending_idx"
-      assert_includes indexes, "waits_timer_pending_idx"
-      assert_includes indexes, "waits_workflow_created_idx"
       assert_includes indexes, "step_attempts_workflow_started_position_idx"
       assert_includes indexes, "step_attempts_workflow_position_status_started_idx"
       assert_includes indexes, "outbox_claim_idx"

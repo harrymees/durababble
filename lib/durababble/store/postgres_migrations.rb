@@ -82,21 +82,6 @@ module Durababble
         )
       SQL
       execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("waits")} (
-          id text PRIMARY KEY,
-          workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
-          position integer NOT NULL,
-          kind text NOT NULL,
-          event_key text,
-          wake_at timestamptz,
-          context bytea NOT NULL,
-          payload bytea,
-          status text NOT NULL,
-          created_at timestamptz NOT NULL DEFAULT now(),
-          completed_at timestamptz
-        )
-      SQL
-      execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("fences")} (
           workflow_id text NOT NULL REFERENCES #{table("workflows")}(id) ON DELETE CASCADE,
           key text NOT NULL,
@@ -225,10 +210,6 @@ module Durababble
       create_postgres_index("workflows_claim_idx", "ON #{table("workflows")} (worker_pool ASC, (#{StoreQueries::POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("workflows_expired_lease_idx", "ON #{table("workflows")} (worker_pool ASC, status ASC, locked_until ASC)")
       create_postgres_index("workflow_history_command_idx", "ON #{table("workflow_history")} (workflow_id, command_id, event_index)")
-      create_postgres_index("waits_event_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, event_key ASC, created_at ASC)")
-      create_postgres_index("waits_timer_pending_idx", "ON #{table("waits")} (status ASC, kind ASC, wake_at ASC, created_at ASC)")
-      create_postgres_index("waits_workflow_created_idx", "ON #{table("waits")} (workflow_id ASC, created_at ASC)")
-      create_postgres_index("waits_workflow_status_idx", "ON #{table("waits")} (workflow_id ASC, status ASC)")
       create_postgres_index("object_wakeups_due_idx", "ON #{table("object_wakeups")} (wake_at ASC, created_at ASC)")
       create_postgres_index("step_attempts_workflow_started_position_idx", "ON #{table("step_attempts")} (workflow_id ASC, started_at ASC, position ASC)")
       create_postgres_index("step_attempts_workflow_position_status_started_idx", "ON #{table("step_attempts")} (workflow_id ASC, position ASC, status ASC, started_at DESC)")

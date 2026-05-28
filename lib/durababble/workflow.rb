@@ -39,7 +39,16 @@ module Durababble
   end
 
   class StepRetryScheduled < Error; end
-  class WorkflowSuspended < Error; end
+  class WorkflowSuspended < Error
+    #: Object?
+    attr_reader :next_run_at
+
+    #: (?String, ?next_run_at: Object?) -> void
+    def initialize(message = "workflow suspended", next_run_at: nil)
+      @next_run_at = next_run_at
+      super(message)
+    end
+  end
   class WorkflowCommandDelivered < Error; end
 
   class Workflow

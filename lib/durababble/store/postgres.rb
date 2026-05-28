@@ -89,9 +89,9 @@ module Durababble
       result.affected_rows.to_i == 1 ? result : nil
     end
 
-    #: (workflow_id: String, ?worker_id: String?) -> bool
-    def suspend_workflow(workflow_id:, worker_id: nil)
-      result = execute_store_query(:suspend_workflow, [workflow_id, worker_id])
+    #: (workflow_id: String, ?worker_id: String?, ?next_run_at: Object?) -> bool
+    def suspend_workflow(workflow_id:, worker_id: nil, next_run_at: nil)
+      result = execute_store_query(:suspend_workflow, [workflow_id, worker_id, timestamp_or_nil(next_run_at)])
       return true if result.affected_rows == 1
 
       WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
@@ -316,17 +316,15 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, dump_serialized(wait_request.context)])
-        wait_id = SecureRandom.uuid
-        execute_store_query(:insert_wait, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, timestamp_or_nil(wait_request.wake_at), dump_serialized(wait_request.context)])
         update_latest_attempt(workflow_id:, command_id:, status: "waiting", result: wait_request.context, error: nil)
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_payload(wait_request))
+        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:, next_run_at: next_run_at || wait_request.wake_at)
           raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
         end
 
@@ -338,7 +336,7 @@ module Durababble
           "durababble.wait.kind" => wait_request.kind,
           "durababble.wait.event_key" => wait_request.event_key,
         )
-        wait_id
+        "#{workflow_id}:#{command_id}"
       end
     end
 
@@ -486,7 +484,6 @@ module Durababble
     #: (String, error: String) -> void
     def terminate_workflow_dependents(workflow_id, error:)
       # Called only while request_workflow_termination holds the workflow row lock inside a transaction.
-      execute_store_query(:terminate_workflow_waits, [workflow_id])
       execute_store_query(:terminate_workflow_steps, [workflow_id, error])
       execute_store_query(:terminate_workflow_step_attempts, [workflow_id, error])
       execute_store_query(:terminate_workflow_inbox, [workflow_id, error])
@@ -647,18 +644,6 @@ module Durababble
     end
 
     #: (Time, Integer) -> Integer
-    def complete_timer_waits(now, batch_size)
-      # [DURABABBLE-WAIT-1] Locked wait completion ensures concurrent wakeups observe one winner,
-      # so each due wait produces at most one durable wake event.
-      completed = transaction do
-        returning = execute_store_query(:complete_timer_waits, [now, dump_serialized({}), batch_size])
-        finish_completed_waits(returning, {})
-      end
-      completed = completed #: as Integer
-      completed
-    end
-
-    #: (Time, Integer) -> Integer
     def complete_object_wakeups(now, batch_size)
       completed = transaction do
         wakeups = execute_store_query(:due_object_wakeups, [now, batch_size]).map { |row| decode_row(row) }
@@ -667,20 +652,6 @@ module Durababble
       completed = completed #: as Integer
       report_object_wakeups_completed(completed)
       completed
-    end
-
-    #: (Object, Hash[String, Object?]) -> Integer
-    def finish_completed_waits(returning, payload)
-      returning = returning #: as untyped
-      rows = returning.map { |row| decode_row(row) }
-      rows.each do |wait|
-        record_wait_latency(wait)
-        context = wait.fetch("context").merge(payload)
-        record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-      end
-      mark_waits_workflows_pending(rows)
-      Observability.count("durababble.waits.completed", by: rows.length)
-      rows.length
     end
 
     #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?

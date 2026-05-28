@@ -19,7 +19,7 @@ module Durababble
 
     #: () -> Object?
     def drop_schema!
-      ["target_activations", "inbox", "mailbox_sequences", "object_wakeups", "durable_objects", "waits", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute_store_query(:drop_table, [], table_name: name) }
+      ["target_activations", "inbox", "mailbox_sequences", "object_wakeups", "durable_objects", "outbox", "fences", "step_attempts", "steps", "workflow_history", "workflows"].each { |name| execute_store_query(:drop_table, [], table_name: name) }
       @migrated = false
     end
 
@@ -114,9 +114,9 @@ module Durababble
       result.affected_rows.to_i == 1 ? result : nil
     end
 
-    #: (workflow_id: String, ?worker_id: String?) -> bool
-    def suspend_workflow(workflow_id:, worker_id: nil)
-      result = execute_store_query(:suspend_workflow, [workflow_id, workflow_id, worker_id, worker_id])
+    #: (workflow_id: String, ?worker_id: String?, ?next_run_at: Object?) -> bool
+    def suspend_workflow(workflow_id:, worker_id: nil, next_run_at: nil)
+      result = execute_store_query(:suspend_workflow, [next_run_at, next_run_at, workflow_id, worker_id, worker_id])
       return true if result.affected_rows == 1
 
       WorkflowStatus.suspended_or_runnable?(workflow(workflow_id))
@@ -124,7 +124,7 @@ module Durababble
 
     #: (String, ?now: Time) -> Object?
     def make_workflow_due!(workflow_id, now: Time.now)
-      execute_store_query(:make_workflow_due, [now, workflow_id])
+      execute_store_query(:make_workflow_due, [now, now, workflow_id])
     end
 
     #: (workflow_id: String, reason: String) -> Object?
@@ -293,7 +293,7 @@ module Durababble
         update = if worker_id
           execute_store_query(:complete_workflow_with_worker, [serialized_result, workflow_id, worker_id])
         else
-          execute_store_query(:complete_workflow, [serialized_result, workflow_id, workflow_id, workflow_id, workflow_id])
+          execute_store_query(:complete_workflow, [serialized_result, workflow_id, workflow_id, workflow_id])
         end
         require_workflow_completion_update!(update, workflow_id:, worker_id:)
         cancel_live_workflow_dependents(workflow_id)
@@ -385,15 +385,13 @@ module Durababble
       result
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         serialized_context = dump_serialized(wait_request.context)
         execute_store_query(:upsert_waiting_step, [workflow_id, command_id, name, serialized_context])
-        wait_id = SecureRandom.uuid
-        execute_store_query(:insert_wait, [wait_id, workflow_id, command_id, wait_request.kind, wait_request.event_key, wait_request.wake_at, dump_serialized(wait_request.context)])
         update_latest_attempt_serialized(
           workflow_id:,
           command_id:,
@@ -401,8 +399,8 @@ module Durababble
           serialized_result: serialized_context,
           error: nil,
         )
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_request.context)
-        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_payload(wait_request))
+        if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:, next_run_at: next_run_at || wait_request.wake_at)
           raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
         end
 
@@ -414,7 +412,7 @@ module Durababble
           "durababble.wait.kind" => wait_request.kind,
           "durababble.wait.event_key" => wait_request.event_key,
         )
-        wait_id
+        "#{workflow_id}:#{command_id}"
       end
     end
 
@@ -535,7 +533,6 @@ module Durababble
     #: (String, error: String) -> void
     def terminate_workflow_dependents(workflow_id, error:)
       # Called only while request_workflow_termination holds the workflow row lock inside a transaction.
-      execute_store_query(:terminate_workflow_waits, [workflow_id])
       execute_store_query(:terminate_workflow_steps, [error, workflow_id])
       execute_store_query(:terminate_workflow_step_attempts, [error, workflow_id])
       execute_store_query(:terminate_workflow_inbox, [error, workflow_id])
@@ -687,16 +684,6 @@ module Durababble
     end
 
     #: (Time, Integer) -> Integer
-    def complete_timer_waits(now, batch_size)
-      completed = transaction(isolation: :read_committed) do
-        waits = execute_store_query(:complete_timer_waits, [now], limit: batch_size).map { |row| decode_row(row) }
-        finish_completed_waits(waits, {})
-      end
-      completed = completed #: as Integer
-      completed
-    end
-
-    #: (Time, Integer) -> Integer
     def complete_object_wakeups(now, batch_size)
       completed = transaction(isolation: :read_committed) do
         wakeups = execute_store_query(:due_object_wakeups, [now], limit: batch_size).map { |row| decode_row(row) }
@@ -705,20 +692,6 @@ module Durababble
       completed = completed #: as Integer
       report_object_wakeups_completed(completed)
       completed
-    end
-
-    #: (Array[Hash[String, Object?]], Hash[String, Object?]) -> Integer
-    def finish_completed_waits(waits, payload)
-      waits.each do |wait|
-        wait = wait #: as untyped
-        execute_store_query(:complete_wait, [dump_serialized(payload), wait.fetch("id")])
-        record_wait_latency(wait)
-        context = wait.fetch("context").merge(payload)
-        record_step_completed_without_transaction(workflow_id: wait.fetch("workflow_id"), command_id: wait.fetch("position").to_i, result: context)
-      end
-      mark_waits_workflows_pending(waits)
-      Observability.count("durababble.waits.completed", by: waits.length)
-      waits.length
     end
 
     #: (String) -> untyped

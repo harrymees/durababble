@@ -45,6 +45,7 @@ module Durababble
           queue_available_at INTEGER GENERATED ALWAYS AS (
             CASE
               WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'waiting' AND next_run_at IS NOT NULL THEN next_run_at
               WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
               WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
               ELSE NULL
@@ -138,26 +139,6 @@ module Durababble
           ) STORED,
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
-      SQL
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("waits")} (
-          id TEXT PRIMARY KEY,
-          workflow_id TEXT NOT NULL,
-          position INTEGER NOT NULL,
-          kind TEXT NOT NULL,
-          event_key TEXT,
-          wake_at INTEGER,
-          context BLOB NOT NULL,
-          payload BLOB,
-          status TEXT NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT (dura_now()),
-          completed_at INTEGER,
-          FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
-        )
-      SQL
-      execute(<<~SQL)
-        CREATE INDEX IF NOT EXISTS #{index_name("waits", "timer_pending")}
-        ON #{table("waits")} (status, kind, wake_at, created_at)
       SQL
       execute(<<~SQL)
         CREATE TABLE IF NOT EXISTS #{table("durable_objects")} (

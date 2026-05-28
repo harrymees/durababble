@@ -25,8 +25,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["step_scheduled", "step_waiting"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "direct-resume").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "direct-resume")
 
         assert_equal "completed", completed.status
         assert_equal({ "id" => "sleep", "slept" => true, "done" => true }, completed.result)
@@ -37,7 +36,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
     test "sleep_until waits can recover after crashing after wait persistence with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_timer_crash") do |store|
         store.migrate!
-        wake_at = Time.utc(2026, 4, 1, 12, 0, 0)
+        wake_at = Time.now + 3600
         workflow = Class.new(Durababble::Workflow) do
           workflow_name "direct-sleep-until-crash"
 
@@ -59,8 +58,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "locked_by" => nil
         assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
 
-        assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-        recovered = Durababble::Engine.new(store:, worker_id: "direct-recover").resume(workflow, workflow_id:)
+        recovered = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "direct-recover")
 
         assert_equal "completed", recovered.status
         assert_equal({ "id" => "timer", "slept" => true, "done" => true }, recovered.result)
@@ -113,8 +111,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         waiting = Durababble::Engine.new(store:, worker_id: "condition-wait").resume(workflow, workflow_id:)
         assert_equal "waiting", waiting.status
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 2)
-        completed = Durababble::Engine.new(store:, worker_id: "condition-resume").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "condition-resume")
 
         assert_equal "completed", completed.status
         assert_equal({ "ready" => true, "checks" => 2 }, completed.result)
@@ -141,8 +138,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         waiting = Durababble::Engine.new(store:, worker_id: "condition-poll-wait").resume(workflow, workflow_id:)
         assert_equal "waiting", waiting.status
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 2)
-        completed = Durababble::Engine.new(store:, worker_id: "condition-poll-resume").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "condition-poll-resume")
 
         assert_equal "completed", completed.status
         assert_equal({ "ready" => true, "checks" => 2 }, completed.result)
@@ -179,12 +175,56 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
           store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }.sort_by(&:first),
         )
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = Durababble::Engine.new(store:, worker_id: "async-resume").resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "async-resume")
 
         assert_equal "completed", completed.status
         assert_equal [{ "id" => "async", "released" => true }, { "sibling" => "async" }], completed.result
       end
     end
+
+    test "concurrent direct timer waits keep the earliest unresolved wake on the workflow row with #{backend.name}" do
+      with_durababble_store(backend, "workflow_wait_parallel_timers") do |store|
+        store.migrate!
+        early = Time.now + 3600
+        late = Time.now + 7200
+        workflow = Class.new(Durababble::Workflow) do
+          workflow_name "direct-wait-parallel-timers"
+
+          define_method(:execute) do |input|
+            Async do |task|
+              late_wait = task.async { sleep_until(late, input.merge("timer" => "late")) }
+              early_wait = task.async { sleep_until(early, input.merge("timer" => "early")) }
+              [late_wait.wait, early_wait.wait]
+            end.wait
+          end
+        end
+        workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "parallel" })
+
+        waiting = Durababble::Engine.new(store:, worker_id: "parallel-wait").resume(workflow, workflow_id:)
+
+        assert_equal "waiting", waiting.status
+        assert_in_delta early.to_f, timestamp_value(store.workflow(workflow_id).fetch("next_run_at")).to_f, 1
+        assert_equal ["pending", "pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+
+        still_waiting = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "parallel-early")
+
+        assert_equal "waiting", still_waiting.status
+        assert_in_delta late.to_f, timestamp_value(store.workflow(workflow_id).fetch("next_run_at")).to_f, 1
+        statuses_by_timer = store.waits_for(workflow_id).to_h { |wait| [wait.fetch("context").fetch("timer"), wait.fetch("status")] }
+        assert_equal({ "early" => "completed", "late" => "pending" }, statuses_by_timer)
+
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "parallel-late")
+
+        assert_equal "completed", completed.status
+        assert_equal [{ "id" => "parallel", "timer" => "late" }, { "id" => "parallel", "timer" => "early" }], completed.result
+        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+      end
+    end
+  end
+
+  def timestamp_value(value)
+    return value if value.is_a?(Time)
+
+    Time.parse(value.to_s)
   end
 end
