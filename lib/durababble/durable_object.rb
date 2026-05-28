@@ -390,7 +390,7 @@ module Durababble
     # Tunables for `open_pulled_object_stream` (consumer-side activation pull).
     # The initial poll interval is tight (25ms) so the consumer catches a
     # worker's short-lived activation lease on an empty inbox; it then backs off
-    # exponentially (×2) up to a 0.5s cap, with full jitter, so a crowd of
+    # exponentially (×2) up to a 0.5s cap, with jitter, so a crowd of
     # consumers waiting on the same unowned object de-synchronizes instead of
     # hammering `current_object_lease` in lockstep. The re-upsert interval is
     # ~10× the typical worker target-activation poll so a freshly-completed
@@ -627,12 +627,9 @@ module Durababble
             "no worker established ownership of #{object_type}/#{object_id} within #{STREAM_PULL_TIMEOUT}s"
         end
 
-        # Back off exponentially (jittered) so a crowd of consumers waiting on
-        # the same unowned object spreads its `current_object_lease` polls out
-        # instead of hammering in lockstep. Never sleep past the deadline.
         attempt += 1
         delay = Backoff.exponential(attempt, step: STREAM_PULL_POLL_INTERVAL, factor: STREAM_PULL_POLL_BACKOFF_FACTOR, max: STREAM_PULL_POLL_MAX_INTERVAL)
-        sleep(delay.clamp(0.0, deadline - Time.now))
+        sleep(delay.clamp(0.0, [deadline - Time.now, 0.0].max))
       end
     end
 
