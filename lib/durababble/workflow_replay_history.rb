@@ -10,6 +10,33 @@ module Durababble
     TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled", "step_failed"].freeze
     WORKFLOW_COMMAND_KINDS = ["workflow_command_completed", "workflow_command_failed"].freeze
 
+    class << self
+      # The next physical event_index to append after the given history: one past
+      # the highest recorded index, or 0 when empty. The lease holder allocates
+      # from here so appends are a single plain insert; hot-path reports and
+      # query-count tests call it to mirror that allocation exactly.
+      #
+      # workflow_history_for loads rows ORDER BY event_index, so the last indexed
+      # row holds the highest index; scan back to it instead of over the whole
+      # array. In production every row carries an index, so the first step finds it
+      # (O(1)); the loop only walks past trailing rows in the legacy/synthetic case
+      # where some events lack a persisted index. This is deliberately last+1, not
+      # events.length: a failed append still advances the in-memory counter (see
+      # allocate_event_index!), so a committed append can leave a hole in the
+      # persisted indexes (e.g. a step's completion write fails transiently and a
+      # failure row commits at the next index instead). length would then return an
+      # index that already exists and collide on the (workflow_id, event_index) PK
+      # after reload.
+      #: (Array[Hash[String, Object?]]) -> Integer
+      def next_event_index_after(events)
+        events.reverse_each do |event|
+          index = event["event_index"]
+          return index.to_s.to_i + 1 if index
+        end
+        0
+      end
+    end
+
     #: Integer
     attr_reader :event_count
 
@@ -24,6 +51,10 @@ module Durababble
       @consumed_event_indexes = {}
       @resolution_index = 0
       events.each { |event| index_event(event) }
+      # Distinct from @event_count, which is a coarse size budget (it reserves
+      # ahead and counts remembered-but-unwritten events); the physical PK
+      # sequence must come from here, advanced only by allocate_event_index!.
+      @next_event_index = self.class.next_event_index_after(events)
       @terminal_events = @terminal.values.sort_by { |event| event.fetch("event_index").to_i }
       @workflow_command_events.sort_by! { |event| event.fetch("event_index").to_i }
       # Scheduled events remembered mid-replay carry no "event_index", so the set of
@@ -110,6 +141,19 @@ module Durababble
     #: (Integer) -> void
     def reserve_events!(count)
       @event_count += count
+    end
+
+    # Hand out the next physical event_index for a workflow_history append and
+    # advance the counter. Callers must invoke this inside synchronize_store so
+    # allocation order matches the order appends hit the store, mirroring the
+    # legacy SQL MAX(event_index)+1 path it replaces. A rolled-back or skipped
+    # append leaves a harmless gap: replay orders by event_index and relies on
+    # PK uniqueness, not contiguity.
+    #: () -> Integer
+    def allocate_event_index!
+      index = @next_event_index
+      @next_event_index += 1
+      index
     end
 
     #: (workflow_id: String, next_command_id: Integer) -> void

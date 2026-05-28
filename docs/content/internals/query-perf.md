@@ -15,3 +15,5 @@ The docs publishing path regenerates these MySQL hot-path reports before Hugo bu
 - [Claim outbox](/query-perf/claim_outbox.html) traces the unified outbox queue probe and lease update used by sender claims.
 - [Worker poll idle](/query-perf/worker_poll_idle.html) traces one worker tick when no matching workflow work is available.
 - [Worker tick claim](/query-perf/worker_tick_claim.html) traces one worker tick that claims and completes a workflow.
+- [Record step started](/query-perf/record_step_started.html) traces the durable workflow-history append when a leased worker starts a step.
+- [Record step completed](/query-perf/record_step_completed.html) traces the durable workflow-history append when a leased worker completes a step.

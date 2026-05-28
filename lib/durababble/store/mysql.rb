@@ -180,7 +180,12 @@ module Durababble
 
         execute_store_query(:terminate_workflow, [dump_serialized(nil), error, workflow_id])
         terminate_workflow_dependents(workflow_id, error:)
-        append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error })
+        # Admin termination is rare and has no replayed history in memory, so
+        # read back the next index (one indexed row, not the whole history)
+        # under the lock we already hold here rather than forcing every hot-path
+        # caller to pay for a SQL read-back.
+        termination_index = next_workflow_history_index_for(workflow_id)
+        append_workflow_history_without_transaction(workflow_id:, kind: "workflow_terminated", payload: { "reason" => error }, event_index: termination_index)
         wake_parent_workflow_if_child_terminal(workflow_id)
 
         workflow(workflow_id)
@@ -297,12 +302,12 @@ module Durababble
       row.fetch("count").to_i
     end
 
-    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
-    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
+    #: (workflow_id: String, command_id: Integer, result: Object?, event_index: Integer) -> Object?
+    def record_step_completed_without_transaction(workflow_id:, command_id:, result:, event_index:)
       serialized = dump_step_output(workflow_id:, command_id:, result:)
       execute_store_query(:complete_step, [serialized, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "completed", serialized_result: serialized, error: nil)
-      append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result, event_index:)
     end
 
     #: (String, result: Object?, ?worker_id: String?) -> Object
@@ -354,23 +359,23 @@ module Durababble
       execute_store_query(:fail_live_step_attempts_for_workflow, [error, workflow_id])
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?) -> Object?
-    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_canceled(workflow_id:, error:, event_index:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
         execute_store_query(:cancel_step, [error, workflow_id, command_id])
         update_latest_attempt_serialized(workflow_id:, command_id:, status: "canceled", serialized_result: dump_serialized(nil), error:)
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_canceled", command_id:, error:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_canceled", command_id:, error:, event_index:)
       end
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
+    #: (workflow_id: String, command_id: Integer, error: String, event_index: Integer, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, event_index:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       execute_store_query(:fail_step, [error, workflow_id, command_id])
       update_latest_attempt_serialized(workflow_id:, command_id:, status: "failed", serialized_result: dump_serialized(nil), error:)
       payload = step_failure_payload(terminal:, error_class:, error_message:, retrying:)
-      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
+      append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:, event_index:)
     end
 
     #: (workflow_id: String, topic: String, payload: Object?, key: String) -> Object?
@@ -405,8 +410,8 @@ module Durababble
       result
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
+    #: (workflow_id: String, name: String, wait_request: WaitRequest, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, event_index:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
@@ -419,7 +424,7 @@ module Durababble
           serialized_result: serialized_context,
           error: nil,
         )
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_payload(wait_request))
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_waiting", command_id:, name:, payload: wait_payload(wait_request), event_index:)
         if suspend_workflow && !suspend_workflow(workflow_id:, worker_id:, next_run_at: next_run_at || wait_request.wake_at)
           raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before wait suspension"
         end

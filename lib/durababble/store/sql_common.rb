@@ -47,18 +47,18 @@ module Durababble
       mark_workflow_running_unchecked(workflow_id, worker_id:, lease_microseconds:, worker_pool:)
     end
 
-    #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+    #: (workflow_id: String, command_id: Integer, name: String, event_index: Integer, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
+    def record_step_scheduled(workflow_id:, command_id:, name:, event_index:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       payload = { "name" => name, "args" => args, "kwargs" => kwargs }.merge(metadata)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_scheduled", command_id:, name:, payload:, event_index:)
         execute_store_query(:insert_scheduled_step, [workflow_id, command_id, name])
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, ?worker_id: String?) -> Object?
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, name: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_started(workflow_id:, name:, event_index:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
@@ -66,36 +66,36 @@ module Durababble
         execute_store_query(:upsert_step_running, [workflow_id, command_id, name])
         attempt_id = SecureRandom.uuid
         execute_store_query(:insert_step_attempt, [attempt_id, workflow_id, command_id, name])
-        append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:)
+        append_workflow_history_without_transaction(workflow_id:, kind: "step_started", command_id:, name:, attempt_id:, event_index:)
         attempt_id
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, result: Object?, ?worker_id: String?) -> Object?
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, result: Object?, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_completed(workflow_id:, result:, event_index:, command_id: nil, position: nil, worker_id: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        record_step_completed_without_transaction(workflow_id:, command_id:, result:)
+        record_step_completed_without_transaction(workflow_id:, command_id:, result:, event_index:)
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed(workflow_id:, error:, event_index:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:) if worker_id
-        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal:, error_class:, error_message:)
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal:, error_class:, error_message:, event_index:)
       end
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, error: String, worker_id: String, run_at: Time) -> Object?
-    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+    #: (workflow_id: String, error: String, worker_id: String, run_at: Time, event_index: Integer, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, event_index:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       transaction do
         assert_workflow_lease_for_update!(workflow_id:, worker_id:)
         # [DURABABBLE-STEP-2] A retryable failure and its backoff row commit atomically.
-        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, retrying: true)
+        record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, retrying: true, event_index:)
         scheduled = schedule_workflow_retry(workflow_id:, worker_id:, run_at:)
         raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow retry scheduling" unless scheduled
 
@@ -255,6 +255,16 @@ module Durababble
       return 0 unless row
 
       row.fetch("count").to_s.to_i
+    end
+
+    # The next event_index for an out-of-band writer (e.g. admin termination)
+    # that holds no replayed history in memory and so can't allocate from the
+    # in-memory counter. Reads back only the highest-indexed row rather than the
+    # whole history; next_event_index_after turns it into max+1 (or 0 when none).
+    #: (String) -> Integer
+    def next_workflow_history_index_for(workflow_id)
+      rows = execute_store_query(:last_workflow_history_for, [workflow_id]).to_a
+      WorkflowReplayHistory.next_event_index_after(rows)
     end
 
     #: (?now: Time, ?batch_size: Integer) -> Integer
@@ -554,8 +564,8 @@ module Durababble
       end
     end
 
-    #: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
-    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time, event_index: Integer) -> Object?
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:, event_index:)
       transaction do
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
@@ -578,6 +588,7 @@ module Durababble
           attempt_id: message_id,
           payload: workflow_command_history_payload(command, message_id:),
           error:,
+          event_index:,
         )
         updated = retry_inbox_message_without_transaction(message_id:, error:, ready_at:)
         reconcile_command_target_activation(command)
@@ -585,8 +596,8 @@ module Durababble
       end
     end
 
-    #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
-    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+    #: (message_id: String, workflow_id: String, result: Object?, worker_id: String, event_index: Integer) -> Object?
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:, event_index:)
       transaction do
         command = lock_inbox_message_for_completion(message_id:, worker_id:)
         next nil unless command
@@ -613,6 +624,7 @@ module Durababble
           name: command["method_name"],
           attempt_id: message_id,
           payload: workflow_command_history_payload(command, message_id:, result:, include_result: true),
+          event_index:,
         )
         updated = complete_inbox_message_without_transaction(message_id:, result:)
         reconcile_command_target_activation(command)
@@ -685,8 +697,8 @@ module Durababble
       execute_store_query(:child_workflow_rows_for_object, [parent_object_type, parent_object_id]).map { |row| child_workflow_row(decode_row(row)) }
     end
 
-    #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
-    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String, event_index: Integer) -> Object?
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:, event_index:)
       transaction do
         command = lock_inbox_message_for_failure(command_id: message_id, worker_id:)
         next nil unless command
@@ -713,6 +725,7 @@ module Durababble
           attempt_id: message_id,
           payload: workflow_command_history_payload(command, message_id:),
           error:,
+          event_index:,
         )
         updated = dead_letter_inbox_message_without_transaction(message_id:, error:)
         reconcile_command_target_activation(command)
@@ -997,13 +1010,13 @@ module Durababble
       id.to_i
     end
 
-    #: (workflow_id: String, command_id: Integer, result: Object?) -> Object?
-    def record_step_completed_without_transaction(workflow_id:, command_id:, result:)
+    #: (workflow_id: String, command_id: Integer, result: Object?, event_index: Integer) -> Object?
+    def record_step_completed_without_transaction(workflow_id:, command_id:, result:, event_index:)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, command_id: Integer, error: String, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
-    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, terminal: false, error_class: nil, error_message: nil, retrying: false)
+    #: (workflow_id: String, command_id: Integer, error: String, event_index: Integer, ?terminal: bool, ?error_class: String?, ?error_message: String?, ?retrying: bool) -> Object?
+    def record_step_failed_without_transaction(workflow_id:, command_id:, error:, event_index:, terminal: false, error_class: nil, error_message: nil, retrying: false)
       raise NotImplementedError
     end
 
@@ -1207,23 +1220,18 @@ module Durababble
       command.fetch("target_kind") == "object" && command.fetch("target_type") == object_type && command.fetch("target_id") == object_id
     end
 
-    #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
-    def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
-      execute_store_query(:lock_workflow_history_workflow, [workflow_id])
-      result = execute_store_query(:insert_workflow_history, [workflow_id, kind, command_id, name, attempt_id, dump_serialized(payload), error, workflow_id])
-      inserted_workflow_history_event_index(result, workflow_id:)
+    #: (workflow_id: String, kind: String, event_index: Integer, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?) -> Integer
+    def append_workflow_history_without_transaction(workflow_id:, kind:, event_index:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil)
+      # The lease holder allocates event_index from the history it already replayed
+      # in memory, so the insert is a plain parameterized append: the lease assert
+      # locked the workflows row, and no MAX(event_index) read-back is needed.
+      execute_store_query(:insert_workflow_history_at, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
+      event_index
     end
 
     #: (message_id: String, error: String) -> Object?
     def dead_letter_inbox_message_without_transaction(message_id:, error:)
       raise NotImplementedError
-    end
-
-    #: (untyped, workflow_id: String) -> Integer
-    def inserted_workflow_history_event_index(result, workflow_id:)
-      row = result.first
-      row ||= execute_store_query(:inserted_workflow_history_event_index, [workflow_id]).first
-      row.fetch("event_index").to_i
     end
 
     #: (Hash[String, Object?]) -> Object?

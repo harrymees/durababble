@@ -79,15 +79,15 @@ class DurababbleEngineTest < DurababbleTestCase
       @messages.first(limit)
     end
 
-    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:, event_index:)
       @completed << { message_id:, workflow_id:, result:, worker_id: }
     end
 
-    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:, event_index:)
       @failed << { message_id:, workflow_id:, error:, worker_id: }
     end
 
-    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:, event_index:)
       @failed << { message_id:, workflow_id:, error:, worker_id:, ready_at: }
     end
 
@@ -628,9 +628,9 @@ class DurababbleEngineTest < DurababbleTestCase
             end
           end
           workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
-          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
-          store.record_step_started(workflow_id:, command_id: 0, name: "first")
-          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
+          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
+          store.record_step_started(workflow_id:, command_id: 0, name: "first", event_index: next_event_index(workflow_id))
+          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 }, event_index: next_event_index(workflow_id))
 
           run = Durababble::Engine.new(store:, worker_id: "history-at-max").resume(workflow, workflow_id:)
 
@@ -646,10 +646,10 @@ class DurababbleEngineTest < DurababbleTestCase
       with_workflow_history_limit(3) do
         with_durababble_store(backend, "history_limit_prefetch") do |store|
           workflow_id = store.enqueue_workflow(name: ImmediateWorkflow.workflow_name, input: { "count" => 0 })
-          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
-          store.record_step_started(workflow_id:, command_id: 0, name: "first")
-          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
-          store.record_step_scheduled(workflow_id:, command_id: 1, name: "second", args: [{ "count" => 1 }], metadata: default_retry_shape)
+          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
+          store.record_step_started(workflow_id:, command_id: 0, name: "first", event_index: next_event_index(workflow_id))
+          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 }, event_index: next_event_index(workflow_id))
+          store.record_step_scheduled(workflow_id:, command_id: 1, name: "second", args: [{ "count" => 1 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
           history_fetches = 0
           store.define_singleton_method(:workflow_history_for) do |_workflow_id|
             history_fetches += 1
@@ -678,9 +678,9 @@ class DurababbleEngineTest < DurababbleTestCase
             end
           end
           workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
-          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
-          store.record_step_started(workflow_id:, command_id: 0, name: "first")
-          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
+          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
+          store.record_step_started(workflow_id:, command_id: 0, name: "first", event_index: next_event_index(workflow_id))
+          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 }, event_index: next_event_index(workflow_id))
 
           run = Durababble::Engine.new(store:, worker_id: "history-over").resume(workflow, workflow_id:)
           replay = Durababble::Engine.new(store:, worker_id: "history-over-again").resume(workflow, workflow_id:)
@@ -706,9 +706,9 @@ class DurababbleEngineTest < DurababbleTestCase
                 test_step("second") { |ctx| ctx.merge("count" => ctx.fetch("count") + 1) }
               end
               workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
-              store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
-              store.record_step_started(workflow_id:, command_id: 0, name: "first")
-              store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
+              store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
+              store.record_step_started(workflow_id:, command_id: 0, name: "first", event_index: next_event_index(workflow_id))
+              store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 }, event_index: next_event_index(workflow_id))
 
               run = Durababble::Engine.new(store:, worker_id: "history-warning").resume(workflow, workflow_id:)
 
@@ -737,9 +737,9 @@ class DurababbleEngineTest < DurababbleTestCase
             expose_command :ping
           end
           workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "count" => 0 })
-          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
-          store.record_step_started(workflow_id:, command_id: 0, name: "first")
-          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 })
+          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
+          store.record_step_started(workflow_id:, command_id: 0, name: "first", event_index: next_event_index(workflow_id))
+          store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 1 }, event_index: next_event_index(workflow_id))
           message_id = store.enqueue_workflow_command(
             workflow_id:,
             workflow_name: workflow.workflow_name,
@@ -777,7 +777,7 @@ class DurababbleEngineTest < DurababbleTestCase
             end
           end
           workflow_id = store.enqueue_workflow(name: workflow.name, input: { "count" => 0 })
-          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape)
+          store.record_step_scheduled(workflow_id:, command_id: 0, name: "first", args: [{ "count" => 0 }], metadata: default_retry_shape, event_index: next_event_index(workflow_id))
 
           run = Durababble::Engine.new(store:, worker_id: "history-attempt").resume(workflow, workflow_id:)
 

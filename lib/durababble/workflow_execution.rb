@@ -56,17 +56,7 @@ module Durababble
         root_task: @root_task,
         futures: @futures,
         step_contexts: @step_contexts,
-        synchronize_store: ->(&block) { synchronize_store(&block) },
-        raise_if_cancel_requested: -> { raise_if_cancel_requested! },
-        assert_workflow_lease: -> { assert_workflow_lease! },
-        suspend_workflow_immediately: -> { suspend_workflow_immediately? },
-        defer_workflow_suspension: ->(command_id) { defer_workflow_suspension(command_id) },
-        remember_wait: ->(command_id, name, wait_request) { @replay_history.remember_step_waiting(command_id, name:, wait_request:) },
-        next_run_at_for_wait: ->(wait_request) { next_run_at_for_wait(wait_request) },
-        timer_due: ->(wake_at) { timer_due?(wake_at) },
-        complete_due_wait: ->(future, command_id, reserved_history_event: false) { complete_due_wait_timer!(future, command_id, reserved_history_event:) },
-        retry_run_at: ->(delay) { retry_run_at(delay) },
-        crash: ->(point) { crash!(point) },
+        execution: self,
       )
       register_workflow_task(root_task)
     end
@@ -433,6 +423,19 @@ module Durababble
       @replay_history.validate_complete!(workflow_id: @workflow_id, next_command_id: @next_command_id)
     end
 
+    # Allocates the next physical history event index from the in-memory replay
+    # counter. The step runner calls this so every append it writes is a single
+    # plain insert with a Ruby-supplied index.
+    #: () -> Integer
+    def allocate_history_event_index!
+      @replay_history.allocate_event_index!
+    end
+
+    #: (Integer, name: String, wait_request: WaitRequest) -> void
+    def remember_step_waiting(command_id, name:, wait_request:)
+      @replay_history.remember_step_waiting(command_id, name:, wait_request:)
+    end
+
     private
 
     # Reserves the next command id, registers its future, and replays or records
@@ -748,6 +751,7 @@ module Durababble
         kwargs: shape.fetch("kwargs"),
         metadata: shape.reject { |key, _value| ["name", "args", "kwargs"].include?(key) },
         worker_id: @worker_id,
+        event_index: @replay_history.allocate_event_index!,
       )
       crash!(:step_scheduled)
       @replay_history.remember_scheduled(command_id, step_name: name, shape:)
@@ -794,6 +798,7 @@ module Durababble
           suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
           next_run_at:,
+          event_index: @replay_history.allocate_event_index!,
         )
         @replay_history.remember_step_waiting(command_id, name:, wait_request:)
       end
@@ -880,6 +885,7 @@ module Durababble
           command_id:,
           result:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
         @replay_history.remember_step_completed(command_id, payload: result, reserved_history_event:)
       end
@@ -1074,6 +1080,7 @@ module Durababble
           workflow_id: @workflow_id,
           result:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     rescue StandardError => e
@@ -1139,6 +1146,7 @@ module Durababble
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     end
@@ -1166,6 +1174,7 @@ module Durababble
           error:,
           worker_id: @worker_id,
           ready_at: retry_run_at(delay),
+          event_index: @replay_history.allocate_event_index!,
         )
       end
     end
@@ -1378,5 +1387,22 @@ module Durababble
     def crash!(point)
       raise InjectedCrash, "injected crash after #{point}" if @crash_after == point
     end
+
+    # Operations the WorkflowStepRunner drives back through its owning execution.
+    # Defined private above for internal callers; re-exported here so the step
+    # runner can invoke them on the execution instead of being handed a bag of
+    # lambdas.
+    public(
+      :synchronize_store,
+      :raise_if_cancel_requested!,
+      :assert_workflow_lease!,
+      :suspend_workflow_immediately?,
+      :defer_workflow_suspension,
+      :next_run_at_for_wait,
+      :timer_due?,
+      :complete_due_wait_timer!,
+      :retry_run_at,
+      :crash!,
+    )
   end
 end

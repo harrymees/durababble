@@ -89,6 +89,15 @@ module DurababbleMinitestHelper
     @durababble_store || Kernel.raise("Durababble store has not been configured for this test")
   end
 
+  # The lease holder allocates the next history event_index from the replayed
+  # history it already holds in memory. Tests that append history directly don't
+  # have that replay state, so this helper does the expensive read-back for them.
+  # Pass `store:` for tests that build their own store instead of with_durababble_store.
+  #: (String, ?store: untyped) -> Integer
+  def next_event_index(workflow_id, store: self.store)
+    Durababble::WorkflowReplayHistory.next_event_index_after(store.workflow_history_for(workflow_id))
+  end
+
   #: (untyped, Class, String, ?worker_id: String) -> untyped
   def resume_waiting_workflow(store, workflow, workflow_id, worker_id: "timer-resume")
     row = store.workflow(workflow_id)

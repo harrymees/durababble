@@ -25,8 +25,8 @@ module Durababble
           h.workflows["counter"] = counter_workflow
           workflow_id = h.store.enqueue_workflow(name: "counter", input: { "count" => seed })
           h.store.claim_workflow(workflow_id:, worker_id: "stale-owner", lease_seconds: 10)
-          h.store.record_step_scheduled(workflow_id:, command_id: 0, name: "work", args: [])
-          h.store.record_step_started(workflow_id:, command_id: 0, name: "work")
+          h.store.record_step_scheduled(workflow_id:, command_id: 0, name: "work", args: [], event_index: h.next_event_index(workflow_id))
+          h.store.record_step_started(workflow_id:, command_id: 0, name: "work", event_index: h.next_event_index(workflow_id))
 
           # The lease expires; a reaper reclaims it and a new worker takes over.
           h.scheduler.schedule(actor: "reaper", delay: 20, name: "steal_expired") do
@@ -40,9 +40,9 @@ module Durababble
           # work. Each durable write carries worker_id: "stale-owner" and must be
           # rejected. Any write that is ACCEPTED is a split-brain bug.
           stale_writes = {
-            "record_step_completed" => -> { h.store.record_step_completed(workflow_id:, command_id: 0, result: { "stale" => true }, worker_id: "stale-owner") },
-            "record_step_failed" => -> { h.store.record_step_failed(workflow_id:, command_id: 0, error: "stale failure", worker_id: "stale-owner") },
-            "record_step_canceled" => -> { h.store.record_step_canceled(workflow_id:, command_id: 0, error: "stale cancel", worker_id: "stale-owner") },
+            "record_step_completed" => -> { h.store.record_step_completed(workflow_id:, command_id: 0, result: { "stale" => true }, worker_id: "stale-owner", event_index: h.next_event_index(workflow_id)) },
+            "record_step_failed" => -> { h.store.record_step_failed(workflow_id:, command_id: 0, error: "stale failure", worker_id: "stale-owner", event_index: h.next_event_index(workflow_id)) },
+            "record_step_canceled" => -> { h.store.record_step_canceled(workflow_id:, command_id: 0, error: "stale cancel", worker_id: "stale-owner", event_index: h.next_event_index(workflow_id)) },
             "complete_workflow" => -> { h.store.complete_workflow(workflow_id, result: { "stale" => true }, worker_id: "stale-owner") },
             "fail_workflow" => -> { h.store.fail_workflow(workflow_id, error: "stale failure", worker_id: "stale-owner") },
             "cancel_workflow" => -> { h.store.cancel_workflow(workflow_id, reason: "stale cancel", worker_id: "stale-owner") },
@@ -58,7 +58,7 @@ module Durababble
 
           # The legitimate new owner finishes the step and workflow.
           h.scheduler.schedule(actor: "new-owner", delay: 40, name: "finish") do
-            h.store.record_step_completed(workflow_id:, command_id: 0, result: { "ok" => true }, worker_id: "new-owner")
+            h.store.record_step_completed(workflow_id:, command_id: 0, result: { "ok" => true }, worker_id: "new-owner", event_index: h.next_event_index(workflow_id))
             h.store.complete_workflow(workflow_id, result: { "count" => seed }, worker_id: "new-owner")
           end
 

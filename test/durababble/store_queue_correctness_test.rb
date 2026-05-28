@@ -225,6 +225,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
           position: 0,
           name: "sleep",
           wait_request: Durababble.wait_until(Time.now + 3600, { "before" => true }),
+          event_index: next_event_index(workflow_id),
         )
 
         assert_raises(Durababble::Error) do
@@ -242,6 +243,7 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
           position: 0,
           name: "approval",
           wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+          event_index: next_event_index(workflow_id),
         )
 
         assert_hash_includes(

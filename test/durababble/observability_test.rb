@@ -172,11 +172,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil, event_index:)
       append_history(workflow_id, "kind" => "step_scheduled", "command_id" => command_id, "name" => name, "payload" => { "name" => name, "args" => args, "kwargs" => kwargs, "retry" => metadata.fetch("retry") })
     end
 
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil, event_index:)
       position = command_id || position
       step = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running" }
       steps[workflow_id].delete_if { |row| row.fetch("position") == position }
@@ -185,7 +185,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_started", "command_id" => position, "name" => name, "attempt_id" => attempts[workflow_id].last.fetch("id"))
     end
 
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil, event_index:)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "completed", "result" => result)
@@ -193,7 +193,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_completed", "command_id" => position, "payload" => result)
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil, event_index:)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "failed", "error" => error)

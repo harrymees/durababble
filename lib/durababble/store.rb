@@ -363,38 +363,38 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+    #: (workflow_id: String, command_id: Integer, name: String, event_index: Integer, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
+    def record_step_scheduled(workflow_id:, command_id:, name:, event_index:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, name: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_started(workflow_id:, name:, event_index:, command_id: nil, position: nil, worker_id: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, result: Object?, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, result: Object?, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_completed(workflow_id:, result:, event_index:, command_id: nil, position: nil, worker_id: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+    #: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> Object?
+    def record_step_failed(workflow_id:, error:, event_index:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, error: String, worker_id: String, run_at: Time, ?command_id: Integer?, ?position: Integer?) -> Object?
-    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, command_id: nil, position: nil)
+    #: (workflow_id: String, error: String, worker_id: String, run_at: Time, event_index: Integer, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_failed_and_schedule_retry(workflow_id:, error:, worker_id:, run_at:, event_index:, command_id: nil, position: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
-    def record_step_canceled(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil)
+    #: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> Object?
+    def record_step_canceled(workflow_id:, error:, event_index:, command_id: nil, position: nil, worker_id: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
-    def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
+    #: (workflow_id: String, name: String, wait_request: WaitRequest, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+    def record_wait(workflow_id:, name:, wait_request:, event_index:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
       raise NotImplementedError
     end
 
@@ -465,18 +465,18 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
-    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:)
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time, event_index: Integer) -> Object?
+    def retry_workflow_command(message_id:, workflow_id:, error:, worker_id:, ready_at:, event_index:)
       raise NotImplementedError
     end
 
-    #: (message_id: String, workflow_id: String, result: Object?, worker_id: String) -> Object?
-    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:)
+    #: (message_id: String, workflow_id: String, result: Object?, worker_id: String, event_index: Integer) -> Object?
+    def complete_workflow_command(message_id:, workflow_id:, result:, worker_id:, event_index:)
       raise NotImplementedError
     end
 
-    #: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
-    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:)
+    #: (message_id: String, workflow_id: String, error: String, worker_id: String, event_index: Integer) -> Object?
+    def fail_workflow_command(message_id:, workflow_id:, error:, worker_id:, event_index:)
       raise NotImplementedError
     end
 
