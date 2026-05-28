@@ -11,5 +11,7 @@ class DurababbleStatusTest < DurababbleTestCase
     assert Durababble::WorkflowStatus.rpc_not_running?({ "status" => Durababble::WorkflowStatus::FAILED, "next_run_at" => nil })
     refute Durababble::WorkflowStatus.rpc_not_running?({ "status" => Durababble::WorkflowStatus::FAILED, "next_run_at" => Time.now })
     assert Durababble::AttemptStatus.live?({ "status" => Durababble::AttemptStatus::RUNNING })
+    assert Durababble::AttemptStatus.live?(Durababble::AttemptStatus::WAITING)
+    refute Durababble::AttemptStatus.live?(Durababble::AttemptStatus::COMPLETED)
   end
 end
