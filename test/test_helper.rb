@@ -101,7 +101,7 @@ module DurababbleMinitestHelper
 
   #: (untyped, String, at: Object?) -> void
   def make_workflow_timer_due(store, workflow_id, at:)
-    store.make_workflow_due!(workflow_id, now: Time.now)
+    store.make_workflow_due!(workflow_id, now: Time.now - 60)
   end
 
   #: (untyped, Object?) { -> untyped } -> untyped
