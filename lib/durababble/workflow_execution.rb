@@ -7,6 +7,7 @@ require "digest"
 require "time"
 
 require_relative "command_future"
+require_relative "durable_time"
 require_relative "execution_context"
 require_relative "workflow_determinism"
 require_relative "workflow_replay_history"
@@ -480,7 +481,7 @@ module Durababble
       deadline = recorded_child_workflow_await_deadline(recorded)
       return deadline if deadline
 
-      WorkflowDeterminism.allow_host_operations { @store.current_time + timeout }
+      WorkflowDeterminism.allow_host_operations { store_current_time + timeout }
     end
 
     #: (ChildWorkflowHandle, poll_interval: Numeric, current_time: Time, deadline: Time?) -> Time
@@ -909,10 +910,7 @@ module Durababble
 
     #: (Object, ?durable: bool) -> untyped
     def comparable_time(value, durable: false)
-      time = value.is_a?(String) ? Time.parse(value) : value
-      return time unless durable && time.is_a?(Time)
-
-      Time.at(time.to_i, time.usec, :usec).getlocal(time.utc_offset)
+      durable ? DurableTime.durable_comparable(value) : DurableTime.comparable(value)
     end
 
     #: (Array[Object]) -> Object?
@@ -1266,14 +1264,20 @@ module Durababble
 
     #: (untyped) -> untyped
     def retry_run_at(delay)
-      @store.current_time + delay
+      store_current_time + delay
     end
 
     #: (untyped) -> untyped
     def wait_condition_wake_at(timeout)
       WorkflowDeterminism.allow_host_operations do
-        timeout ? @store.current_time + timeout : @store.current_time + 1
+        current_time = store_current_time
+        timeout ? current_time + timeout : current_time + 1
       end
+    end
+
+    #: () -> untyped
+    def store_current_time
+      DurableTime.comparable(@store.current_time)
     end
 
     #: () -> bool

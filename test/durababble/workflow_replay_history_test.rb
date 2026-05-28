@@ -216,6 +216,34 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     assert_equal wake_at, history.earliest_unresolved_timer_wake_at
   end
 
+  test "earliest_unresolved_timer_wake_at parses ISO timestamps without host time" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "sleep", payload: { "name" => "sleep" }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "sleep", "payload" => wait_payload(wake_at: "2026-01-02T00:00:00.000000Z") },
+      scheduled_event(1, name: "sleep", payload: { "name" => "sleep" }, event_index: 2),
+      { "kind" => "step_waiting", "command_id" => 1, "event_index" => 3, "name" => "sleep", "payload" => wait_payload(wake_at: "2026-01-01T00:00:00.000000Z") },
+    ])
+
+    Durababble::WorkflowExecutionContext.with_current(Object.new) do
+      Durababble::WorkflowDeterminism.enforce(workflow_id: "wf") do
+        assert_equal "2026-01-01T00:00:00.000000Z", history.earliest_unresolved_timer_wake_at
+      end
+    end
+  end
+
+  test "durable timestamp comparison normalizes explicit offsets" do
+    utc = Durababble::DurableTime.durable_comparable("2026-01-01T00:00:00.000000Z")
+
+    assert_equal utc, Durababble::DurableTime.durable_comparable("2026-01-01T01:30:00.000000+0130")
+    assert_equal utc, Durababble::DurableTime.durable_comparable("2026-01-01T01:30:00.000000+01:30")
+  end
+
+  test "durable timestamp parsing supports timer math from backend strings" do
+    start = Durababble::DurableTime.comparable("2026-01-01T00:00:00.000000Z")
+
+    assert_equal Time.utc(2026, 1, 1, 1), start + 3600
+  end
+
   test "waiting_timer falls back to scheduled wait metadata for legacy waiting payloads" do
     wake_at = Time.utc(2026, 1, 1)
     history = Durababble::WorkflowReplayHistory.new([

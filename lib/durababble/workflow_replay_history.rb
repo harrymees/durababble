@@ -3,6 +3,8 @@
 
 require "time"
 
+require_relative "durable_time"
+
 module Durababble
   class WorkflowReplayHistory
     TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled", "step_failed"].freeze
@@ -209,9 +211,7 @@ module Durababble
 
     #: (Object) -> Object
     def comparable_time(value)
-      return value unless value.is_a?(String)
-
-      Time.parse(value)
+      DurableTime.comparable(value)
     end
 
     #: (Hash[String, Object?]) -> void
