@@ -167,14 +167,10 @@ module DurababbleMysqlHotPathReport
       @options.fetch(:fixture_size)
     end
 
-    # Mirror the lease holder's in-memory bookkeeping: the next physical
-    # event_index is max(recorded)+1. Computed in setup (recording disabled) so
-    # the measured append can pass it as a plain INSERT parameter, exactly as the
-    # execution path does via WorkflowReplayHistory#allocate_event_index!.
+    # Computed in setup (recording disabled) so the measured append can pass it
+    # as a plain INSERT parameter, exactly as the execution path does.
     def compute_next_event_index(workflow_id)
-      events = store.workflow_history_for(workflow_id)
-      max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
-      max ? max + 1 : 0
+      Durababble::WorkflowReplayHistory.next_event_index_after(store.workflow_history_for(workflow_id))
     end
 
     def worker(

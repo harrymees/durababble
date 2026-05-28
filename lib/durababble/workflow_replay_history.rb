@@ -10,6 +10,18 @@ module Durababble
     TERMINAL_KINDS = ["step_completed", "step_waiting", "step_canceled", "step_failed"].freeze
     WORKFLOW_COMMAND_KINDS = ["workflow_command_completed", "workflow_command_failed"].freeze
 
+    class << self
+      # The next physical event_index to append after the given history: one past
+      # the highest recorded index, or 0 when empty. The lease holder allocates
+      # from here so appends are a single plain insert; hot-path reports and
+      # query-count tests call it to mirror that allocation exactly.
+      #: (Array[Hash[String, Object?]]) -> Integer
+      def next_event_index_after(events)
+        max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
+        max ? max + 1 : 0
+      end
+    end
+
     #: Integer
     attr_reader :event_count
 
@@ -24,14 +36,10 @@ module Durababble
       @consumed_event_indexes = {}
       @resolution_index = 0
       events.each { |event| index_event(event) }
-      # The next physical event_index to hand out for an append. Seeded one past
-      # the highest recorded index so a fresh allocation can never collide with
-      # loaded history, and only ever advanced by allocate_event_index! as real
-      # appends happen. This is distinct from @event_count, which is a coarse
-      # size budget (it reserves ahead and counts remembered-but-unwritten
-      # events); the physical PK sequence must come from here.
-      max_event_index = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
-      @next_event_index = max_event_index ? max_event_index + 1 : 0
+      # Distinct from @event_count, which is a coarse size budget (it reserves
+      # ahead and counts remembered-but-unwritten events); the physical PK
+      # sequence must come from here, advanced only by allocate_event_index!.
+      @next_event_index = self.class.next_event_index_after(events)
       @terminal_events = @terminal.values.sort_by { |event| event.fetch("event_index").to_i }
       @workflow_command_events.sort_by! { |event| event.fetch("event_index").to_i }
       # Scheduled events remembered mid-replay carry no "event_index", so the set of

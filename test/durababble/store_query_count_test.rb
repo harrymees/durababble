@@ -212,13 +212,10 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
     end.join("\n")
   end
 
-  # The lease holder always knows the next physical event_index in memory; the
-  # hot path supplies it so the append is a single plain INSERT. Computed here
-  # outside the measured block, mirroring WorkflowReplayHistory#allocate_event_index!.
+  # Computed outside the measured block, mirroring how the lease holder allocates
+  # from replayed history so the append is a single plain insert.
   def next_event_index(workflow_id)
-    events = store.workflow_history_for(workflow_id)
-    max = events.filter_map { |event| event["event_index"] }.map { |value| value.to_s.to_i }.max
-    max ? max + 1 : 0
+    Durababble::WorkflowReplayHistory.next_event_index_after(store.workflow_history_for(workflow_id))
   end
 
   def prepare_release_worker_leases_fixture

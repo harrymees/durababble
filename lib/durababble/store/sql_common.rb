@@ -1207,12 +1207,9 @@ module Durababble
 
     #: (workflow_id: String, kind: String, ?command_id: Integer?, ?name: Object?, ?attempt_id: String?, ?payload: Object?, ?error: String?, ?event_index: Integer?) -> Integer
     def append_workflow_history_without_transaction(workflow_id:, kind:, command_id: nil, name: nil, attempt_id: nil, payload: nil, error: nil, event_index: nil)
-      # When the lease holder supplies the next event_index (computed in Ruby from
-      # replayed history) we append it directly: a single plain row insert with no
-      # max-event-index self-join, no redundant row re-lock (the lease assert
-      # already locked the workflows row), and no read-back. The legacy max-index
-      # path stays for callers without replay state (direct tests, admin
-      # termination), keyed off event_index being nil.
+      # The lease assert already locked the workflows row, so a caller-supplied
+      # event_index needs no re-lock and no read-back. The legacy path stays for
+      # callers without replay state (direct tests, admin termination).
       if event_index
         execute_store_query(:insert_workflow_history_at, [workflow_id, event_index, kind, command_id, name, attempt_id, dump_serialized(payload), error])
         return event_index

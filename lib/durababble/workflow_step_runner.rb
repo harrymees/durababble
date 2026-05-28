@@ -244,10 +244,6 @@ module Durababble
       @synchronize_store.call(&block)
     end
 
-    # Pull the next physical event_index from the workflow's replay history. Must
-    # be invoked inside synchronize_store so the order indexes are handed out
-    # matches the order appends reach the store, exactly as the legacy SQL
-    # MAX(event_index)+1 did under the same lock.
     #: () -> Integer
     def allocate_history_event_index!
       @allocate_history_event_index.call
