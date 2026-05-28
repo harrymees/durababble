@@ -233,6 +233,31 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     def rpc_client_factory = ->(worker_id) { @clients.fetch(worker_id) }
   end
 
+  # Models a store that doesn't expose the optional `local_worker_id` hook, so
+  # ownership can never resolve to the current runtime and queries always route
+  # to the lease owner's RPC endpoint.
+  class NoLocalWorkerIdStore < QueryRoutingStore
+    undef_method :local_worker_id
+    undef_method :local_worker_id=
+  end
+
+  # Models a store that owns the object locally but doesn't expose the optional
+  # `local_transient_handler` fast path, forcing the owned-local query to run
+  # through the read gate and in-process invocation.
+  class NoTransientHandlerStore < QueryRoutingStore
+    undef_method :local_transient_handler
+    undef_method :local_transient_handler=
+  end
+
+  # Models a store where the caller-local lease claim always loses the race
+  # (another worker grabbed ownership between the lease read and the claim).
+  class ClaimRaceStore < QueryRoutingStore
+    def claim_object_lease(**kwargs)
+      @claims << kwargs
+      nil
+    end
+  end
+
   class LeaseLossStore
     def initialize(store, worker_id:)
       @store = store
@@ -270,6 +295,18 @@ class DurababbleDurableObjectTest < DurababbleTestCase
 
     expose def value(prefix: nil)
       [prefix, current_state.fetch("value")].compact.join(":")
+    end
+  end
+
+  class QueryStartsWorkflowObject < Durababble::DurableObject
+    object_type "query_starts_workflow_object"
+
+    def initialize_state
+      { "value" => "initial" }
+    end
+
+    expose def boom
+      start_workflow(Object, nil)
     end
   end
 
@@ -935,6 +972,88 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     assert_equal 0, store.object_state_reads
     assert_empty store.claims
     assert_equal [[QueryRoutingObject.object_type, "object-1", "value", { "args" => [], "kwargs" => { prefix: "seen" } }]], local_calls
+  end
+
+  test "resolves a callable local_worker_id when deciding local ownership" do
+    store = QueryRoutingStore.new(
+      lease: { "worker_id" => "owner-node", "worker_pool" => "owner-pool", "locked_until" => Time.now + 30 },
+      state: { "value" => "owned-local" },
+    )
+    store.local_worker_id = -> { "owner-node" }
+
+    assert_equal "owned-local", QueryRoutingObject.handle("object-1", store:).value
+    assert_empty store.client.calls
+    assert_empty store.claims
+    assert_equal 1, store.object_state_reads
+  end
+
+  test "serves an owned query in-process when the store exposes no transient handler" do
+    store = NoTransientHandlerStore.new(
+      lease: { "worker_id" => "owner-node", "worker_pool" => "owner-pool", "locked_until" => Time.now + 30 },
+      state: { "value" => "owned-local" },
+    )
+    store.local_worker_id = "owner-node"
+
+    assert_equal "owned-local", QueryRoutingObject.handle("object-1", store:).value
+    assert_empty store.client.calls
+    assert_empty store.claims
+    assert_equal 1, store.object_state_reads
+  end
+
+  test "routes to the lease owner when the store exposes no local_worker_id hook" do
+    client = QueryRoutingClient.new(result: "owner-value")
+    store = NoLocalWorkerIdStore.new(
+      lease: { "worker_id" => "owner-node", "worker_pool" => "owner-pool", "locked_until" => Time.now + 30 },
+      state: { "value" => "caller-stale" },
+      client:,
+    )
+
+    assert_equal "owner-value", QueryRoutingObject.handle("object-1", store:).value
+    assert_equal 1, client.calls.length
+    assert_equal 0, store.object_state_reads
+    assert_empty store.claims
+  end
+
+  test "stops retrying transient routing once the owner keeps reporting a stale lease" do
+    store = QueryRoutingStore.new(
+      lease: { "worker_id" => "owner-node", "worker_pool" => "owner-pool", "locked_until" => Time.now + 30 },
+      client: QueryRoutingClient.new(error: Durababble::WorkflowRpc::StaleLease.new("lease moved")),
+    )
+
+    assert_raises_matching(Durababble::WorkflowRpc::StaleLease, /lease moved/) do
+      QueryRoutingObject.handle("object-1", store:).value
+    end
+    assert_equal Durababble::DurableObjectRef::TRANSIENT_ROUTE_ATTEMPTS, store.client.calls.length
+  end
+
+  test "resolves a callable local_worker_id when claiming a caller-local lease" do
+    store = QueryRoutingStore.new(lease: nil, state: { "value" => "local" })
+    store.local_worker_id = -> { "claimer-node" }
+
+    assert_equal "local", QueryRoutingObject.handle("object-1", store:).value
+    assert_equal 1, store.claims.length
+    assert_equal "claimer-node", store.claims.first.fetch(:worker_id)
+    assert_equal(
+      [{ object_type: QueryRoutingObject.object_type, object_id: "object-1", worker_id: "claimer-node" }],
+      store.releases,
+    )
+  end
+
+  test "rejects starting a workflow from within an exposed query" do
+    store = QueryRoutingStore.new(lease: nil, state: { "value" => "initial" })
+
+    assert_raises_matching(Durababble::Error, /cannot start workflows from an exposed query/) do
+      QueryStartsWorkflowObject.handle("object-1", store:).boom
+    end
+  end
+
+  test "raises no-active-owner when a caller-local lease claim loses the race" do
+    store = ClaimRaceStore.new(lease: nil, state: { "value" => "local" })
+
+    assert_raises_matching(Durababble::WorkflowRpc::NoActiveLease, /no active owner/) do
+      QueryRoutingObject.handle("object-1", store:).value
+    end
+    assert_equal Durababble::DurableObjectRef::TRANSIENT_ROUTE_ATTEMPTS, store.claims.length
   end
 
   test "refreshes object ownership once when a transient RPC reports a stale lease" do
@@ -1828,6 +1947,23 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
   end
 
+  # `open_pulled_object_stream` also bootstraps an activation before routing, so
+  # it needs the `upsert_target_activation` surface `pull_object_owner` reaches.
+  # The first `current_object_lease` resolves the pulled owner; later lookups
+  # feed the bounded re-resolve, exactly as in `ScriptedLeaseStore`.
+  class PulledLeaseStore < ScriptedLeaseStore
+    attr_reader :activations
+
+    def initialize(leases:, client_factory:)
+      super
+      @activations = []
+    end
+
+    def upsert_target_activation(**kwargs)
+      @activations << kwargs
+    end
+  end
+
   test "open_remote_object_stream re-resolves once after StaleLease before any value emits" do
     # Two leases: pre-call (passed to the ref) and a re-resolve lease for the
     # retry. Two scripted RPC calls: first raises StaleLease before yielding,
@@ -1920,6 +2056,53 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       kwargs: {},
       lease: { "worker_id" => "host-a@127.0.0.1:1" },
     )
+
+    assert_raises(Durababble::WorkflowRpc::NodeUnavailable) { stream.to_a }
+    assert_equal(2, client.calls.size, "second failure must propagate; no third attempt")
+  end
+
+  test "open_pulled_object_stream pulls an owner, then re-resolves once after StaleLease" do
+    # pull_object_owner upserts an activation and resolves the first lease; the
+    # initial RPC raises StaleLease before any value, so the bounded re-resolve
+    # fetches a fresh owner and the retry yields cleanly.
+    client = ScriptedRpcClient.new(
+      [Durababble::WorkflowRpc::StaleLease, [{ "tick" => 1 }]],
+    )
+    store = PulledLeaseStore.new(
+      leases: [{ "worker_id" => "host-a@127.0.0.1:1" }, { "worker_id" => "host-b@127.0.0.1:1" }],
+      client_factory: client,
+    )
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(:open_pulled_object_stream, :ticks, args: [], kwargs: {})
+
+    assert_equal([{ "tick" => 1 }], stream.to_a)
+    assert_equal(2, client.calls.size)
+    assert_equal(1, store.activations.size, "activation bootstrapped once before the owner appeared")
+  end
+
+  test "open_pulled_object_stream raises StaleLease when re-resolve finds no fresh owner" do
+    client = ScriptedRpcClient.new([Durababble::WorkflowRpc::StaleLease])
+    store = PulledLeaseStore.new(
+      leases: [{ "worker_id" => "host-a@127.0.0.1:1" }, nil],
+      client_factory: client,
+    )
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(:open_pulled_object_stream, :ticks, args: [], kwargs: {})
+
+    assert_raises(Durababble::WorkflowRpc::StaleLease) { stream.to_a }
+    assert_equal(1, client.calls.size, "no retry when re-resolve has no fresh owner")
+  end
+
+  test "open_pulled_object_stream gives up after one re-resolve when the retry also fails" do
+    client = ScriptedRpcClient.new(
+      [Durababble::WorkflowRpc::StaleLease, Durababble::WorkflowRpc::NodeUnavailable],
+    )
+    store = PulledLeaseStore.new(
+      leases: [{ "worker_id" => "host-a@127.0.0.1:1" }, { "worker_id" => "host-b@127.0.0.1:1" }],
+      client_factory: client,
+    )
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(:open_pulled_object_stream, :ticks, args: [], kwargs: {})
 
     assert_raises(Durababble::WorkflowRpc::NodeUnavailable) { stream.to_a }
     assert_equal(2, client.calls.size, "second failure must propagate; no third attempt")
