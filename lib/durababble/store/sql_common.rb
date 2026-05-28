@@ -270,18 +270,19 @@ module Durababble
       Store.validate_positive_lease_seconds!(lease_seconds)
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
-        claimable = contiguous_claimable_inbox_rows(rows, now:)
+        claimable_rows = contiguous_claimable_inbox_rows(rows, now:)
         # Gate object inbox claims on ownership of the unified per-object lease so
         # commands are only processed by the single, exclusive object owner.
-        # Lease acquisition happens AFTER selecting a claimable prefix: an empty
-        # or blocked row set means no work can run in this pool yet, so we must
-        # not side-effect a free lease into a held one. Workflow inbox claims
-        # keep the existing workflows.locked_by fence and are unaffected.
-        if target_kind == "object" && !claimable.empty?
+        # Lease acquisition happens AFTER claimability is known: an empty or
+        # blocked row set means no executable work in this pool, so we must not
+        # side-effect a free lease into a held one (that would block the real
+        # owner in another pool from progressing). Workflow inbox claims keep
+        # the existing workflows.locked_by fence and are unaffected.
+        if target_kind == "object" && !claimable_rows.empty?
           holder = claim_object_lease(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_seconds:)
           next [] unless holder
         end
-        claimable.map do |row|
+        claimable_rows.map do |row|
           mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
           claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
         end
