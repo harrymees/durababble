@@ -964,6 +964,51 @@ class DurababbleDurableObjectTest < DurababbleTestCase
     end
     assert_equal 0, store.object_state_reads
     assert_empty store.claims
+    assert_equal 1, store.client.calls.length
+    assert_equal "owner-node", store.current_object_lease(QueryRoutingObject.object_type, "object-1").fetch("worker_id")
+  end
+
+  test "serves a local exposed query when an unavailable short-lived owner releases before retry" do
+    client = QueryRoutingClient.new(error: Durababble::WorkflowRpc::NodeUnavailable.new("raw worker unavailable"))
+    store = HandoffRoutingStore.new(
+      leases: [
+        { "worker_id" => "raw-worker", "locked_until" => Time.now + 30 },
+        nil,
+      ],
+      clients: {
+        "raw-worker" => client,
+      },
+    )
+
+    assert_equal "local", QueryRoutingObject.handle("object-1", store:).value
+    assert_equal 1, client.calls.length
+    assert_equal 1, store.object_state_reads
+    assert_equal 1, store.claims.length
+    assert_equal(
+      [{ object_type: QueryRoutingObject.object_type, object_id: "object-1", worker_id: store.claims.first.fetch(:worker_id) }],
+      store.releases,
+    )
+  end
+
+  test "reroutes an exposed query when an unavailable owner has handed off" do
+    old_client = QueryRoutingClient.new(error: Durababble::WorkflowRpc::NodeUnavailable.new("old owner unavailable"))
+    new_client = QueryRoutingClient.new(result: "new-owner-value")
+    store = HandoffRoutingStore.new(
+      leases: [
+        { "worker_id" => "old-node", "locked_until" => Time.now + 30 },
+        { "worker_id" => "new-node", "locked_until" => Time.now + 30 },
+      ],
+      clients: {
+        "old-node" => old_client,
+        "new-node" => new_client,
+      },
+    )
+
+    assert_equal "new-owner-value", QueryRoutingObject.handle("object-1", store:).value
+    assert_equal 1, old_client.calls.length
+    assert_equal 1, new_client.calls.length
+    assert_equal 0, store.object_state_reads
+    assert_empty store.claims
   end
 
   test "claims an object lease before serving a caller-local exposed query" do

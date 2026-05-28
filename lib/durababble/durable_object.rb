@@ -267,6 +267,8 @@ module Durababble
   class DurableObjectRef
     COMMAND_WAIT_TIMEOUT_SLACK_SECONDS = 10
     TRANSIENT_ROUTE_ATTEMPTS = 2
+    TRANSIENT_OWNER_RELEASE_WAIT_SECONDS = 0.25
+    TRANSIENT_OWNER_RELEASE_POLL_INTERVAL = 0.005
     LOCAL_QUERY_LEASE_SECONDS = 30
 
     class TransientRequest
@@ -541,7 +543,16 @@ module Durababble
           if (lease = current_object_lease)
             return invoke_owned_query(method_name, args:, kwargs:, block:, lease:) if current_runtime_owns?(lease)
 
-            return invoke_remote_query(method_name, args:, kwargs:, lease:)
+            begin
+              return invoke_remote_query(method_name, args:, kwargs:, lease:)
+            rescue WorkflowRpc::NodeUnavailable
+              refreshed = wait_for_object_lease_change(lease)
+              return invoke_claimed_local_query(method_name, args:, kwargs:, block:) unless refreshed
+
+              raise if same_lease_owner?(lease, refreshed)
+
+              raise WorkflowRpc::StaleLease, "durable object #{@object_class.object_type}/#{@durable_id} moved from #{lease.fetch("worker_id")} to #{refreshed.fetch("worker_id")}"
+            end
           end
 
           invoke_claimed_local_query(method_name, args:, kwargs:, block:)
@@ -565,6 +576,23 @@ module Durababble
       worker_id = worker_id #: as untyped
       worker_id = worker_id.call if worker_id.respond_to?(:call)
       !!(!worker_id.nil? && lease.fetch("worker_id") == worker_id)
+    end
+
+    #: (Hash[String, Object?]) -> Hash[String, Object?]?
+    def wait_for_object_lease_change(previous)
+      deadline = Time.now + TRANSIENT_OWNER_RELEASE_WAIT_SECONDS
+      loop do
+        refreshed = current_object_lease
+        return refreshed unless same_lease_owner?(previous, refreshed)
+        return refreshed if Time.now >= deadline
+
+        sleep(TRANSIENT_OWNER_RELEASE_POLL_INTERVAL)
+      end
+    end
+
+    #: (Hash[String, Object?], Hash[String, Object?]?) -> bool
+    def same_lease_owner?(previous, refreshed)
+      !!(refreshed && refreshed.fetch("worker_id") == previous.fetch("worker_id"))
     end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?], block: Object?, lease: Hash[String, Object?]) -> Object?
