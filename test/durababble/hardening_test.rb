@@ -188,7 +188,7 @@ class DurababbleHardeningTest < DurababbleTestCase
     assert_equal "completed", with_store_current_time(store, due_at) {
       Durababble::Engine.new(store:, worker_id: claim.fetch("locked_by")).resume(workflow, workflow_id:, claimed: claim)
     }.status
-    assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+    assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
   end
 
   test "marks waiting step attempts completed when the wait is satisfied" do

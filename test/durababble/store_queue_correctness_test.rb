@@ -233,6 +233,35 @@ class DurababbleStoreQueueCorrectnessTest < DurababbleTestCase
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "result" => nil
       end
     end
+
+    test "activation claims clear waiting timer deadlines before release with #{backend.name}" do
+      with_durababble_store(backend, "activation_claim_clears_deadline") do |store|
+        workflow_id = store.create_workflow(name: "approval", input: {})
+        store.record_wait(
+          workflow_id:,
+          position: 0,
+          name: "approval",
+          wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+        )
+
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "activation-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "activation-worker",
+        )
+        assert_nil store.workflow(workflow_id).fetch("next_run_at")
+
+        store.release_worker_leases!(worker_id: "activation-worker")
+        released = store.workflow(workflow_id)
+        assert_hash_includes released, "status" => "pending", "locked_by" => nil
+        assert_nil released.fetch("next_run_at")
+        assert_hash_includes(
+          store.claim_workflow_for_activation(workflow_id:, worker_id: "recovery-worker", lease_seconds: 30),
+          "id" => workflow_id,
+          "locked_by" => "recovery-worker",
+        )
+      end
+    end
   end
 
   private

@@ -104,7 +104,7 @@ module Durababble
     end
 
     #: (Hash[String, Object?]) -> Hash[String, Object?]?
-    def wait_row_from_history_event(event)
+    def wait_snapshot_from_history_event(event)
       command_id_value = event["command_id"]
       return unless command_id_value
 
@@ -132,10 +132,7 @@ module Durababble
         "event_key" => wait["event_key"],
         "wake_at" => wait["wake_at"],
         "context" => wait["context"] || event["payload"],
-        "payload" => status == "completed" ? event["payload"] : nil,
         "status" => status,
-        "created_at" => event["created_at"],
-        "completed_at" => status == "pending" ? nil : event["created_at"],
       }
     end
 
@@ -264,23 +261,24 @@ module Durababble
       total
     end
 
+    # Diagnostic/test view reconstructed from workflow history and step state.
+    # Runtime wake/claim paths must not call this; they use workflows.next_run_at.
     #: (String) -> Array[Hash[String, Object?]]
-    def waits_for(workflow_id)
-      rows = {}
+    def wait_snapshots_for(workflow_id)
+      snapshots = {}
       step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_s.to_i, step.fetch("status")] }
       workflow_history_for(workflow_id).each do |event|
-        row = wait_row_from_history_event(event)
-        next unless row
+        snapshot = wait_snapshot_from_history_event(event)
+        next unless snapshot
 
-        if row.fetch("status") == "pending" && step_statuses[row.fetch("command_id").to_s.to_i] == "canceled"
-          row = row.merge(
+        if snapshot.fetch("status") == "pending" && step_statuses[snapshot.fetch("command_id").to_s.to_i] == "canceled"
+          snapshot = snapshot.merge(
             "status" => "canceled",
-            "completed_at" => nil,
           )
         end
-        rows[row.fetch("id")] = row
+        snapshots[snapshot.fetch("id")] = snapshot
       end
-      rows.values.sort_by { |row| row.fetch("position").to_i }
+      snapshots.values.sort_by { |snapshot| snapshot.fetch("position").to_i }
     end
 
     #: (String) -> Hash[String, Object?]?

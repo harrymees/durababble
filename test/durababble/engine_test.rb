@@ -612,7 +612,7 @@ class DurababbleEngineTest < DurababbleTestCase
         )
         assert_equal 75, side_effect_count
         assert_equal 77, store.steps_for(workflow_id).length
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
       end
     end
 
@@ -811,7 +811,7 @@ class DurababbleEngineTest < DurababbleTestCase
           assert_equal "completed", completed.status
           assert_equal({ "id" => "wait", "slept" => true }, completed.result)
           assert_equal 3, store.workflow_history_count_for(workflow_id)
-          assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+          assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         end
       end
     end
@@ -840,7 +840,7 @@ class DurababbleEngineTest < DurababbleTestCase
           assert_equal "completed", completed.status
           assert_equal({ "id" => "immediate", "slept" => true, "after" => true }, completed.result)
           assert_equal 6, store.workflow_history_count_for(workflow_id)
-          assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+          assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         end
       end
     end

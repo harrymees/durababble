@@ -628,7 +628,7 @@ module Durababble
 
       #: () -> Hash[String, Hash[String, Object?]]
       def all_waits
-        base = all_workflows.keys.flat_map { |workflow_id| waits_for(workflow_id) }.to_h { |row| [row.fetch("id"), row] }
+        base = all_workflows.keys.flat_map { |workflow_id| wait_snapshots_for(workflow_id) }.to_h { |row| [row.fetch("id"), row] }
         base.merge(@injected_waits)
       end
 

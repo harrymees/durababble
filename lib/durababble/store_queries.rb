@@ -1381,7 +1381,7 @@ module Durababble
     define(:mysql_claim_workflow_for_activation_update, backend: :mysql, description: "Claim a workflow through its activation path.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
       SQL
     end

@@ -88,7 +88,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "pending"
         assert_equal [], store.workflow_history_for(workflow_id)
         assert_equal [], store.steps_for(workflow_id)
-        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.wait_snapshots_for(workflow_id)
         assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
         assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-id", target_id: workflow_id)
       end
@@ -108,7 +108,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_match(/workflow #{Regexp.escape(workflow_id)} already exists/, error.message)
 
         assert_hash_includes store.workflow(workflow_id), "input" => { "count" => 1 }, "status" => "completed", "result" => { "count" => 2 }
-        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.wait_snapshots_for(workflow_id)
         assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
         assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-completed", target_id: workflow_id)
       end
@@ -164,7 +164,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.workflow(workflow_id), "id" => workflow_id, "name" => "explicit-race", "status" => "pending"
         assert_equal [], store.workflow_history_for(workflow_id)
         assert_equal [], store.steps_for(workflow_id)
-        assert_equal [], store.waits_for(workflow_id)
+        assert_equal [], store.wait_snapshots_for(workflow_id)
         assert_equal [], store.inbox_messages_for(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
         assert_nil store.target_activation(target_kind: "workflow", target_type: "explicit-race", target_id: workflow_id)
       end
@@ -273,7 +273,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
 
         assert_equal 0, store.wake_due_timers(now: due_at - 1)
-        assert_hash_includes store.waits_for(workflow_id).first, "id" => wait_id, "status" => "pending"
+        assert_hash_includes store.wait_snapshots_for(workflow_id).first, "id" => wait_id, "status" => "pending"
 
         make_workflow_timer_due(store, workflow_id, at: due_at)
         claimed = store.claim_runnable_workflow(worker_id: "timer-worker", lease_seconds: 60, workflow_names: ["timer"])
@@ -303,8 +303,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         second_claim = store.claim_runnable_workflow(worker_id: "timer-worker-b", lease_seconds: 60, workflow_names: ["timer-batch"])
         assert_equal [first_workflow, second_workflow].sort, [first_claim.fetch("id"), second_claim.fetch("id")].sort
         assert_nil store.claim_runnable_workflow(worker_id: "timer-worker-c", lease_seconds: 60, workflow_names: ["timer-batch"])
-        assert_equal ["pending"], store.waits_for(first_workflow).map { |wait| wait.fetch("status") }
-        assert_equal ["pending"], store.waits_for(second_workflow).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(first_workflow).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(second_workflow).map { |wait| wait.fetch("status") }
       end
     end
 
@@ -1678,7 +1678,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           store.complete_workflow(pending_wait_id, result: { "done" => true })
         end
         assert_hash_includes store.workflow(pending_wait_id), "status" => "waiting", "result" => nil
-        assert_equal ["completed"], store.waits_for(pending_wait_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed"], store.wait_snapshots_for(pending_wait_id).map { |wait| wait.fetch("status") }
 
         cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
         store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
@@ -1694,7 +1694,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.workflow(cancel_id), "status" => "canceled", "error" => "operator stop"
         assert_equal ["canceled", "canceled", "canceled"], store.steps_for(cancel_id).map { |step| step.fetch("status") }
         assert_equal ["canceled"], store.step_attempts_for(cancel_id).map { |attempt| attempt.fetch("status") }
-        assert_equal ["canceled"], store.waits_for(cancel_id).map { |wait| wait.fetch("status") }
+        assert_equal ["canceled"], store.wait_snapshots_for(cancel_id).map { |wait| wait.fetch("status") }
       end
     end
 

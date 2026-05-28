@@ -116,7 +116,7 @@ FOR UPDATE SKIP LOCKED
 
 -- mysql_claim_workflow_for_activation_update
 UPDATE `durababble_mysql_snapshot_workflows`
-SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
 WHERE id = ? AND worker_pool = ?
 
 -- mysql_claim_workflow_lock

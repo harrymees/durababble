@@ -88,7 +88,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         assert_equal "waiting", waiting.status
         make_workflow_timer_due(store, workflow_id, at: store.workflow(workflow_id).fetch("next_run_at"))
         store.claim_workflow(workflow_id:, worker_id: "timer-version", lease_seconds: 60)
-        wait_context = store.waits_for(workflow_id).first.fetch("context")
+        wait_context = store.wait_snapshots_for(workflow_id).first.fetch("context")
         store.record_step_completed(workflow_id:, command_id: 1, result: wait_context, worker_id: "timer-version")
         store.suspend_workflow(workflow_id:, worker_id: "timer-version")
 
@@ -234,13 +234,13 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         assert_equal :worked, worker.tick
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_hash_includes store.waits_for(workflow_id).first, "kind" => "timer", "status" => "pending"
+        assert_hash_includes store.wait_snapshots_for(workflow_id).first, "kind" => "timer", "status" => "pending"
 
         assert_equal 0, store.wake_due_timers(now: wake_at - 1)
         make_workflow_timer_due(store, workflow_id, at: wake_at)
         assert_equal :worked, with_store_current_time(store, wake_at + 1) { worker.tick }
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_equal ["completed", "pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
         next_wake = store.workflow(workflow_id).fetch("next_run_at")
         make_workflow_timer_due(store, workflow_id, at: next_wake)
@@ -251,7 +251,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
           "status" => "completed",
           "result" => { "id" => "hatchet", "slept" => true, "approved" => true, "done" => true },
         )
-        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal(
           ["completed", "completed", "completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },

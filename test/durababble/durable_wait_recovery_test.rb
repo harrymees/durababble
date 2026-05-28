@@ -29,14 +29,14 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           ).resume(workflow, workflow_id:)
         end
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "locked_by" => nil
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
         run = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "recover")
 
         assert_equal "completed", run.status
         assert_equal({ "id" => "timer-crash", "slept" => true, "done" => true }, run.result)
-        assert_equal 1, store.waits_for(workflow_id).length
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal 1, store.wait_snapshots_for(workflow_id).length
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end
@@ -96,7 +96,7 @@ class DurababbleDurableWaitRecoveryTest < DurababbleTestCase
           [["0", "pause_until", "completed"], ["1", "pause_until", "completed"]],
           store.steps_for(workflow_id).map { |step| [step.fetch("position").to_s, step.fetch("name"), step.fetch("status")] },
         )
-        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end
     end

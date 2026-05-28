@@ -81,7 +81,7 @@ class DurababbleCompleteTest < DurababbleTestCase
 
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_equal "timer", store.waits_for(workflow_id).first.fetch("kind")
+        assert_equal "timer", store.wait_snapshots_for(workflow_id).first.fetch("kind")
 
         assert_equal 0, store.wake_due_timers(now: Time.now)
         first_wake = store.workflow(workflow_id).fetch("next_run_at")
@@ -89,7 +89,7 @@ class DurababbleCompleteTest < DurababbleTestCase
         assert_equal :worked, with_store_current_time(store, first_wake) { worker.tick }
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
         assert_equal ["completed", "waiting"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
-        assert_nil store.waits_for(workflow_id).last.fetch("event_key")
+        assert_nil store.wait_snapshots_for(workflow_id).last.fetch("event_key")
 
         second_wake = store.workflow(workflow_id).fetch("next_run_at")
         make_workflow_timer_due(store, workflow_id, at: second_wake)

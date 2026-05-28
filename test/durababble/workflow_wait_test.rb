@@ -22,7 +22,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
 
         assert_equal "waiting", waiting.status
         assert_equal [["sleep", "waiting"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["step_scheduled", "step_waiting"], store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }
 
         completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "direct-resume")
@@ -56,14 +56,14 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         end
 
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting", "locked_by" => nil
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
         recovered = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "direct-recover")
 
         assert_equal "completed", recovered.status
         assert_equal({ "id" => "timer", "slept" => true, "done" => true }, recovered.result)
-        assert_equal 1, store.waits_for(workflow_id).length
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal 1, store.wait_snapshots_for(workflow_id).length
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
       end
     end
 
@@ -83,7 +83,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
         assert_equal "waiting", waiting.status
 
         workflow.handle(workflow_id, store:).cancel(reason: "stop direct wait")
-        assert_equal ["canceled"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["canceled"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         canceled = Durababble::Engine.new(store:, worker_id: "cancel-resume").resume(workflow, workflow_id:)
 
         assert_equal "canceled", canceled.status
@@ -204,20 +204,20 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
 
         assert_equal "waiting", waiting.status
         assert_in_delta early.to_f, timestamp_value(store.workflow(workflow_id).fetch("next_run_at")).to_f, 1
-        assert_equal ["pending", "pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending", "pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
         still_waiting = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "parallel-early")
 
         assert_equal "waiting", still_waiting.status
         assert_in_delta late.to_f, timestamp_value(store.workflow(workflow_id).fetch("next_run_at")).to_f, 1
-        statuses_by_timer = store.waits_for(workflow_id).to_h { |wait| [wait.fetch("context").fetch("timer"), wait.fetch("status")] }
+        statuses_by_timer = store.wait_snapshots_for(workflow_id).to_h { |wait| [wait.fetch("context").fetch("timer"), wait.fetch("status")] }
         assert_equal({ "early" => "completed", "late" => "pending" }, statuses_by_timer)
 
         completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "parallel-late")
 
         assert_equal "completed", completed.status
         assert_equal [{ "id" => "parallel", "timer" => "late" }, { "id" => "parallel", "timer" => "early" }], completed.result
-        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
       end
     end
   end

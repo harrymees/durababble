@@ -738,7 +738,7 @@ class DurababbleWorkflowTest < DurababbleTestCase
         assert_equal({ "approved_by" => "operator" }, value)
 
         assert_hash_includes(store.workflow(workflow_id), "status" => "waiting")
-        assert_equal(["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") })
+        assert_equal(["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") })
         assert_nil(store.target_activation(target_kind: "workflow", target_type: ApiTestApprovalWorkflow.workflow_name, target_id: workflow_id))
         assert_hash_includes(store.inbox_message(workflow_messages.first.fetch("id")), "status" => "completed", "result" => { "approved_by" => "operator" })
         assert_includes(store.workflow_history_for(workflow_id).map { |event| event.fetch("kind") }, "workflow_command_completed")

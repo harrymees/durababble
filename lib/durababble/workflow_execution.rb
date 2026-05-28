@@ -43,7 +43,6 @@ module Durababble
       @claimed_next_run_at = claimed_next_run_at
       @store_mutex = Mutex.new
       @replay_history = WorkflowReplayHistory.new(history)
-      @claimed_due_wake_at = claimed_next_run_at ? @replay_history.earliest_unresolved_timer_wake_at : nil
       @history_warning_logged = history_warning_logged
       @cancellation_delivered = false
       @delivering_workflow_command = false
@@ -878,7 +877,7 @@ module Durababble
       wake_at = wait["wake_at"]
       return true if wait.fetch("kind", nil) == "child_workflow" && child_workflow_wait_ready?(wait)
 
-      !!(wake_at && (timer_due?(wake_at) || claimed_wake_due?(wake_at) || claimed_earliest_wake_due?(wake_at)))
+      !!(wake_at && (timer_due?(wake_at) || claimed_wake_due?(wake_at)))
     end
 
     #: (Object) -> bool
@@ -886,13 +885,6 @@ module Durababble
       return false unless @claimed_next_run_at
 
       comparable_time(wake_at) <= comparable_time(@claimed_next_run_at)
-    end
-
-    #: (Object) -> bool
-    def claimed_earliest_wake_due?(wake_at)
-      return false unless @claimed_due_wake_at
-
-      comparable_time(wake_at) == comparable_time(@claimed_due_wake_at)
     end
 
     #: (Hash[String, Object?]) -> bool

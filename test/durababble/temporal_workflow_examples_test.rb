@@ -60,7 +60,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
         assert_equal :worked, worker.tick
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
         assert_equal ["failed", "completed", "completed", "completed"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
-        assert_equal ["pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal 0, store.wake_due_timers(now: wake_at - 1)
 
         make_workflow_timer_due(store, workflow_id, at: wake_at)
@@ -82,7 +82,7 @@ class DurababbleTemporalWorkflowExamplesTest < DurababbleTestCase
           "confirmation_sent" => true,
         )
         assert_equal "durababble:v1:workflow:#{workflow_id}:step:0", result.fetch("charge_idempotency_key")
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
       end
     end
 
