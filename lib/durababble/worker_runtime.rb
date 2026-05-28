@@ -79,9 +79,8 @@ module Durababble
       @migrate = migrate
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
-      # @mutex guards the lifecycle state shared between the control path and
-      # the runtime owner (@stopping, @task, @deliveries). @wakeups is
-      # only a hint channel to interrupt the polling fiber's idle sleep.
+      # @mutex guards lifecycle state touched by callers and the runtime task.
+      # @wakeups is only a hint channel; durable work still lives in the store.
       @mutex = Mutex.new
       @wakeups = Async::Queue.new
       @deliveries = []
@@ -98,28 +97,13 @@ module Durababble
 
     #: () -> WorkerRuntime
     def start
-      @mutex.synchronize do
-        return self if running?
-
-        parent = Async::Task.current?
-        raise ConfigurationError, "WorkerRuntime.start requires an active Async task; wrap worker boot in Async { ... } or call start_async(parent:)" unless parent
-
-        worker = prepare_start_locked(async_parent: parent, raise_loop_errors: false)
-        @task = parent.async { |task| run_loop(task, worker) }
-      end
+      start_task(parent: nil, operation: "WorkerRuntime.start", raise_loop_errors: false)
       self
     end
 
     #: (?parent: Object?) -> Object
-    def start_async(parent: Async::Task.current?)
-      raise ConfigurationError, "WorkerRuntime.start_async requires an active Async task; pass parent: from an Async block" unless parent
-
-      @mutex.synchronize do
-        return @task if running? && @task
-
-        worker = prepare_start_locked(async_parent: parent, raise_loop_errors: true)
-        @task = parent.async { |task| run_loop(task, worker) }
-      end
+    def start_async(parent: nil)
+      start_task(parent:, operation: "WorkerRuntime.start_async", raise_loop_errors: true)
     end
 
     #: (?timeout: Numeric) -> Symbol
@@ -174,8 +158,27 @@ module Durababble
 
     private
 
-    #: (async_parent: Object?, raise_loop_errors: bool) -> Worker
-    def prepare_start_locked(async_parent:, raise_loop_errors:)
+    #: (parent: Object?, operation: String, raise_loop_errors: bool) -> Object
+    def start_task(parent:, operation:, raise_loop_errors:)
+      @mutex.synchronize do
+        return @task if running? && @task
+
+        async_parent = parent || current_async_task!(operation)
+        async_parent = async_parent #: as untyped
+        worker = prepare_start_locked(parent: async_parent, raise_loop_errors:)
+        @task = async_parent.async { |task| run_loop(task, worker) }
+      end
+    end
+
+    #: (String) -> Object
+    def current_async_task!(operation)
+      Async::Task.current
+    rescue RuntimeError
+      raise ConfigurationError, "#{operation} requires an active Async task; wrap worker boot in Async { ... } or pass parent: from your application's Async supervisor"
+    end
+
+    #: (parent: Object, raise_loop_errors: bool) -> Worker
+    def prepare_start_locked(parent:, raise_loop_errors:)
       Durababble.assert_fiber_isolation!
       @stopping = false
       @last_error = nil
@@ -188,7 +191,7 @@ module Durababble
         "durababble.worker.pool" => @worker_pool,
         "durababble.worker.id" => @worker_id,
       )
-      start_rpc_server(parent: async_parent)
+      start_rpc_server(parent:)
       Worker.new(
         store: @store,
         workflows: @workflows,
@@ -205,8 +208,8 @@ module Durababble
       raise
     end
 
-    #: (?parent: Object?) -> untyped
-    def start_rpc_server(parent: nil)
+    #: (parent: Object) -> untyped
+    def start_rpc_server(parent:)
       server = Rpc::Server.new(
         node_id: nil,
         store: @store,
@@ -220,7 +223,7 @@ module Durababble
         identity_id: @worker_identity_id,
         deliver_message: method(:enqueue_delivery),
       )
-      @rpc_server = parent ? server.start_async(parent:) : server.start
+      @rpc_server = server.start_async(parent:)
       @rpc_address = @rpc_server.address
       @worker_id = @rpc_server.node_id
       configure_local_workflow_rpc(@store)
@@ -320,30 +323,16 @@ module Durababble
     #: (untyped, untyped) -> untyped
     def run_loop(task, worker)
       active_targets = {}
-      loop do
-        if stopping?
-          break if active_targets.empty?
-
-          await_active_work(task)
-          next
-        end
-
+      until stopping? && active_targets.empty?
         begin
-          scheduled = schedule_available_work(task, worker, active_targets)
-          next if scheduled
-
-          if active_targets.length >= @concurrency
-            await_active_work(task)
-          else
-            await_work(task)
-          end
+          poll_once(task, worker, active_targets) || wait_for_runtime_event(task, active_targets)
         rescue LeaseConflict => e
           record_worker_error(e)
         rescue StandardError => e
           record_worker_error(e)
           raise if @raise_loop_errors
 
-          await_work(task)
+          wait_for_runtime_event(task, active_targets)
         end
       end
     ensure
@@ -355,26 +344,20 @@ module Durababble
     end
 
     #: (untyped, untyped, Hash[Array[String], untyped]) -> bool
-    def schedule_available_work(task, worker, active_targets)
-      scheduled_count = 0
-      while active_targets.length < @concurrency && !stopping?
-        work_item = next_delivery_work(worker) || worker.claim_work(excluding_target_keys: active_targets.keys)
-        break unless work_item
+    def poll_once(task, worker, active_targets)
+      return false if stopping?
+      return false if active_targets.length >= @concurrency
 
-        if active_targets.key?(work_item.target_key)
-          defer_duplicate_work(worker, work_item)
-          next
-        end
+      work_item = next_work_item(worker, active_targets)
+      return false unless work_item
 
-        scheduled_count += 1
-        active_targets[work_item.target_key] = true
-        schedule_work_item(task, worker, active_targets, work_item)
-      end
-      scheduled_count.positive?
+      start_work_item(task, worker, active_targets, work_item)
+      true
     end
 
     #: (untyped, untyped, Hash[Array[String], untyped], untyped) -> void
-    def schedule_work_item(task, worker, active_targets, scheduled_item)
+    def start_work_item(task, worker, active_targets, scheduled_item)
+      active_targets[scheduled_item.target_key] = true
       task.async do
         worker.perform_work(scheduled_item)
         @consecutive_errors = 0
@@ -385,6 +368,17 @@ module Durababble
       ensure
         active_targets.delete(scheduled_item.target_key)
         @wakeups.push(:finished)
+      end
+    end
+
+    #: (untyped, Hash[Array[String], untyped]) -> untyped
+    def next_work_item(worker, active_targets)
+      loop do
+        work_item = next_delivery_work(worker) || worker.claim_work(excluding_target_keys: active_targets.keys)
+        return unless work_item
+        return work_item unless active_targets.key?(work_item.target_key)
+
+        defer_duplicate_work(worker, work_item)
       end
     end
 
@@ -435,13 +429,11 @@ module Durababble
       @mutex.synchronize { @deliveries.empty? }
     end
 
-    # Park the polling fiber until a wakeup arrives or @poll_interval elapses,
-    # whichever comes first. Wakeup tokens are only hints: the real work lives in
-    # @deliveries and the store, so draining stale tokens afterward is safe and
-    # prevents the loop from spinning through a backlog of signals.
-    #: (untyped) -> void
-    def await_work(task)
-      return if stopping? || !deliveries_empty?
+    # Wakeup tokens are only hints. After each wake or timeout the loop re-checks
+    # deliveries, active targets, and the store as the source of truth.
+    #: (untyped, Hash[Array[String], untyped]) -> void
+    def wait_for_runtime_event(task, active_targets)
+      return if ready_to_poll?(active_targets)
 
       task.with_timeout(@poll_interval) { @wakeups.dequeue }
     rescue Async::TimeoutError
@@ -450,13 +442,11 @@ module Durababble
       clear_wakeups
     end
 
-    #: (untyped) -> void
-    def await_active_work(task)
-      task.with_timeout(@poll_interval) { @wakeups.dequeue }
-    rescue Async::TimeoutError
-      nil
-    ensure
-      clear_wakeups
+    #: (Hash[Array[String], untyped]) -> bool
+    def ready_to_poll?(active_targets)
+      return false if stopping?
+
+      active_targets.length < @concurrency && !deliveries_empty?
     end
 
     # Surface unexpected polling failures so a worker that is silently spinning
