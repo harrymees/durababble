@@ -9,6 +9,12 @@ end
 module Async
   class TimeoutError < StandardError; end
 
+  # `Async::Stop` (raised into a task by `#stop`) descends from `Async::Cancel`,
+  # which descends from `Exception` — deliberately NOT a `StandardError`, so a
+  # producer's `rescue StandardError` does not swallow cancellation.
+  class Cancel < Exception; end
+  class Stop < Cancel; end
+
   class Scheduler
     def interrupt; end
     def terminate; end
@@ -22,9 +28,26 @@ module Async
 
   class Task
     def self.current; end
-    def async(&blk); end
+    def self.current?; end
+    def async(*args, **kwargs, &blk); end
     def wait; end
+    def stop(later = false); end
+    def transient?; end
     def with_timeout(duration, exception = nil, message = nil, &blk); end
+  end
+
+  class Queue
+    class ClosedError < StandardError; end
+
+    def initialize; end
+    def enqueue(item); end
+    def dequeue; end
+    def close; end
+    def closed?; end
+  end
+
+  class LimitedQueue < Queue
+    def initialize(limit = nil); end
   end
 
   module HTTP
@@ -59,10 +82,25 @@ module Protocol
     class Response
       def self.[](status, headers = nil, body = nil); end
     end
+
+    module Body
+      class Writable
+        class Closed < StandardError; end
+
+        def initialize(length = nil, queue: nil); end
+        def write(chunk); end
+        def read; end
+        def close(error = nil); end
+        def close_write(error = nil); end
+        def closed?; end
+      end
+    end
   end
 
   module HTTP2
-    class Error < StandardError; end
+    class Error < StandardError
+      CANCEL = 8
+    end
   end
 end
 

@@ -315,6 +315,30 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     server&.stop
   end
 
+  test "stop returns even when the reactor thread never drains" do
+    server = Durababble::Rpc::Server.allocate
+    # A scheduler whose interrupt is a no-op models a reactor that never observes
+    # the stop signal; a thread blocked until we release it models a wedged
+    # accept loop. stop must bound its join by @stop_drain_timeout, not hang.
+    release = Thread::Queue.new
+    thread = Thread.new { release.pop }
+    fake_scheduler = Object.new
+    def fake_scheduler.interrupt; end
+    fake_bound = Object.new
+    def fake_bound.close; end
+    server.instance_variable_set(:@scheduler, fake_scheduler)
+    server.instance_variable_set(:@thread, thread)
+    server.instance_variable_set(:@bound, fake_bound)
+    server.instance_variable_set(:@stop_drain_timeout, 0.1)
+
+    Timeout.timeout(5) { server.stop }
+
+    assert_nil(server.instance_variable_get(:@thread))
+  ensure
+    release&.push(nil)
+    thread&.join
+  end
+
   test "rejects unauthorized peers before running handlers" do
     store = self.store
     ran = false

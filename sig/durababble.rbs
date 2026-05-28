@@ -68,6 +68,10 @@ module Durababble
     def call: (request: Object, args: serialized_payload) -> serialized_payload
   end
 
+  interface _StreamHandler
+    def call: (request: Object, args: serialized_payload, writer: Rpc::StreamWriter) -> void
+  end
+
   interface _RpcRequester
     def request: (String command, payload_map payload) -> serialized_payload
   end
@@ -222,6 +226,7 @@ module Durababble
     def claim_runnable_workflow: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String], ?worker_pool: String, ?excluding_workflow_ids: Array[String]) -> workflow_row?
     def claim_workflow: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
     def claim_workflow_for_activation: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> workflow_row?
+    def upsert_target_activation: (worker_pool: String, target_kind: String, target_type: String, target_id: String, ?ready_at: Object?) -> Object?
     def heartbeat: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Object
     def workflow_owned?: (workflow_id: String, worker_id: String) -> bool
     def release_worker_leases!: (worker_id: String) -> lease_release_counts
@@ -362,6 +367,35 @@ module Durababble
   class DurableObjectExecutor
     def initialize: (store: Store, objects: object_registry, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def drain_object_inbox: (String object_type, object_id: String, ?limit: Integer) -> Integer
+  end
+
+  # Enumerable consumer for a streaming-result RPC, built on the async reactor
+  # with no background threads: the producer runs as a transient child task and
+  # bridges to the consumer through a bounded `Async::LimitedQueue`. `each`
+  # self-wraps in `Sync {}` off a reactor; `read` requires an ambient reactor
+  # (raises `NotOnReactor` otherwise). `each` re-raises a producer error after any
+  # values already delivered; `read` returns the next value or nil at graceful
+  # end; `close` is idempotent.
+  class ResultStream
+    include Enumerable[serialized_payload]
+
+    # Raised when `read` is called without an ambient reactor task.
+    class NotOnReactor < Durababble::Error
+    end
+
+    # Producer-facing handle wrapping the bounded bridge queue (an
+    # `Async::LimitedQueue`, which RBS has no signature for — hence `Object`).
+    class Writer
+      def initialize: (Object queue) -> void
+      def emit: (serialized_payload value) -> void
+      def cancelled?: () -> bool
+    end
+
+    def initialize: () { (Writer writer) -> void } -> void
+    def each: () { (serialized_payload value) -> void } -> ResultStream
+            | () -> Enumerator[serialized_payload, ResultStream]
+    def read: () -> serialized_payload
+    def close: () -> void
   end
 
   class WaitRequest
@@ -532,6 +566,14 @@ module Durababble
       def rpc_address_for: (String node_id) -> String?
     end
 
+    # Server-side producer handle: `emit` writes one value frame to the streaming
+    # response body; `cancelled?` reports whether the consumer reset the stream.
+    class StreamWriter
+      def initialize: (Object body) -> void
+      def emit: (serialized_payload value) -> void
+      def cancelled?: () -> bool
+    end
+
     module Messages
       class AwakenBatchRequest
         attr_reader worker_pool: String
@@ -607,6 +649,7 @@ module Durababble
       def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
       def call_transient_response: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> Messages::TransientResponse
       def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+      def call_transient_stream: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> ResultStream
     end
 
     class WorkflowClient
@@ -619,7 +662,7 @@ module Durababble
       attr_reader host: String
       attr_reader port: Integer?
 
-      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: credentials?, ?pool_size: Integer?, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?stream_handler: _StreamHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: credentials?, ?pool_size: Integer?, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?, ?stop_drain_timeout: Float) -> void
       def start: () -> self
       def start_async: (?parent: Object) -> self
       def stop: () -> void
