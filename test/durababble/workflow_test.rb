@@ -378,46 +378,51 @@ class DurababbleWorkflowTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_query_local_owner") do |store|
         store.migrate!
         reset_queryable_workflow_controls
-        runtime = Durababble::WorkerRuntime.start(
+        runtime = Durababble::WorkerRuntime.new(
           store:,
           workflows: [ApiTestQueryableWorkflow],
           worker_pool: "default",
           poll_interval: 0.01,
           migrate: false,
         )
-        workflow_id = store.enqueue_workflow(
-          name: ApiTestQueryableWorkflow.workflow_name,
-          input: { "state" => "local-owner" },
-        )
-        wait_until do
-          ApiTestQueryableWorkflow.step_started.pop(true)
-        rescue
-          nil
+        workflow_id = nil
+        with_started_runtime(runtime) do
+          workflow_id = store.enqueue_workflow(
+            name: ApiTestQueryableWorkflow.workflow_name,
+            input: { "state" => "local-owner" },
+          )
+          wait_until do
+            ApiTestQueryableWorkflow.step_started.pop(true)
+          rescue
+            nil
+          end
+          store.workflow_rpc_client_factory = ->(_worker_id, worker_pool:) { raise "local query should not open a gRPC client for #{worker_pool}" }
+
+          before_history = store.workflow_history_for(workflow_id)
+          before_inbox = store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id)
+          result = ApiTestQueryableWorkflow.handle(workflow_id, store:).snapshot(
+            prefix: "local",
+            metadata: { "nested" => ["value", 7] },
+          )
+
+          assert_equal(
+            {
+              "prefix" => "local",
+              "state" => "local-owner",
+              "metadata" => { "nested" => ["value", 7] },
+              "instance_id" => ApiTestQueryableWorkflow.current_instance_id,
+            },
+            result,
+          )
+          assert_equal(before_history, store.workflow_history_for(workflow_id))
+          assert_equal(before_inbox, store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
+        ensure
+          ApiTestQueryableWorkflow.release_step&.push(true)
+          wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if workflow_id
         end
-        store.workflow_rpc_client_factory = ->(_worker_id, worker_pool:) { raise "local query should not open a gRPC client for #{worker_pool}" }
-
-        before_history = store.workflow_history_for(workflow_id)
-        before_inbox = store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id)
-        result = ApiTestQueryableWorkflow.handle(workflow_id, store:).snapshot(
-          prefix: "local",
-          metadata: { "nested" => ["value", 7] },
-        )
-
-        assert_equal(
-          {
-            "prefix" => "local",
-            "state" => "local-owner",
-            "metadata" => { "nested" => ["value", 7] },
-            "instance_id" => ApiTestQueryableWorkflow.current_instance_id,
-          },
-          result,
-        )
-        assert_equal(before_history, store.workflow_history_for(workflow_id))
-        assert_equal(before_inbox, store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
       ensure
         ApiTestQueryableWorkflow.release_step&.push(true)
         wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if store && workflow_id
-        runtime&.shutdown(timeout: 2)
       end
     end
 
@@ -425,44 +430,50 @@ class DurababbleWorkflowTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_query_remote_owner") do |store|
         store.migrate!
         reset_queryable_workflow_controls
-        runtime = Durababble::WorkerRuntime.start(
+        runtime = Durababble::WorkerRuntime.new(
           store:,
           workflows: [ApiTestQueryableWorkflow],
           worker_pool: "default",
           poll_interval: 0.01,
           migrate: false,
         )
-        workflow_id = store.enqueue_workflow(
-          name: ApiTestQueryableWorkflow.workflow_name,
-          input: { "state" => "remote-owner" },
-        )
-        wait_until do
-          ApiTestQueryableWorkflow.step_started.pop(true)
-        rescue
-          nil
+        workflow_id = nil
+        caller_store = nil
+        with_started_runtime(runtime) do
+          workflow_id = store.enqueue_workflow(
+            name: ApiTestQueryableWorkflow.workflow_name,
+            input: { "state" => "remote-owner" },
+          )
+          wait_until do
+            ApiTestQueryableWorkflow.step_started.pop(true)
+          rescue
+            nil
+          end
+          caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
+
+          result = ApiTestQueryableWorkflow.handle(workflow_id, store: caller_store).snapshot(
+            prefix: "remote",
+            metadata: { "nested" => [{ "a" => 1 }, "b"] },
+          )
+
+          assert_equal(
+            {
+              "prefix" => "remote",
+              "state" => "remote-owner",
+              "metadata" => { "nested" => [{ "a" => 1 }, "b"] },
+              "instance_id" => ApiTestQueryableWorkflow.current_instance_id,
+            },
+            result,
+          )
+          assert_empty(caller_store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
+        ensure
+          ApiTestQueryableWorkflow.release_step&.push(true)
+          wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if workflow_id
         end
-        caller_store = Durababble::Store.connect(database_url: backend.database_url, schema:)
-
-        result = ApiTestQueryableWorkflow.handle(workflow_id, store: caller_store).snapshot(
-          prefix: "remote",
-          metadata: { "nested" => [{ "a" => 1 }, "b"] },
-        )
-
-        assert_equal(
-          {
-            "prefix" => "remote",
-            "state" => "remote-owner",
-            "metadata" => { "nested" => [{ "a" => 1 }, "b"] },
-            "instance_id" => ApiTestQueryableWorkflow.current_instance_id,
-          },
-          result,
-        )
-        assert_empty(caller_store.inbox_messages_for(target_kind: "workflow", target_type: ApiTestQueryableWorkflow.workflow_name, target_id: workflow_id))
       ensure
         caller_store&.close
         ApiTestQueryableWorkflow.release_step&.push(true)
         wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if store && workflow_id
-        runtime&.shutdown(timeout: 2)
       end
     end
 
@@ -586,50 +597,57 @@ class DurababbleWorkflowTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_query_context_isolation") do |store|
         store.migrate!
         reset_queryable_workflow_controls
-        runtime = Durababble::WorkerRuntime.start(
+        runtime = Durababble::WorkerRuntime.new(
           store:,
           workflows: [ApiTestQueryableWorkflow],
           worker_pool: "default",
           poll_interval: 0.01,
           migrate: false,
         )
-        workflow_id = store.enqueue_workflow(
-          name: ApiTestQueryableWorkflow.workflow_name,
-          input: { "state" => "query-isolated" },
-        )
-        wait_until do
-          ApiTestQueryableWorkflow.step_started.pop(true)
-        rescue
-          nil
-        end
+        workflow_id = nil
+        query_thread = nil
+        with_started_runtime(runtime) do
+          workflow_id = store.enqueue_workflow(
+            name: ApiTestQueryableWorkflow.workflow_name,
+            input: { "state" => "query-isolated" },
+          )
+          wait_until do
+            ApiTestQueryableWorkflow.step_started.pop(true)
+          rescue
+            nil
+          end
 
-        result_queue = Queue.new
-        query_thread = Thread.new do
-          result_queue << [:ok, ApiTestQueryableWorkflow.handle(workflow_id, store:).blocking_snapshot]
-        rescue StandardError => e
-          result_queue << [:error, e]
-        end
-        wait_until do
-          ApiTestQueryableWorkflow.query_entered.pop(true)
-        rescue
-          nil
-        end
+          result_queue = Queue.new
+          query_thread = Thread.new do
+            result_queue << [:ok, ApiTestQueryableWorkflow.handle(workflow_id, store:).blocking_snapshot]
+          rescue StandardError => e
+            result_queue << [:error, e]
+          end
+          wait_until do
+            ApiTestQueryableWorkflow.query_entered.pop(true)
+          rescue
+            nil
+          end
 
-        ApiTestQueryableWorkflow.release_step << true
-        wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" }
-        ApiTestQueryableWorkflow.query_release << true
-        status, value = result_queue.pop
-        query_thread.join
+          ApiTestQueryableWorkflow.release_step << true
+          wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" }
+          ApiTestQueryableWorkflow.query_release << true
+          status, value = result_queue.pop
+          query_thread.join
 
-        flunk(value.full_message) if status == :error
-        assert_equal(:ok, status)
-        assert_equal({ "state" => "query-isolated" }, value)
-        assert_hash_includes(store.workflow(workflow_id), "status" => "completed")
+          flunk(value.full_message) if status == :error
+          assert_equal(:ok, status)
+          assert_equal({ "state" => "query-isolated" }, value)
+          assert_hash_includes(store.workflow(workflow_id), "status" => "completed")
+        ensure
+          ApiTestQueryableWorkflow.query_release&.push(true)
+          ApiTestQueryableWorkflow.release_step&.push(true)
+          query_thread&.kill if query_thread&.alive?
+        end
       ensure
         ApiTestQueryableWorkflow.query_release&.push(true)
         ApiTestQueryableWorkflow.release_step&.push(true)
         query_thread&.kill if query_thread&.alive?
-        runtime&.shutdown(timeout: 2)
       end
     end
 
@@ -637,33 +655,38 @@ class DurababbleWorkflowTest < DurababbleTestCase
       with_durababble_store(backend, "workflow_query_durable_boundary_guard") do |store|
         store.migrate!
         reset_queryable_workflow_controls
-        runtime = Durababble::WorkerRuntime.start(
+        runtime = Durababble::WorkerRuntime.new(
           store:,
           workflows: [ApiTestQueryableWorkflow],
           worker_pool: "default",
           poll_interval: 0.01,
           migrate: false,
         )
-        workflow_id = store.enqueue_workflow(
-          name: ApiTestQueryableWorkflow.workflow_name,
-          input: { "state" => "guard" },
-        )
-        wait_until do
-          ApiTestQueryableWorkflow.step_started.pop(true)
-        rescue
-          nil
-        end
+        workflow_id = nil
+        with_started_runtime(runtime) do
+          workflow_id = store.enqueue_workflow(
+            name: ApiTestQueryableWorkflow.workflow_name,
+            input: { "state" => "guard" },
+          )
+          wait_until do
+            ApiTestQueryableWorkflow.step_started.pop(true)
+          rescue
+            nil
+          end
 
-        assert_raises_matching(Durababble::Error, /cannot call workflow steps from an exposed query/) do
-          ApiTestQueryableWorkflow.handle(workflow_id, store:).query_step_forbidden
-        end
-        assert_raises_matching(Durababble::Error, /cannot schedule workflow waits from an exposed query/) do
-          ApiTestQueryableWorkflow.handle(workflow_id, store:).query_wait_forbidden
+          assert_raises_matching(Durababble::Error, /cannot call workflow steps from an exposed query/) do
+            ApiTestQueryableWorkflow.handle(workflow_id, store:).query_step_forbidden
+          end
+          assert_raises_matching(Durababble::Error, /cannot schedule workflow waits from an exposed query/) do
+            ApiTestQueryableWorkflow.handle(workflow_id, store:).query_wait_forbidden
+          end
+        ensure
+          ApiTestQueryableWorkflow.release_step&.push(true)
+          wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if workflow_id
         end
       ensure
         ApiTestQueryableWorkflow.release_step&.push(true)
         wait_until(timeout: 2) { store.workflow(workflow_id).fetch("status") == "completed" } if store && workflow_id
-        runtime&.shutdown(timeout: 2)
       end
     end
 
@@ -1087,6 +1110,15 @@ class DurababbleWorkflowTest < DurababbleTestCase
     ApiTestQueryableWorkflow.query_entered = Queue.new
     ApiTestQueryableWorkflow.query_release = Queue.new
     ApiTestQueryableWorkflow.current_instance_id = nil
+  end
+
+  def with_started_runtime(*runtimes)
+    Async do
+      runtimes.each(&:start)
+      yield
+    ensure
+      runtimes.reverse_each { |runtime| runtime&.shutdown(timeout: 2) }
+    end
   end
 
   def replay_execution_for(workflow_class)

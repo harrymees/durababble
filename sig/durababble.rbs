@@ -298,7 +298,6 @@ module Durababble
 
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
-    def __durababble_with_query_context__: () { () -> serialized_payload } -> serialized_payload
     def execute: (Input input) -> Output
     def step_context: () -> StepContext
     def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
@@ -421,7 +420,7 @@ module Durababble
 
     def initialize: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
     def start: () -> self
-    def start_async: (?parent: Object) -> Object
+    def start_async: (?parent: Object?) -> Object
     def shutdown: (?timeout: Numeric) -> (:stopped | :timeout)
     def stop: (?timeout: Numeric) -> (:stopped | :timeout)
     def wait: (?timeout: Numeric?) -> Object?

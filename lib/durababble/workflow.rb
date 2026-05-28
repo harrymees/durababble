@@ -145,11 +145,6 @@ module Durababble
       @__durababble_execution__ || raise(Error, "durable step #{self.class.name}##{label} called outside workflow execution")
     end
 
-    #: () { () -> Object? } -> Object?
-    def __durababble_with_query_context__(&block)
-      WorkflowQueryContext.with_current(true, &block)
-    end
-
     #: () -> StepContext
     def step_context
       __durababble_execution__.step_context

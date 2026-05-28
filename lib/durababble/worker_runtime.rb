@@ -80,13 +80,12 @@ module Durababble
       @rpc_credentials = rpc_credentials
       @rpc_pool_size = rpc_pool_size
       # @mutex guards the lifecycle state shared between the control path and
-      # the runtime owner (@stopping, @thread/@task, @deliveries). @wakeups is
+      # the runtime owner (@stopping, @task, @deliveries). @wakeups is
       # only a hint channel to interrupt the polling fiber's idle sleep.
       @mutex = Mutex.new
-      @wakeups = Thread::Queue.new
+      @wakeups = Async::Queue.new
       @deliveries = []
       @stopping = false
-      @thread = nil
       @task = nil
       @raise_loop_errors = false
       @last_error = nil
@@ -102,18 +101,19 @@ module Durababble
       @mutex.synchronize do
         return self if running?
 
-        worker = prepare_start_locked(async_parent: nil, raise_loop_errors: false)
-        # The scheduler runs as fibers inside one async reactor. A non-blocking
-        # background service still needs one host thread to drive the reactor,
-        # but the worker logic fans out cooperatively up to @concurrency and is
-        # woken by hints rather than hand-rolling worker threads.
-        @thread = Thread.new { Async { |task| run_loop(task, worker) } }
+        parent = Async::Task.current?
+        raise ConfigurationError, "WorkerRuntime.start requires an active Async task; wrap worker boot in Async { ... } or call start_async(parent:)" unless parent
+
+        worker = prepare_start_locked(async_parent: parent, raise_loop_errors: false)
+        @task = parent.async { |task| run_loop(task, worker) }
       end
       self
     end
 
-    #: (?parent: Object) -> Object
-    def start_async(parent: Async::Task.current)
+    #: (?parent: Object?) -> Object
+    def start_async(parent: Async::Task.current?)
+      raise ConfigurationError, "WorkerRuntime.start_async requires an active Async task; pass parent: from an Async block" unless parent
+
       @mutex.synchronize do
         return @task if running? && @task
 
@@ -124,12 +124,12 @@ module Durababble
 
     #: (?timeout: Numeric) -> Symbol
     def shutdown(timeout: DEFAULT_SHUTDOWN_TIMEOUT)
-      thread, task = @mutex.synchronize do
+      task = @mutex.synchronize do
         @stopping = true
-        [@thread, @task]
+        @task
       end
       @wakeups.push(:stop)
-      unless thread || task
+      unless task
         stop_rpc_server
         return :stopped
       end
@@ -138,7 +138,7 @@ module Durababble
         "durababble.worker.pool" => @worker_pool,
         "durababble.worker.id" => @worker_id,
       }
-      if thread ? thread.join(timeout) : wait_for_task_stop(task, timeout:)
+      if wait_for_task_stop(task, timeout:)
         stop_rpc_server
         Observability.count("durababble.worker.runtime.shutdowns", attributes.merge("durababble.worker.runtime.result" => "stopped"))
         return :stopped
@@ -153,10 +153,9 @@ module Durababble
 
     alias_method :stop, :shutdown
 
-    #: (?timeout: Numeric?) -> Thread?
+    #: (?timeout: Numeric?) -> Object?
     def wait(timeout: nil)
-      thread, task = @mutex.synchronize { [@thread, @task] }
-      return timeout ? thread&.join(timeout) : thread&.join if thread
+      task = @mutex.synchronize { @task }
       return unless task
 
       wait_for_task_stop(task, timeout:) ? task : nil
@@ -164,7 +163,7 @@ module Durababble
 
     #: () -> bool
     def running?
-      @thread&.alive? || @task&.running? || false
+      @task&.running? || false
     end
 
     #: () -> void
@@ -254,7 +253,7 @@ module Durababble
 
     #: () -> void
     def clear_wakeups
-      @wakeups.pop(timeout: 0) until @wakeups.empty?
+      @wakeups.dequeue(timeout: 0) until @wakeups.empty?
     end
 
     #: () -> Hash[String, Object]
@@ -350,9 +349,8 @@ module Durababble
     ensure
       stop_rpc_server
       @mutex.synchronize do
-        @thread = nil if Thread.current == @thread
-        @task = nil if defined?(Async::Task) && Async::Task.current.equal?(@task)
-        @raise_loop_errors = false unless @thread || @task
+        @task = nil if Async::Task.current?.equal?(@task)
+        @raise_loop_errors = false unless @task
       end
     end
 
@@ -438,17 +436,14 @@ module Durababble
     end
 
     # Park the polling fiber until a wakeup arrives or @poll_interval elapses,
-    # whichever comes first. Blocking on @wakeups yields to the reactor so the
-    # fiber never pins the host thread, and a cross-thread push (from
-    # enqueue_delivery or shutdown) wakes it promptly even when poll_interval is
-    # long. Wakeup tokens are only hints: the real work lives in @deliveries and
-    # the store, so draining stale tokens afterward is safe and prevents the
-    # loop from spinning through a backlog of signals.
+    # whichever comes first. Wakeup tokens are only hints: the real work lives in
+    # @deliveries and the store, so draining stale tokens afterward is safe and
+    # prevents the loop from spinning through a backlog of signals.
     #: (untyped) -> void
     def await_work(task)
       return if stopping? || !deliveries_empty?
 
-      task.with_timeout(@poll_interval) { @wakeups.pop }
+      task.with_timeout(@poll_interval) { @wakeups.dequeue }
     rescue Async::TimeoutError
       nil
     ensure
@@ -457,7 +452,7 @@ module Durababble
 
     #: (untyped) -> void
     def await_active_work(task)
-      task.with_timeout(@poll_interval) { @wakeups.pop }
+      task.with_timeout(@poll_interval) { @wakeups.dequeue }
     rescue Async::TimeoutError
       nil
     ensure

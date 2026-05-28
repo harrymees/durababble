@@ -151,14 +151,19 @@ The status-code mapping the transport uses:
 Production workers need a reachable address. The [install instructions](install.md#workers-and-cluster-addresses) cover the `rpc_host` / `rpc_port` arguments to `Durababble::WorkerRuntime`. The short version:
 
 ```ruby
-Durababble::WorkerRuntime.start(
-  store:,
-  workflows: [FulfillOrder],
-  objects: [Account],
-  worker_pool: "orders",
-  rpc_host: ENV.fetch("POD_IP"),
-  rpc_port: 50_051,
-)
+Async do
+  runtime = Durababble::WorkerRuntime.start(
+    store:,
+    workflows: [FulfillOrder],
+    objects: [Account],
+    worker_pool: "orders",
+    rpc_host: ENV.fetch("POD_IP"),
+    rpc_port: 50_051,
+  )
+  sleep
+ensure
+  runtime&.shutdown(timeout: 10)
+end
 ```
 
 Single-process scripts and tests can stick with `Durababble::Worker.new(...)` and skip the mesh entirely; in that mode RPCs are routed in-process. The mesh only matters when more than one worker is running and they need to address each other.

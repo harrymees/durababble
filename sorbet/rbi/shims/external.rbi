@@ -20,8 +20,16 @@ module Async
     def signal; end
   end
 
+  class Queue
+    def initialize; end
+    def push(value); end
+    def dequeue(timeout: nil); end
+    def empty?; end
+  end
+
   class Task
     def self.current; end
+    def self.current?; end
     def async(&blk); end
     def wait; end
     def with_timeout(duration, exception = nil, message = nil, &blk); end

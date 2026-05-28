@@ -23,11 +23,9 @@ module AgentLoopExample
       # Everything runs in the default worker pool. WorkerRuntime requires the
       # pool name explicitly, but because it is the default, nothing in the
       # workflow steps, the enqueue, or the snapshot query has to name a pool.
-      # Workflows and objects are split across two runtimes (two threads) on
-      # purpose, not for pool isolation: a workflow step calls a durable-object
-      # command and blocks waiting for its result, so a separate thread must be
-      # free to drain object work. One runtime would deadlock that wait.
-      @workflow_runtime = Durababble::WorkerRuntime.start(
+      # Workflows and objects are split across two runtimes so object work can
+      # keep draining while a workflow step waits for a command result.
+      @workflow_runtime = Durababble::WorkerRuntime.new(
         workflows: [AgentLoopWorkflow],
         objects: [],
         database_url:,
@@ -35,7 +33,7 @@ module AgentLoopExample
         worker_pool: "default",
         poll_interval: 0.05,
       )
-      @object_runtime = Durababble::WorkerRuntime.start(
+      @object_runtime = Durababble::WorkerRuntime.new(
         workflows: [],
         objects: [VirtualFileSystem],
         database_url:,
@@ -52,10 +50,18 @@ module AgentLoopExample
     end
 
     def run
-      puts "Agent loop example listening on #{url}"
-      loop do
-        socket = @tcp_server.accept
-        handle(socket)
+      Async do
+        @workflow_runtime.start
+        @object_runtime.start
+        puts "Agent loop example listening on #{url}"
+        loop do
+          socket = @tcp_server.accept
+          handle(socket)
+        end
+      rescue IOError
+        nil
+      ensure
+        shutdown_runtimes
       end
     rescue Interrupt, IOError
       nil
@@ -65,14 +71,17 @@ module AgentLoopExample
 
     def close
       @tcp_server&.close unless @tcp_server&.closed?
-      @workflow_runtime&.shutdown
-      @object_runtime&.shutdown
       @store&.close
     rescue IOError
       nil
     end
 
     private
+
+    def shutdown_runtimes
+      @workflow_runtime&.shutdown
+      @object_runtime&.shutdown
+    end
 
     def handle(socket)
       request_line = socket.gets&.strip

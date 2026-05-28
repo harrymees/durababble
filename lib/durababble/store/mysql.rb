@@ -24,8 +24,7 @@ module Durababble
     end
 
     #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
       if worker_id
         execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_seconds, workflow_id, worker_pool])
       else
@@ -34,8 +33,7 @@ module Durababble
     end
 
     #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
-    def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_runnable_workflow_unchecked(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
       transaction do
@@ -56,8 +54,7 @@ module Durababble
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
@@ -71,8 +68,7 @@ module Durababble
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return decode_row(already_owned) if already_owned
 
@@ -86,8 +82,7 @@ module Durababble
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
-    def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def heartbeat_unchecked(workflow_id:, worker_id:, lease_seconds:)
       execute_store_query(:heartbeat_workflow, [lease_seconds, workflow_id, worker_id])
       owned = workflow_owned?(workflow_id:, worker_id:)
       if owned
@@ -192,8 +187,7 @@ module Durababble
     end
 
     #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
-    def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def heartbeat_step_unchecked(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       renewed = transaction do
         renewal = execute_store_query(:heartbeat_step_workflow, [lease_seconds, workflow_id, worker_id])
@@ -245,8 +239,7 @@ module Durababble
     # "matched but unchanged" branch indistinguishable from a winning fresh
     # insert (both report affected_rows = 1).
     #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
-    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
       execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
       result = execute_store_query(:claim_object_lease, [worker_id, lease_seconds.to_i, object_type, object_id, worker_id])
       return unless result.affected_rows.to_i.positive?
@@ -258,8 +251,7 @@ module Durababble
     # has been lost (evicted, stolen, or released). Object identity is global —
     # `worker_pool` isn't part of the lease key.
     #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
-    def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_seconds: 60)
       result = execute_store_query(:renew_object_lease, [lease_seconds.to_i, object_type, object_id, worker_id])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
@@ -380,8 +372,7 @@ module Durababble
     end
 
     #: (worker_id: String, lease_seconds: Integer) -> Object?
-    def claim_outbox(worker_id:, lease_seconds:)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_outbox_unchecked(worker_id:, lease_seconds:)
       transaction do
         candidates = []
         candidates.concat(execute_store_query(:claim_pending_outbox).to_a)
@@ -501,8 +492,7 @@ module Durababble
     end
 
     #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
-    def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
+    def claim_target_activation_unchecked(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
       return if target_kinds&.empty? || target_types&.empty?
 
       transaction do
