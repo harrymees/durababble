@@ -379,7 +379,28 @@ module Durababble
         @deliver_message = deliver_message
         @verify_deliver_message_owner = verify_deliver_message_owner
         @identity_id = identity_id
+        @reactor = nil
       end
+
+      class ReactorCallback
+        #: () { () -> Object? } -> void
+        def initialize(&block)
+          @block = block #: Proc?
+        end
+
+        #: () -> bool
+        def alive?
+          !@block.nil?
+        end
+
+        #: () -> Object?
+        def transfer
+          block = @block
+          @block = nil
+          block&.call #: as Object?
+        end
+      end
+      private_constant :ReactorCallback
 
       #: () -> Server
       def start
@@ -394,17 +415,22 @@ module Durababble
         async_parent = parent #: as untyped
         server = build_http_server
         @task = async_parent.async(transient: true, finished: false) { server.run.wait }
+        @reactor = @task.reactor
         self
       end
 
       #: () -> void
       def stop
-        @task&.stop
-      ensure
-        @bound&.close
+        task = @task
+        reactor = @reactor || task&.reactor
+        bound = @bound #: as untyped
+
         @task = nil
+        @reactor = nil
         @bound = nil
         @port = nil
+
+        stop_task(task, reactor, bound)
       end
 
       #: () -> String
@@ -419,6 +445,31 @@ module Durababble
         Async::Task.current
       rescue RuntimeError
         raise ConfigurationError, "#{operation} must be called from inside a running Async reactor; pass parent: from your application's Async supervisor"
+      end
+
+      #: (Object?, Object?, Object?) -> void
+      def stop_task(task, reactor, bound)
+        bound = bound #: as untyped
+        unless task
+          bound&.close
+          return
+        end
+
+        task = task #: as untyped
+        reactor = reactor #: as untyped
+        if reactor && Fiber.scheduler.equal?(reactor)
+          task.stop
+          bound&.close
+        elsif reactor&.respond_to?(:unblock)
+          reactor.unblock(nil, ReactorCallback.new do
+            task.stop
+          ensure
+            bound&.close
+          end)
+        else
+          task.stop
+          bound&.close
+        end
       end
 
       #: () -> Async::HTTP::Server

@@ -108,6 +108,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   test "routes workflow RPC through real clients and reroutes when the lease moves" do
     store = self.store
+    assertions_ran = false
     claim_as("node-a")
     directory = Durababble::Rpc::NodeDirectory.new
     with_rpc_server(
@@ -139,8 +140,10 @@ class DurababbleRpcTransportTest < DurababbleTestCase
         )
 
         assert_equal({ "owner" => "node-b" }, router.request(workflow_id:, command: "status", payload: {}))
+        assertions_ran = true
       end
     end
+    assert_equal(true, assertions_ran)
   end
 
   test "rejects workflow RPCs addressed to a previous worker incarnation at a recycled address" do
@@ -318,6 +321,49 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end.wait
   ensure
     server&.stop
+  end
+
+  test "stop can be invoked from a non-reactor control thread" do
+    store = self.store
+    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0)
+    started = Queue.new
+
+    reactor_thread = Thread.new do
+      Thread.current.report_on_exception = false
+      Async do |task|
+        server.start_async(parent: task)
+        started << server.address
+        server.instance_variable_get(:@task).wait
+      ensure
+        server.stop
+      end.wait
+    end
+
+    address = started.pop
+    assert_match(/\A127\.0\.0\.1:\d+\z/, address)
+    assert_equal(true, Durababble::Rpc::Client.new(address:).awaken_batch(worker_pool: "default", workflow_ids: []))
+
+    Timeout.timeout(5) { server.stop }
+    Timeout.timeout(5) { reactor_thread.join }
+    assert_equal(false, reactor_thread.alive?)
+    assert_nil(server.port)
+  ensure
+    server&.stop
+    if reactor_thread&.alive?
+      reactor_thread.kill
+      reactor_thread.join
+    end
+  end
+
+  test "nested rpc server helper waits for child assertions" do
+    with_rpc_server(node_id: "node-a", store:, workflow_handlers: {}) do
+      error = assert_raises(Minitest::Assertion) do
+        with_rpc_server(node_id: "node-b", store:, workflow_handlers: {}) do
+          flunk("nested failure must propagate through the helper")
+        end
+      end
+      assert_match(/nested failure/, error.message)
+    end
   end
 
   test "rejects unauthorized peers before running handlers" do
@@ -736,12 +782,18 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   def with_rpc_server(**kwargs)
     server = nil
-    Async do |task|
+    runner = lambda do |task|
       server = Durababble::Rpc::Server.new(**kwargs, port: 0, pool_size: 2)
       server.start_async(parent: task)
       yield server
     ensure
       server&.stop
+    end
+
+    if (task = Async::Task.current?)
+      runner.call(task)
+    else
+      Async(&runner)
     end
   end
 
