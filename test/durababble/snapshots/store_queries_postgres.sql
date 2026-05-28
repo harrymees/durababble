@@ -351,6 +351,7 @@ ON CONFLICT (target_kind, target_type, target_id) DO NOTHING
 INSERT INTO "durababble_pg_snapshot"."outbox" (id, workflow_id, topic, payload, key, status)
 VALUES ($1, $2, $3, $4::bytea, $5, 'pending')
 ON CONFLICT (key) DO NOTHING
+RETURNING id
 
 -- pg_insert_scheduled_step
 INSERT INTO "durababble_pg_snapshot"."steps" (workflow_id, position, name, status, updated_at)
@@ -370,7 +371,10 @@ INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status,
 
 -- pg_insert_workflow_history
 INSERT INTO "durababble_pg_snapshot"."workflow_history" (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
+FROM "durababble_pg_snapshot"."workflow_history"
+WHERE workflow_id = $8
+RETURNING event_index
 
 -- pg_insert_workflow_with_worker
 INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))
@@ -450,9 +454,6 @@ SET status = 'running', error = NULL, locked_by = $1,
     locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, updated_at = now()
 WHERE id = $3 AND worker_pool = $4
   AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
-
--- pg_next_workflow_history_event_index
-SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM "durababble_pg_snapshot"."workflow_history" WHERE workflow_id = $1
 
 -- pg_object_state
 SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2 AND state IS NOT NULL

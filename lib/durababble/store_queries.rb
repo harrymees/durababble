@@ -352,6 +352,7 @@ module Durababble
         INSERT INTO #{table(store, "outbox")} (id, workflow_id, topic, payload, key, status)
         VALUES ($1, $2, $3, $4::bytea, $5, 'pending')
         ON CONFLICT (key) DO NOTHING
+        RETURNING id
       SQL
     end
 
@@ -522,13 +523,6 @@ module Durababble
       SQL
     end
 
-    define(:mysql_claim_workflow_already_owned, backend: :mysql, description: "Check whether this worker already holds a live workflow lease.") do |store|
-      <<~SQL.chomp
-        SELECT * FROM #{table(store, "workflows")}
-        WHERE id = ? AND worker_pool = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
-      SQL
-    end
-
     define(:mysql_claim_workflow_lock, backend: :mysql, description: "Lock a target workflow row before a MySQL lease update.") do |store|
       <<~SQL.chomp
         SELECT id FROM #{table(store, "workflows")}
@@ -648,16 +642,16 @@ module Durababble
       SQL
     end
 
-    define(:mysql_count_outbox_leases, backend: :mysql) do |store, index:|
-      "SELECT COUNT(*) AS count FROM #{table(store, "outbox")} FORCE INDEX (#{index}) WHERE status = 'processing' AND locked_by = ?"
-    end
-
     define(:mysql_release_outbox_leases, backend: :mysql) do |store, index:|
       <<~SQL.chomp
         UPDATE #{table(store, "outbox")} FORCE INDEX (#{index})
         SET status = 'pending', locked_by = NULL, locked_until = NULL
         WHERE status = 'processing' AND locked_by = ?
       SQL
+    end
+
+    define(:mysql_count_outbox_leases, backend: :mysql) do |store, index:|
+      "SELECT COUNT(*) AS count FROM #{table(store, "outbox")} FORCE INDEX (#{index}) WHERE status = 'processing' AND locked_by = ?"
     end
 
     define(:mysql_claim_pending_outbox, backend: :mysql) do |store|
@@ -1334,14 +1328,13 @@ module Durababble
       "SELECT id FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
     end
 
-    define(:pg_next_workflow_history_event_index, backend: :postgres) do |store|
-      "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = $1"
-    end
-
     define(:pg_insert_workflow_history, backend: :postgres) do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::bytea, $8)
+        SELECT $1, COALESCE(MAX(event_index), -1) + 1, $2, $3, $4, $5, $6::bytea, $7
+        FROM #{table(store, "workflow_history")}
+        WHERE workflow_id = $8
+        RETURNING event_index
       SQL
     end
 
@@ -2112,15 +2105,17 @@ module Durababble
       "SELECT id FROM #{table(store, "workflows")} WHERE id = ? FOR UPDATE"
     end
 
-    define(:mysql_next_workflow_history_event_index, backend: :mysql, description: "Compute the next workflow history event index.") do |store|
-      "SELECT COALESCE(MAX(event_index), -1) + 1 AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
-    end
-
     define(:mysql_insert_workflow_history, backend: :mysql, description: "Append a workflow replay history event.") do |store|
       <<~SQL.chomp
         INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
+        FROM #{table(store, "workflow_history")}
+        WHERE workflow_id = ?
       SQL
+    end
+
+    define(:mysql_inserted_workflow_history_event_index, backend: :mysql, description: "Read the workflow history event index inserted by the previous statement.") do |store|
+      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     define(:mysql_workflow_history_for, backend: :mysql, description: "Read workflow history events in replay order.") do |store|
@@ -2244,6 +2239,19 @@ module Durababble
           LIMIT 1
         )
       SQL
+    end
+
+    define(:sqlite_insert_workflow_history, backend: :sqlite) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "workflow_history")} (workflow_id, event_index, kind, command_id, name, attempt_id, payload, error)
+        SELECT ?, COALESCE(MAX(event_index), -1) + 1, ?, ?, ?, ?, ?, ?
+        FROM #{table(store, "workflow_history")}
+        WHERE workflow_id = ?
+      SQL
+    end
+
+    define(:sqlite_inserted_workflow_history_event_index, backend: :sqlite) do |store|
+      "SELECT MAX(event_index) AS event_index FROM #{table(store, "workflow_history")} WHERE workflow_id = ?"
     end
 
     # No :sqlite_claim_object_lease override: the two-step

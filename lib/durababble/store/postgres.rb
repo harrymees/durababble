@@ -39,20 +39,20 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
       row = execute_store_query(:claim_workflow_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
-      decode_row(row) if row
+      return decode_row(row) if row
+
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
     def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      return decode_row(already_owned) if already_owned
-
       row = execute_store_query(:claim_workflow_for_activation_update, [workflow_id, worker_pool, worker_id, lease_seconds]).first
-      decode_row(row) if row
+      return decode_row(row) if row
+
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+      decode_row(already_owned) if already_owned
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
@@ -389,12 +389,13 @@ module Durababble
     def enqueue_outbox(workflow_id:, topic:, payload:, key:)
       # [DURABABBLE-OUTBOX-1] Message keys dedupe producer retries to one durable row;
       # subsequent enqueues resolve to the same row and never deliver twice.
-      existing = execute_store_query(:outbox_by_key, [key]).first
-      return existing.fetch("id") if existing
-
       id = SecureRandom.uuid
-      execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key])
-      Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+      inserted = execute_store_query(:insert_outbox, [id, workflow_id, topic, dump_serialized(payload), key]).first
+      if inserted
+        Observability.count("durababble.outbox.pending", "durababble.workflow.id" => workflow_id, "durababble.outbox.topic" => topic)
+        return inserted.fetch("id")
+      end
+
       execute_store_query(:outbox_by_key, [key]).first.fetch("id")
     end
 

@@ -359,6 +359,79 @@ class DurababbleStoreTest < DurababbleTestCase
     refute_includes sql, "UPDATE"
   end
 
+  test "mysql targeted workflow claims lock candidates with skip locked before updating" do
+    results = [
+      sql_result([{ "id" => "wf-target" }]),
+      sql_result([], affected_rows: 1),
+      sql_result([{
+        "id" => "wf-target",
+        "status" => "running",
+        "input" => nil,
+        "locked_by" => "worker-a",
+        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+      }]),
+      sql_result([{ "id" => "wf-activation" }]),
+      sql_result([], affected_rows: 1),
+      sql_result([{
+        "id" => "wf-activation",
+        "status" => "running",
+        "input" => nil,
+        "locked_by" => "worker-a",
+        "locked_until" => Time.utc(2026, 1, 1, 0, 1),
+      }]),
+    ]
+    connection = ScriptedMysqlConnection.new { |_sql| results.shift || sql_result }
+    store = mysql_store(connection, schema: "durababble_test")
+
+    assert_equal "wf-target", store.claim_workflow(workflow_id: "wf-target", worker_id: "worker-a", lease_seconds: 9).fetch("id")
+    assert_equal "wf-activation", store.claim_workflow_for_activation(workflow_id: "wf-activation", worker_id: "worker-a", lease_seconds: 9).fetch("id")
+
+    direct_lock_sql, direct_update_sql, _direct_read_sql, activation_lock_sql, activation_update_sql = connection.queries
+    assert_includes direct_lock_sql, "FOR UPDATE SKIP LOCKED"
+    assert_includes direct_lock_sql, "locked_by = 'worker-a'"
+    assert_includes direct_update_sql, "UPDATE"
+    refute_includes direct_update_sql, "locked_by = 'worker-a' OR locked_until"
+    assert_includes activation_lock_sql, "FOR UPDATE SKIP LOCKED"
+    assert_includes activation_lock_sql, "OR status = 'waiting'"
+    assert_includes activation_update_sql, "UPDATE"
+    refute_includes activation_update_sql, "OR status = 'waiting'"
+  end
+
+  test "mysql release_worker_leases reports pre-update lease counts instead of found rows" do
+    connection = ScriptedMysqlConnection.new do |sql|
+      case sql
+      when /SELECT COUNT\(\*\) AS count FROM .*workflows/m
+        sql_result([{ "count" => 1 }])
+      when /SELECT COUNT\(\*\) AS count FROM .*outbox/m
+        sql_result([{ "count" => 2 }])
+      when /SELECT COUNT\(\*\) AS count FROM .*inbox/m
+        sql_result([{ "count" => 3 }])
+      when /SELECT COUNT\(\*\) AS count FROM .*target_activations/m
+        sql_result([{ "count" => 4 }])
+      when /UPDATE .*durable_objects/m
+        sql_result([], affected_rows: 5)
+      else
+        sql_result([], affected_rows: 99)
+      end
+    end
+    store = mysql_store(connection, schema: "durababble_test")
+
+    released = store.release_worker_leases!(worker_id: "worker-a")
+
+    assert_equal(
+      {
+        "workflows" => 1,
+        "outbox" => 2,
+        "inbox" => 3,
+        "target_activations" => 4,
+        "durable_objects" => 5,
+      },
+      released,
+    )
+    release_sql = connection.queries.grep(/\AUPDATE /)
+    assert_equal 5, release_sql.length
+  end
+
   test "postgres claim_runnable_workflow claims pending work with one update returning statement" do
     connection = ScriptedPgConnection.new(params_results: [
       sql_result([{
@@ -511,9 +584,10 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
       sql_result,
       sql_result,
+      sql_result([], affected_rows: 0),
       sql_result([{ "id" => "outbox-old" }]),
-      sql_result,
       sql_result([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
+      sql_result,
       sql_result([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
       sql_result,
@@ -1136,8 +1210,6 @@ class DurababbleStoreTest < DurababbleTestCase
       ])).with_fence(workflow_id: "wf", key: "slow", timeout: 0)
     end
     assert_equal "new-outbox", pg_store(ScriptedPgConnection.new(params_results: [
-      sql_result,
-      sql_result,
       sql_result([{ "id" => "new-outbox" }]),
     ])).enqueue_outbox(workflow_id: "wf", topic: "email", payload: {}, key: "new")
     assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
