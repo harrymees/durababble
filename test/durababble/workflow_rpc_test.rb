@@ -602,7 +602,7 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
   end
 
   def signal_wait_and_claim_as(worker_id)
-    store.wake_due_timers(now: Time.now + 7200)
+    make_workflow_timer_due(store, workflow_id, at: store.workflow(workflow_id).fetch("next_run_at"))
     claim_as(worker_id)
   end
 end

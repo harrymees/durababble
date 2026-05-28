@@ -17,7 +17,7 @@ module Durababble
           # because the workflow is not terminal yet). On the NEXT resume (to
           # deliver command B), execute replays from the top and re-encounters
           # wait A. Re-recording wait A would be a duplicate-key INSERT
-          # (mysql_insert_wait has no ON DUPLICATE KEY UPDATE) -- the only thing
+          # (waiting step upsert keys by workflow/position) -- the only thing
           # preventing it is that step_waiting is in TERMINAL_KINDS, so
           # terminal_recorded?(A) is true on replay and call_wait skips the record,
           # resolving A's future from the recorded step_waiting instead. This pins

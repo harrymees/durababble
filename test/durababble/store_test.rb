@@ -158,11 +158,32 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_nil shared_store.send(:observe_claim_latency, { "created_at" => "2024-01-01T00:00:00Z" }, "workflow")
   end
 
+  test "observe_claim_latency accepts timestamp values without to_time" do
+    created_at = Object.new
+    created_at.define_singleton_method(:to_s) { "2024-01-01T00:00:00Z" }
+
+    assert_nil shared_store.send(:observe_claim_latency, { "created_at" => created_at }, "workflow")
+  end
+
   test "record_wait_latency accepts serialized timestamps" do
     wait = {
       "kind" => "timer",
       "created_at" => "2024-01-01T00:00:00Z",
       "completed_at" => "2024-01-01T00:00:01Z",
+    }
+
+    assert_nil shared_store.send(:record_wait_latency, wait)
+  end
+
+  test "record_wait_latency accepts timestamp values without to_time" do
+    created_at = Object.new
+    created_at.define_singleton_method(:to_s) { "2024-01-01T00:00:00Z" }
+    completed_at = Object.new
+    completed_at.define_singleton_method(:to_s) { "2024-01-01T00:00:01Z" }
+    wait = {
+      "kind" => "timer",
+      "created_at" => created_at,
+      "completed_at" => completed_at,
     }
 
     assert_nil shared_store.send(:record_wait_latency, wait)
@@ -499,7 +520,6 @@ class DurababbleStoreTest < DurababbleTestCase
       assert_includes columns, ["steps", "result", "bytea"]
       assert_includes columns, ["steps", "heartbeat_cursor", "bytea"]
       assert_includes columns, ["step_attempts", "heartbeat_cursor", "bytea"]
-      assert_includes columns, ["waits", "context", "bytea"]
       assert_includes columns, ["outbox", "payload", "bytea"]
       refute columns.any? { |column| column.include?("jsonb") }
 
@@ -526,13 +546,9 @@ class DurababbleStoreTest < DurababbleTestCase
 
       assert_includes indexes, "workflows_claim_idx"
       assert_includes indexes, "workflows_expired_lease_idx"
-      assert_includes indexes, "waits_event_pending_idx"
-      assert_includes indexes, "waits_timer_pending_idx"
-      assert_includes indexes, "waits_workflow_created_idx"
       assert_includes indexes, "step_attempts_workflow_started_position_idx"
       assert_includes indexes, "step_attempts_workflow_position_status_started_idx"
-      assert_includes indexes, "outbox_queue_idx"
-      assert_includes indexes, "outbox_expired_lease_idx"
+      assert_includes indexes, "outbox_claim_idx"
     end
   end
 
@@ -586,8 +602,6 @@ class DurababbleStoreTest < DurababbleTestCase
       sql_result,
       sql_result([], affected_rows: 0),
       sql_result([{ "id" => "outbox-old" }]),
-      sql_result([{ "id" => "outbox-new", "created_at" => "2024-01-01T00:00:00Z" }]),
-      sql_result,
       sql_result([{ "id" => "outbox-new", "payload" => pg_dump({ "ok" => true }) }]),
       sql_result([{ "id" => "wf", "input" => pg_dump({}) }]),
       sql_result,
@@ -1077,7 +1091,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     pg_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    pg_fenced_workflow_updates = pg_fenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, pg_fenced_workflow_updates.length
     assert pg_fenced_workflow_updates.all? { |sql, _params| sql.include?("locked_by") && sql.include?("locked_until >= now()") }
 
@@ -1087,7 +1101,7 @@ class DurababbleStoreTest < DurababbleTestCase
     pg_unfenced_store.cancel_workflow("wf", reason: "stop")
     pg_unfenced_store.fail_workflow("wf", error: "boom")
 
-    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") }
+    pg_unfenced_workflow_updates = pg_unfenced_connection.exec_params_calls.select { |sql, _params| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, pg_unfenced_workflow_updates.length
     assert pg_unfenced_workflow_updates.none? { |sql, _params| sql.include?("AND locked_by =") }
 
@@ -1097,7 +1111,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_fenced_store.cancel_workflow("wf", reason: "stop", result: nil, worker_id: "worker-1")
     mysql_fenced_store.fail_workflow("wf", error: "boom", worker_id: "worker-1")
 
-    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    mysql_fenced_workflow_updates = mysql_fenced_connection.queries.select { |sql| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, mysql_fenced_workflow_updates.length
     assert mysql_fenced_workflow_updates.all? { |sql| sql.include?("locked_by") && sql.include?("locked_until >= NOW(6)") }
 
@@ -1107,7 +1121,7 @@ class DurababbleStoreTest < DurababbleTestCase
     mysql_unfenced_store.cancel_workflow("wf", reason: "stop")
     mysql_unfenced_store.fail_workflow("wf", error: "boom")
 
-    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") }
+    mysql_unfenced_workflow_updates = mysql_unfenced_connection.queries.select { |sql| sql.include?("next_run_at") && sql.include?("SET status") }
     assert_equal 3, mysql_unfenced_workflow_updates.length
     assert mysql_unfenced_workflow_updates.none? { |sql| sql.include?("AND locked_by =") }
 
@@ -1212,7 +1226,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "new-outbox", pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "new-outbox" }]),
     ])).enqueue_outbox(workflow_id: "wf", topic: "email", payload: {}, key: "new")
-    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result, sql_result]))
+    assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .claim_outbox(worker_id: "w", lease_seconds: 5)
     assert_nil pg_store(ScriptedPgConnection.new(params_results: [sql_result]))
       .claim_object_command(command_id: "cmd", worker_id: "w")

@@ -7,6 +7,16 @@ end
 
 module Durababble
   type serialized_payload = Object?
+  type durable_timestamp = Time | Integer | String
+  type wait_kind = "timer" | "child_workflow" | "event" | String
+  type wait_status = "pending" | "completed" | "canceled"
+  type wait_payload = { "kind" => wait_kind, "event_key" => String?, "wake_at" => durable_timestamp? }
+  type wait_metadata = wait_payload & { "context" => serialized_payload }
+  type wait_event_payload = { "context" => serialized_payload, "wait" => wait_payload }
+  type step_waiting_history_event = { "kind" => "step_waiting", "workflow_id" => String, "command_id" => Integer | String, ?"event_index" => Integer | String, ?"name" => String, "payload" => wait_event_payload | serialized_payload }
+  type wait_terminal_history_event = { "kind" => "step_completed" | "step_canceled" | "step_failed", "workflow_id" => String, "command_id" => Integer | String, ?"event_index" => Integer | String, ?"payload" => serialized_payload, ?"error" => String }
+  type wait_history_event = step_waiting_history_event | wait_terminal_history_event
+  type wait_snapshot = { "id" => String, "workflow_id" => String, "position" => Integer, "command_id" => Integer, "kind" => wait_kind, "event_key" => String?, "wake_at" => durable_timestamp?, "context" => serialized_payload, "status" => wait_status }
   type payload_map = Hash[String | Symbol, serialized_payload]
   type workflow_row = Hash[String, serialized_payload]
   type workflow_handle[Input, Output, Dispatch] = WorkflowRef[Input, Output] & Dispatch
@@ -264,10 +274,10 @@ module Durababble
     def record_step_failed_and_schedule_retry: (workflow_id: String, error: String, run_at: Time, worker_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
     def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
     def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
+    def wait_snapshots_for: (String workflow_id) -> Array[wait_snapshot]
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def workflow_history_count_for: (String workflow_id) -> Integer
     def wake_due_timers: (?now: Time, ?batch_size: Integer) -> Integer
-    def waits_for: (String workflow_id) -> Array[workflow_row]
     def with_fence: (workflow_id: String, key: String, ?poll_interval: Numeric, ?timeout: Numeric) { () -> serialized_payload } -> serialized_payload
     def enqueue_outbox: (workflow_id: String, topic: String, payload: serialized_payload, key: String) -> String
     def claim_outbox: (worker_id: String, lease_seconds: Numeric) -> workflow_row?
@@ -481,6 +491,15 @@ module Durababble
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def timer_after: (Numeric duration) -> Time
     def validate_replay_complete!: () -> void
+  end
+
+  class WorkflowReplayHistory
+    attr_reader event_count: Integer
+
+    def initialize: (Array[workflow_row] events) -> void
+    def waiting_timer: (Integer command_id) -> wait_metadata?
+    def waiting_timer_or_child_workflow: (Integer command_id) -> wait_metadata?
+    def earliest_unresolved_timer_wake_at: () -> durable_timestamp?
   end
 
   class RetryPolicy

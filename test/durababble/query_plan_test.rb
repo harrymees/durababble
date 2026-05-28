@@ -63,6 +63,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_update_mailbox_sequence,
     :pg_upsert_object_wakeup,
     :pg_upsert_target_activation,
+    :pg_wake_parent_workflow_if_child_terminal,
     :pg_workflow_cancellation,
     :pg_workflow_history_count_for,
     :pg_workflow_history_for,
@@ -78,8 +79,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_child_workflow_by_child_id_for_update,
     :mysql_child_workflow_rows_for_object,
     :mysql_child_workflow_rows_for_parent,
-    :mysql_claim_expired_outbox,
-    :mysql_claim_pending_outbox,
+    :mysql_claim_outbox,
     :mysql_claim_runnable_workflow,
     :mysql_claim_selected_outbox,
     :mysql_claim_selected_target_activation,
@@ -91,8 +91,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_complete_fence,
     :mysql_complete_inbox_message,
     :mysql_complete_step,
-    :mysql_complete_timer_waits,
-    :mysql_complete_wait,
     :mysql_complete_workflow,
     :mysql_complete_workflow_with_worker,
     :mysql_count_expired_workflow_leases,
@@ -125,7 +123,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_insert_outbox,
     :mysql_insert_scheduled_step,
     :mysql_insert_step_attempt,
-    :mysql_insert_wait,
     :mysql_insert_workflow,
     :mysql_insert_workflow_history,
     :mysql_insert_workflow_with_worker,
@@ -140,7 +137,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_mailbox_sequence_for_update,
     :mysql_make_workflow_due,
     :mysql_mark_inbox_row_running,
-    :mysql_mark_waits_workflows_pending,
     :mysql_mark_workflow_canceling_for_request,
     :mysql_mark_workflow_cancellation_delivered,
     :mysql_mark_workflow_running,
@@ -171,7 +167,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_upsert_step_running,
     :mysql_upsert_target_activation,
     :mysql_upsert_waiting_step,
-    :mysql_waits_for_workflow,
+    :mysql_wake_parent_workflow_if_child_terminal,
     :mysql_workflow,
     :mysql_workflow_cancellation,
     :mysql_workflow_history_count_for,
@@ -574,22 +570,17 @@ class DurababbleQueryPlanTest < DurababbleTestCase
             ),
           )
         end,
-        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "waits_workflow_created_idx", "waits_workflow_status_idx", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
-        allow_post_filter_indexes: ["waits_workflow_created_idx", "waits_workflow_status_idx", "workflows_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allowed_indexes: ["steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
+        allow_post_filter_indexes: ["workflows_pkey", "step_attempts_workflow_position_status_started_idx", "step_attempts_workflow_started_position_idx"],
       },
       "request_workflow_cancellation" => {
         call: -> { store.request_workflow_cancellation(workflow_id: "running-owned", reason: "query plan") },
-        allowed_indexes: ["workflows_pkey", "waits_workflow_status_idx", "steps_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
+        allowed_indexes: ["workflows_pkey", "steps_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
         allow_post_filter_indexes: ["workflows_pkey", "steps_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
       },
       "wake_due_timers" => {
         call: -> { store.wake_due_timers(now: Time.now + 120) },
-        allowed_indexes: ["waits_timer_pending_idx", "waits_pkey", "steps_pkey", "workflows_pkey", "workflow_history_pkey", "step_attempts_pkey", "step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx", "object_wakeups_due_idx"],
-        allow_post_filter_indexes: ["step_attempts_workflow_started_position_idx", "step_attempts_workflow_position_status_started_idx"],
-      },
-      "waits_for" => {
-        call: -> { store.waits_for("running-owned") },
-        allowed_indexes: ["waits_workflow_created_idx"],
+        allowed_indexes: ["object_wakeups_due_idx"],
       },
       "with_fence_existing" => {
         call: -> { store.with_fence(workflow_id: "running-owned", key: "completed-fence", timeout: 1) { "unused" } },
@@ -601,8 +592,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       },
       "claim_outbox" => {
         call: -> { store.claim_outbox(worker_id: "plan-worker", lease_seconds: 60) },
-        allowed_indexes: ["outbox_pkey", "outbox_queue_idx", "outbox_expired_lease_idx"],
-        allow_post_filter_indexes: ["outbox_queue_idx"],
+        allowed_indexes: ["outbox_claim_idx"],
       },
       "ack_outbox" => {
         call: -> { store.ack_outbox("processing-outbox", worker_id: "owner") },
@@ -727,7 +717,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     serialized_empty = Durababble::Store::SERIALIZER.dump({}).unpack1("H*")
     serialized_count = Durababble::Store::SERIALIZER.dump({ "count" => 1 }).unpack1("H*")
     serialized_result = Durababble::Store::SERIALIZER.dump({ "done" => true }).unpack1("H*")
-    serialized_wait_context = Durababble::Store::SERIALIZER.dump({ "waiting" => true }).unpack1("H*")
     serialized_outbox = Durababble::Store::SERIALIZER.dump({ "message" => true }).unpack1("H*")
 
     connection.exec(<<~SQL)
@@ -755,10 +744,11 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       SELECT 'running-expired-' || i, 'demo', 'running', decode('#{serialized_empty}', 'hex'), 'stale', now() - interval '5 minutes', now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 2000) AS i;
 
-      INSERT INTO #{quoted_schema}.workflows (id, name, status, input, locked_by, locked_until, created_at, updated_at)
+      INSERT INTO #{quoted_schema}.workflows (id, name, status, input, locked_by, locked_until, next_run_at, created_at, updated_at)
       VALUES
-        ('pending-target', 'demo', 'pending', decode('#{serialized_count}', 'hex'), NULL, NULL, now() - interval '2 hours', now()),
-        ('running-owned', 'demo', 'running', decode('#{serialized_count}', 'hex'), 'owner', now() + interval '5 minutes', now() - interval '3 hours', now());
+        ('pending-target', 'demo', 'pending', decode('#{serialized_count}', 'hex'), NULL, NULL, NULL, now() - interval '2 hours', now()),
+        ('running-owned', 'demo', 'running', decode('#{serialized_count}', 'hex'), 'owner', now() + interval '5 minutes', NULL, now() - interval '3 hours', now()),
+        ('waiting-due', 'demo', 'waiting', decode('#{serialized_count}', 'hex'), NULL, NULL, now() - interval '1 minute', now() - interval '1 hour', now());
 
         INSERT INTO #{quoted_schema}.workflows (
           id, name, status, input, worker_pool, child_origin_kind, parent_workflow_id,
@@ -781,14 +771,6 @@ class DurababbleQueryPlanTest < DurababbleTestCase
       INSERT INTO #{quoted_schema}.step_attempts (id, workflow_id, position, name, status, result, started_at, completed_at)
       SELECT 'attempt-' || i, 'running-owned', i % 10, 'step-' || (i % 10), CASE WHEN i % 10 = 0 THEN 'running' ELSE 'completed' END, decode('#{serialized_result}', 'hex'), now() - (i || ' seconds')::interval, now()
       FROM generate_series(1, 3000) AS i;
-
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'timer-wait-' || i, 'waiting-' || i, 0, 'timer', NULL, now() - interval '1 minute', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
-      FROM generate_series(1, 2000) AS i;
-
-      INSERT INTO #{quoted_schema}.waits (id, workflow_id, position, kind, event_key, wake_at, context, status, created_at)
-      SELECT 'owned-wait-' || i, 'running-owned', i, 'timer', NULL, now() + interval '1 hour', decode('#{serialized_wait_context}', 'hex'), 'pending', now() - (i || ' seconds')::interval
-      FROM generate_series(1, 200) AS i;
 
       INSERT INTO #{quoted_schema}.fences (workflow_id, key, status, result, completed_at)
       VALUES ('running-owned', 'completed-fence', 'completed', decode('#{serialized_result}', 'hex'), now());

@@ -101,7 +101,7 @@ class DurababbleEngineTest < DurababbleTestCase
       @terminal << { workflow_id:, error:, worker_id: }
     end
 
-    def suspend_workflow(workflow_id:, worker_id:)
+    def suspend_workflow(workflow_id:, worker_id:, next_run_at: nil)
       @suspended = [workflow_id, worker_id]
     end
   end
@@ -595,8 +595,9 @@ class DurababbleEngineTest < DurababbleTestCase
           end,
         )
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        assert_equal :worked, worker.tick
+        wake_at = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
+        assert_equal :worked, with_store_current_time(store, wake_at) { worker.tick }
 
         assert_hash_includes(
           store.workflow(workflow_id),
@@ -611,7 +612,7 @@ class DurababbleEngineTest < DurababbleTestCase
         )
         assert_equal 75, side_effect_count
         assert_equal 77, store.steps_for(workflow_id).length
-        assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
+        assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }.uniq
       end
     end
 
@@ -791,7 +792,7 @@ class DurababbleEngineTest < DurababbleTestCase
     test "timer waits can complete at the configured history limit after recovery with #{backend.name}" do
       with_workflow_history_limit(3) do
         with_durababble_store(backend, "history_limit_wait") do |store|
-          wake_at = Time.utc(2026, 5, 25, 4, 0, 0)
+          wake_at = Time.now + 3600
           workflow = Class.new(Durababble::Workflow) do
             workflow_name "history-limit-wait"
 
@@ -805,13 +806,41 @@ class DurababbleEngineTest < DurababbleTestCase
           assert_equal "waiting", waiting.status
           assert_equal 2, store.workflow_history_count_for(workflow_id)
 
-          assert_equal 1, store.wake_due_timers(now: wake_at + 1)
-          completed = Durababble::Engine.new(store:, worker_id: "history-wait-recover").resume(workflow, workflow_id:)
+          completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "history-wait-recover")
 
           assert_equal "completed", completed.status
           assert_equal({ "id" => "wait", "slept" => true }, completed.result)
           assert_equal 3, store.workflow_history_count_for(workflow_id)
-          assert_equal ["completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+          assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
+        end
+      end
+    end
+
+    test "immediate timer waits count one completion event when followed by more work with #{backend.name}" do
+      with_workflow_history_limit(6) do
+        with_durababble_store(backend, "history_limit_immediate_wait") do |store|
+          wake_at = Time.now - 1
+          workflow = Class.new(Durababble::Workflow) do
+            workflow_name "history-limit-immediate-wait"
+
+            def after(ctx)
+              ctx.merge("after" => true)
+            end
+            step :after
+
+            define_method(:execute) do |input|
+              waited = Durababble.wait_until(wake_at, input.merge("slept" => true))
+              after(waited)
+            end
+          end
+          workflow_id = store.enqueue_workflow(name: workflow.name, input: { "id" => "immediate" })
+
+          completed = Durababble::Engine.new(store:, worker_id: "history-immediate").resume(workflow, workflow_id:)
+
+          assert_equal "completed", completed.status
+          assert_equal({ "id" => "immediate", "slept" => true, "after" => true }, completed.result)
+          assert_equal 6, store.workflow_history_count_for(workflow_id)
+          assert_equal ["completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         end
       end
     end

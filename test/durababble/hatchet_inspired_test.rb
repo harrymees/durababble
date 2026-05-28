@@ -86,7 +86,11 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         waiting = Durababble::Engine.new(store:, worker_id: "first-version").resume(first_version, workflow_id:)
         assert_equal "waiting", waiting.status
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
+        make_workflow_timer_due(store, workflow_id, at: store.workflow(workflow_id).fetch("next_run_at"))
+        store.claim_workflow(workflow_id:, worker_id: "timer-version", lease_seconds: 60)
+        wait_context = store.wait_snapshots_for(workflow_id).first.fetch("context")
+        store.record_step_completed(workflow_id:, command_id: 1, result: wait_context, worker_id: "timer-version")
+        store.suspend_workflow(workflow_id:, worker_id: "timer-version")
 
         run = Durababble::Engine.new(store:, worker_id: "second-version").resume(second_version, workflow_id:)
 
@@ -206,14 +210,14 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
     test "runs sequential durable timer waits with #{backend.name}" do
       with_durababble_store(backend, "hatchet_inspired") do |store|
-        wake_at = Time.utc(2026, 1, 1, 0, 0, 0)
+        wake_at = Time.now + 3600
         workflow = durababble_test_workflow("sleep-then-sleep") do
           test_step("sleep") do |ctx|
             Durababble.wait_until(wake_at, ctx.merge("slept" => true))
           end
 
           test_step("sleep_again") do |ctx|
-            Durababble.wait_until(Time.now + 3600, ctx.merge("approved" => true))
+            Durababble.wait_until(wake_at + 3600, ctx.merge("approved" => true))
           end
 
           test_step("finish") do |ctx|
@@ -230,23 +234,24 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
 
         assert_equal :worked, worker.tick
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_hash_includes store.waits_for(workflow_id).first, "kind" => "timer", "status" => "pending"
+        assert_hash_includes store.wait_snapshots_for(workflow_id).first, "kind" => "timer", "status" => "pending"
 
-        assert_equal 0, store.wake_due_timers(now: Time.utc(2025, 12, 31, 23, 59, 59))
-        assert_equal 1, store.wake_due_timers(now: Time.utc(2026, 1, 1, 0, 0, 1))
-        assert_equal :worked, worker.tick
+        assert_equal 0, store.wake_due_timers(now: wake_at - 1)
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
+        assert_equal :worked, with_store_current_time(store, wake_at + 1) { worker.tick }
         assert_hash_includes store.workflow(workflow_id), "status" => "waiting"
-        assert_equal ["completed", "pending"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "pending"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        assert_equal :worked, worker.tick
+        next_wake = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: next_wake)
+        assert_equal :worked, with_store_current_time(store, next_wake) { worker.tick }
 
         assert_hash_includes(
           store.workflow(workflow_id),
           "status" => "completed",
           "result" => { "id" => "hatchet", "slept" => true, "approved" => true, "done" => true },
         )
-        assert_equal ["completed", "completed"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["completed", "completed"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal(
           ["completed", "completed", "completed"],
           store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") },

@@ -113,6 +113,21 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
     end
   end
 
+  class ParentTimerAndChildWorkflow < Durababble::Workflow
+    workflow_name "parent-timer-and-child"
+
+    def execute(input)
+      handle = ChildEchoWorkflow.enqueue(
+        input.fetch("child"),
+        id: input.fetch("child_id"),
+        cancellation: :abandon,
+      )
+      timer_task = Async { sleep_until(input.fetch("timer_at"), { "timer" => true }) }
+      child_result = handle.await(poll_interval: 0)
+      { "child" => child_result, "timer" => timer_task.wait }
+    end
+  end
+
   class ParentStartsOtherPoolWorkflow < Durababble::Workflow
     workflow_name "parent-starts-other-pool-child"
 
@@ -195,7 +210,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         assert_equal "completed", run.fetch("status")
         assert_equal({ "child_id" => "child-success", "result" => { "echo" => "ok" } }, run.fetch("result"))
         assert_equal(
-          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "sleep", "child_workflow:workflow:observe"],
+          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "child_workflow:workflow:await", "child_workflow:workflow:observe"],
           store.steps_for(workflow_id).map { |step| step.fetch("name") },
         )
         assert_hash_includes(
@@ -225,7 +240,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
           run.fetch("result"),
         )
         assert_equal(
-          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "sleep", "child_workflow:workflow:observe"],
+          ["child_workflow:child-echo:start", "child_workflow:workflow:observe", "child_workflow:workflow:await", "child_workflow:workflow:observe"],
           store.steps_for(workflow_id).map { |step| step.fetch("name") },
         )
       end
@@ -290,14 +305,51 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
 
         worker.run_until_idle(max_ticks: 20)
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_equal 1, store.wake_due_timers(now: Time.now + 60)
+        wake_at = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
 
-        worker.run_until_idle(max_ticks: 20)
+        with_store_current_time(store, wake_at) { worker.run_until_idle(max_ticks: 20) }
         run = store.workflow(workflow_id)
 
         assert_equal "failed", run.fetch("status")
         assert_match(/timed out waiting for child workflow child-await-timeout/, run.fetch("error"))
         assert_equal "pending", store.workflow("child-await-timeout").fetch("status")
+      end
+    end
+
+    test "child completion does not complete a sibling future timer early with #{backend.name}" do
+      with_durababble_store(backend, "child_completion_keeps_future_timer") do |store|
+        timer_at = Time.now + 3600
+        workflow_id = store.enqueue_workflow(
+          name: ParentTimerAndChildWorkflow.workflow_name,
+          input: {
+            "child" => { "value" => "ok" },
+            "child_id" => "child-future-timer",
+            "timer_at" => timer_at,
+          },
+        )
+        worker = worker_for(backend, store, workflows: [ParentTimerAndChildWorkflow, ChildEchoWorkflow])
+
+        worker.run_until_idle(max_ticks: 20)
+        assert_equal "waiting", store.workflow(workflow_id).fetch("status")
+        assert_in_delta timer_at.to_f, timestamp_value(store.workflow(workflow_id).fetch("next_run_at")).to_f, 1
+
+        child_run = run_workers_until_terminal(backend, store, "child-future-timer", workflows: [ParentTimerAndChildWorkflow, ChildEchoWorkflow])
+        assert_equal "completed", child_run.fetch("status")
+
+        worker.run_until_idle(max_ticks: 20)
+        parent = store.workflow(workflow_id)
+        assert_equal "waiting", parent.fetch("status")
+        assert_in_delta timer_at.to_f, timestamp_value(parent.fetch("next_run_at")).to_f, 1
+        assert_equal({ "timer" => "pending", "child_workflow" => "completed" }, store.wait_snapshots_for(workflow_id).to_h { |wait| [wait.fetch("kind"), wait.fetch("status")] })
+
+        make_workflow_timer_due(store, workflow_id, at: timer_at)
+        with_store_current_time(store, timer_at) { worker.run_until_idle(max_ticks: 20) }
+        assert_hash_includes(
+          store.workflow(workflow_id),
+          "status" => "completed",
+          "result" => { "child" => { "echo" => "ok" }, "timer" => { "timer" => true } },
+        )
       end
     end
 
@@ -542,7 +594,10 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
       run = store.workflow(workflow_id)
       return run if Durababble::WorkflowStatus.terminal?(run)
 
-      store.wake_due_timers(now: Time.now + 3600)
+      if (wake_at = run["next_run_at"])
+        make_workflow_timer_due(store, workflow_id, at: wake_at)
+        with_store_current_time(store, wake_at) { worker.run_until_idle(max_ticks: 20) }
+      end
     end
     raise "workflow #{workflow_id} did not finish"
   end
@@ -558,6 +613,12 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
 
   def run_one_worker_tick(backend, store, workflows:, objects: [], worker_pool: "default")
     worker_for(backend, store, workflows:, objects:, worker_pool:).tick
+  end
+
+  def timestamp_value(value)
+    return value if value.is_a?(Time)
+
+    Time.parse(value.to_s)
   end
 
   def worker_for(_backend, store, workflows:, objects: [], worker_pool: "default")

@@ -211,8 +211,7 @@ class DurababbleWorkflowDeterminismTest < DurababbleTestCase
         assert_equal "waiting", waiting.status
         assert_equal [["sleep", "waiting"]], store.steps_for(workflow_id).map { |step| [step.fetch("name"), step.fetch("status")] }
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        completed = engine.resume(workflow, workflow_id:)
+        completed = resume_waiting_workflow(store, workflow, workflow_id, worker_id: "determinism-sleep-worker")
         assert_equal "completed", completed.status
         assert_equal({ "duration" => 3600, "slept" => true }, completed.result)
       end

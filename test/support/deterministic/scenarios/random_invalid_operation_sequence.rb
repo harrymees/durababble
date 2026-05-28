@@ -146,7 +146,7 @@ module Durababble
             ["cancel_missing", request_missing_cancel],
             ["terminate_missing", request_missing_terminate],
             ["duplicate_workflow_id", ->(_actor) { h.store.enqueue_workflow(name: "counter", input: {}, id: terminal_id) }],
-            ["early_timer_wake", ->(_actor) { h.store.wake_due_timers(now: h.store.current_time + 10) }],
+            ["early_timer_poll", ->(_actor) { h.store.claim_runnable_workflow(worker_id: "early-timer", lease_seconds: 20, workflow_names: ["invalid-waiting"]) }],
             ["wrong_outbox_ack", wrong_ack],
           ]
           guaranteed.each_with_index do |(operation, block), index|
@@ -156,10 +156,7 @@ module Durababble
           end
 
           h.scheduler.schedule(actor: "waiting-worker", delay: 6, name: "park_waiting") do
-            Durababble::Engine.new(store: h.store, worker_id: "waiting-worker").resume(
-              h.workflows.fetch("invalid-waiting"),
-              workflow_id: waiting_id,
-            )
+            resume_workflow_once(h, actor: "waiting-worker", workflow: h.workflows.fetch("invalid-waiting"), workflow_id: waiting_id)
           end
           h.scheduler.schedule(actor: "reaper", delay: 10, name: "steal_expired") { h.store.steal_expired_leases! }
           h.scheduler.schedule(actor: "new-owner", delay: 12, name: "claim_stale_workflow") do
@@ -215,20 +212,17 @@ module Durababble
                   name, block = stale_writes[h.scheduler.rng.int(stale_writes.length)]
                   reject_stale_write.call(actor, name, block)
                 when "wake_timers"
-                  h.store.wake_due_timers(now: h.store.current_time + 120)
+                  resume_workflow_once(h, actor:, workflow: h.workflows.fetch("invalid-waiting"), workflow_id: waiting_id)
                 end
               end
             end
           end
 
           h.scheduler.schedule(actor: "timer", delay: 80, name: "wake_waiting") do
-            h.store.wake_due_timers(now: h.store.current_time + 120)
+            resume_workflow_once(h, actor: "timer", workflow: h.workflows.fetch("invalid-waiting"), workflow_id: waiting_id)
           end
           h.scheduler.schedule(actor: "waiting-worker", delay: 90, name: "finish_waiting") do
-            Durababble::Engine.new(store: h.store, worker_id: "waiting-worker").resume(
-              h.workflows.fetch("invalid-waiting"),
-              workflow_id: waiting_id,
-            )
+            resume_workflow_once(h, actor: "waiting-worker", workflow: h.workflows.fetch("invalid-waiting"), workflow_id: waiting_id)
           end
           h.scheduler.schedule(actor: "terminal-drainer", delay: 100, name: "final_terminal_drain") do
             drain_terminal_commands.call("terminal-drainer")

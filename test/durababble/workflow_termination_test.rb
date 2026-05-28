@@ -13,12 +13,12 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
       @termination_requests = 0
     end
 
-    def suspend_workflow(workflow_id:, worker_id: nil)
+    def suspend_workflow(workflow_id:, worker_id: nil, next_run_at: nil)
       if @termination_requests.zero?
         @termination_requests += 1
         @store.request_workflow_termination(workflow_id:, reason: @reason)
       end
-      @store.suspend_workflow(workflow_id:, worker_id:)
+      @store.suspend_workflow(workflow_id:, worker_id:, next_run_at:)
     end
 
     def method_missing(method_name, *args, **kwargs, &block)
@@ -124,7 +124,7 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         assert_equal "terminated", terminated.status
         assert_equal "terminated", recovered.status
         assert_equal "stop wait", recovered.error
-        assert_equal ["canceled"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["canceled"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
         assert_equal ["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
         assert_equal 0, store.wake_due_timers(now: Time.now + 3601)
@@ -155,7 +155,7 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
         assert_equal "terminated", run.status
         assert_equal "operator stop at wait boundary", run.error
         assert_equal 1, race_store.termination_requests
-        assert_equal ["canceled"], store.waits_for(workflow_id).map { |wait| wait.fetch("status") }
+        assert_equal ["canceled"], store.wait_snapshots_for(workflow_id).map { |wait| wait.fetch("status") }
         assert_equal ["canceled"], store.steps_for(workflow_id).map { |step| step.fetch("status") }
         assert_equal ["canceled"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
       end

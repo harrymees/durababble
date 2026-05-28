@@ -8,30 +8,15 @@ module Durababble
       def wait_condition_timer_command_race(seed)
         run(seed, "wait_condition_timer_command_race") do |h|
           h.expect_settled!
-          # Races the TWO ways a wait_condition wakes: its timer firing vs. a
-          # command satisfying the predicate. wait_condition(timeout: 10) parks
-          # the workflow `waiting` on a `timer` wait whose wake_at == enqueue_time
-          # + 10. Two independent forces converge on that window:
-          #   * timer workers run wake_due_timers -> complete_timer_waits, whose
-          #     SELECT picks the due timer wait when the workflow is waiting OR
-          #     RUNNING (it locks only the wait row, FOR UPDATE OF w), then
-          #     mark_waits_workflows_pending flips the workflow back to pending --
-          #     but that UPDATE is gated on status='waiting', so it CANNOT flip a
-          #     workflow a command-delivery worker has already claimed to running.
-          #   * command-delivery workers claim the waiting workflow -> running and
-          #     resume(claimed:), delivering the :signal command inline at the
-          #     wait's safe point; the predicate goes true and execute returns ->
-          #     complete_workflow.
-          # The dangerous interleave: a timer worker completes the timer wait
-          # (locking only the wait) WHILE a command worker holds the workflow
-          # running. The pending-flip no-ops (not waiting), so the command worker
-          # drives the workflow terminal with a now-`completed` timer wait + its
-          # step left behind. If complete_workflow does not reconcile that
-          # abandoned wait/step, the terminal workflow keeps a live wait or a
-          # waiting step -> verify_step_invariants! / expect_settled! fire. The
-          # mirror interleave -- timer wins, flips to pending, then the command
-          # worker also delivers -- must still leave exactly one terminal outcome
-          # and deliver/dead-letter the command exactly once.
+          # Races the TWO ways a wait_condition wakes: a due workflow-timer
+          # claim vs. a command satisfying the predicate. wait_condition(timeout:
+          # 10) parks the workflow `waiting` with next_run_at == enqueue_time +
+          # 10. Once due, ordinary workers claim the workflow and complete the
+          # wait while holding the workflow lease. Command-delivery workers can
+          # also claim the waiting workflow through the activation path and
+          # deliver :signal inline at the wait's safe point. The race should
+          # still leave exactly one terminal outcome and deliver/dead-letter the
+          # command exactly once.
           workflow = workflow_class("race-signal") do
             expose_command(:signal)
             define_method(:signal) do
@@ -81,15 +66,12 @@ module Durababble
             h.scheduler.trace.event(h.scheduler.time, "crash-worker", "claim_conflict", id:)
           end
 
-          # Timer workers fire wake_due_timers in the wake window. complete_timer_waits
-          # selects the due `timer` wait when the workflow is waiting OR running, so a
-          # timer worker here can complete the wait while crash-worker holds the
-          # workflow running -- and mark_waits_workflows_pending (waiting-gated) then
-          # CANNOT flip the running workflow back to pending. If completion does not
-          # reconcile, the running workflow is left with a completed timer wait.
+          # Timer workers try to claim the workflow in the wake window. If
+          # crash-worker still holds a live lease they must lose; once the lease
+          # expires, one ordinary resume should complete the due wait.
           3.times do |i|
-            h.scheduler.schedule(actor: "timer-#{i}", delay: 10 + h.scheduler.rng.int(6), name: "wake_due_timers") do
-              h.store.wake_due_timers(now: h.store.current_time)
+            h.scheduler.schedule(actor: "timer-#{i}", delay: 10 + h.scheduler.rng.int(6), name: "claim_due_workflow") do
+              resume_workflow_once(h, actor: "timer-#{i}", workflow:, workflow_id: id)
             end
           end
 

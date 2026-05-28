@@ -10,6 +10,15 @@ require_relative "durababble/observability"
 require_relative "durababble/backoff"
 
 module Durababble
+  #: type durable_timestamp = Time | Integer | String
+  #: type wait_kind = String
+  #: type wait_status = String
+  #: type wait_history_value = durable_timestamp | String | Integer | Object?
+  #: type wait_history_event = Hash[String, wait_history_value]
+  #: type wait_metadata = { "kind" => wait_kind, "event_key" => String?, "wake_at" => durable_timestamp?, "context" => Object? }
+  #: type wait_event_payload = { "context" => Object?, "wait" => { "kind" => wait_kind, "event_key" => String?, "wake_at" => durable_timestamp? } }
+  #: type wait_snapshot = { "id" => String, "workflow_id" => String, "position" => Integer, "command_id" => Integer, "kind" => wait_kind, "event_key" => String?, "wake_at" => durable_timestamp?, "context" => Object?, "status" => wait_status }
+
   DEFAULT_SCHEMA_PREFIX = "durababble"
   MAX_SCHEMA_IDENTIFIER_LENGTH = 63
   DEFAULT_MAX_WORKFLOW_HISTORY_EVENTS = 10_000

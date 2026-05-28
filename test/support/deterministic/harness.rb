@@ -36,8 +36,8 @@ module Durababble
       end
 
       # Declare that, once the scheduler drains, every workflow must be either
-      # terminal or *legitimately* parked (a pending event wait, or a timer /
-      # retry scheduled beyond the simulation horizon). Opt-in because some
+      # terminal or *legitimately* parked by replay history (a pending event wait,
+      # or a timer / retry scheduled beyond the simulation horizon). Opt-in because some
       # scenarios intentionally leave runnable work behind. Enables the
       # liveness/termination checker.
       #: () -> void
@@ -603,9 +603,9 @@ module Durababble
           when "waiting"
             pending = waits_state.values.select { |wait| wait.fetch("workflow_id") == id && wait.fetch("status") == "pending" }
             if pending.empty?
-              violations << "workflow #{id} waiting with no pending wait at end of run"
+              violations << "workflow #{id} waiting with no pending replay wait at end of run"
             elsif pending.any? { |wait| wait.fetch("kind") == "timer" && !wait.fetch("wake_at").nil? && wait.fetch("wake_at") <= final_time }
-              violations << "workflow #{id} waiting on a timer past its wake_at at end of run (timer never fired)"
+              violations << "workflow #{id} waiting on a timer past its wake_at at end of run (workflow was never reclaimed)"
             end
           end
         end
@@ -676,7 +676,7 @@ module Durababble
 
       #: (untyped, untyped, untyped) -> untyped
       def verify_step_invariants!(workflows_state, steps_state, attempts_state, waits_state)
-        # Steps backed by a wait row are control-flow waits (workflow-level
+        # Steps backed by wait history are control-flow waits (workflow-level
         # wait_condition / wait_until / sleep): they go scheduled -> waiting ->
         # completed/canceled WITHOUT ever recording a step_started, so they carry
         # no attempt by design (the canonical history is step_scheduled,

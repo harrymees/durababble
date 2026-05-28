@@ -103,6 +103,114 @@ module Durababble
       end
     end
 
+    #: (wait_history_event, Hash[Integer, wait_metadata]) -> wait_snapshot?
+    def wait_snapshot_from_history_event(event, wait_metadata_by_command_id)
+      command_id_value = event["command_id"]
+      return unless command_id_value
+
+      command_id = command_id_value.to_s.to_i
+      wait = wait_payload_from_history_event(event, wait_metadata_by_command_id)
+      return unless wait
+
+      workflow_id = event.fetch("workflow_id").to_s
+      status = case event.fetch("kind")
+      when "step_waiting"
+        "pending"
+      when "step_completed"
+        "completed"
+      when "step_canceled", "step_failed"
+        "canceled"
+      else
+        return
+      end
+      {
+        "id" => "#{workflow_id}:#{command_id}",
+        "workflow_id" => workflow_id,
+        "position" => command_id,
+        "command_id" => command_id,
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => wait["context"] || event["payload"],
+        "status" => status,
+      }
+    end
+
+    #: (wait_history_event, Hash[Integer, wait_metadata]) -> wait_metadata?
+    def wait_payload_from_history_event(event, wait_metadata_by_command_id)
+      payload = event["payload"]
+      return unless payload.is_a?(Hash)
+
+      if payload["wait"].is_a?(Hash)
+        wait = payload.fetch("wait") #: as untyped
+        return {
+          "kind" => wait["kind"],
+          "event_key" => wait["event_key"],
+          "wake_at" => wait["wake_at"],
+          "context" => payload["context"] || wait["context"],
+        }
+      end
+
+      command_id = event.fetch("command_id").to_s.to_i
+      wait = wait_metadata_by_command_id[command_id]
+      return unless wait
+
+      {
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => payload,
+      }
+    end
+
+    #: (Array[Hash[String, Object?]]) -> Hash[Integer, wait_metadata]
+    def wait_metadata_index(history)
+      history.each_with_object({}) do |event, index|
+        next unless ["step_scheduled", "step_waiting"].include?(event.fetch("kind"))
+
+        command_id_value = event["command_id"]
+        next unless command_id_value
+
+        wait = wait_metadata_from_payload(event["payload"])
+        next unless wait
+
+        index[command_id_value.to_s.to_i] = wait
+      end
+    end
+
+    #: (Object?) -> wait_metadata?
+    def wait_metadata_from_payload(payload)
+      return unless payload.is_a?(Hash)
+
+      wait = payload["wait"]
+      return unless wait.is_a?(Hash)
+
+      wait = wait #: as untyped
+      {
+        "kind" => wait["kind"],
+        "event_key" => wait["event_key"],
+        "wake_at" => wait["wake_at"],
+        "context" => payload["context"] || wait["context"],
+      }
+    end
+
+    #: (WaitRequest) -> wait_event_payload
+    def wait_payload(wait_request)
+      {
+        "context" => wait_request.context,
+        "wait" => {
+          "kind" => wait_request.kind,
+          "event_key" => wait_request.event_key,
+          "wake_at" => wait_request.wake_at,
+        },
+      }
+    end
+
+    #: (String) -> Object?
+    def wake_parent_workflow_if_child_terminal(workflow_id)
+      raise NotImplementedError
+    end
+
     #: (String) -> Hash[String, Object?]
     def workflow(workflow_id)
       row = execute_store_query(:workflow, [workflow_id]).first
@@ -157,11 +265,6 @@ module Durababble
       total = 0
       timestamp = timestamp_or_nil(now) || now
       loop do
-        completed = complete_timer_waits(timestamp, batch_size)
-        total += completed
-        break if completed < batch_size
-      end
-      loop do
         completed = complete_object_wakeups(timestamp, batch_size)
         total += completed
         break if completed < batch_size
@@ -169,21 +272,26 @@ module Durababble
       total
     end
 
-    # Flip every workflow whose timer just fired back to pending in a single statement.
-    # Called once per wake batch instead of once per wait to avoid an N+1 of single-row UPDATEs.
-    #: (Array[Hash[String, Object?]]) -> void
-    def mark_waits_workflows_pending(waits)
-      workflow_ids = waits.map { |wait| wait.fetch("workflow_id") }.uniq
-      return if workflow_ids.empty?
+    # Diagnostic/test view reconstructed from workflow history and step state.
+    # Runtime wake/claim paths must not call this; they use workflows.next_run_at.
+    #: (String) -> Array[wait_snapshot]
+    def wait_snapshots_for(workflow_id)
+      snapshots = {}
+      step_statuses = steps_for(workflow_id).to_h { |step| [step.fetch("position").to_s.to_i, step.fetch("status")] }
+      history = workflow_history_for(workflow_id)
+      wait_metadata_by_command_id = wait_metadata_index(history)
+      history.each do |event|
+        snapshot = wait_snapshot_from_history_event(event, wait_metadata_by_command_id)
+        next unless snapshot
 
-      placeholders = workflow_ids.each_index.map { |index| placeholder(index + 1) }.join(", ")
-      execute_store_query(:mark_waits_workflows_pending, workflow_ids, placeholders:)
-    end
-
-    #: (String) -> Array[Hash[String, Object?]]
-    def waits_for(workflow_id)
-      execute_store_query(:waits_for_workflow, [workflow_id])
-        .map { |row| decode_row(row) }
+        if snapshot.fetch("status") == "pending" && step_statuses[snapshot.fetch("command_id").to_s.to_i] == "canceled"
+          snapshot = snapshot.merge(
+            "status" => "canceled",
+          )
+        end
+        snapshots[snapshot.fetch("id")] = snapshot
+      end
+      snapshots.values.sort_by { |snapshot| snapshot.fetch("position").to_i }
     end
 
     #: (String) -> Hash[String, Object?]?
@@ -676,7 +784,7 @@ module Durababble
 
     # Terminal workflow writes have one shared postcondition: if the update was
     # made by a leased worker it must still own the row, and the workflow must
-    # not strand live waits, steps, or attempts after becoming terminal. The
+    # not strand live waiting steps or attempts after becoming terminal. The
     # `failure_error` lets fail_workflow terminalize live steps/attempts as
     # "failed" (carrying the workflow's own error) while cancel/complete leave
     # them as "canceled".
@@ -690,32 +798,29 @@ module Durababble
         else
           cancel_live_workflow_dependents(workflow_id)
         end
+        wake_parent_workflow_if_child_terminal(workflow_id)
         result
       end
     end
 
     #: (String) -> Object?
     def cancel_pending_waits_for_workflow(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_waiting_step_attempts_for_workflow, [workflow_id])
     end
 
     #: (String) -> Object?
     def cancel_live_workflow_dependents(workflow_id)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_store_query(:cancel_live_steps_for_workflow, [workflow_id])
       execute_store_query(:cancel_live_step_attempts_for_workflow, [workflow_id])
     end
 
-    # Terminalize live waits/steps/attempts on workflow failure. A step that was
+    # Terminalize live waiting steps/attempts on workflow failure. A step that was
     # actively running observed the failure and is marked 'failed' with the
     # workflow's error. Scheduled/waiting steps never observed it and are
-    # canceled, matching how an abandoned parked branch lands. Pending waits are
-    # canceled because a wait has no failure semantics.
+    # canceled, matching how an abandoned parked branch lands.
     #: (String, String) -> Object?
     def fail_live_workflow_dependents(workflow_id, error)
-      execute_store_query(:cancel_pending_waits_for_workflow, [workflow_id])
       execute_fail_live_steps_for_workflow(workflow_id, error)
       execute_fail_live_step_attempts_for_workflow(workflow_id, error)
       # cancel_live_*_for_workflow filter on 'scheduled'/'waiting' (and 'running'
@@ -914,11 +1019,6 @@ module Durababble
 
     #: (Time?) -> String?
     def timestamp_or_nil(time)
-      raise NotImplementedError
-    end
-
-    #: (Object?, Integer) -> Integer
-    def complete_timer_waits(now, batch_size)
       raise NotImplementedError
     end
 

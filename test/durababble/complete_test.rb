@@ -81,17 +81,19 @@ class DurababbleCompleteTest < DurababbleTestCase
 
         assert_equal :worked, worker.tick
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
-        assert_equal "timer", store.waits_for(workflow_id).first.fetch("kind")
+        assert_equal "timer", store.wait_snapshots_for(workflow_id).first.fetch("kind")
 
         assert_equal 0, store.wake_due_timers(now: Time.now)
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        assert_equal :worked, worker.tick
+        first_wake = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: first_wake)
+        assert_equal :worked, with_store_current_time(store, first_wake) { worker.tick }
         assert_equal "waiting", store.workflow(workflow_id).fetch("status")
         assert_equal ["completed", "waiting"], store.step_attempts_for(workflow_id).map { |attempt| attempt.fetch("status") }
-        assert_nil store.waits_for(workflow_id).last.fetch("event_key")
+        assert_nil store.wait_snapshots_for(workflow_id).last.fetch("event_key")
 
-        assert_equal 1, store.wake_due_timers(now: Time.now + 7202)
-        assert_equal 1, worker.run_until_idle
+        second_wake = store.workflow(workflow_id).fetch("next_run_at")
+        make_workflow_timer_due(store, workflow_id, at: second_wake)
+        assert_equal 1, with_store_current_time(store, second_wake) { worker.run_until_idle }
         assert_equal "completed", store.workflow(workflow_id).fetch("status")
         assert_hash_includes store.workflow(workflow_id).fetch("result"), "finished" => true, "approved" => true
         assert_equal(
@@ -145,8 +147,7 @@ class DurababbleCompleteTest < DurababbleTestCase
           engine(crash_after: :wait_recorded).resume(waiting, workflow_id: waiting_id)
         end
         assert_equal "waiting", store.workflow(waiting_id).fetch("status")
-        assert_equal 1, store.wake_due_timers(now: Time.now + 3601)
-        result = engine(worker_id: "recover").resume(waiting, workflow_id: waiting_id).result
+        result = resume_waiting_workflow(store, waiting, waiting_id, worker_id: "recover").result
         assert_hash_includes result, "done" => true, "slept" => true
 
         outbox_workflow_id = store.enqueue_workflow(name: "counter", input: { "count" => 5 })

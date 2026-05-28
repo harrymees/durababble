@@ -296,8 +296,8 @@ module Durababble
         out
       end
 
-      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?) -> Object?
-      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil)
+      #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, name: String, wait_request: WaitRequest, ?suspend_workflow: bool, ?worker_id: String?, ?next_run_at: Object?) -> Object?
+      def record_wait(workflow_id:, name:, wait_request:, command_id: nil, position: nil, suspend_workflow: true, worker_id: nil, next_run_at: nil)
         wait_id = super
         trace_event("wait_recorded", id: workflow_id, wait_id:, kind: wait_request.kind, event_key: wait_request.event_key)
         fault_plan.after(:record_wait)
@@ -628,7 +628,7 @@ module Durababble
 
       #: () -> Hash[String, Hash[String, Object?]]
       def all_waits
-        base = select_all("waits").to_h { |row| [row.fetch("id"), row] }
+        base = all_workflows.keys.flat_map { |workflow_id| wait_snapshots_for(workflow_id) }.to_h { |row| [row.fetch("id"), row] }
         base.merge(@injected_waits)
       end
 
@@ -764,18 +764,6 @@ module Durababble
       #: (Hash[String, Object?]) -> String
       def claim_tiebreak(row)
         row["id"]&.to_s || [row["target_kind"], row["target_type"], row["target_id"], row["key"]].join("/")
-      end
-
-      # Emit wait completions for the harness's `wait_completed` assertions; the
-      # shared finish path otherwise writes silently.
-      #: (Array[Hash[String, Object?]], Hash[String, Object?]) -> Integer
-      def finish_completed_waits(waits, payload)
-        count = super
-        waits.each do |wait|
-          wait = wait #: as untyped
-          trace_event("wait_completed", id: wait.fetch("workflow_id"), wait_id: wait.fetch("id"), payload:)
-        end
-        count
       end
 
       #: (String, ?order: String?) -> Array[Hash[String, Object?]]

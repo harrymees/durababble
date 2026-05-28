@@ -36,6 +36,7 @@ module Durababble
           queue_available_at DATETIME(6) GENERATED ALWAYS AS (
             CASE
               WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+              WHEN status = 'waiting' AND next_run_at IS NOT NULL THEN next_run_at
               WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
               WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
               ELSE NULL
@@ -122,29 +123,15 @@ module Durababble
           locked_until DATETIME(6),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           processed_at DATETIME(6),
-          INDEX #{quote_column_name(index_name("outbox", "queue"))} (status, created_at),
-          INDEX #{quote_column_name(index_name("outbox", "expired_lease"))} (status, locked_until, created_at),
+          queue_available_at DATETIME(6) GENERATED ALWAYS AS (
+            CASE
+              WHEN status = 'pending' THEN created_at
+              WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+              ELSE NULL
+            END
+          ) STORED,
+          INDEX #{quote_column_name(index_name("outbox", "claim"))} (queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("outbox", "worker_lease"))} (status, locked_by),
-          FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
-        )
-      SQL
-      execute(<<~SQL)
-        CREATE TABLE IF NOT EXISTS #{table("waits")} (
-          id VARCHAR(191) PRIMARY KEY,
-          workflow_id VARCHAR(191) NOT NULL,
-          position INT NOT NULL,
-          kind VARCHAR(32) NOT NULL,
-          event_key VARCHAR(191),
-          wake_at DATETIME(6),
-          context LONGBLOB NOT NULL,
-          payload LONGBLOB,
-          status VARCHAR(32) NOT NULL,
-          created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
-          completed_at DATETIME(6),
-          INDEX #{quote_column_name(index_name("waits", "workflow_created"))} (workflow_id, created_at),
-          INDEX #{quote_column_name(index_name("waits", "workflow_status"))} (workflow_id, status),
-          INDEX #{quote_column_name(index_name("waits", "event_pending"))} (status, kind, event_key, created_at),
-          INDEX #{quote_column_name(index_name("waits", "timer_pending"))} (status, kind, wake_at, created_at),
           FOREIGN KEY (workflow_id) REFERENCES #{table("workflows")}(id) ON DELETE CASCADE
         )
       SQL

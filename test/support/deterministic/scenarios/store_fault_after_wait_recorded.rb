@@ -26,14 +26,8 @@ module Durababble
           rescue InjectedCrash
             h.scheduler.trace.event(h.scheduler.time, "faulty-worker", "store_fault_observed", workflow_id: id)
           end
-          h.scheduler.schedule(actor: "timer", delay: 20, name: "wake_due_timers") do
-            h.store.wake_due_timers(now: h.store.current_time + 100)
-          end
           h.scheduler.schedule(actor: "recover", delay: 25, name: "resume") do
-            Durababble::Engine.new(store: h.store, worker_id: "recover").resume(
-              h.workflows.fetch("waiting"),
-              workflow_id: id,
-            )
+            resume_workflow_once(h, actor: "recover", workflow: h.workflows.fetch("waiting"), workflow_id: id)
           end
           h.check("fault was injected after wait write") { h.scheduler.trace.to_s.include?("fault.injected") }
           h.check("workflow completed after recovering from durable wait write") do

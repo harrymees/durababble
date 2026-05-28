@@ -20,6 +20,17 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     { "kind" => "workflow_command_completed", "event_index" => event_index, "name" => "approve", "payload" => { "method" => "approve", "args" => [], "kwargs" => {}, "result" => { "approved" => true } } }
   end
 
+  def wait_payload(kind: "timer", wake_at: Time.utc(2026, 1, 1), context: { "slept" => true })
+    {
+      "wait" => {
+        "kind" => kind,
+        "event_key" => nil,
+        "wake_at" => wake_at,
+      },
+      "context" => context,
+    }
+  end
+
   test "event_count reflects the number of persisted events" do
     history = Durababble::WorkflowReplayHistory.new([scheduled_event(0, event_index: 0), completed_event(0, event_index: 1)])
 
@@ -189,5 +200,90 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     ])
 
     assert_nil history.next_undeliverable_command_id({})
+  end
+
+  test "waiting_timer reads wait metadata from step_waiting history payloads" do
+    wake_at = Time.utc(2026, 1, 1)
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "sleep", payload: { "name" => "sleep" }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "sleep", "payload" => wait_payload(wake_at:, context: { "slept" => true }) },
+    ])
+
+    assert_equal(
+      { "kind" => "timer", "event_key" => nil, "wake_at" => wake_at, "context" => { "slept" => true } },
+      history.waiting_timer(0),
+    )
+    assert_equal wake_at, history.earliest_unresolved_timer_wake_at
+  end
+
+  test "earliest_unresolved_timer_wake_at parses ISO timestamps without host time" do
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "sleep", payload: { "name" => "sleep" }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "sleep", "payload" => wait_payload(wake_at: "2026-01-02T00:00:00.000000Z") },
+      scheduled_event(1, name: "sleep", payload: { "name" => "sleep" }, event_index: 2),
+      { "kind" => "step_waiting", "command_id" => 1, "event_index" => 3, "name" => "sleep", "payload" => wait_payload(wake_at: "2026-01-01T00:00:00.000000Z") },
+    ])
+
+    Durababble::WorkflowExecutionContext.with_current(Object.new) do
+      Durababble::WorkflowDeterminism.enforce(workflow_id: "wf") do
+        assert_equal "2026-01-01T00:00:00.000000Z", history.earliest_unresolved_timer_wake_at
+      end
+    end
+  end
+
+  test "durable timestamp comparison normalizes explicit offsets" do
+    utc = Durababble::DurableTime.durable_comparable("2026-01-01T00:00:00.000000Z")
+
+    assert_equal utc, Durababble::DurableTime.durable_comparable("2026-01-01T01:30:00.000000+0130")
+    assert_equal utc, Durababble::DurableTime.durable_comparable("2026-01-01T01:30:00.000000+01:30")
+  end
+
+  test "durable timestamp parsing supports timer math from backend strings" do
+    start = Durababble::DurableTime.comparable("2026-01-01T00:00:00.000000Z")
+
+    assert_equal Time.utc(2026, 1, 1, 1), start + 3600
+  end
+
+  test "waiting_timer falls back to scheduled wait metadata for legacy waiting payloads" do
+    wake_at = Time.utc(2026, 1, 1)
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "sleep", payload: { "name" => "sleep", "wait" => { "kind" => "timer", "event_key" => nil, "wake_at" => wake_at } }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "sleep", "payload" => { "slept" => true } },
+    ])
+
+    assert_equal(
+      { "kind" => "timer", "event_key" => nil, "wake_at" => wake_at, "context" => { "slept" => true } },
+      history.waiting_timer(0),
+    )
+  end
+
+  test "waiting_timer ignores non timer waits and forgotten timers" do
+    wake_at = Time.utc(2026, 1, 1)
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "event", payload: { "name" => "event" }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "event", "payload" => wait_payload(kind: "event", wake_at:, context: {}) },
+      scheduled_event(1, name: "sleep", payload: { "name" => "sleep" }, event_index: 2),
+      { "kind" => "step_waiting", "command_id" => 1, "event_index" => 3, "name" => "sleep", "payload" => wait_payload(wake_at:) },
+    ])
+
+    assert_nil history.waiting_timer(0)
+    refute_nil history.waiting_timer(1)
+
+    history.forget_waiting_timer(1)
+
+    assert_nil history.waiting_timer(1)
+    assert_nil history.earliest_unresolved_timer_wake_at
+  end
+
+  test "interrupted wait conditions are not treated as timer waits" do
+    wake_at = Time.utc(2026, 1, 1)
+    history = Durababble::WorkflowReplayHistory.new([
+      scheduled_event(0, name: "wait_condition", payload: { "name" => "wait_condition" }, event_index: 0),
+      { "kind" => "step_waiting", "command_id" => 0, "event_index" => 1, "name" => "wait_condition", "payload" => wait_payload(wake_at:) },
+      workflow_command_event(event_index: 2),
+    ])
+
+    assert_nil history.waiting_timer(0)
+    assert_nil history.waiting_timer_or_child_workflow(0)
   end
 end
