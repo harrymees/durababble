@@ -241,8 +241,7 @@ module Durababble
       create_postgres_index("inbox_idempotency_hash_idx", "ON #{table("inbox")} (idempotency_hash) WHERE idempotency_hash IS NOT NULL", unique: true)
       create_postgres_index("inbox_target_status_sequence_idx", "ON #{table("inbox")} (target_kind, target_type, target_id, status, sequence)")
       create_postgres_index("inbox_ready_idx", "ON #{table("inbox")} (status, ready_at, created_at)")
-      create_postgres_index("target_activations_queue_idx", "ON #{table("target_activations")} (worker_pool, status, ready_at, created_at)")
-      create_postgres_index("target_activations_expired_idx", "ON #{table("target_activations")} (worker_pool, status, locked_until, created_at)")
+      create_postgres_index("target_activations_claim_idx", "ON #{table("target_activations")} (worker_pool ASC, target_kind ASC, target_type ASC, (#{StoreQueries::POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("durable_objects_worker_lease_idx", "ON #{table("durable_objects")} (locked_by) WHERE locked_by IS NOT NULL")
       create_postgres_index("durable_objects_expired_lease_idx", "ON #{table("durable_objects")} (locked_until) WHERE locked_by IS NOT NULL")
     end

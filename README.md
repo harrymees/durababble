@@ -17,7 +17,7 @@ The docs site source starts at [docs/content/README.md](docs/content/README.md).
 - [Testing](docs/content/testing.md)
 - [Reference](docs/content/reference.md)
 - [Spec](docs/spec.md)
-- [Architecture](docs/content/architecture.md)
+- [Architecture](docs/content/internals/architecture.md)
 - [Comparisons](docs/content/comparisons.md)
 - [Deterministic Testing](docs/deterministic-testing.md)
 - [Benchmarks](bench/README.md)

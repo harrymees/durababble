@@ -496,7 +496,8 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
 
   test "starts expired leases with the first worker that can claim and awaits the active owner" do
     store = self.store
-    claim_as("worker-a", lease_seconds: -1)
+    claim_as("worker-a", lease_seconds: 1)
+    sleep(1.1)
     starter = Durababble::WorkflowRpc::LeaseStarter.new(store:, worker_ids: ["worker-b", "worker-c"], lease_seconds: 9)
 
     lease = starter.call(workflow_id:)

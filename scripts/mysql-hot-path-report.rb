@@ -27,6 +27,7 @@ module DurababbleMysqlHotPathReport
   BUILTIN_OPERATION_DESCRIPTIONS = {
     "enqueue_workflow" => "Trace the single durable write that enqueues a pending workflow.",
     "claim_runnable_workflow" => "Trace the MySQL queue probes and lease update used when a worker claims runnable workflow work.",
+    "claim_target_activation" => "Trace the target activation queue probes and lease update used when a worker claims mailbox wakeup work.",
     "worker_poll_idle" => "Trace one Worker#tick poll when no workflow work is available.",
     "worker_tick_claim" => "Trace one Worker#tick that polls, claims a workflow, and runs it to completion.",
   }.freeze
@@ -197,6 +198,24 @@ module DurababbleMysqlHotPathReport
           name:,
           input: { "n" => index },
           id: "#{id_prefix}-#{index}",
+          worker_pool:,
+        )
+      end
+    end
+
+    def seed_target_activations(
+      count = fixture_size,
+      target_kind: "workflow",
+      target_type: "background-workflow",
+      worker_pool: DEFAULT_WORKER_POOL,
+      id_prefix: "hot-path-background-activation"
+    )
+      count.times do |index|
+        store.rearm_target_activation(
+          target_kind:,
+          target_type:,
+          target_id: "#{id_prefix}-#{index}",
+          ready_at: Time.now - 1,
           worker_pool:,
         )
       end
@@ -1087,6 +1106,29 @@ module DurababbleMysqlHotPathReport
       worker_id: DEFAULT_WORKER_ID,
       lease_seconds: 60,
       workflow_names: [DEFAULT_WORKFLOW_NAME],
+      worker_pool: DEFAULT_WORKER_POOL,
+    )
+  end
+
+  register_scenario(
+    "claim_target_activation",
+    description: BUILTIN_OPERATION_DESCRIPTIONS.fetch("claim_target_activation"),
+    setup: lambda do |context|
+      context.seed_target_activations
+      context.store.rearm_target_activation(
+        target_kind: "workflow",
+        target_type: DEFAULT_WORKFLOW_NAME,
+        target_id: "hot-path-activation",
+        ready_at: Time.now - 1,
+        worker_pool: DEFAULT_WORKER_POOL,
+      )
+    end,
+  ) do |context|
+    context.store.claim_target_activation(
+      worker_id: DEFAULT_WORKER_ID,
+      lease_seconds: 60,
+      target_kinds: ["workflow"],
+      target_types: [DEFAULT_WORKFLOW_NAME],
       worker_pool: DEFAULT_WORKER_POOL,
     )
   end
