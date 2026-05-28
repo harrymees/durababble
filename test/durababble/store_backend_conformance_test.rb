@@ -1916,6 +1916,53 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "does not claim an object lease until pool-local inbox work is claimable with #{backend.name}" do
+      with_durababble_store(backend, "object_lease_requires_claimable_work") do |store|
+        now = Time.now
+        ready_at = now + 60
+        message_id = store.enqueue_inbox_message(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "deferred",
+          message_kind: "tell",
+          method_name: "write",
+          payload: { "method_name" => "write", "args" => [], "kwargs" => {} },
+          ready_at:,
+        )
+
+        early = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "deferred",
+          worker_id: "early-worker",
+          lease_seconds: 30,
+          limit: 1,
+          now:,
+        )
+        assert_empty early
+        assert_nil store.current_object_lease("counter", "deferred")
+
+        claimed = store.claim_inbox_messages(
+          worker_pool: "pool-a",
+          target_kind: "object",
+          target_type: "counter",
+          target_id: "deferred",
+          worker_id: "ready-worker",
+          lease_seconds: 30,
+          limit: 1,
+          now: ready_at + 1,
+        )
+        assert_equal [message_id], claimed.map { |message| message.fetch("id") }
+        assert_hash_includes(
+          store.current_object_lease("counter", "deferred"),
+          "worker_id" => "ready-worker",
+          "worker_pool" => "pool-a",
+        )
+      end
+    end
+
     test "awards the object lease to exactly one of many concurrent claimers with #{backend.name}" do
       # The atomic-claim primitive's contract is "exactly one wins" — Ruby-level
       # serialization through a single connection only proves the WHERE clause
