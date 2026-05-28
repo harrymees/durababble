@@ -9,11 +9,14 @@ require "async/http/endpoint"
 require "protocol/http/middleware"
 require "protocol/grpc"
 require_relative "rpc_messages"
+require_relative "result_stream"
+require_relative "worker_identity"
 
 module Durababble
   module Rpc
     SERIALIZER = Paquito::SingleBytePrefixVersion.new(1, 1 => Marshal)
     DEFAULT_TIMEOUT = 5.0
+    STREAM_POLL_TIMEOUT = 0.25
 
     SERVICE_NAME = "durababble.v1.Rpc"
 
@@ -29,6 +32,7 @@ module Durababble
       rpc :EvictLease, Messages::EvictLeaseRequest, Messages::EvictLeaseResponse
       rpc :DeliverMessage, Messages::DeliverMessageRequest, Messages::DeliverMessageResponse
       rpc :CallTransient, Messages::TransientRequest, Messages::TransientResponse
+      rpc :CallTransientStream, Messages::TransientRequest, stream(Messages::StreamFrame)
     end
 
     class << self
@@ -86,6 +90,12 @@ module Durababble
         cache.clear
       end
 
+      #: (String, String) -> Exception
+      def build_remote_error(klass, message)
+        WorkflowRpc.remote_error_from_fields(klass, message) ||
+          Durababble::Rpc::RemoteError.new("#{klass}: #{message}")
+      end
+
       private
 
       #: () -> Hash[String, untyped]
@@ -113,7 +123,35 @@ module Durababble
 
       #: (String) -> String?
       def rpc_address_for(node_id)
-        @entries[node_id]
+        @entries[node_id] || WorkerIdentity.address_for(node_id)
+      end
+    end
+
+    # Server-side producer handle passed to a `call_transient_stream` handler.
+    # async-grpc owns the HTTP/2 stream and protobuf-style framing; this writer
+    # only wraps application values in `Messages::StreamFrame`.
+    class StreamWriter
+      #: (Object) -> void
+      def initialize(output)
+        @output = output
+        @closed = false
+      end
+
+      #: (Object?) -> void
+      def emit(value)
+        output = @output #: as untyped
+        output.write(Messages::StreamFrame.new(kind: :value, value:))
+      end
+
+      #: () -> bool
+      def cancelled?
+        output = @output #: as untyped
+        @closed || (output.respond_to?(:closed?) && output.closed?)
+      end
+
+      #: () -> void
+      def close
+        @closed = true
       end
     end
 
@@ -229,6 +267,37 @@ module Durababble
         raise WorkflowRpc::NodeUnavailable, e.message
       end
 
+      # Opens a streaming-result RPC and returns a `ResultStream`. The gRPC
+      # request is not sent until the stream is iterated (`each`/`read`). The
+      # configured timeout applies to the full response body, not only to the
+      # initial response headers, so an idle or never-ending peer cannot pin the
+      # consumer forever.
+      #
+      # Stream RPCs intentionally do not send `expected_worker_id`. Higher-level
+      # stream dispatchers fence the producer server-side by target ownership, so
+      # consumers observe hand-off via a terminal `StaleLease`, not via a rejected
+      # request.
+      #: (**Object?) -> ResultStream
+      def call_transient_stream(**kwargs)
+        worker_pool = kwargs.fetch(:worker_pool) #: as String
+        method = kwargs.fetch(:method) #: as String
+        args = kwargs.fetch(:args)
+        class_name = kwargs.fetch(:class_name, "") #: as String
+        durable_object_id = kwargs.fetch(:durable_object_id, "") #: as String
+        workflow_id = kwargs.fetch(:workflow_id, "") #: as String
+        deadline_ms = kwargs.fetch(:deadline_ms, 0) #: as Integer
+        request = Messages::TransientRequest.new(
+          worker_pool:,
+          class_name:,
+          durable_object_id:,
+          workflow_id:,
+          method:,
+          args: Rpc.dump(args, surface: :rpc_argument, context: "CallTransientStream #{method} args"),
+          deadline_ms:,
+        )
+        ResultStream.new { |writer| open_stream(request, writer) }
+      end
+
       private
 
       # Performs one unary gRPC request. Runs inside `Sync` so it is callable
@@ -246,6 +315,136 @@ module Durababble
             end
           end
         end
+      end
+
+      # Runs on the `ResultStream` producer task. async-grpc/protocol-grpc owns
+      # the gRPC request/response framing and decodes `Messages::StreamFrame`
+      # messages; this loop only enforces the absolute client deadline and closes
+      # the response body when the consumer cancels.
+      #: (Messages::TransientRequest, ResultStream::Writer) -> void
+      def open_stream(request, writer)
+        with_rpc_errors do
+          Sync do |task|
+            deadline_at = monotonic_now + @timeout.to_f
+            response = nil
+            body = nil
+            begin
+              response, body = task.with_timeout(remaining_stream_timeout(deadline_at)) do
+                open_grpc_stream(request)
+              end
+              consume_grpc_stream(response, body, writer, task, deadline_at)
+            ensure
+              cancel_grpc_stream(response, body)
+            end
+          end
+        end
+      rescue Unavailable => e
+        raise WorkflowRpc::NodeUnavailable, e.message
+      end
+
+      #: (Messages::TransientRequest) -> [Object, Object?]
+      def open_grpc_stream(request)
+        client = @injected_client || Rpc.grpc_client_for(@address) #: as untyped
+        service = Interface.new(SERVICE_NAME)
+        request_body = Protocol::GRPC::Body::WritableBody.new(message_class: Messages::TransientRequest)
+        request_body.write(request)
+        request_body.close_write
+        headers = Protocol::GRPC::Methods.build_headers(
+          metadata: {},
+          timeout: @timeout,
+          content_type: "application/grpc+proto",
+        )
+        response = client.call(Protocol::HTTP::Request["POST", service.path(:CallTransientStream), headers, request_body])
+        response = response #: as untyped
+        response_body = Protocol::GRPC::Body::ReadableBody.wrap(
+          response,
+          message_class: Messages::StreamFrame,
+          encoding: response.headers["grpc-encoding"],
+        )
+        check_grpc_status!(response) unless response_body
+        [response, response_body]
+      end
+
+      #: (Object?, Object?) -> void
+      def cancel_grpc_stream(response, body)
+        body = body #: as untyped
+        body&.close
+        response = response #: as untyped
+        stream = response&.respond_to?(:stream) ? response.stream : nil
+        stream&.send_reset_stream(Protocol::HTTP2::Error::CANCEL) unless stream&.closed?
+        response&.close
+      rescue StandardError => e
+        raise if e.is_a?(Protocol::HTTP2::Error)
+
+        nil
+      end
+
+      #: (Object, Object?, ResultStream::Writer, Object, Float) -> void
+      def consume_grpc_stream(response, body, writer, task, deadline_at)
+        return unless body
+
+        loop do
+          break if writer.cancelled?
+
+          frame = read_stream_frame(body, task, deadline_at)
+          next if frame == :timeout
+          break unless frame
+
+          deliver_frame(frame, writer)
+        end
+
+        check_grpc_status!(response) unless writer.cancelled?
+      end
+
+      #: (Object, Object, Float) -> (Messages::StreamFrame | Symbol)?
+      def read_stream_frame(body, task, deadline_at)
+        body = body #: as untyped
+        task = task #: as untyped
+        remaining = remaining_stream_timeout(deadline_at)
+        deadline_limited = remaining <= STREAM_POLL_TIMEOUT
+        read_timeout = deadline_limited ? remaining : STREAM_POLL_TIMEOUT
+
+        begin
+          task.with_timeout(read_timeout) { body.read }
+        rescue Async::TimeoutError
+          raise if deadline_limited
+
+          :timeout
+        end
+      end
+
+      #: (Object?, ResultStream::Writer) -> void
+      def deliver_frame(frame, writer)
+        frame = frame #: as Messages::StreamFrame
+        if frame.error?
+          error = frame.error #: as untyped
+          raise Rpc.build_remote_error(error.klass.to_s, error.message.to_s)
+        end
+
+        writer.emit(frame.value)
+      end
+
+      #: (Float) -> Float
+      def remaining_stream_timeout(deadline_at)
+        remaining = deadline_at - monotonic_now
+        raise Async::TimeoutError, "execution expired" unless remaining.positive?
+
+        remaining
+      end
+
+      #: () -> Float
+      def monotonic_now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC).to_f
+      end
+
+      #: (Object) -> void
+      def check_grpc_status!(response)
+        response = response #: as untyped
+        status = Protocol::GRPC::Metadata.extract_status(response.headers)
+        return if status == Protocol::GRPC::Status::OK
+
+        message = Protocol::GRPC::Metadata.extract_message(response.headers)
+        raise Protocol::GRPC::Error.for(status, message)
       end
 
       #: () { () -> Object? } -> Object?
@@ -312,13 +511,14 @@ module Durababble
       # reactor multiplexes connections on one fiber scheduler (no thread pool).
       # `identity_id:` seeds the generated `node_id` (`<id>@<address>`) so a worker
       # keeps a stable identity across address reuse (see #68/#69).
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
       def initialize(
         node_id:,
         store:,
         worker_pool: "default",
         workflow_handlers: {},
         transient_handler: nil,
+        stream_handler: nil,
         node_directory: NodeDirectory.new,
         host: "127.0.0.1",
         port: 50_051,
@@ -336,6 +536,7 @@ module Durababble
         @worker_pool = worker_pool
         @workflow_handlers = workflow_handlers
         @transient_handler = transient_handler
+        @stream_handler = stream_handler
         @node_directory = node_directory
         @host = host
         @requested_port = port
@@ -463,6 +664,7 @@ module Durababble
           worker_pool: @worker_pool,
           workflow_handlers: @workflow_handlers,
           transient_handler: @transient_handler,
+          stream_handler: @stream_handler,
           node_directory: @node_directory,
           authorize: @authorize,
           awaken_batch: @awaken_batch,
@@ -532,6 +734,16 @@ module Durababble
         raise Protocol::GRPC::Internal, e.message
       end
 
+      #: (Object, Object, Object) -> void
+      def call_transient_stream(input, output, call)
+        rpc_input = input #: as untyped
+        @service.call_transient_stream(rpc_input.read, output, call)
+      rescue Unauthenticated => e
+        assign_status(call, Protocol::GRPC::Status::UNAUTHENTICATED, e)
+      rescue StandardError => e
+        assign_status(call, Protocol::GRPC::Status::INTERNAL, e)
+      end
+
       private
 
       #: (Async::TimeoutError, Object) -> bot
@@ -546,10 +758,16 @@ module Durababble
         call = call #: as untyped
         call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
       end
+
+      #: (Object, Integer, StandardError) -> void
+      def assign_status(call, status, error)
+        call = call #: as untyped
+        Protocol::GRPC::Metadata.assign_status!(call.response.headers, status:, message: error.message, error:)
+      end
     end
 
     class Service
-      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
+      #: (node_id: String, store: Store, worker_pool: String, workflow_handlers: Hash[String, Object], transient_handler: (Proc | Method)?, node_directory: NodeDirectory, authorize: (Proc | Method)?, awaken_batch: (Proc | Method)?, evict_lease: (Proc | Method)?, deliver_message: (Proc | Method)?, ?stream_handler: (Proc | Method)?, ?verify_deliver_message_owner: bool) -> void
       def initialize(
         node_id:,
         store:,
@@ -561,6 +779,7 @@ module Durababble
         awaken_batch:,
         evict_lease:,
         deliver_message:,
+        stream_handler: nil,
         verify_deliver_message_owner: true
       )
         @node_id = node_id
@@ -568,6 +787,7 @@ module Durababble
         @worker_pool = worker_pool
         @workflow_handlers = workflow_handlers
         @transient_handler = transient_handler
+        @stream_handler = stream_handler
         @node_directory = node_directory
         @authorize = authorize
         @awaken_batch = awaken_batch
@@ -646,6 +866,27 @@ module Durababble
       rescue StandardError => e
         observe_transient_error(request, e)
         remote_error_response(e)
+      end
+
+      #: (Messages::TransientRequest, Object, Object) -> void
+      def call_transient_stream(request, output, call)
+        Observability.trace("durababble.rpc.server.call_transient_stream", "durababble.worker.pool" => request.worker_pool, "durababble.worker.id" => @node_id, "durababble.rpc.method" => request["method"], "durababble.workflow.id" => request.workflow_id, "durababble.object.type" => request.class_name, "durababble.object.id" => request.durable_object_id) do
+          authorize!(call)
+          raise WorkflowRpc::UnknownCommand, "no streaming RPC handler registered" unless @stream_handler
+
+          args = load_request_args(request, context: "CallTransientStream #{request["method"]} args")
+          writer = StreamWriter.new(output)
+          begin
+            @stream_handler.call(request:, args:, writer:)
+          ensure
+            writer.close
+          end
+        end
+      rescue Unauthenticated
+        raise
+      rescue StandardError => e
+        observe_transient_error(request, e)
+        write_stream_error(output, e)
       end
 
       private
@@ -730,6 +971,25 @@ module Durababble
         bytes = request.args.to_s
         Durababble.enforce_payload_limit!(surface: :rpc_argument, bytesize: bytes.bytesize, context:)
         Rpc.load(request.args)
+      end
+
+      #: (Object, StandardError) -> void
+      def write_stream_error(output, error)
+        output = output #: as untyped
+        return if output.respond_to?(:closed?) && output.closed?
+
+        output.write(
+          Messages::StreamFrame.new(
+            kind: :error,
+            error: Messages::RemoteError.new(
+              klass: error.class.name.to_s,
+              message: error.message.to_s,
+              backtrace: error.backtrace || [],
+            ),
+          ),
+        )
+      rescue Protocol::HTTP::Body::Writable::Closed, IOError
+        nil
       end
 
       #: (Messages::DeliverMessageRequest) -> bool

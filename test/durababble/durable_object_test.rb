@@ -1270,4 +1270,201 @@ class DurababbleDurableObjectTest < DurababbleTestCase
       sleep(0.01)
     end
   end
+
+  # Fixture object exposing a single stream method. Used only by the routing
+  # unit tests below; the actual stream body never executes since we stub the
+  # RPC layer.
+  class RouterStreamObject < Durababble::DurableObject
+    expose_stream :ticks
+    def ticks
+      # No-op; the test exercises the routing layer, not the stream body.
+    end
+  end
+
+  # Minimal RPC client double that scripts the per-call behaviour the
+  # `open_remote_object_stream` bounded re-resolve depends on. Each scripted
+  # entry is one consumer iteration's worth of behaviour: either a list of
+  # values to yield, or an exception class to raise before yielding.
+  class ScriptedRpcClient
+    def initialize(script)
+      @script = script
+      @calls = []
+    end
+
+    attr_reader :calls
+
+    def call_transient_stream(**kwargs)
+      @calls << kwargs
+      entry = @script.shift or raise "ScriptedRpcClient ran out of script entries"
+      if entry.is_a?(Class) && entry < Exception
+        Enumerator.new { |_y| raise entry, "scripted #{entry}" }
+      else
+        Enumerator.new { |y| entry.each { |v| y << v } }
+      end
+    end
+  end
+
+  # Fake store providing only the surface `open_remote_object_stream` reaches:
+  # a `current_object_lease` reader and an `rpc_client_factory`. The first
+  # `current_object_lease` call returns the *initial* lease passed to the ref
+  # (the stream caller already has one), then subsequent calls return the
+  # *next* lease in the script so the re-resolve picks up the new owner.
+  class ScriptedLeaseStore
+    attr_reader :lookups
+
+    def initialize(leases:, client_factory:)
+      @leases = leases
+      @client_factory = client_factory
+      @lookups = []
+    end
+
+    def current_object_lease(object_type, object_id)
+      @lookups << [object_type, object_id]
+      @leases.shift
+    end
+
+    def rpc_client_factory
+      ->(_address) { @client_factory }
+    end
+  end
+
+  test "open_remote_object_stream re-resolves once after StaleLease before any value emits" do
+    # Two leases: pre-call (passed to the ref) and a re-resolve lease for the
+    # retry. Two scripted RPC calls: first raises StaleLease before yielding,
+    # second yields one value cleanly.
+    client = ScriptedRpcClient.new(
+      [Durababble::WorkflowRpc::StaleLease, [{ "tick" => 1 }]],
+    )
+    store = ScriptedLeaseStore.new(
+      leases: [{ "worker_id" => "host-b@127.0.0.1:1" }],
+      client_factory: client,
+    )
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(
+      :open_remote_object_stream,
+      :ticks,
+      args: [],
+      kwargs: {},
+      lease: { "worker_id" => "host-a@127.0.0.1:1" },
+    )
+
+    values = stream.to_a
+    assert_equal([{ "tick" => 1 }], values)
+    assert_equal(2, client.calls.size)
+  end
+
+  test "open_remote_object_stream propagates StaleLease after the first value has emitted" do
+    # Yield one value, then on the next iteration the producer raises. We can't
+    # script that within a single Enumerator easily, so model it as two RPC
+    # calls — but the first one's enumerator yields then raises. Once one value
+    # is emitted, the bounded re-resolve must NOT retry; the exception propagates.
+    raising_enum = Enumerator.new do |y|
+      y << { "tick" => 1 }
+      raise Durababble::WorkflowRpc::StaleLease, "lost mid-stream"
+    end
+    client = Object.new
+    client.define_singleton_method(:call_transient_stream) { |**_kwargs| raising_enum }
+    store = Object.new
+    store.define_singleton_method(:current_object_lease) { |_t, _i| nil }
+    store.define_singleton_method(:rpc_client_factory) { ->(_a) { client } }
+
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(
+      :open_remote_object_stream,
+      :ticks,
+      args: [],
+      kwargs: {},
+      lease: { "worker_id" => "host-a@127.0.0.1:1" },
+    )
+
+    emitted = []
+    err = assert_raises(Durababble::WorkflowRpc::StaleLease) do
+      stream.each { |v| emitted << v }
+    end
+    assert_equal([{ "tick" => 1 }], emitted)
+    assert_match(/lost mid-stream/, err.message)
+  end
+
+  test "open_remote_object_stream raises StaleLease when re-resolve returns no fresh lease" do
+    client = ScriptedRpcClient.new([Durababble::WorkflowRpc::StaleLease])
+    store = ScriptedLeaseStore.new(leases: [nil], client_factory: client)
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(
+      :open_remote_object_stream,
+      :ticks,
+      args: [],
+      kwargs: {},
+      lease: { "worker_id" => "host-a@127.0.0.1:1" },
+    )
+
+    assert_raises(Durababble::WorkflowRpc::StaleLease) { stream.to_a }
+    assert_equal(1, client.calls.size, "no retry attempted when re-resolve has no fresh lease")
+  end
+
+  test "open_remote_object_stream gives up after one re-resolve when the second attempt also fails" do
+    # Drives the `attempts >= 2` branch of the bounded re-resolve: the first
+    # RPC raises StaleLease, re-resolve produces a fresh lease, the second RPC
+    # also raises — and we propagate rather than spin forever.
+    client = ScriptedRpcClient.new(
+      [Durababble::WorkflowRpc::StaleLease, Durababble::WorkflowRpc::NodeUnavailable],
+    )
+    store = ScriptedLeaseStore.new(
+      leases: [{ "worker_id" => "host-b@127.0.0.1:1" }],
+      client_factory: client,
+    )
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store:)
+    stream = ref.send(
+      :open_remote_object_stream,
+      :ticks,
+      args: [],
+      kwargs: {},
+      lease: { "worker_id" => "host-a@127.0.0.1:1" },
+    )
+
+    assert_raises(Durababble::WorkflowRpc::NodeUnavailable) { stream.to_a }
+    assert_equal(2, client.calls.size, "second failure must propagate; no third attempt")
+  end
+
+  test "open_object_stream routes to the lease holder when the store reports a live lease" do
+    # Drives the `if lease` branch of the open_object_stream router. The store
+    # returns a lease, so the ref must call open_remote_object_stream with it
+    # and route through the scripted RPC client.
+    client = ScriptedRpcClient.new([[{ "tick" => 1 }]])
+    store_obj = Object.new
+    store_obj.define_singleton_method(:current_object_lease) do |_t, _i|
+      { "worker_id" => "host-a@127.0.0.1:1" }
+    end
+    store_obj.define_singleton_method(:rpc_client_factory) { ->(_a) { client } }
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store: store_obj)
+
+    stream = ref.send(:open_object_stream, :ticks, args: [], kwargs: {})
+
+    assert_equal([{ "tick" => 1 }], stream.to_a)
+    assert_equal(1, client.calls.size)
+  end
+
+  test "open_object_stream self-routes through Durababble.local_stream_host when no lease exists" do
+    # Drives the `elsif host = Durababble.local_stream_host` branch — no live
+    # lease in the store, but this process is a worker, so the router self-
+    # routes to the local host's RPC server.
+    client = ScriptedRpcClient.new([[{ "tick" => 1 }]])
+    store_obj = Object.new
+    store_obj.define_singleton_method(:current_object_lease) { |_t, _i| nil }
+    store_obj.define_singleton_method(:rpc_client_factory) { ->(_a) { client } }
+    fake_host = Object.new
+    fake_host.define_singleton_method(:worker_id) { "host-self@127.0.0.1:9" }
+    fake_host.define_singleton_method(:worker_pool) { "default" }
+    ref = Durababble::DurableObjectRef.new(RouterStreamObject, "obj-1", store: store_obj)
+
+    previous = Durababble.local_stream_host
+    Durababble.local_stream_host = fake_host
+    begin
+      stream = ref.send(:open_object_stream, :ticks, args: [], kwargs: {})
+      assert_equal([{ "tick" => 1 }], stream.to_a)
+      assert_equal(1, client.calls.size)
+      assert_equal("default", client.calls.first[:worker_pool])
+    ensure
+      Durababble.local_stream_host = previous
+    end
+  end
 end

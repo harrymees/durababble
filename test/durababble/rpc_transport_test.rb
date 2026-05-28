@@ -48,6 +48,54 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
   end
 
+  class RawStreamGrpcClient
+    attr_reader :request
+
+    def initialize(response)
+      @response = response
+    end
+
+    def call(request)
+      @request = request
+      @response
+    end
+  end
+
+  class FakeGrpcResponse
+    attr_reader :headers, :stream
+
+    def initialize(headers:, stream: nil, close_error: nil)
+      @headers = headers
+      @stream = stream
+      @close_error = close_error
+      @closed = false
+    end
+
+    def closed? = @closed
+
+    def close
+      @closed = true
+      raise @close_error if @close_error
+    end
+  end
+
+  class FakeGrpcStream
+    attr_reader :resets
+
+    def initialize(closed: false, reset_error: nil)
+      @closed = closed
+      @reset_error = reset_error
+      @resets = []
+    end
+
+    def closed? = @closed
+
+    def send_reset_stream(code)
+      @resets << code
+      raise @reset_error if @reset_error
+    end
+  end
+
   def setup
     @durababble_backend = durababble_store_backends.first
     @durababble_schema = "#{@durababble_backend.default_schema_prefix}_rpc_transport_test_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -335,6 +383,79 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     assert_raises_matching(ArgumentError, /unexpected/) do
       surprising_client.awaken_batch(worker_pool: "default", workflow_ids: [])
     end
+  end
+
+  test "maps http2 stream failures during unary calls to node unavailable" do
+    client = Durababble::Rpc::Client.new(
+      address: "node-a",
+      grpc_client: FailingGrpcClient.new(Protocol::HTTP2::StreamError.new("stream reset")),
+    )
+
+    assert_raises_matching(Durababble::WorkflowRpc::NodeUnavailable, /stream reset/) do
+      client.call_transient(worker_pool: "default", workflow_id:, method: "status", args: {})
+    end
+  end
+
+  test "stream opening checks grpc trailers-only status before returning a body" do
+    headers = Protocol::HTTP::Headers.new([], nil, policy: Protocol::GRPC::HEADER_POLICY)
+    Protocol::GRPC::Metadata.assign_status!(
+      headers,
+      status: Protocol::GRPC::Status::INTERNAL,
+      message: "stream failed before data",
+    )
+    response = FakeGrpcResponse.new(headers:)
+    client = Durababble::Rpc::Client.new(address: "node-a", grpc_client: RawStreamGrpcClient.new(response))
+    request = Durababble::Rpc::Messages::TransientRequest.new(
+      worker_pool: "default",
+      method: "tail",
+      args: Durababble::Rpc.dump({}),
+    )
+
+    Protocol::GRPC::Body::ReadableBody.stub(:wrap, nil) do
+      error = assert_raises(Protocol::GRPC::Internal) do
+        client.send(:open_grpc_stream, request)
+      end
+      assert_match(/stream failed before data/, error.message)
+    end
+  end
+
+  test "stream cleanup swallows ordinary close failures but re-raises http2 errors" do
+    client = Durababble::Rpc::Client.new(address: "node-a")
+    noisy_body = Object.new
+    noisy_body.define_singleton_method(:close) { raise StandardError, "body close failed" }
+    response = FakeGrpcResponse.new(headers: Protocol::HTTP::Headers.new)
+
+    assert_nil(client.send(:cancel_grpc_stream, response, noisy_body))
+
+    reset_error = Protocol::HTTP2::StreamError.new("reset failed")
+    stream = FakeGrpcStream.new(reset_error:)
+    response = FakeGrpcResponse.new(headers: Protocol::HTTP::Headers.new, stream:)
+
+    assert_raises(Protocol::HTTP2::StreamError) do
+      client.send(:cancel_grpc_stream, response, nil)
+    end
+    assert_equal([Protocol::HTTP2::Error::CANCEL], stream.resets)
+  end
+
+  test "stream consumption handles absent response bodies and expired deadlines" do
+    client = Durababble::Rpc::Client.new(address: "node-a")
+    response = FakeGrpcResponse.new(headers: Protocol::HTTP::Headers.new)
+    writer = Object.new
+    writer.define_singleton_method(:cancelled?) { false }
+
+    assert_nil(client.send(:consume_grpc_stream, response, nil, writer, Object.new, 0.0))
+    assert_raises(Async::TimeoutError) do
+      client.send(:remaining_stream_timeout, Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1)
+    end
+  end
+
+  test "grpc error message falls back when the peer supplies an empty message" do
+    client = Durababble::Rpc::Client.new(address: "node-a")
+
+    assert_equal(
+      "fallback message",
+      client.send(:grpc_error_message, StandardError.new(""), "fallback message"),
+    )
   end
 
   test "keeps server lifecycle and workflow client command validation idempotent" do

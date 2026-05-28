@@ -501,8 +501,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     active_targets = {}
 
     Async do |task|
-      assert_equal(true, runtime.send(:poll_once, task, worker, active_targets))
-      assert_equal(true, runtime.send(:poll_once, task, worker, active_targets))
+      assert_equal(true, runtime.send(:schedule_available_work, task, worker, active_targets))
     end
 
     assert_equal([:first, :second], queue_values(worker.performed, 2))
