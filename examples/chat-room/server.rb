@@ -215,7 +215,7 @@ module ChatRoomExample
       }
       begin
         payload["room_snapshot"] = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool).snapshot
-      rescue Durababble::ObjectReadBlocked => e
+      rescue Durababble::ObjectReadBlocked, Durababble::WorkflowRpc::Error => e
         payload["room_snapshot_blocked"] = e.message
       end
       json(200, payload)

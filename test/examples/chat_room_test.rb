@@ -13,6 +13,17 @@ require_relative "../../examples/chat-room/server"
 class ChatRoomExampleTest < DurababbleTestCase
   TERMINAL_STATUSES = ["completed", "failed", "canceled"].freeze
 
+  class AnnouncementStatusStore
+    def workflow(_workflow_id)
+      {
+        "input" => { "room" => "lobby" },
+        "status" => "completed",
+        "result" => { "ok" => true },
+        "error" => nil,
+      }
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "chat room persists join, post, topic, leave with #{backend.name}" do
       with_durababble_store(backend, "chat_room_object") do |store|
@@ -239,6 +250,30 @@ class ChatRoomExampleTest < DurababbleTestCase
       server_thread&.kill if server_thread&.alive?
       ChatRoomExample.reset_configuration!
     end
+  end
+
+  test "announcement status survives a transient room snapshot RPC error" do
+    store = AnnouncementStatusStore.new
+    server = ChatRoomExample::Server.allocate
+    server.instance_variable_set(:@store, store)
+    ChatRoomExample.configure(object_worker_pool: ChatRoomExample::Server::OBJECT_WORKER_POOL)
+    room = mock
+    room.expects(:snapshot).raises(Durababble::WorkflowRpc::NodeUnavailable.new("owner unavailable"))
+    ChatRoomExample::ChatRoom.expects(:at)
+      .with("lobby", store:, worker_pool: ChatRoomExample.object_worker_pool)
+      .returns(room)
+
+    status, content_type, body = server.send(:show_announcement, "workflow-1")
+
+    assert_equal(200, status)
+    assert_equal("application/json", content_type)
+    payload = JSON.parse(body)
+    assert_equal(true, payload.fetch("terminal"))
+    assert_equal("completed", payload.fetch("status"))
+    assert_equal({ "ok" => true }, payload.fetch("result"))
+    assert_match(/owner unavailable/, payload.fetch("room_snapshot_blocked"))
+  ensure
+    ChatRoomExample.reset_configuration!
   end
 
   private
