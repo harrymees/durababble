@@ -187,13 +187,13 @@ module Durababble
 
         # Same duck-typed contract as `decode_transient_response`; accepts the
         # concrete `Messages::RemoteError` or the test's lookalike Struct.
+        # Reconstruction goes through the shared `build_remote_error` helper so
+        # the unary and streaming response paths rebuild the same typed errors
+        # (e.g. `ObjectReadBlocked`) rather than diverging.
         #: (Object) -> bot
         def raise_remote_error(error)
           error = error #: as untyped
-          typed = WorkflowRpc.remote_error_from_fields(error.klass, error.message)
-          raise typed if typed
-
-          raise Durababble::Rpc::RemoteError, "#{error.klass}: #{error.message}"
+          raise Rpc.build_remote_error(error.klass.to_s, error.message.to_s)
         end
       end
 

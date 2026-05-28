@@ -961,9 +961,7 @@ module Durababble
       # for "an in-flight stream still needs this lease": defer to it and let
       # the host's own release run when refcount drops to zero.
       host = Durababble.local_stream_host #: as ObjectStreamHost?
-      if host && host.worker_id == @worker_id && host.holds?(worker_pool: @worker_pool, object_type:, object_id:)
-        # Host's refcount drives release.
-      else
+      unless host && host.worker_id == @worker_id && host.holds?(worker_pool: @worker_pool, object_type:, object_id:)
         @store.release_object_lease(object_type:, object_id:, worker_id: @worker_id)
       end
     end

@@ -33,7 +33,7 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
   end
 
   test "a durable-object stream with no lease and no local host raises NoActiveLease after the pull timeout" do
-    # PR #2 unsoundness fix: a plain consumer (no `Durababble.local_stream_host`)
+    # Unsoundness fix: a plain consumer (no `Durababble.local_stream_host`)
     # MUST NOT fall back to a local snapshot: a worker can claim the unified
     # object lease at any moment after the snapshot was read, leaving the
     # consumer emitting from a frozen view while commands mutate state on the
@@ -58,12 +58,12 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
   end
 
   test "a durable-object stream with no lease bootstraps an owner via upsert_target_activation and routes remote" do
-    # PR #2: when no lease and no local host exists, the consumer asks the
+    # When no lease and no local host exists, the consumer asks the
     # scheduler to activate the object via `upsert_target_activation` and polls
     # `current_object_lease` until a worker claims it. Here we run a worker in
     # the background so `process_object_activation` picks up the row, claims
-    # the per-object lease (PR #1's eager claim), and the consumer's poll then
-    # finds a holder to RPC. The stream is served from the worker's
+    # the per-object lease (the worker's eager claim), and the consumer's poll
+    # then finds a holder to RPC. The stream is served from the worker's
     # `StreamDispatcher` over a real loopback Rpc::Server.
     object_class = Class.new(Durababble::DurableObject) do
       object_type "pull_owner_log"
@@ -73,21 +73,23 @@ class DurababbleStreamConsumerTest < DurababbleTestCase
       end
     end
 
-    server = start_dispatch_server(objects: [object_class])
-    # Pre-claim the object lease for the dispatcher's node so the consumer's
-    # first poll resolves immediately. This isolates the test from the
-    # worker-claim cadence and exercises only the consumer-side pull plumbing.
-    store.claim_object_lease(
-      worker_pool: "default",
-      object_type: object_class.object_type,
-      object_id: "log-1",
-      worker_id: server.node_id,
-      lease_seconds: 60,
-    )
+    Async do
+      server = start_dispatch_server(objects: [object_class])
+      # Pre-claim the object lease for the dispatcher's node so the consumer's
+      # first poll resolves immediately. This isolates the test from the
+      # worker-claim cadence and exercises only the consumer-side pull plumbing.
+      store.claim_object_lease(
+        worker_pool: "default",
+        object_type: object_class.object_type,
+        object_id: "log-1",
+        worker_id: server.node_id,
+        lease_seconds: 60,
+      )
 
-    stream = object_class.at("log-1", store:).entries
+      stream = object_class.at("log-1", store:).entries
 
-    assert_equal(["a", "b", "c"], stream.to_a)
+      assert_equal(["a", "b", "c"], stream.to_a)
+    end.wait
   end
 
   test "a workflow stream with no active lease runs against a local snapshot" do
