@@ -60,12 +60,50 @@ module Async
       class HTTP2; end
     end
   end
+
+  module GRPC
+    class Client
+      def initialize(http_client); end
+      def stub(interface, service_name); end
+      def close; end
+    end
+
+    class Service
+      def initialize(interface, service_name); end
+    end
+
+    class Dispatcher
+      def initialize(app = nil); end
+      def register(service); end
+    end
+  end
 end
 
 module Protocol
+  module GRPC
+    class Error < StandardError
+      def status_code; end
+    end
+
+    class Unauthenticated < Error; end
+    class Unavailable < Error; end
+    class DeadlineExceeded < Error; end
+    class Cancelled < Error; end
+    class Internal < Error; end
+    class NotFound < Error; end
+
+    class Interface
+      def self.rpc(name, request, response); end
+    end
+  end
+
   module HTTP
     class Response
       def self.[](status, headers = nil, body = nil); end
+    end
+
+    module Middleware
+      NotFound = nil
     end
   end
 
