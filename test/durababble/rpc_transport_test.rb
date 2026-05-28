@@ -315,6 +315,30 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     server&.stop
   end
 
+  test "stop returns even when the reactor thread never drains" do
+    server = Durababble::Rpc::Server.allocate
+    # A scheduler whose interrupt is a no-op models a reactor that never observes
+    # the stop signal; a thread blocked until we release it models a wedged
+    # accept loop. stop must bound its join by @stop_drain_timeout, not hang.
+    release = Thread::Queue.new
+    thread = Thread.new { release.pop }
+    fake_scheduler = Object.new
+    def fake_scheduler.interrupt; end
+    fake_bound = Object.new
+    def fake_bound.close; end
+    server.instance_variable_set(:@scheduler, fake_scheduler)
+    server.instance_variable_set(:@thread, thread)
+    server.instance_variable_set(:@bound, fake_bound)
+    server.instance_variable_set(:@stop_drain_timeout, 0.1)
+
+    Timeout.timeout(5) { server.stop }
+
+    assert_nil(server.instance_variable_get(:@thread))
+  ensure
+    release&.push(nil)
+    thread&.join
+  end
+
   test "rejects unauthorized peers before running handlers" do
     store = self.store
     ran = false
@@ -361,9 +385,17 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     args = { "body" => "x" * 64 }
     size = Durababble::Rpc::SERIALIZER.dump(args).bytesize
     calls = []
+    workflow_calls = []
+    claim_as("node-a")
     server = start_rpc_server(
       node_id: "node-a",
       store:,
+      workflow_handlers: {
+        "status" => lambda do |payload|
+          workflow_calls << payload
+          { "workflow" => true }
+        end,
+      },
       transient_handler: lambda do |request:, args:|
         calls << [request["method"], args]
         { "ok" => true }
@@ -408,6 +440,19 @@ class DurababbleRpcTransportTest < DurababbleTestCase
     end
     assert_equal("Durababble::PayloadTooLarge", response.err.klass)
     assert_equal(2, calls.length)
+    assert_empty(workflow_calls)
+
+    raw_workflow_request = Durababble::Rpc::Messages::TransientRequest.new(
+      worker_pool: "default",
+      workflow_id:,
+      method: "status",
+      args: raw_args,
+    )
+    workflow_response = with_payload_limit(:rpc_argument, size - 1) do
+      post_raw_transient(server.address, raw_workflow_request)
+    end
+    assert_equal("Durababble::PayloadTooLarge", workflow_response.err.klass)
+    assert_empty(workflow_calls)
   ensure
     server&.stop
   end
