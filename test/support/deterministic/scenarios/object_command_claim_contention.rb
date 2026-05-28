@@ -59,6 +59,7 @@ module Durababble
               object_type:,
               object_id:,
               state: { "n" => current.fetch("n") + 1 },
+              worker_id: "worker-b",
             )
             h.scheduler.trace.event(h.scheduler.time, "worker-b", "b_completed_after_reclaim", id: command_id)
           end

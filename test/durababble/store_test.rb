@@ -848,13 +848,13 @@ class DurababbleStoreTest < DurababbleTestCase
 
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
-      sql_result,
+      sql_result([{ "owned" => 1 }]),
       sql_result,
       sql_result,
     ])).complete_object_command(command_id: "cmd", result: "ok", worker_id: "w")
     pg_store(ScriptedPgConnection.new(params_results: [
       sql_result([{ "id" => "cmd", "target_kind" => "object", "target_type" => "account", "target_id" => "1" }]),
-      sql_result,
+      sql_result([{ "owned" => 1 }]),
       sql_result,
       sql_result,
     ])).fail_object_command(command_id: "cmd", error: "boom", worker_id: "w")

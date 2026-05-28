@@ -126,7 +126,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes store.inbox_message(enqueued_command_id), "status" => "pending"
 
         direct_claim_command_id = enqueue_object_command("direct-claim-object")
-        direct_claim = assert_sql_query_budget("claim_object_command", mysql: 4, postgres: 4) do
+        direct_claim = assert_sql_query_budget("claim_object_command", mysql: 5, postgres: 5) do
           store.claim_object_command(command_id: direct_claim_command_id, worker_id: "object-worker", lease_seconds: 30)
         end
         assert_hash_includes direct_claim, "id" => direct_claim_command_id, "status" => "running"
@@ -151,7 +151,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_hash_includes target_activation, "target_kind" => "object", "target_type" => "query-count-target", "target_id" => "target-activation-claim-object", "status" => "running"
         assert_hash_includes store.inbox_message(target_activation_command_id), "status" => "pending"
 
-        completed = assert_sql_query_budget("complete_object_command", mysql: 5, postgres: 5) do
+        completed = assert_sql_query_budget("complete_object_command", mysql: 6, postgres: 6) do
           store.complete_object_command(
             command_id: inbox_claim_command_id,
             object_type: "counter",

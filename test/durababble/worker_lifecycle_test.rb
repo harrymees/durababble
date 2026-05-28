@@ -44,6 +44,33 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     end
   end
 
+  class IdlePollObservedStore
+    def initialize(store)
+      @store = store
+      @idle_polls = Queue.new
+    end
+
+    def claim_runnable_workflow(**kwargs)
+      @store.claim_runnable_workflow(**kwargs).tap do |result|
+        @idle_polls << true unless result
+      end
+    end
+
+    def await_idle_poll(timeout:)
+      @idle_polls.pop(timeout:)
+    end
+
+    def method_missing(method_name, *args, **kwargs, &block)
+      return @store.public_send(method_name, *args, **kwargs, &block) if @store.respond_to?(method_name)
+
+      super
+    end
+
+    def respond_to_missing?(method_name, include_private = false)
+      @store.respond_to?(method_name, include_private) || super
+    end
+  end
+
   class SaturatedDeliveryWorker
     attr_reader :claim_attempts, :delivery_claims
 
@@ -951,8 +978,9 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
         { "approved_by" => reason }
       end
     end
+    observed_runtime_store = IdlePollObservedStore.new(runtime_store)
     runtime = Durababble::WorkerRuntime.new(
-      store: runtime_store,
+      store: observed_runtime_store,
       workflows: { workflow.workflow_name => workflow },
       worker_pool: "pool-a",
       poll_interval: 10,
@@ -961,6 +989,11 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
       rpc_port: 0,
     )
     with_started_runtime(runtime) do
+      assert(
+        observed_runtime_store.await_idle_poll(timeout: 2),
+        "runtime did not enter its idle poll before command setup",
+      )
+
       workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {}, worker_pool: "pool-a")
       store.claim_workflow(workflow_id:, worker_id: runtime.worker_id, lease_seconds: 30, worker_pool: "pool-a")
       message_id = store.enqueue_workflow_command(
