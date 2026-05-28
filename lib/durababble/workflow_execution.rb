@@ -379,10 +379,17 @@ module Durababble
 
     #: (?timeout: Numeric?) { () -> bool } -> bool
     def wait_condition(timeout: nil, &block)
+      deadline = wait_condition_deadline(timeout)
       loop do
         deliver_workflow_commands_at_safe_point!
         if scheduled_history_for_next_command?
-          next if wait_condition_command_delivered?(timeout)
+          if wait_condition_command_delivered?(timeout, deadline)
+            raise_if_cancel_requested!
+            return true if block.call
+
+            next
+          end
+
           return !!block.call if timeout
 
           next
@@ -391,18 +398,24 @@ module Durababble
         raise_if_cancel_requested!
         return true if block.call
 
-        next if wait_condition_command_delivered?(timeout)
+        if wait_condition_command_delivered?(timeout, deadline)
+          raise_if_cancel_requested!
+          return true if block.call
+
+          next
+        end
+
         return !!block.call if timeout
       end
     end
 
-    #: (Numeric?) -> bool
-    def wait_condition_command_delivered?(timeout)
+    #: (Numeric?, Time?) -> bool
+    def wait_condition_command_delivered?(timeout, deadline)
       wait_request = WaitRequest.new(
         kind: "timer",
-        wake_at: wait_condition_wake_at(timeout),
+        wake_at: wait_condition_wake_at(timeout, deadline),
         event_key: nil,
-        context: {},
+        context: wait_condition_context(deadline),
       )
       call_wait(wait_request, name: "wait_condition", kwargs: { timeout: }, interrupt_on_command: true)
       false
@@ -1267,8 +1280,56 @@ module Durababble
       store_current_time + delay
     end
 
-    #: (untyped) -> untyped
-    def wait_condition_wake_at(timeout)
+    #: (Numeric?) -> Time?
+    def wait_condition_deadline(timeout)
+      return unless timeout
+
+      recorded_deadline = recorded_wait_condition_deadline
+      return recorded_deadline if recorded_deadline
+
+      WorkflowDeterminism.allow_host_operations { @store.current_time + timeout }
+    end
+
+    #: () -> Time?
+    def recorded_wait_condition_deadline
+      wait = recorded_wait_condition_wait
+      context = wait&.fetch("context", nil)
+      return unless context.is_a?(Hash)
+
+      context["wait_condition_deadline_at"]
+    end
+
+    #: () -> Hash[String, Object?]?
+    def recorded_wait_condition_wait
+      scheduled = @replay_history.recorded_schedule(@next_command_id)
+      payload = scheduled&.fetch("payload", nil)
+      return unless payload.is_a?(Hash)
+      return unless payload["name"] == "wait_condition"
+
+      wait = payload["wait"]
+      wait if wait.is_a?(Hash)
+    end
+
+    #: (Time?) -> Hash[String, Object?]
+    def wait_condition_context(deadline)
+      return {} if legacy_recorded_wait_condition_wait?
+
+      deadline ? { "wait_condition_deadline_at" => deadline } : {}
+    end
+
+    #: () -> bool
+    def legacy_recorded_wait_condition_wait?
+      wait = recorded_wait_condition_wait
+      return false unless wait
+
+      context = wait["context"]
+      !context.is_a?(Hash) || !context.key?("wait_condition_deadline_at")
+    end
+
+    #: (untyped, Time?) -> untyped
+    def wait_condition_wake_at(timeout, deadline)
+      return deadline if deadline
+
       WorkflowDeterminism.allow_host_operations do
         current_time = store_current_time
         timeout ? current_time + timeout : current_time + 1

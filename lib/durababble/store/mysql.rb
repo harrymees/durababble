@@ -4,6 +4,16 @@
 module Durababble
   class MysqlStore < SqlStore
     include MysqlMigrations
+    include ActiveRecord::Sanitization::ClassMethods
+
+    private :disallow_raw_sql!,
+      :sanitize_sql,
+      :sanitize_sql_array,
+      :sanitize_sql_for_assignment,
+      :sanitize_sql_for_conditions,
+      :sanitize_sql_for_order,
+      :sanitize_sql_hash_for_assignment,
+      :sanitize_sql_like
 
     # Retry budget for transactions that hit a retryable error (deadlock /
     # lock-wait timeout). Backoff grows linearly per attempt and is jittered.
@@ -23,17 +33,17 @@ module Durababble
       @migrated = false
     end
 
-    #: (String, ?worker_id: String?, ?lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+    #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
+    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_microseconds: 60_000_000, worker_pool: "default")
       if worker_id
-        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_seconds, workflow_id, worker_pool])
+        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_microseconds, workflow_id, worker_pool])
       else
         execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
       end
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
-    def claim_runnable_workflow_unchecked(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
+    #: (worker_id: String, lease_microseconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
+    def claim_runnable_workflow_unchecked(worker_id:, lease_microseconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
 
       transaction do
@@ -44,7 +54,7 @@ module Durababble
         candidate = execute_store_query(:claim_runnable_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).first
         next unless candidate
 
-        updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_seconds, candidate.fetch("id"), worker_pool])
+        updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_microseconds, candidate.fetch("id"), worker_pool])
         next unless updated.affected_rows == 1
 
         claimed = workflow(candidate.fetch("id"))
@@ -55,31 +65,31 @@ module Durababble
       end
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, ?worker_pool: String) -> Object?
+    def claim_workflow_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool: "default")
       transaction do
         candidate = execute_store_query(:claim_workflow_lock, [workflow_id, worker_pool, worker_id]).first
         next unless candidate
 
-        execute_store_query(:claim_workflow_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+        execute_store_query(:claim_workflow_update, [worker_id, lease_microseconds, workflow_id, worker_pool])
         workflow(workflow_id)
       end
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Integer, ?worker_pool: String) -> Object?
-    def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, ?worker_pool: String) -> Object?
+    def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool: "default")
       transaction do
         candidate = execute_store_query(:claim_workflow_for_activation_lock, [workflow_id, worker_pool, worker_id]).first
         next unless candidate
 
-        execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_seconds, workflow_id, worker_pool])
+        execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_microseconds, workflow_id, worker_pool])
         workflow(workflow_id)
       end
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Integer) -> ActiveRecord::Result
-    def heartbeat_unchecked(workflow_id:, worker_id:, lease_seconds:)
-      result = execute_store_query(:heartbeat_workflow, [lease_seconds, workflow_id, worker_id])
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer) -> ActiveRecord::Result
+    def heartbeat_unchecked(workflow_id:, worker_id:, lease_microseconds:)
+      result = execute_store_query(:heartbeat_workflow, [lease_microseconds, workflow_id, worker_id])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.workflow.id" => workflow_id, "durababble.worker.id" => worker_id)
       else
@@ -188,11 +198,11 @@ module Durababble
       execute_store_query(:mark_workflow_cancellation_delivered, [workflow_id])
     end
 
-    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_seconds: Integer, cursor: Object?) -> Object?
-    def heartbeat_step_unchecked(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+    #: (workflow_id: String, ?command_id: Integer?, ?position: Integer?, worker_id: String, lease_microseconds: Integer, cursor: Object?) -> Object?
+    def heartbeat_step_unchecked(workflow_id:, worker_id:, lease_microseconds:, cursor:, command_id: nil, position: nil)
       command_id = normalize_command_id(command_id, position)
       renewed = transaction do
-        renewal = execute_store_query(:heartbeat_step_workflow, [lease_seconds, workflow_id, worker_id])
+        renewal = execute_store_query(:heartbeat_step_workflow, [lease_microseconds, workflow_id, worker_id])
         next nil unless renewal.affected_rows == 1
 
         serialized_cursor = dump_serialized(cursor)
@@ -240,10 +250,10 @@ module Durababble
     # the trilogy adapter forces CLIENT_FOUND_ROWS, which makes a rejected
     # "matched but unchanged" branch indistinguishable from a winning fresh
     # insert (both report affected_rows = 1).
-    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
-    def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_microseconds: Integer) -> Hash[String, Object?]?
+    def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_microseconds: 60_000_000)
       execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
-      result = execute_store_query(:claim_object_lease, [worker_id, lease_seconds.to_i, object_type, object_id, worker_id])
+      result = execute_store_query(:claim_object_lease, [worker_id, lease_microseconds.to_i, object_type, object_id, worker_id])
       return unless result.affected_rows.to_i.positive?
 
       { "worker_pool" => worker_pool, "object_type" => object_type, "object_id" => object_id, "worker_id" => worker_id }
@@ -252,9 +262,9 @@ module Durababble
     # Conditional renew. MySQL reports affected_rows from the UPDATE; 0 means the lease
     # has been lost (evicted, stolen, or released). Object identity is global —
     # `worker_pool` isn't part of the lease key.
-    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
-    def renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_seconds: 60)
-      result = execute_store_query(:renew_object_lease, [lease_seconds.to_i, object_type, object_id, worker_id])
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_microseconds: Integer) -> bool
+    def renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_microseconds: 60_000_000)
+      result = execute_store_query(:renew_object_lease, [lease_microseconds.to_i, object_type, object_id, worker_id])
       if result.affected_rows.to_i.positive?
         Observability.count("durababble.leases.heartbeats", "durababble.object.type" => object_type, "durababble.object.id" => object_id, "durababble.worker.id" => worker_id)
         true
@@ -375,13 +385,13 @@ module Durababble
       execute_store_query(:outbox_by_key, [key]).first.fetch("id")
     end
 
-    #: (worker_id: String, lease_seconds: Integer) -> Object?
-    def claim_outbox_unchecked(worker_id:, lease_seconds:)
+    #: (worker_id: String, lease_microseconds: Integer) -> Object?
+    def claim_outbox_unchecked(worker_id:, lease_microseconds:)
       transaction do
         candidate = execute_store_query(:claim_outbox).first
         next unless candidate
 
-        execute_store_query(:claim_selected_outbox, [worker_id, lease_seconds, candidate.fetch("id")])
+        execute_store_query(:claim_selected_outbox, [worker_id, lease_microseconds, candidate.fetch("id")])
         message = outbox_message(candidate.fetch("id"))
         observe_claim_latency(message, "outbox")
         message
@@ -490,8 +500,8 @@ module Durababble
       execute_store_query(:delete_all_object_wakeups, [worker_pool, object_type, object_id])
     end
 
-    #: (worker_id: String, lease_seconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
-    def claim_target_activation_unchecked(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
+    #: (worker_id: String, lease_microseconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Object?
+    def claim_target_activation_unchecked(worker_id:, lease_microseconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
       return if target_kinds&.empty? || target_types&.empty?
 
       transaction do
@@ -499,7 +509,7 @@ module Durababble
         candidate = execute_store_query(:claim_target_activation, [worker_pool, now] + filter_params, filter_sql:).first
         next unless candidate
 
-        execute_store_query(:claim_selected_target_activation, [worker_id, lease_seconds, worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
+        execute_store_query(:claim_selected_target_activation, [worker_id, lease_microseconds, worker_pool, candidate.fetch("target_kind"), candidate.fetch("target_type"), candidate.fetch("target_id")])
         target_activation(worker_pool:, target_kind: candidate.fetch("target_kind"), target_type: candidate.fetch("target_type"), target_id: candidate.fetch("target_id"))
       end
     end
@@ -516,12 +526,12 @@ module Durababble
 
     private
 
-    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_microseconds: Numeric?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_microseconds: nil, worker_pool: "default")
       workflow_id = id
       serialized_input = dump_workflow_input(name:, input:)
       if worker_id
-        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, serialized_input, worker_id, lease_seconds || 60])
+        execute_store_query(:insert_workflow_with_worker, [workflow_id, name, worker_pool, status, serialized_input, worker_id, lease_microseconds || 60_000_000])
       else
         execute_store_query(:insert_workflow, [workflow_id, name, worker_pool, status, serialized_input])
       end
@@ -645,9 +655,14 @@ module Durababble
       execute_store_query(:inbox_head_for_update, [worker_pool, target_kind, target_type, target_id]).first
     end
 
-    #: (message_id: String, worker_id: String, lease_seconds: Integer) -> Object?
-    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
-      execute_store_query(:mark_inbox_row_running, [worker_id, lease_seconds, message_id])
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String) -> Object?
+    def inbox_head_metadata_for_update(worker_pool:, target_kind:, target_type:, target_id:)
+      execute_store_query(:inbox_head_metadata_for_update, [worker_pool, target_kind, target_type, target_id]).first
+    end
+
+    #: (message_id: String, worker_id: String, lease_microseconds: Integer) -> Object?
+    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_microseconds:)
+      execute_store_query(:mark_inbox_row_running, [worker_id, lease_microseconds, message_id])
     end
 
     #: (message_id: String, result: Object?) -> Object?
@@ -720,7 +735,7 @@ module Durababble
     def execute_store_query_sql(sql, params)
       with_connection do |active_record_connection|
         if trilogy_connection?(active_record_connection)
-          sanitized_sql = sanitizer_class(active_record_connection).send(:sanitize_sql_array, [sql, *params])
+          sanitized_sql = sanitize_sql_array([sql, *params])
           active_record_connection.exec_query(sanitized_sql, "Durababble SQL")
         else
           active_record_connection.exec_query(sql, "Durababble SQL", params, prepare: false)
@@ -824,17 +839,6 @@ module Durababble
     #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> bool
     def trilogy_connection?(active_record_connection)
       active_record_connection.adapter_name.to_s.downcase.include?("trilogy")
-    end
-
-    #: (ActiveRecord::ConnectionAdapters::AbstractAdapter) -> Class
-    def sanitizer_class(active_record_connection)
-      Class.new do
-        extend ActiveRecord::Sanitization::ClassMethods
-
-        define_singleton_method(:with_connection) do |&block|
-          block.call(active_record_connection)
-        end
-      end
     end
   end
 end

@@ -327,7 +327,7 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_equal "default", params[2]
     assert_equal "running", params[3]
     assert_equal "worker-a", params[5]
-    assert_equal 9, params[6]
+    assert_equal 9_000_000, params[6]
   end
 
   test "mysql enqueue_workflow inserts the pending row in one statement" do
@@ -479,8 +479,9 @@ class DurababbleStoreTest < DurababbleTestCase
     assert_includes sql, "FOR UPDATE SKIP LOCKED"
     assert_includes sql, "COALESCE(next_run_at, created_at)"
     refute_includes sql, "UNION ALL"
-    refute_includes sql, "ORDER BY"
-    assert_equal ["default", "worker-a", 9, "demo"], params
+    assert_includes sql, "ORDER BY (CASE"
+    assert_includes sql, "END), created_at"
+    assert_equal ["default", "worker-a", 9_000_000, "demo"], params
   end
 
   test "migrates and persists workflow plus step state" do

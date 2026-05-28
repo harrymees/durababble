@@ -239,10 +239,7 @@ module Durababble
       SQL
       return if exists
 
-      execute("SET search_path TO #{quoted_schema}")
       execute("CREATE #{"UNIQUE " if unique}INDEX IF NOT EXISTS #{quote_column_name(index_name)} #{definition}")
-    ensure
-      execute("RESET search_path")
     end
 
     #: (untyped) -> untyped

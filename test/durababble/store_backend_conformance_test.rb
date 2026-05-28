@@ -1945,6 +1945,20 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "preserves fractional object lease durations with #{backend.name}" do
+      with_durababble_store(backend, "fractional_object_lease") do |store|
+        claim_key = { worker_pool: "default", object_type: "counter", object_id: "fractional" }
+
+        assert_equal "owner-a", store.claim_object_lease(**claim_key, worker_id: "owner-a", lease_seconds: 0.75).fetch("worker_id")
+        lease = store.current_object_lease("counter", "fractional")
+
+        refute_nil lease
+        assert_hash_includes(lease, "worker_id" => "owner-a")
+        assert_operator lease_seconds_remaining(store, backend, lease.fetch("locked_until")), :>, 0.1
+        assert_nil store.claim_object_lease(**claim_key, worker_id: "intruder", lease_seconds: 30)
+      end
+    end
+
     test "takes over an expired object lease and reports it via release_worker_leases / steal with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         claim_key = { worker_pool: "default", object_type: "counter", object_id: "expired" }
@@ -2236,6 +2250,15 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       ).first
     end
     row.fetch("in_tx").to_i
+  end
+
+  def lease_seconds_remaining(store, backend, locked_until)
+    if backend.sqlite?
+      return (locked_until.to_f - store.current_time.to_f) / store.send(:seconds_scale)
+    end
+
+    locked_until = locked_until.is_a?(Time) ? locked_until : Time.parse(locked_until.to_s)
+    locked_until.to_f - Time.now.to_f
   end
 
   def workflow_lease_time(value)

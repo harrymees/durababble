@@ -136,11 +136,12 @@ module Durababble
           WHERE worker_pool = $1
             AND (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) <= now()
             #{name_filter}
+          ORDER BY (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}), created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
         UPDATE #{workflows} AS workflows
-        SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+        SET status = 'running', locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         FROM candidate
         WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
         RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
@@ -158,7 +159,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $3,
-            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+            locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -174,7 +175,7 @@ module Durababble
     define(:pg_heartbeat_workflow, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+        SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
       SQL
     end
@@ -226,7 +227,7 @@ module Durababble
     define(:pg_heartbeat_step_workflow, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+        SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
         RETURNING locked_until
       SQL
@@ -360,11 +361,12 @@ module Durababble
         WITH candidate AS (
           SELECT id FROM #{outbox}
           WHERE (#{POSTGRES_OUTBOX_CLAIM_EXPRESSION}) <= now()
+          ORDER BY (#{POSTGRES_OUTBOX_CLAIM_EXPRESSION}), created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
         )
         UPDATE #{outbox} AS outbox
-        SET status = 'processing', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+        SET status = 'processing', locked_by = $1, locked_until = now() + ($2::bigint * interval '1 microsecond')
         FROM candidate
         WHERE outbox.id = candidate.id
         RETURNING outbox.*
@@ -486,6 +488,7 @@ module Durababble
         WHERE worker_pool = ?
           AND queue_available_at <= NOW(6)
           #{name_sql}
+        ORDER BY queue_available_at, created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
@@ -494,7 +497,7 @@ module Durababble
     define(:mysql_claim_selected_workflow, backend: :mysql, description: "Attach this worker lease to the selected workflow candidate.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
+        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= NOW(6)))
@@ -524,7 +527,7 @@ module Durababble
     define(:mysql_claim_workflow_update, backend: :mysql, description: "Move a target workflow to running and attach this worker lease.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
+        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
       SQL
     end
@@ -532,7 +535,7 @@ module Durababble
     define(:mysql_heartbeat_workflow, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
       SQL
     end
@@ -548,7 +551,7 @@ module Durababble
     define(:mysql_heartbeat_step_workflow, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE id = ? AND locked_by = ? AND status = 'running' AND locked_until >= NOW(6)
       SQL
     end
@@ -650,7 +653,7 @@ module Durababble
     define(:mysql_claim_selected_outbox, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "outbox")}
-        SET status = 'processing', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND)
+        SET status = 'processing', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
         WHERE id = ?
       SQL
     end
@@ -735,14 +738,14 @@ module Durababble
     end
 
     define(:pg_insert_workflow_with_worker, backend: :postgres) do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::bigint * interval '1 microsecond'))"
     end
 
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $3,
-            locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+            locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         WHERE id = $1 AND worker_pool = $2
           AND (
             (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -869,7 +872,7 @@ module Durababble
       <<~SQL.chomp
         INSERT INTO #{table(store, "durable_objects")}
           (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 second'), now(), now())
+        VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 microsecond'), now(), now())
         ON CONFLICT (object_type, object_id) DO UPDATE
         SET locked_by = EXCLUDED.locked_by,
             locked_until = EXCLUDED.locked_until,
@@ -886,7 +889,7 @@ module Durababble
     define(:pg_renew_object_lease, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "durable_objects")}
-        SET locked_until = now() + ($4::int * interval '1 second'), updated_at = now()
+        SET locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
         WHERE object_type = $1 AND object_id = $2
           AND locked_by = $3 AND locked_until >= now()
         RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
@@ -949,7 +952,7 @@ module Durababble
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET status = 'running', error = NULL, locked_by = $1,
-            locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+            locked_until = now() + ($2::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         WHERE id = $3 AND worker_pool = $4
           AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
@@ -1093,6 +1096,7 @@ module Durababble
         WHERE worker_pool = $1
           AND (#{POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) <= $2::timestamptz
           #{filter_sql}
+        ORDER BY (#{POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}), created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
@@ -1101,7 +1105,7 @@ module Durababble
     define(:pg_claim_selected_target_activation, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
-        SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
+        SET status = 'running', locked_by = $5, locked_until = now() + ($6::bigint * interval '1 microsecond'), updated_at = now()
         WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
         RETURNING *
       SQL
@@ -1228,6 +1232,18 @@ module Durababble
       SQL
     end
 
+    define(:pg_inbox_head_metadata_for_update, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT id, status, ready_at, locked_until
+        FROM #{table(store, "inbox")}
+        WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT 1
+        FOR UPDATE
+      SQL
+    end
+
     define(:pg_lock_inbox_message_for_worker, backend: :postgres) do |store|
       <<~SQL.chomp
         SELECT * FROM #{table(store, "inbox")}
@@ -1243,7 +1259,7 @@ module Durababble
     define(:pg_mark_inbox_row_running, backend: :postgres) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "inbox")}
-        SET status = 'running', attempts = attempts + 1, locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+        SET status = 'running', attempts = attempts + 1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
         WHERE id = $1
       SQL
     end
@@ -1345,14 +1361,14 @@ module Durababble
     end
 
     define(:mysql_insert_workflow_with_worker, backend: :mysql, description: "Insert a running workflow row with an initial worker lease.") do |store|
-      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND), NOW(6), NOW(6))"
+      "INSERT INTO #{table(store, "workflows")} (id, name, worker_pool, status, input, locked_by, locked_until, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), NOW(6), NOW(6))"
     end
 
     define(:mysql_mark_workflow_running_with_worker, backend: :mysql, description: "Move a workflow to running and attach a worker lease.") do |store|
       # [DURABABBLE-WF-1] Terminal rows must stay terminal even when a worker holds a lease.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
           AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
       SQL
@@ -1381,7 +1397,7 @@ module Durababble
     define(:mysql_claim_workflow_for_activation_update, backend: :mysql, description: "Claim a workflow through its activation path.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
-        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), next_run_at = NULL, updated_at = NOW(6)
+        SET status = 'running', error = NULL, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), next_run_at = NULL, updated_at = NOW(6)
         WHERE id = ? AND worker_pool = ?
       SQL
     end
@@ -1539,7 +1555,7 @@ module Durababble
     define(:mysql_claim_object_lease, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "durable_objects")}
-        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE object_type = ? AND object_id = ?
           AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
       SQL
@@ -1549,7 +1565,7 @@ module Durababble
     define(:mysql_renew_object_lease, backend: :mysql) do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "durable_objects")}
-        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE object_type = ? AND object_id = ?
           AND locked_by = ? AND locked_until >= NOW(6)
       SQL
@@ -1807,6 +1823,7 @@ module Durababble
         WHERE worker_pool = ?
           AND queue_available_at <= ?
           #{filter_sql}
+        ORDER BY queue_available_at, created_at
         LIMIT 1
         FOR UPDATE SKIP LOCKED
       SQL
@@ -1815,7 +1832,7 @@ module Durababble
     define(:mysql_claim_selected_target_activation, backend: :mysql, description: "Attach this worker lease to the selected target activation.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "target_activations")}
-        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET status = 'running', locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
       SQL
     end
@@ -2005,10 +2022,22 @@ module Durababble
       SQL
     end
 
+    define(:mysql_inbox_head_metadata_for_update, backend: :mysql, description: "Lock current mailbox head metadata for activation reconciliation.") do |store|
+      <<~SQL.chomp
+        SELECT id, status, ready_at, locked_until
+        FROM #{table(store, "inbox")}
+        WHERE worker_pool = ? AND target_kind = ? AND target_type = ? AND target_id = ?
+          AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+        ORDER BY sequence
+        LIMIT 1
+        FOR UPDATE
+      SQL
+    end
+
     define(:mysql_mark_inbox_row_running, backend: :mysql, description: "Attach this worker lease to an inbox message.") do |store|
       <<~SQL.chomp
         UPDATE #{table(store, "inbox")}
-        SET status = 'running', attempts = attempts + 1, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? SECOND), updated_at = NOW(6)
+        SET status = 'running', attempts = attempts + 1, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
         WHERE id = ?
       SQL
     end

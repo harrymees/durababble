@@ -13,38 +13,38 @@ module Durababble
 
     #: (name: String, input: Object?, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> String
     def create_workflow(name:, input:, worker_id: nil, lease_seconds: 60, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      insert_workflow(name:, input:, status: "running", id: SecureRandom.uuid, worker_id:, lease_seconds:, worker_pool:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      insert_workflow(name:, input:, status: "running", id: SecureRandom.uuid, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Hash[String, Object?]?
     def claim_runnable_workflow(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_runnable_workflow_unchecked(worker_id:, lease_seconds:, workflow_names:, worker_pool:, excluding_workflow_ids:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_runnable_workflow_unchecked(worker_id:, lease_microseconds:, workflow_names:, worker_pool:, excluding_workflow_ids:)
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
     def claim_workflow(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_workflow_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
     def claim_workflow_for_activation(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> ActiveRecord::Result
     def heartbeat(workflow_id:, worker_id:, lease_seconds:)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      heartbeat_unchecked(workflow_id:, worker_id:, lease_seconds:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      heartbeat_unchecked(workflow_id:, worker_id:, lease_microseconds:)
     end
 
     #: (String, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> Object?
     def mark_workflow_running(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      mark_workflow_running_unchecked(workflow_id, worker_id:, lease_seconds:, worker_pool:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      mark_workflow_running_unchecked(workflow_id, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (workflow_id: String, command_id: Integer, name: String, ?args: Array[Object?], ?kwargs: Hash[Symbol, Object?], ?metadata: Hash[String, Object?], ?worker_id: String?) -> Object?
@@ -375,7 +375,7 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, worker_id: String, ?lease_seconds: Numeric, ?limit: Integer, ?now: Time, ?worker_pool: String) -> Array[Hash[String, Object?]]
     def claim_inbox_messages(target_kind:, target_type:, target_id:, worker_id:, lease_seconds: 60, limit: 1, now: Time.now, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
       result = transaction do
         rows = inbox_claim_rows_for_update(worker_pool:, target_kind:, target_type:, target_id:, limit:)
         claimable_rows = contiguous_claimable_inbox_rows(rows, now:)
@@ -387,11 +387,11 @@ module Durababble
         # owner in another pool from progressing). Workflow inbox claims keep
         # the existing workflows.locked_by fence and are unaffected.
         if target_kind == "object" && !claimable_rows.empty?
-          holder = claim_object_lease(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_seconds:)
+          holder = claim_object_lease_unchecked(worker_pool:, object_type: target_type, object_id: target_id, worker_id:, lease_microseconds:)
           next [] unless holder
         end
         claimable_rows.map do |row|
-          mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_seconds:)
+          mark_inbox_row_running_without_transaction(message_id: row.fetch("id"), worker_id:, lease_microseconds:)
           claimed_inbox_row(row, worker_id:, lease_seconds:, now:)
         end
       end
@@ -423,7 +423,7 @@ module Durababble
 
     #: (worker_pool: String, workflow_name: String, workflow_id: String, worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
     def claim_next_workflow_command(worker_pool:, workflow_name:, workflow_id:, worker_id:, lease_seconds:)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+      lease_duration_microseconds(lease_seconds)
       return unless target_activation(worker_pool:, target_kind: "workflow", target_type: workflow_name, target_id: workflow_id)
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before workflow command claim" unless workflow_owned?(workflow_id:, worker_id:)
 
@@ -455,7 +455,7 @@ module Durababble
 
     #: (command_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
     def claim_object_command(command_id:, worker_id:, lease_seconds: 60)
-      Store.validate_positive_lease_seconds!(lease_seconds)
+      lease_duration_microseconds(lease_seconds)
       row = inbox_message(command_id)
       return unless object_command_message?(row)
 
@@ -479,32 +479,32 @@ module Durababble
 
     #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: Object?, ?command_id: Integer?, ?position: Integer?) -> Object?
     def heartbeat_step(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      heartbeat_step_unchecked(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id:, position:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      heartbeat_step_unchecked(workflow_id:, worker_id:, lease_microseconds:, cursor:, command_id:, position:)
     end
 
     #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
     def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_microseconds:)
     end
 
     #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
     def renew_object_lease(object_type:, object_id:, worker_id:, lease_seconds: 60)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_seconds:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_microseconds:)
     end
 
     #: (worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
     def claim_outbox(worker_id:, lease_seconds:)
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_outbox_unchecked(worker_id:, lease_seconds:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_outbox_unchecked(worker_id:, lease_microseconds:)
     end
 
     #: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Hash[String, Object?]?
     def claim_target_activation(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
-      Store.validate_positive_lease_seconds!(lease_seconds)
-      claim_target_activation_unchecked(worker_id:, lease_seconds:, target_kinds:, target_types:, now:, worker_pool:)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
+      claim_target_activation_unchecked(worker_id:, lease_microseconds:, target_kinds:, target_types:, now:, worker_pool:)
     end
 
     #: (command_id: String, result: Object?, ?object_type: String?, ?object_id: String?, ?state: Object?, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> Object?
@@ -919,58 +919,58 @@ module Durababble
       end
     end
 
-    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_seconds: Numeric?, ?worker_pool: String) -> String
-    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_seconds: nil, worker_pool: "default")
+    #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_microseconds: Integer?, ?worker_pool: String) -> String
+    def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_microseconds: nil, worker_pool: "default")
       raise NotImplementedError
     end
 
-    #: (worker_id: String, lease_seconds: Numeric, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Hash[String, Object?]?
-    def claim_runnable_workflow_unchecked(worker_id:, lease_seconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
+    #: (worker_id: String, lease_microseconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Hash[String, Object?]?
+    def claim_runnable_workflow_unchecked(worker_id:, lease_microseconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
-    def claim_workflow_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_workflow_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool: "default")
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> Hash[String, Object?]?
-    def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_seconds:, worker_pool: "default")
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_workflow_for_activation_unchecked(workflow_id:, worker_id:, lease_microseconds:, worker_pool: "default")
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric) -> ActiveRecord::Result
-    def heartbeat_unchecked(workflow_id:, worker_id:, lease_seconds:)
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer) -> ActiveRecord::Result
+    def heartbeat_unchecked(workflow_id:, worker_id:, lease_microseconds:)
       raise NotImplementedError
     end
 
-    #: (String, ?worker_id: String?, ?lease_seconds: Numeric, ?worker_pool: String) -> Object?
-    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_seconds: 60, worker_pool: "default")
+    #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
+    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_microseconds: 60_000_000, worker_pool: "default")
       raise NotImplementedError
     end
 
-    #: (workflow_id: String, worker_id: String, lease_seconds: Numeric, cursor: Object?, ?command_id: Integer?, ?position: Integer?) -> Object?
-    def heartbeat_step_unchecked(workflow_id:, worker_id:, lease_seconds:, cursor:, command_id: nil, position: nil)
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, cursor: Object?, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def heartbeat_step_unchecked(workflow_id:, worker_id:, lease_microseconds:, cursor:, command_id: nil, position: nil)
       raise NotImplementedError
     end
 
-    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> Hash[String, Object?]?
-    def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
+    #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_microseconds: Integer) -> Hash[String, Object?]?
+    def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_microseconds: 60_000_000)
       raise NotImplementedError
     end
 
-    #: (object_type: String, object_id: String, worker_id: String, ?lease_seconds: Numeric) -> bool
-    def renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_seconds: 60)
+    #: (object_type: String, object_id: String, worker_id: String, ?lease_microseconds: Integer) -> bool
+    def renew_object_lease_unchecked(object_type:, object_id:, worker_id:, lease_microseconds: 60_000_000)
       raise NotImplementedError
     end
 
-    #: (worker_id: String, lease_seconds: Numeric) -> Hash[String, Object?]?
-    def claim_outbox_unchecked(worker_id:, lease_seconds:)
+    #: (worker_id: String, lease_microseconds: Integer) -> Hash[String, Object?]?
+    def claim_outbox_unchecked(worker_id:, lease_microseconds:)
       raise NotImplementedError
     end
 
-    #: (worker_id: String, lease_seconds: Numeric, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Hash[String, Object?]?
-    def claim_target_activation_unchecked(worker_id:, lease_seconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
+    #: (worker_id: String, lease_microseconds: Integer, ?target_kinds: Array[String]?, ?target_types: Array[String]?, ?now: Time, ?worker_pool: String) -> Hash[String, Object?]?
+    def claim_target_activation_unchecked(worker_id:, lease_microseconds:, target_kinds: nil, target_types: nil, now: Time.now, worker_pool: "default")
       raise NotImplementedError
     end
 
@@ -1131,8 +1131,13 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (message_id: Object?, worker_id: String, lease_seconds: Numeric) -> Object?
-    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
+    #: (worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?) -> Hash[String, Object?]?
+    def inbox_head_metadata_for_update(worker_pool:, target_kind:, target_type:, target_id:)
+      raise NotImplementedError
+    end
+
+    #: (message_id: Object?, worker_id: String, lease_microseconds: Integer) -> Object?
+    def mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_microseconds:)
       raise NotImplementedError
     end
 
@@ -1243,7 +1248,7 @@ module Durababble
         return
       end
 
-      head = inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
+      head = inbox_head_metadata_for_update(worker_pool:, target_kind:, target_type:, target_id:)
 
       if head && !InboxStatus.dead_lettered?(head)
         ready_at = target_activation_ready_at_for(head, now:)
@@ -1292,6 +1297,7 @@ module Durababble
 
     #: (message_id: String, worker_pool: String, target_kind: Object?, target_type: Object?, target_id: Object?, worker_id: String, lease_seconds: Numeric, ?now: Time) -> Object?
     def claim_inbox_message_by_id(message_id:, worker_pool:, target_kind:, target_type:, target_id:, worker_id:, lease_seconds:, now: Time.now)
+      lease_microseconds = lease_duration_microseconds(lease_seconds)
       transaction do
         head = inbox_head_for_update(worker_pool:, target_kind:, target_type:, target_id:)
         next unless head&.fetch("id") == message_id
@@ -1300,11 +1306,11 @@ module Durababble
         next unless inbox_row_claimable?(head, now:)
 
         if target_kind == "object"
-          holder = claim_object_lease(worker_pool:, object_type: target_type.to_s, object_id: target_id.to_s, worker_id:, lease_seconds:)
+          holder = claim_object_lease_unchecked(worker_pool:, object_type: target_type.to_s, object_id: target_id.to_s, worker_id:, lease_microseconds:)
           next unless holder
         end
 
-        mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_seconds:)
+        mark_inbox_row_running_without_transaction(message_id:, worker_id:, lease_microseconds:)
         claimed_inbox_row(head, worker_id:, lease_seconds:, now:)
       end
     end

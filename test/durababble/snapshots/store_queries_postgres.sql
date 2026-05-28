@@ -47,7 +47,7 @@ WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < no
 -- pg_claim_object_lease
 INSERT INTO "durababble_pg_snapshot"."durable_objects"
   (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
-VALUES ($1, $2, $3, $4, now() + ($5::int * interval '1 second'), now(), now())
+VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 microsecond'), now(), now())
 ON CONFLICT (object_type, object_id) DO UPDATE
 SET locked_by = EXCLUDED.locked_by,
     locked_until = EXCLUDED.locked_until,
@@ -65,11 +65,16 @@ WITH candidate AS (
   WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
   ELSE NULL
 END) <= now()
+  ORDER BY (CASE
+  WHEN status = 'pending' THEN created_at
+  WHEN status = 'processing' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END), created_at
   LIMIT 1
   FOR UPDATE SKIP LOCKED
 )
 UPDATE "durababble_pg_snapshot"."outbox" AS outbox
-SET status = 'processing', locked_by = $1, locked_until = now() + ($2::int * interval '1 second')
+SET status = 'processing', locked_by = $1, locked_until = now() + ($2::bigint * interval '1 microsecond')
 FROM candidate
 WHERE outbox.id = candidate.id
 RETURNING outbox.*
@@ -86,18 +91,25 @@ WITH candidate AS (
   ELSE NULL
 END) <= now()
     <name_filter>
+  ORDER BY (CASE
+  WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
+  WHEN status = 'waiting' AND next_run_at IS NOT NULL THEN next_run_at
+  WHEN status = 'failed' AND next_run_at IS NOT NULL THEN next_run_at
+  WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END), created_at
   LIMIT 1
   FOR UPDATE SKIP LOCKED
 )
 UPDATE "durababble_pg_snapshot"."workflows" AS workflows
-SET status = 'running', locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+SET status = 'running', locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 FROM candidate
 WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
 RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
 
 -- pg_claim_selected_target_activation
 UPDATE "durababble_pg_snapshot"."target_activations"
-SET status = 'running', locked_by = $5, locked_until = now() + ($6::int * interval '1 second'), updated_at = now()
+SET status = 'running', locked_by = $5, locked_until = now() + ($6::bigint * interval '1 microsecond'), updated_at = now()
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 RETURNING *
 
@@ -110,6 +122,11 @@ WHERE worker_pool = $1
   ELSE NULL
 END) <= $2::timestamptz
   <filter_sql>
+ORDER BY (CASE
+  WHEN status = 'pending' THEN ready_at
+  WHEN status = 'running' AND locked_until IS NOT NULL THEN locked_until
+  ELSE NULL
+END), created_at
 LIMIT 1
 FOR UPDATE SKIP LOCKED
 
@@ -120,7 +137,7 @@ WHERE id = $1 AND worker_pool = $2 AND status = 'running' AND locked_by = $3 AND
 -- pg_claim_workflow_for_activation_update
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, locked_by = $3,
-    locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+    locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 WHERE id = $1 AND worker_pool = $2
   AND (
     (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -134,7 +151,7 @@ RETURNING *
 -- pg_claim_workflow_update
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, locked_by = $3,
-    locked_until = now() + ($4::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+    locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 WHERE id = $1 AND worker_pool = $2
   AND (
     (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -255,13 +272,13 @@ RETURNING heartbeat_cursor
 
 -- pg_heartbeat_step_workflow
 UPDATE "durababble_pg_snapshot"."workflows"
-SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
 WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
 RETURNING locked_until
 
 -- pg_heartbeat_workflow
 UPDATE "durababble_pg_snapshot"."workflows"
-SET locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
 WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
 
 -- pg_inbox_claim_rows_for_update
@@ -275,6 +292,15 @@ FOR UPDATE
 
 -- pg_inbox_head_for_update
 SELECT *
+FROM "durababble_pg_snapshot"."inbox"
+WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
+  AND status IN ('pending', 'failed', 'running', 'dead_lettered')
+ORDER BY sequence
+LIMIT 1
+FOR UPDATE
+
+-- pg_inbox_head_metadata_for_update
+SELECT id, status, ready_at, locked_until
 FROM "durababble_pg_snapshot"."inbox"
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
   AND status IN ('pending', 'failed', 'running', 'dead_lettered')
@@ -351,7 +377,7 @@ WHERE workflow_id = $8
 RETURNING event_index
 
 -- pg_insert_workflow_with_worker
-INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::int * interval '1 second'))
+INSERT INTO "durababble_pg_snapshot"."workflows" (id, name, worker_pool, status, input, locked_by, locked_until) VALUES ($1, $2, $3, $4, $5::bytea, $6, now() + ($7::bigint * interval '1 microsecond'))
 
 -- pg_lock_inbox_message
 SELECT * FROM "durababble_pg_snapshot"."inbox" WHERE id = $1 FOR UPDATE
@@ -401,7 +427,7 @@ UPDATE "durababble_pg_snapshot"."workflows" SET next_run_at = CASE WHEN status =
 
 -- pg_mark_inbox_row_running
 UPDATE "durababble_pg_snapshot"."inbox"
-SET status = 'running', attempts = attempts + 1, locked_by = $2, locked_until = now() + ($3::int * interval '1 second'), updated_at = now()
+SET status = 'running', attempts = attempts + 1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
 WHERE id = $1
 
 -- pg_mark_workflow_canceling_for_request
@@ -422,7 +448,7 @@ WHERE id = $1 AND worker_pool = $2 AND status = 'pending' AND locked_by IS NULL
 -- pg_mark_workflow_running_with_worker
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = 'running', error = NULL, locked_by = $1,
-    locked_until = now() + ($2::int * interval '1 second'), next_run_at = NULL, updated_at = now()
+    locked_until = now() + ($2::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 WHERE id = $3 AND worker_pool = $4
   AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
@@ -474,7 +500,7 @@ WHERE status = 'running' AND locked_by = $1
 
 -- pg_renew_object_lease
 UPDATE "durababble_pg_snapshot"."durable_objects"
-SET locked_until = now() + ($4::int * interval '1 second'), updated_at = now()
+SET locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
 WHERE object_type = $1 AND object_id = $2
   AND locked_by = $3 AND locked_until >= now()
 RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
