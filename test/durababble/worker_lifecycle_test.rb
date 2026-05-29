@@ -9,6 +9,8 @@ require "logger"
 class DurababbleWorkerLifecycleTest < DurababbleTestCase
   class RuntimeBranchStore
     attr_reader :closed, :released
+    # Owner-routing hooks the worker runtime sets on start and clears on stop.
+    attr_accessor :local_worker_id, :local_transient_handler
 
     def initialize(tick_results: [])
       @tick_results = tick_results.dup
@@ -501,8 +503,7 @@ class DurababbleWorkerLifecycleTest < DurababbleTestCase
     active_targets = {}
 
     Async do |task|
-      assert_equal(true, runtime.send(:poll_once, task, worker, active_targets))
-      assert_equal(true, runtime.send(:poll_once, task, worker, active_targets))
+      assert_equal(true, runtime.send(:schedule_available_work, task, worker, active_targets))
     end
 
     assert_equal([:first, :second], queue_values(worker.performed, 2))

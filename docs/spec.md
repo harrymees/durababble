@@ -108,9 +108,9 @@ Child workflows run independently in the target worker pool. If `worker_pool:` i
 
 Parent cancellation is cooperative and policy driven. The default workflow-origin policy is `:request_cancel`: when the parent observes a cancellation request, Durababble durably requests cancellation of each non-terminal child workflow row whose child cancellation policy is `request_cancel`, then raises `Durababble::CancellationError` into parent workflow code. `cancellation: :abandon` leaves the child running/pending when the parent cancels. Parent hard termination does not deliver cancellation, does not run parent cleanup, and does not request child cancellation; operators can cancel or terminate the child separately through its handle. Child retry policy remains whatever the child workflow declares; parent step/replay retries never duplicate child start and do not reset child retry attempts.
 
-Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `sleep_until(time, context)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, `Durababble.sleep_until(time, context)`, and `Durababble.wait_until(time, context)`.
+Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, and `Durababble.wait_until(time, context)`.
 
-Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
+Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `wait_until(time)` are timer waits with workflow-friendly API shape.
 
 `wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, park the workflow with the earliest unresolved timer in `workflows.next_run_at`, and resume under the normal workflow claim path when the timer is due. Durable sleeps are implemented as timer waits and must survive process exit.
 
@@ -135,7 +135,11 @@ class Account < Durababble::DurableObject
 end
 ```
 
-`expose` registers transient non-durable owner-local methods. Transient methods read latest persisted state, may run concurrently with other transient methods, must not enqueue inbox messages, call workflow steps, mutate durable state, schedule sleeps, or write Durababble tables, and reject `idempotency_key:`.
+`expose` registers transient non-durable owner-local methods. Transient methods are dispatched to the active object owner through `CallTransient` when one exists, with an in-process fast path only inside the runtime that currently owns the object lease. A caller must not satisfy an exposed read by loading persisted object state in its own process while another live owner exists. There is at most one materialized instance of an object in the cluster, and every read, command, and stream is served from that single resident instance, so a read always observes the same live object that commands mutate.
+
+When no node owns the object, a read claims the object lease and becomes the resident owner: it materializes the instance (running `on_load`, or `on_create` when no durable state exists yet) and keeps it warm so the next operation reuses it. A pure-client process with no residency host instead falls back to a transient claim-read-release. Reads no longer wait on a mailbox read gate; because they run against the live resident instance on the owning node's single cooperative reactor — where commands for one object are FIFO-serialized — a read reflects every command that has already committed and never observes a stale snapshot that skipped unresolved commands.
+
+Transient object methods may run concurrently with other admitted transient methods, must not enqueue inbox messages, call workflow steps, mutate durable state, schedule sleeps, or write Durababble tables, and reject `idempotency_key:`. `update_state` from an exposed read raises `Durababble::Error`.
 
 `expose_command` registers durable mailbox commands. Commands execute through the durable object's identity, receive `command_context`, and update state only through `update_state(new_state)`. `command_context.idempotency_key` is generated from object type, object id, and mailbox message id and is stable for the durable command.
 
@@ -355,9 +359,11 @@ Admin and observability surfaces expose patch usage by workflow type/id: normal 
 
 ## Durable object execution semantics
 
-Object commands, scheduled wakeups, and other mailbox work acquire an exclusive writer slot for the target. Exposed transient methods acquire shared read access, can run concurrently with each other, and stop entering once mailbox work is waiting.
+The owning node keeps a single resident instance per `(object_type, object_id)` and serves commands, wakes, queries, and streams from it. Commands and wakes for one target are FIFO-serialized by the owner's single drain loop, so they never overlap each other. Queries and streams observe the live resident instance on the same cooperative reactor; `update_state` replaces the current-state reference atomically, so a read never sees a torn write. Because durable state round-trips the store on every command (each operation re-reads it and persists on completion), crash-safety does not depend on resident memory — only the expensive user resource set up in `on_create`/`on_load` stays warm in the instance. (A per-object cooperative gate remains a documented future option should a concrete read/write race surface.)
 
-Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the cached instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery.
+The per-object lease is the residency token: the owner holds it continuously while the object is resident, rather than releasing it after each command drain. Because `DeliverMessage` is owner-routed (it delivers to the lease holder), a held lease naturally routes all of an object's work back to its resident owner, guaranteeing at most one materialized instance in the cluster. The owner retains the lease and instance for a configurable idle window (`object_idle_ttl`, default `lease_seconds`) after the last operation; on expiry it runs `on_destroy` and releases the lease so ownership can rebalance. Lease takeover, graceful shutdown, and renewal failure tear the instance down through `on_destroy` the same way.
+
+Object inboxes are push-driven. The owner pod drains commands, wakes, and internal work from the mailbox and invokes registered command/lifecycle methods against the resident instance. Ready object commands wake the active owner through `DeliverMessage` or leave a durable target activation for pool-local recovery. Exposed object reads use the same `CallTransient` method as workflow transient calls: the caller looks up the current object lease, calls the owner node when the lease belongs to another runtime, and uses the registered local transient handler when the current runtime owns the lease. When no node owns the object, a caller with a local residency host claims the lease and becomes the resident owner before reading; a caller without one performs a transient claim-read-release. Stale-owner or no-active-owner responses retry once after refreshing the lease. Transport-unavailable owner failures are returned to the caller and do not fall back to caller-local persisted-state inspection. The owner validates its lease before and after executing the transient method.
 
 Commands execute one at a time in strict FIFO order per durable target. Target executors drain only the contiguous ready prefix from the mailbox head. `SKIP LOCKED` must not let later messages overtake a blocked head for the same target.
 
@@ -369,7 +375,7 @@ Ask rows store serialized result or error. Tell/wake rows retry with backoff and
 
 A command's inbox row owns a stable `operation_id`. Any durable checkpoints inside that command use the operation id so retries skip completed side-effect checkpoints.
 
-Durable object cache entries include `{instance, lock_version, lease_token, last_used_at, gate}` and must never invoke user code when the lease is expired or near its refresh threshold.
+The owner's residency host tracks each held key as `{instance, last_used_at, refcount, lost}`: the resident user instance (nil until first materialized), the monotonic idle stamp set when refcount drops to zero, the count of in-flight operations holding the lease, and a flag set when renewal fails or the lease is evicted. A renewal that fails flips `lost`, which surfaces to in-flight streams as `StaleLease`; the host must never invoke user code under a lease that is expired or has been lost.
 
 ## Shared durable primitives
 

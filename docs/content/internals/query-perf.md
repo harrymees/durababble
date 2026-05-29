@@ -5,7 +5,7 @@ weight: 10
 
 # Query Perf
 
-The docs publishing path regenerates these MySQL hot-path reports before Hugo builds the site. Each report captures the SQL timeline, transaction context, callsites, EXPLAIN output, and touched table DDL for one registered query reporter scenario.
+The docs publishing path regenerates these MySQL hot-path reports before Zeitung builds the site. Each report captures the SQL timeline, transaction context, callsites, EXPLAIN output, and touched table DDL for one registered query reporter scenario.
 
 ## Reports
 
@@ -15,3 +15,5 @@ The docs publishing path regenerates these MySQL hot-path reports before Hugo bu
 - [Claim outbox](/query-perf/claim_outbox.html) traces the unified outbox queue probe and lease update used by sender claims.
 - [Worker poll idle](/query-perf/worker_poll_idle.html) traces one worker tick when no matching workflow work is available.
 - [Worker tick claim](/query-perf/worker_tick_claim.html) traces one worker tick that claims and completes a workflow.
+- [Record step started](/query-perf/record_step_started.html) traces the durable workflow-history append when a leased worker starts a step.
+- [Record step completed](/query-perf/record_step_completed.html) traces the durable workflow-history append when a leased worker completes a step.

@@ -220,6 +220,18 @@ class DurababbleWorkflowTest < DurababbleTestCase
     end
   end
 
+  test "workflow class starts are rejected inside exposed workflow query context" do
+    store = WorkerPoolEnqueueStore.new
+
+    assert_raises_matching(Durababble::Error, /cannot start workflows from an exposed query/) do
+      Durababble::WorkflowQueryContext.with_current(true) do
+        ApiTestOrderWorkflow.enqueue({}, store:, worker_pool: "default")
+      end
+    end
+
+    assert_empty store.enqueued
+  end
+
   test "uses the store's atomic workflow command enqueue path" do
     store = TerminalRaceCommandStore.new
     error = assert_raises(Durababble::Error) do

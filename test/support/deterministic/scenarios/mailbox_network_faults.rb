@@ -65,6 +65,7 @@ module Durababble
                 workflow_id:,
                 result: { "ok" => message.fetch("id") },
                 worker_id:,
+                event_index: h.next_event_index(workflow_id),
               )
               h.scheduler.trace.event(h.scheduler.time, worker_id, "mailbox_workflow_delivered", message_id: message.fetch("id"))
             end

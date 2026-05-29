@@ -32,9 +32,9 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           "locked_by" => "worker-a",
         )
 
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "increment", args: [{ "count" => 1 }])
-        store.record_step_started(workflow_id:, command_id: 0, name: "increment")
-        store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 2 })
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "increment", args: [{ "count" => 1 }], event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "increment", event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "count" => 2 }, event_index: next_event_index(workflow_id))
         store.complete_workflow(workflow_id, result: { "count" => 2 })
 
         assert_hash_includes store.workflow(workflow_id), "status" => "completed", "result" => { "count" => 2 }
@@ -50,17 +50,17 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     test "step completion and failure APIs return inserted workflow history indexes with #{backend.name}" do
       with_durababble_store(backend, "history_indexes") do |store|
         completed_workflow_id = store.create_workflow(name: "history-completed", input: {})
-        store.record_step_started(workflow_id: completed_workflow_id, command_id: 0, name: "step")
+        store.record_step_started(workflow_id: completed_workflow_id, command_id: 0, name: "step", event_index: next_event_index(completed_workflow_id))
 
-        completed_index = store.record_step_completed(workflow_id: completed_workflow_id, command_id: 0, result: { "ok" => true })
+        completed_index = store.record_step_completed(workflow_id: completed_workflow_id, command_id: 0, result: { "ok" => true }, event_index: next_event_index(completed_workflow_id))
 
         assert_equal 1, completed_index
         assert_equal [0, 1], store.workflow_history_for(completed_workflow_id).map { |event| event.fetch("event_index") }
 
         failed_workflow_id = store.create_workflow(name: "history-failed", input: {})
-        store.record_step_started(workflow_id: failed_workflow_id, command_id: 0, name: "step")
+        store.record_step_started(workflow_id: failed_workflow_id, command_id: 0, name: "step", event_index: next_event_index(failed_workflow_id))
 
-        failed_index = store.record_step_failed(workflow_id: failed_workflow_id, command_id: 0, error: "boom")
+        failed_index = store.record_step_failed(workflow_id: failed_workflow_id, command_id: 0, error: "boom", event_index: next_event_index(failed_workflow_id))
 
         assert_equal 1, failed_index
         assert_equal [0, 1], store.workflow_history_for(failed_workflow_id).map { |event| event.fetch("event_index") }
@@ -174,18 +174,18 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "step_start_metadata") do |store|
         workflow_id = store.create_workflow(name: "step-start-metadata", input: {})
 
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "existing_step")
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "existing_step", event_index: next_event_index(workflow_id))
         scheduled = store.steps_for(workflow_id).first
         assert_hash_includes scheduled, "status" => "scheduled", "started_at" => nil
 
-        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step", event_index: next_event_index(workflow_id))
         running = store.steps_for(workflow_id).first
         assert_hash_includes running, "status" => "running", "error" => nil
         refute_nil running.fetch("started_at")
         first_started_at = running.fetch("started_at")
 
         sleep 0.01
-        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step")
+        store.record_step_started(workflow_id:, command_id: 0, name: "existing_step", event_index: next_event_index(workflow_id))
         restarted = store.steps_for(workflow_id).first
         assert_hash_includes restarted, "status" => "running", "error" => nil
         assert_equal first_started_at, restarted.fetch("started_at")
@@ -196,8 +196,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "step_retry_atomicity") do |store|
         workflow_id = store.enqueue_workflow(name: "atomic-retry", input: {})
         store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 30)
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
-        store.record_step_started(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a")
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a", event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "retryable", worker_id: "worker-a", event_index: next_event_index(workflow_id))
 
         assert_raises(Durababble::LeaseConflict) do
           store.record_step_failed_and_schedule_retry(
@@ -206,6 +206,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
             error: "RuntimeError: wrong owner",
             worker_id: "worker-b",
             run_at: Time.now + 60,
+            event_index: next_event_index(workflow_id),
           )
         end
         assert_hash_includes store.steps_for(workflow_id).first, "status" => "running"
@@ -218,6 +219,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           error: "RuntimeError: retry me",
           worker_id: "worker-a",
           run_at:,
+          event_index: next_event_index(workflow_id),
         )
 
         assert_hash_includes store.steps_for(workflow_id).first, "status" => "failed", "error" => "RuntimeError: retry me"
@@ -270,6 +272,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           position: 0,
           name: "sleep",
           wait_request: Durababble.wait_until(due_at, { "timer" => true }),
+          event_index: next_event_index(workflow_id),
         )
 
         assert_equal 0, store.wake_due_timers(now: due_at - 1)
@@ -295,6 +298,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
             position: 0,
             name: "sleep",
             wait_request: Durababble.wait_until(due_at, { "timer" => index }),
+            event_index: next_event_index(workflow_id),
           )
           make_workflow_timer_due(store, workflow_id, at: due_at)
         end
@@ -312,8 +316,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "attempt_count") do |store|
         workflow_id = store.create_workflow(name: "attempt-count", input: {})
 
-        3.times { store.record_step_started(workflow_id:, command_id: 0, name: "flaky") }
-        2.times { store.record_step_started(workflow_id:, command_id: 1, name: "other") }
+        3.times { store.record_step_started(workflow_id:, command_id: 0, name: "flaky", event_index: next_event_index(workflow_id)) }
+        2.times { store.record_step_started(workflow_id:, command_id: 1, name: "other", event_index: next_event_index(workflow_id)) }
 
         assert_equal 3, store.step_attempt_count_for(workflow_id:, command_id: 0)
         assert_equal 2, store.step_attempt_count_for(workflow_id:, position: 1)
@@ -571,7 +575,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         )
         claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: workflow_id, worker_id: "activation-worker", lease_seconds: 30, limit: 1)
         assert_equal [first], claimed.map { |message| message.fetch("id") }
-        store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker")
+        store.complete_workflow_command(message_id: first, workflow_id:, result: { "ok" => 1 }, worker_id: "activation-worker", event_index: next_event_index(workflow_id))
         assert store.suspend_workflow(workflow_id:, worker_id: "activation-worker")
         store.complete_target_activation(
           target_kind: "workflow",
@@ -605,6 +609,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
                 workflow_id:,
                 result: { "ok" => true },
                 worker_id: "workflow-owner",
+                event_index: next_event_index(workflow_id),
               )
             end,
           ],
@@ -616,6 +621,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
                 workflow_id:,
                 error: "boom",
                 worker_id: "workflow-owner",
+                event_index: next_event_index(workflow_id),
               )
             end,
           ],
@@ -729,9 +735,9 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-a", worker_id: "command-worker", lease_seconds: 30, limit: 2)
         assert_equal [first, second], claimed.map { |message| message.fetch("id") }
 
-        assert_nil store.complete_workflow_command(message_id: first, workflow_id: "wf-b", result: { "ok" => true }, worker_id: "command-worker")
+        assert_nil store.complete_workflow_command(message_id: first, workflow_id: "wf-b", result: { "ok" => true }, worker_id: "command-worker", event_index: next_event_index("wf-b"))
         assert_hash_includes store.inbox_message(first), "status" => "running", "locked_by" => "command-worker"
-        assert_nil store.fail_workflow_command(message_id: second, workflow_id: "wf-b", error: "wrong target", worker_id: "command-worker")
+        assert_nil store.fail_workflow_command(message_id: second, workflow_id: "wf-b", error: "wrong target", worker_id: "command-worker", event_index: next_event_index("wf-b"))
         assert_hash_includes store.inbox_message(second), "status" => "running", "locked_by" => "command-worker"
         assert_empty store.workflow_history_for("wf-a")
         assert_empty store.workflow_history_for("wf-b")
@@ -1369,7 +1375,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_hash_includes store.current_workflow_lease(workflow_id), "workflow_id" => workflow_id, "worker_id" => "worker-a"
         assert_equal 1, store.heartbeat(workflow_id:, worker_id: "worker-a", lease_seconds: 30).affected_rows
 
-        store.record_step_started(workflow_id:, position: 0, name: "heartbeat")
+        store.record_step_started(workflow_id:, position: 0, name: "heartbeat", event_index: next_event_index(workflow_id))
         assert_nil store.heartbeat_step(
           workflow_id:,
           position: 99,
@@ -1385,7 +1391,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           cursor: { "offset" => 10 },
         )
         assert_equal({ "offset" => 10 }, store.step_heartbeat_cursor(workflow_id:, position: 0))
-        store.record_step_failed(workflow_id:, position: 0, error: "boom")
+        store.record_step_failed(workflow_id:, position: 0, error: "boom", event_index: next_event_index(workflow_id))
         assert_hash_includes store.steps_for(workflow_id).first, "status" => "failed", "error" => "boom"
 
         run_at = Time.now + 60
@@ -1549,7 +1555,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       with_durababble_store(backend, "conformance") do |store|
         workflow_id = store.enqueue_workflow(name: "heartbeat-fence", input: {})
         store.claim_workflow(workflow_id:, worker_id: "owner", lease_seconds: 30)
-        store.record_step_started(workflow_id:, position: 0, name: "fenced")
+        store.record_step_started(workflow_id:, position: 0, name: "fenced", event_index: next_event_index(workflow_id))
 
         # The genuine owner renews successfully while it holds the lease.
         refute_nil store.heartbeat_step(workflow_id:, position: 0, worker_id: "owner", lease_seconds: 30, cursor: { "offset" => 1 })
@@ -1659,7 +1665,7 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
     test "terminal workflow writes do not leave incomplete durable work with #{backend.name}" do
       with_durababble_store(backend, "terminal_work_cleanup") do |store|
         completion_id = store.create_workflow(name: "reject-incomplete-complete", input: {})
-        store.record_step_scheduled(workflow_id: completion_id, command_id: 0, name: "not_done")
+        store.record_step_scheduled(workflow_id: completion_id, command_id: 0, name: "not_done", event_index: next_event_index(completion_id))
         assert_raises(Durababble::Error) do
           store.complete_workflow(completion_id, result: { "done" => true })
         end
@@ -1672,8 +1678,9 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
           command_id: 0,
           name: "waiting",
           wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+          event_index: next_event_index(pending_wait_id),
         )
-        store.record_step_completed(workflow_id: pending_wait_id, command_id: 0, result: { "finished" => true })
+        store.record_step_completed(workflow_id: pending_wait_id, command_id: 0, result: { "finished" => true }, event_index: next_event_index(pending_wait_id))
         assert_raises(Durababble::Error) do
           store.complete_workflow(pending_wait_id, result: { "done" => true })
         end
@@ -1681,13 +1688,14 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         assert_equal ["completed"], store.wait_snapshots_for(pending_wait_id).map { |wait| wait.fetch("status") }
 
         cancel_id = store.create_workflow(name: "cancel-incomplete-work", input: {})
-        store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled")
-        store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running")
+        store.record_step_scheduled(workflow_id: cancel_id, command_id: 0, name: "scheduled", event_index: next_event_index(cancel_id))
+        store.record_step_started(workflow_id: cancel_id, command_id: 1, name: "running", event_index: next_event_index(cancel_id))
         store.record_wait(
           workflow_id: cancel_id,
           command_id: 2,
           name: "waiting",
           wait_request: Durababble.wait_until(Time.now + 3600, { "waiting" => true }),
+          event_index: next_event_index(cancel_id),
         )
 
         store.cancel_workflow(cancel_id, reason: "operator stop")

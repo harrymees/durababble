@@ -6,8 +6,8 @@ require_relative "execution_context"
 
 module Durababble
   class WorkflowStepRunner
-    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], synchronize_store: Proc, raise_if_cancel_requested: Proc, assert_workflow_lease: Proc, suspend_workflow_immediately: Proc, defer_workflow_suspension: Proc, remember_wait: Proc, next_run_at_for_wait: Proc, timer_due: Proc, complete_due_wait: Proc, retry_run_at: Proc, crash: Proc) -> void
-    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, synchronize_store:, raise_if_cancel_requested:, assert_workflow_lease:, suspend_workflow_immediately:, defer_workflow_suspension:, remember_wait:, next_run_at_for_wait:, timer_due:, complete_due_wait:, retry_run_at:, crash:)
+    #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, root_task: Object, futures: Hash[Integer, Object], step_contexts: Hash[Object, StepContext], execution: WorkflowExecution) -> void
+    def initialize(store:, workflow_id:, worker_id:, lease_seconds:, root_task:, futures:, step_contexts:, execution:)
       @store = store
       @workflow_id = workflow_id
       @worker_id = worker_id
@@ -15,17 +15,7 @@ module Durababble
       @root_task = root_task #: as untyped
       @futures = futures #: as untyped
       @step_contexts = step_contexts
-      @synchronize_store = synchronize_store
-      @raise_if_cancel_requested = raise_if_cancel_requested
-      @assert_workflow_lease = assert_workflow_lease
-      @suspend_workflow_immediately = suspend_workflow_immediately
-      @defer_workflow_suspension = defer_workflow_suspension
-      @remember_wait = remember_wait
-      @next_run_at_for_wait = next_run_at_for_wait
-      @timer_due = timer_due
-      @complete_due_wait = complete_due_wait
-      @retry_run_at = retry_run_at
-      @crash = crash
+      @execution = execution
     end
 
     #: (Integer, step: Object, attributes: Hash[String, Object?]) { -> Object? } -> void
@@ -34,7 +24,7 @@ module Durababble
       @root_task.async(transient: true) do |task|
         raise_if_cancel_requested!
         synchronize_store do
-          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name, worker_id: @worker_id)
+          @store.record_step_started(workflow_id: @workflow_id, command_id:, name: step.name, worker_id: @worker_id, event_index: allocate_history_event_index!)
         end
         crash!(:step_started)
 
@@ -50,7 +40,7 @@ module Durababble
           end
 
           assert_workflow_lease!
-          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output, worker_id: @worker_id) }
+          synchronize_store { @store.record_step_completed(workflow_id: @workflow_id, command_id:, result: output, worker_id: @worker_id, event_index: allocate_history_event_index!) }
           Observability.count("durababble.workflow.step.successes", attempt_attributes)
           crash!(:step_completed)
           raise_if_cancel_requested!
@@ -80,9 +70,9 @@ module Durababble
     #: (Integer, step: Object, wait_request: WaitRequest) -> void
     def record_wait(command_id, step:, wait_request:)
       step = step #: as untyped
-      suspend_workflow = @suspend_workflow_immediately.call
-      due_timer = wait_request.kind == "timer" && wait_request.wake_at && @timer_due.call(wait_request.wake_at)
-      next_run_at = @next_run_at_for_wait.call(wait_request)
+      suspend_workflow = @execution.suspend_workflow_immediately?
+      due_timer = wait_request.kind == "timer" && wait_request.wake_at && @execution.timer_due?(wait_request.wake_at)
+      next_run_at = @execution.next_run_at_for_wait(wait_request)
       synchronize_store do
         @store.record_wait(
           workflow_id: @workflow_id,
@@ -92,16 +82,17 @@ module Durababble
           suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
           next_run_at:,
+          event_index: allocate_history_event_index!,
         )
-        @remember_wait.call(command_id, step.name, wait_request)
+        @execution.remember_step_waiting(command_id, name: step.name, wait_request:)
       end
       crash!(:wait_recorded)
       if due_timer
-        @complete_due_wait.call(future(command_id), command_id, reserved_history_event: true)
+        @execution.complete_due_wait_timer!(future(command_id), command_id, reserved_history_event: true)
         return
       end
 
-      @defer_workflow_suspension.call(command_id)
+      @execution.defer_workflow_suspension(command_id)
     end
 
     # Control-flow errors are rejected onto the future unchanged; only an
@@ -134,6 +125,7 @@ module Durababble
           command_id:,
           error: "#{error.class}: #{error.message}",
           worker_id: @worker_id,
+          event_index: allocate_history_event_index!,
         )
       end
     end
@@ -158,13 +150,14 @@ module Durababble
         attributes.merge("durababble.retry.delay_ms" => (delay * 1000.0).round),
       )
       synchronize_store do
-        run_at = @retry_run_at.call(delay)
+        run_at = @execution.retry_run_at(delay)
         @store.record_step_failed_and_schedule_retry(
           workflow_id: @workflow_id,
           command_id:,
           error: message,
           worker_id: @worker_id,
           run_at:,
+          event_index: allocate_history_event_index!,
         )
       end
       crash_or(:step_failed_recorded, StepRetryScheduled.new(message))
@@ -181,6 +174,7 @@ module Durababble
           terminal: true,
           error_class: fallback_error.class.name,
           error_message: fallback_error.message,
+          event_index: allocate_history_event_index!,
         )
       end
       crash_or(:step_failed_recorded, fallback_error)
@@ -234,24 +228,29 @@ module Durababble
       @futures.fetch(command_id)
     end
 
-    #: () { -> Object? } -> Object?
+    #: () { -> untyped } -> untyped
     def synchronize_store(&block)
-      @synchronize_store.call(&block)
+      @execution.synchronize_store(&block)
+    end
+
+    #: () -> Integer
+    def allocate_history_event_index!
+      @execution.allocate_history_event_index!
     end
 
     #: () -> void
     def raise_if_cancel_requested!
-      @raise_if_cancel_requested.call
+      @execution.raise_if_cancel_requested!
     end
 
     #: () -> void
     def assert_workflow_lease!
-      @assert_workflow_lease.call
+      @execution.assert_workflow_lease!
     end
 
     #: (Symbol) -> Object?
     def crash!(point)
-      @crash.call(point)
+      @execution.crash!(point)
     end
   end
 end

@@ -219,6 +219,7 @@ module Durababble
                   workflow_id: target_id,
                   result: { "primer" => true },
                   worker_id:,
+                  event_index: h.next_event_index(target_id),
                 )
               end
               h.store.complete_target_activation(

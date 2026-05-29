@@ -317,6 +317,7 @@ class DurababbleWorkflowTerminationTest < DurababbleTestCase
           workflow_id:,
           result: { "approved" => true },
           worker_id: "command-worker",
+          event_index: next_event_index(workflow_id),
         )
 
         assert_hash_includes(

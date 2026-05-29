@@ -82,7 +82,7 @@ module Durababble
 
       #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle)
       def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
-        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current || WorkflowQueryContext.current
 
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child enqueue cannot specify store: or engine:" if store || engine
@@ -124,7 +124,7 @@ module Durababble
 
       #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (WorkflowRef | ChildWorkflowHandle)
       def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
-        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current
+        raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current || WorkflowQueryContext.current
 
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child start cannot specify store: or engine:" if store || engine
@@ -249,6 +249,15 @@ module Durababble
       @__durababble_execution__ || raise(Error, "durable step #{self.class.name}##{label} called outside workflow execution")
     end
 
+    # Sets the `@__durababble_query_context` flag while running `&block`. The
+    # flag is checked by `wrap_step_method` and the `wait_*`/`sleep*` helpers
+    # below so an exposed query can read workflow state without scheduling new
+    # work. Saves/restores the previous value so nested invocations unwind cleanly.
+    #: () { () -> Object? } -> Object?
+    def __durababble_with_query_context__(&block)
+      WorkflowQueryContext.with_current(true, &block)
+    end
+
     #: () -> StepContext
     def step_context
       __durababble_execution__.step_context
@@ -259,13 +268,6 @@ module Durababble
       raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
 
       Durababble.wait_until(time, context)
-    end
-
-    #: (Time, ?Object?) -> Object?
-    def sleep_until(time, context = {})
-      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
-
-      Durababble.sleep_until(time, context)
     end
 
     #: (Numeric, ?Object?) -> Object?
@@ -284,7 +286,7 @@ module Durababble
 
     #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
     def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel)
-      raise Error, "cannot start child workflows from an exposed query" if @__durababble_query_context
+      raise Error, "cannot start child workflows from an exposed query" if WorkflowQueryContext.current
 
       __durababble_execution__.call_child_workflow_start(
         workflow_class,
@@ -297,6 +299,11 @@ module Durababble
     end
 
     alias_method :start_workflow, :start_child
+
+    # True when the consumer of an in-progress `expose_stream` has gone away.
+    # Indefinite stream producers should poll this and return when it flips.
+    #: () -> bool
+    def stream_cancelled? = Durababble.stream_cancelled?
   end
 
   class ChildWorkflowHandle
@@ -540,6 +547,8 @@ module Durababble
         end
 
         route_query(method_name, args:, kwargs:)
+      elsif @workflow_class.exposed_streams.key?(method_name)
+        open_workflow_stream(method_name, args:, kwargs:)
       elsif (retry_policy = @workflow_class.exposed_commands[method_name])
         raise ArgumentError, "blocks cannot be passed to workflow command ##{method_name}: command arguments are serialized across nodes and blocks cannot be" if block
 
@@ -574,10 +583,73 @@ module Durababble
 
     #: (Symbol, ?bool) -> bool
     def respond_to_missing?(method_name, include_private = false)
-      @workflow_class.exposed_queries.key?(method_name) || @workflow_class.exposed_commands.key?(method_name) || super
+      @workflow_class.exposed_queries.key?(method_name) ||
+        @workflow_class.exposed_streams.key?(method_name) ||
+        @workflow_class.exposed_commands.key?(method_name) || super
     end
 
     private
+
+    # A workflow stream routes to the lease-holder when the workflow is running
+    # (so an indefinite stream observes live progress), otherwise it falls back
+    # to a local state snapshot (consistent with how exposed queries resolve).
+    #: (untyped, args: untyped, kwargs: untyped) -> ResultStream
+    def open_workflow_stream(method_name, args:, kwargs:)
+      lease = @store.current_workflow_lease(@workflow_id)
+      if lease
+        open_remote_workflow_stream(method_name, args:, kwargs:, lease:)
+      else
+        open_local_workflow_stream(method_name, args:, kwargs:)
+      end
+    end
+
+    # Opens the stream on the worker that currently holds the lease. The lease's
+    # `worker_id` is a worker *identity* (`id@host:port`); we resolve it to the
+    # bare RPC address before building the client, since the identity's `id`
+    # segment is for fencing, not addressing. The pool is taken from the lease
+    # (where the workflow is actually running), falling back to the ref's pool and
+    # then "default" — not hardcoded, so a workflow in a non-default pool routes
+    # to the right place.
+    #: (untyped, args: untyped, kwargs: untyped, lease: untyped) -> ResultStream
+    def open_remote_workflow_stream(method_name, args:, kwargs:, lease:)
+      worker_id = lease.fetch("worker_id")
+      worker_pool = lease.fetch("worker_pool", nil) || @worker_pool || "default"
+      factory = @store.rpc_client_factory
+      factory = factory #: as untyped
+      client = factory.call(WorkerIdentity.address_for(worker_id))
+      client.call_transient_stream(
+        worker_pool:,
+        workflow_id: @workflow_id,
+        class_name: @workflow_class.workflow_name,
+        method: method_name.to_s,
+        args: { "args" => args, "kwargs" => kwargs },
+      )
+    end
+
+    # No active lease: run the `expose_stream` method against a local snapshot
+    # instance as the `ResultStream`'s producer task, publishing the writer so
+    # `Durababble.stream_cancelled?` works inside the method body.
+    #: (untyped, args: untyped, kwargs: untyped) -> ResultStream
+    def open_local_workflow_stream(method_name, args:, kwargs:)
+      workflow_class = @workflow_class
+      store = @store
+      workflow_id = @workflow_id
+      ResultStream.new do |writer|
+        StreamExecutionContext.with_current(writer) do
+          instance = workflow_class.new #: as untyped
+          instance.instance_variable_set(:@__durababble_ref_store, store)
+          instance.instance_variable_set(:@__durababble_ref_workflow_id, workflow_id)
+          emit = ->(value) { writer.emit(value) }
+          WorkflowQueryContext.with_current(true) do
+            if kwargs.empty?
+              instance.public_send(method_name, *args, &emit)
+            else
+              instance.public_send(method_name, *args, **kwargs, &emit)
+            end
+          end
+        end
+      end
+    end
 
     #: (Symbol, args: Array[Object?], kwargs: Hash[Symbol, Object?]) -> Object?
     def route_query(method_name, args:, kwargs:)

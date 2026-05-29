@@ -33,7 +33,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
       end
     end
 
-    test "sleep_until waits can recover after crashing after wait persistence with #{backend.name}" do
+    test "wait_until waits can recover after crashing after wait persistence with #{backend.name}" do
       with_durababble_store(backend, "workflow_wait_timer_crash") do |store|
         store.migrate!
         wake_at = Time.now + 3600
@@ -41,7 +41,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
           workflow_name "direct-sleep-until-crash"
 
           define_method(:execute) do |input|
-            slept = sleep_until(wake_at, input.merge("slept" => true))
+            slept = wait_until(wake_at, input.merge("slept" => true))
             slept.merge("done" => true)
           end
         end
@@ -75,7 +75,7 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
           workflow_name "direct-wait-timestamp-precision"
 
           define_method(:execute) do |input|
-            sleep_until(wake_at, input.merge("slept" => true))
+            wait_until(wake_at, input.merge("slept" => true))
           end
         end
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "precision" })
@@ -263,8 +263,8 @@ class DurababbleWorkflowWaitTest < DurababbleTestCase
 
           define_method(:execute) do |input|
             Async do |task|
-              late_wait = task.async { sleep_until(late, input.merge("timer" => "late")) }
-              early_wait = task.async { sleep_until(early, input.merge("timer" => "early")) }
+              late_wait = task.async { wait_until(late, input.merge("timer" => "late")) }
+              early_wait = task.async { wait_until(early, input.merge("timer" => "early")) }
               [late_wait.wait, early_wait.wait]
             end.wait
           end

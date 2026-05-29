@@ -131,12 +131,12 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: [1, 2])
         store.claim_workflow(workflow_id:, worker_id: "raw-history-seeder", lease_seconds: 60)
         retry_shape = default_retry_shape
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile")
-        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile")
-        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 })
-        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 })
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 }, event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 }, event_index: next_event_index(workflow_id))
 
         run = Durababble::Engine.new(store:, worker_id: "raw-history-seeder").resume(workflow, workflow_id:)
 
@@ -216,9 +216,9 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
 
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
         store.claim_workflow(workflow_id:, worker_id: "failure-history-seeder", lease_seconds: 60)
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "risky_step", metadata: { "retry" => default_retry_shape })
-        store.record_step_started(workflow_id:, command_id: 0, name: "risky_step")
-        store.record_step_failed(workflow_id:, command_id: 0, error: "RuntimeError: persisted failure")
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "risky_step", metadata: { "retry" => default_retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "risky_step", event_index: next_event_index(workflow_id))
+        store.record_step_failed(workflow_id:, command_id: 0, error: "RuntimeError: persisted failure", event_index: next_event_index(workflow_id))
 
         run = Durababble::Engine.new(store:, worker_id: "failure-history-seeder").resume(workflow, workflow_id:)
 
@@ -741,12 +741,12 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
         store.claim_workflow(workflow_id:, worker_id: "history-seeder", lease_seconds: 60)
         retry_shape = default_retry_shape
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile")
-        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile")
-        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 })
-        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 })
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 }, event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 }, event_index: next_event_index(workflow_id))
 
         run = Timeout.timeout(1) do
           Durababble::Engine.new(store:, worker_id: "history-seeder").resume(workflow, workflow_id:)
@@ -780,12 +780,12 @@ class DurababbleAsyncWorkflowTest < DurababbleTestCase
         workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: {})
         store.claim_workflow(workflow_id:, worker_id: "history-seeder", lease_seconds: 60)
         retry_shape = default_retry_shape
-        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile")
-        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape })
-        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile")
-        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 })
-        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 })
+        store.record_step_scheduled(workflow_id:, command_id: 0, name: "fetch_profile", args: [1], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 0, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_scheduled(workflow_id:, command_id: 1, name: "fetch_profile", args: [2], metadata: { "retry" => retry_shape }, event_index: next_event_index(workflow_id))
+        store.record_step_started(workflow_id:, command_id: 1, name: "fetch_profile", event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 1, result: { "id" => 2 }, event_index: next_event_index(workflow_id))
+        store.record_step_completed(workflow_id:, command_id: 0, result: { "id" => 1 }, event_index: next_event_index(workflow_id))
 
         run = Timeout.timeout(1) do
           Durababble::Engine.new(store:, worker_id: "history-seeder").resume(workflow, workflow_id:)

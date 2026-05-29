@@ -28,13 +28,13 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         store.claim_workflow(workflow_id:, worker_id: "cleanup-worker", lease_seconds: 30)
 
         runnable_id = store.enqueue_workflow(name: "query-count-claim", input: { "ok" => true })
-        claimed = assert_sql_query_budget("claim_runnable_workflow", mysql: 3, postgres: 1) do
+        claimed = assert_sql_query_budget("claim_runnable_workflow", mysql: 2, postgres: 1) do
           store.claim_runnable_workflow(worker_id: "claim-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed, "id" => runnable_id, "status" => "running"
 
         targeted_id = store.enqueue_workflow(name: "query-count-targeted-claim", input: { "ok" => true })
-        targeted = assert_sql_query_budget("claim_workflow", mysql: 3, postgres: 2) do
+        targeted = assert_sql_query_budget("claim_workflow", mysql: 2, postgres: 2) do
           store.claim_workflow(workflow_id: targeted_id, worker_id: "target-worker", lease_seconds: 30)
         end
         assert_hash_includes targeted, "id" => targeted_id, "status" => "running"
@@ -62,27 +62,51 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         install_sql_query_counter
 
         started_workflow = store.create_workflow(name: "query-count-step-start", input: {})
-        attempt_id = assert_sql_query_budget("record_step_started", mysql: 6, postgres: 6) do
-          store.record_step_started(workflow_id: started_workflow, command_id: 0, name: "step")
+        started_index = next_event_index(started_workflow)
+        attempt_id = assert_sql_query_budget("record_step_started", mysql: 4, postgres: 5) do
+          store.record_step_started(
+            workflow_id: started_workflow,
+            command_id: 0,
+            name: "step",
+            event_index: started_index,
+          )
         end
         refute_nil attempt_id
 
         completed_workflow = store.create_workflow(name: "query-count-step-complete", input: {})
-        store.record_step_started(workflow_id: completed_workflow, command_id: 0, name: "step")
-        assert_sql_query_budget("record_step_completed", mysql: 5, postgres: 5) do
-          store.record_step_completed(workflow_id: completed_workflow, command_id: 0, result: { "done" => true })
+        store.record_step_started(
+          workflow_id: completed_workflow,
+          command_id: 0,
+          name: "step",
+          event_index: next_event_index(completed_workflow),
+        )
+        completed_index = next_event_index(completed_workflow)
+        assert_sql_query_budget("record_step_completed", mysql: 3, postgres: 4) do
+          store.record_step_completed(
+            workflow_id: completed_workflow,
+            command_id: 0,
+            result: { "done" => true },
+            event_index: completed_index,
+          )
         end
         assert_hash_includes store.steps_for(completed_workflow).first, "status" => "completed", "result" => { "done" => true }
 
         wait_workflow = store.create_workflow(name: "query-count-record-wait", input: {})
-        store.record_step_started(workflow_id: wait_workflow, command_id: 0, name: "timer")
-        wait_id = assert_sql_query_budget("record_wait", mysql: 5, postgres: 5) do
+        store.record_step_started(
+          workflow_id: wait_workflow,
+          command_id: 0,
+          name: "timer",
+          event_index: next_event_index(wait_workflow),
+        )
+        wait_index = next_event_index(wait_workflow)
+        wait_id = assert_sql_query_budget("record_wait", mysql: 3, postgres: 4) do
           store.record_wait(
             workflow_id: wait_workflow,
             command_id: 0,
             name: "timer",
             wait_request: Durababble.wait_until(Time.utc(2026, 2, 1, 0, 0, 0), { "timer" => true }),
             suspend_workflow: false,
+            event_index: wait_index,
           )
         end
         refute_nil wait_id
@@ -107,7 +131,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
 
         claim_outbox_workflow = store.enqueue_workflow(name: "query-count-claim-outbox", input: {})
         claim_outbox_id = store.enqueue_outbox(workflow_id: claim_outbox_workflow, topic: "events", payload: { "ok" => true }, key: "query-count-claim-outbox")
-        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 3, postgres: 1) do
+        claimed_outbox = assert_sql_query_budget("claim_outbox", mysql: 2, postgres: 1) do
           store.claim_outbox(worker_id: "outbox-worker", lease_seconds: 30)
         end
         assert_hash_includes claimed_outbox, "id" => claim_outbox_id, "status" => "processing"
@@ -137,7 +161,7 @@ class DurababbleStoreQueryCountTest < DurababbleTestCase
         assert_equal [inbox_claim_command_id], inbox_messages.map { |message| message.fetch("id") }
 
         target_activation_command_id = enqueue_object_command("target-activation-claim-object", object_type: "query-count-target")
-        target_activation = assert_sql_query_budget("claim_target_activation", mysql: 3, postgres: 2) do
+        target_activation = assert_sql_query_budget("claim_target_activation", mysql: 2, postgres: 2) do
           store.claim_target_activation(worker_id: "target-activation-worker", lease_seconds: 30, target_kinds: ["object"], target_types: ["query-count-target"])
         end
         assert_hash_includes target_activation, "target_kind" => "object", "target_type" => "query-count-target", "target_id" => "target-activation-claim-object", "status" => "running"

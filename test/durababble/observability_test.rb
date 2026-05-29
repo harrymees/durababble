@@ -172,11 +172,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
     def workflow_history_count_for(workflow_id) = history[workflow_id].length
     def step_heartbeat_cursor(workflow_id:, command_id: nil, position: nil) = nil
 
-    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil)
+    def record_step_scheduled(workflow_id:, command_id:, name:, args: [], kwargs: {}, metadata: {}, worker_id: nil, event_index:)
       append_history(workflow_id, "kind" => "step_scheduled", "command_id" => command_id, "name" => name, "payload" => { "name" => name, "args" => args, "kwargs" => kwargs, "retry" => metadata.fetch("retry") })
     end
 
-    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_started(workflow_id:, name:, command_id: nil, position: nil, worker_id: nil, event_index:)
       position = command_id || position
       step = { "workflow_id" => workflow_id, "position" => position, "name" => name, "status" => "running" }
       steps[workflow_id].delete_if { |row| row.fetch("position") == position }
@@ -185,7 +185,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_started", "command_id" => position, "name" => name, "attempt_id" => attempts[workflow_id].last.fetch("id"))
     end
 
-    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil)
+    def record_step_completed(workflow_id:, result:, command_id: nil, position: nil, worker_id: nil, event_index:)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "completed", "result" => result)
@@ -193,7 +193,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_completed", "command_id" => position, "payload" => result)
     end
 
-    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil)
+    def record_step_failed(workflow_id:, error:, command_id: nil, position: nil, worker_id: nil, terminal: false, error_class: nil, error_message: nil, event_index:)
       position = command_id || position
       step = steps[workflow_id].find { |row| row.fetch("position") == position }
       step.merge!("status" => "failed", "error" => error)
@@ -207,7 +207,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "payload" => payload, "error" => error)
     end
 
-    def complete_workflow(workflow_id, result:, worker_id: nil)
+    def complete_workflow(workflow_id, result:, worker_id: nil, wake_parent: true)
       workflows.fetch(workflow_id).merge!("status" => "completed", "result" => result, "locked_by" => nil)
     end
 
@@ -225,6 +225,11 @@ class DurababbleObservabilityTest < DurababbleTestCase
   class ObjectStore
     Result = Data.define(:affected_rows)
 
+    # Every store exposes these owner-routing hooks (set as a pair by the worker
+    # runtime); a nil pair means this process runs no worker, so queries claim a
+    # synthesized local worker id.
+    attr_accessor :local_worker_id, :local_transient_handler
+
     def initialize
       @state = {}
       @commands = {}
@@ -232,6 +237,13 @@ class DurababbleObservabilityTest < DurababbleTestCase
 
     def migrate! = self
     def object_state(object_type:, object_id:) = @state[[object_type, object_id]]
+
+    def current_object_lease(_object_type, _object_id) = nil
+
+    def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds:)
+      _ = [object_type, object_id, lease_seconds]
+      { "worker_pool" => worker_pool, "worker_id" => worker_id }
+    end
 
     def object_state_entry(object_type:, object_id:)
       state = @state[[object_type, object_id]]

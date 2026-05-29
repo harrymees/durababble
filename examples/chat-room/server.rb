@@ -218,17 +218,20 @@ module ChatRoomExample
       row = @store.workflow(workflow_id)
       input = row.fetch("input")
       room_id = input.fetch("room")
-      snapshot = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool).snapshot
-      json(
-        200,
+      payload = {
         "workflow_id" => workflow_id,
         "room" => room_id,
         "status" => row.fetch("status"),
         "terminal" => TERMINAL_STATUSES.include?(row.fetch("status")),
         "result" => row["result"],
         "error" => row["error"],
-        "room_snapshot" => snapshot,
-      )
+      }
+      begin
+        payload["room_snapshot"] = ChatRoom.at(room_id, store: @store, worker_pool: ChatRoomExample.object_worker_pool).snapshot
+      rescue Durababble::WorkflowRpc::Error => e
+        payload["room_snapshot_blocked"] = e.message
+      end
+      json(200, payload)
     end
 
     def json(status, payload)

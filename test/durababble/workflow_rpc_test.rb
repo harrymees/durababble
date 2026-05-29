@@ -591,13 +591,14 @@ class DurababbleWorkflowRpcTest < DurababbleTestCase
 
   def record_waiting_workflow
     claim_as("waiting-owner")
-    store.record_step_scheduled(workflow_id:, command_id: 0, name: "wait")
-    store.record_step_started(workflow_id:, command_id: 0, name: "wait")
+    store.record_step_scheduled(workflow_id:, command_id: 0, name: "wait", event_index: next_event_index(workflow_id))
+    store.record_step_started(workflow_id:, command_id: 0, name: "wait", event_index: next_event_index(workflow_id))
     store.record_wait(
       workflow_id:,
       command_id: 0,
       name: "wait",
       wait_request: Durababble::WaitRequest.new(kind: "timer", wake_at: Time.now + 3600, event_key: nil, context: {}),
+      event_index: next_event_index(workflow_id),
     )
   end
 

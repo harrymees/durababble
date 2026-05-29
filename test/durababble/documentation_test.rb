@@ -127,8 +127,8 @@ class DurababbleDocumentationTest < DurababbleTestCase
     refute_includes workflow_visible, "Durababble::Engine.new"
 
     sleep_visible = visible_marked_ruby_code(workflows, "workflow-sleep-example")
-    assert_includes sleep_visible, "sleep_until(reminder.fetch(\"send_at\"), reminder)"
-    refute_includes sleep_visible, "step def sleep_until_reminder_time"
+    assert_includes sleep_visible, "wait_until(reminder.fetch(\"send_at\"), reminder)"
+    refute_includes sleep_visible, "step def wait_until_reminder_time"
     refute_includes sleep_visible, "Durababble::Store.connect"
     refute_includes sleep_visible, "Durababble::Worker.new"
 
