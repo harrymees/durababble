@@ -72,6 +72,7 @@ module Durababble
                     workflow_id:,
                     result: { "ok" => id },
                     worker_id: "command-worker",
+                    event_index: h.next_event_index(workflow_id),
                   )
                   completed << id
                 end

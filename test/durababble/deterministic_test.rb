@@ -337,23 +337,24 @@ class DurababbleDeterministicTest < DurababbleTestCase
 
     workflow_id = store.enqueue_workflow(name: "virtual-history", input: {})
     store.claim_workflow(workflow_id:, worker_id: "worker-a", lease_seconds: 10)
-    store.record_step_scheduled(workflow_id:, command_id: 0, name: "sleep", args: [10])
-    store.record_step_started(workflow_id:, command_id: 0, name: "sleep")
+    store.record_step_scheduled(workflow_id:, command_id: 0, name: "sleep", args: [10], event_index: next_event_index(workflow_id, store:))
+    store.record_step_started(workflow_id:, command_id: 0, name: "sleep", event_index: next_event_index(workflow_id, store:))
     store.record_wait(
       workflow_id:,
       command_id: 0,
       name: "sleep",
       wait_request: Durababble.wait_until(store.current_time + 10, { "started" => true }),
       suspend_workflow: false,
+      event_index: next_event_index(workflow_id, store:),
     )
 
     assert_equal "running", store.workflow(workflow_id).fetch("status")
-    store.record_step_completed(workflow_id:, command_id: 0, result: { "started" => true })
+    store.record_step_completed(workflow_id:, command_id: 0, result: { "started" => true }, event_index: next_event_index(workflow_id, store:))
     assert_equal "running", store.workflow(workflow_id).fetch("status")
 
-    store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"])
-    store.record_step_started(workflow_id:, command_id: 1, name: "cancelable")
-    store.record_step_canceled(workflow_id:, position: 1, error: "workflow cancellation requested")
+    store.record_step_scheduled(workflow_id:, command_id: 1, name: "cancelable", args: ["work"], event_index: next_event_index(workflow_id, store:))
+    store.record_step_started(workflow_id:, command_id: 1, name: "cancelable", event_index: next_event_index(workflow_id, store:))
+    store.record_step_canceled(workflow_id:, position: 1, error: "workflow cancellation requested", event_index: next_event_index(workflow_id, store:))
 
     assert_equal(
       ["step_scheduled", "step_started", "step_waiting", "step_completed", "step_scheduled", "step_started", "step_canceled"],

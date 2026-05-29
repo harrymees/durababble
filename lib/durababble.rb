@@ -366,8 +366,6 @@ module Durababble
       wait_request
     end
 
-    alias_method :sleep_until, :wait_until
-
     #: (Numeric, ?Object?) -> Object?
     def sleep(duration, context = {})
       execution = WorkflowExecutionContext.current
@@ -384,6 +382,26 @@ module Durababble
 
       execution.wait_condition(timeout:, &block)
     end
+
+    # True when the consumer of the streaming-result RPC currently being produced
+    # has gone away (closed the stream / cancelled the gRPC response). An
+    # `expose_stream` method producing an indefinite stream should poll this and
+    # return when it flips. Outside a streaming producer it is always false.
+    #: () -> bool
+    def stream_cancelled?
+      writer = StreamExecutionContext.current
+      writer ? writer.cancelled? : false
+    end
+
+    # Process-global `ObjectStreamHost` registered by the running worker
+    # runtime, used by `DurableObjectRef#open_object_stream` to self-route a
+    # first-opener via loopback RPC when no live lease yet exists. Cleared on
+    # runtime shutdown. With multiple worker runtimes in one process (test HA
+    # only) this is last-writer-wins; the high-value crash / evict / heartbeat
+    # tests are written at the RPC + dispatcher level where the host is passed
+    # in directly, so the caveat does not bite.
+    #: ObjectStreamHost?
+    attr_accessor :local_stream_host
 
     private
 
@@ -455,4 +473,7 @@ require_relative "durababble/worker"
 require_relative "durababble/worker_runtime"
 
 require_relative "durababble/workflow_rpc"
+require_relative "durababble/result_stream"
 require_relative "durababble/rpc_transport"
+require_relative "durababble/object_stream_host"
+require_relative "durababble/stream_dispatcher"

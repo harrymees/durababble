@@ -89,7 +89,7 @@ class DurababbleHatchetInspiredTest < DurababbleTestCase
         make_workflow_timer_due(store, workflow_id, at: store.workflow(workflow_id).fetch("next_run_at"))
         store.claim_workflow(workflow_id:, worker_id: "timer-version", lease_seconds: 60)
         wait_context = store.wait_snapshots_for(workflow_id).first.fetch("context")
-        store.record_step_completed(workflow_id:, command_id: 1, result: wait_context, worker_id: "timer-version")
+        store.record_step_completed(workflow_id:, command_id: 1, result: wait_context, worker_id: "timer-version", event_index: next_event_index(workflow_id))
         store.suspend_workflow(workflow_id:, worker_id: "timer-version")
 
         run = Durababble::Engine.new(store:, worker_id: "second-version").resume(second_version, workflow_id:)

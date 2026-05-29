@@ -69,6 +69,13 @@ module Durababble
         @checks << [description, block]
       end
 
+      # Mirrors the lease holder's in-memory allocation for scenarios that append
+      # history directly through the store rather than via the engine.
+      #: (untyped) -> Integer
+      def next_event_index(workflow_id)
+        Durababble::WorkflowReplayHistory.next_event_index_after(store.workflow_history_for(workflow_id))
+      end
+
       #: () -> void
       def prepare_for_run!
         @previous_transition_snapshot = transition_snapshot if @monitor_transitions

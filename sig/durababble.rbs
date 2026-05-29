@@ -3,6 +3,11 @@ module Async
     class Client
     end
   end
+
+  module GRPC
+    class Client
+    end
+  end
 end
 
 module Durababble
@@ -68,6 +73,8 @@ module Durababble
 
   interface _RpcDeliverMessageClient
     def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
+    def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+    def call_transient_stream: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> ResultStream
   end
 
   interface _RpcClientFactory
@@ -76,6 +83,14 @@ module Durababble
 
   interface _TransientHandler
     def call: (request: Object, args: serialized_payload) -> serialized_payload
+  end
+
+  interface _StreamHandler
+    def call: (request: Object, args: serialized_payload, writer: Rpc::StreamWriter) -> void
+  end
+
+  interface _WorkerIdProvider
+    def call: () -> String
   end
 
   interface _RpcRequester
@@ -125,6 +140,9 @@ module Durababble
   end
 
   class CommandTimeout < Error
+  end
+
+  class ObjectReadBlocked < Error
   end
 
   class IdempotencyKeyConflict < Error
@@ -232,6 +250,8 @@ module Durababble
     attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
     attr_accessor local_workflow_rpc_node_id: String?
     attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
+    attr_accessor local_worker_id: String?
+    attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
     def self.from_active_record: (connection_pool: _ActiveRecordConnectionPool, ?schema: String, ?owner: _ActiveRecordOwner?) -> Store
@@ -267,13 +287,13 @@ module Durababble
     def complete_workflow: (String workflow_id, result: serialized_payload, ?worker_id: String?) -> Object
     def cancel_workflow: (String workflow_id, reason: String?, ?result: serialized_payload, ?worker_id: String?) -> Object
     def fail_workflow: (String workflow_id, error: String, ?worker_id: String?) -> Object
-    def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
-    def record_step_started: (workflow_id: String, name: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
-    def record_step_completed: (workflow_id: String, result: serialized_payload, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
-    def record_step_failed: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> void
-    def record_step_failed_and_schedule_retry: (workflow_id: String, error: String, run_at: Time, worker_id: String, ?command_id: Integer?, ?position: Integer?) -> Object?
-    def record_step_canceled: (workflow_id: String, error: String, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
-    def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
+    def record_step_scheduled: (workflow_id: String, command_id: Integer, name: String, event_index: Integer, ?args: Array[serialized_payload], ?kwargs: Hash[Symbol, serialized_payload], ?metadata: Hash[String, serialized_payload], ?worker_id: String?) -> void
+    def record_step_started: (workflow_id: String, name: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> String
+    def record_step_completed: (workflow_id: String, result: serialized_payload, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_step_failed: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?, ?terminal: bool, ?error_class: String?, ?error_message: String?) -> void
+    def record_step_failed_and_schedule_retry: (workflow_id: String, error: String, run_at: Time, worker_id: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?) -> Object?
+    def record_step_canceled: (workflow_id: String, error: String, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?worker_id: String?) -> void
+    def record_wait: (workflow_id: String, name: String, wait_request: WaitRequest, event_index: Integer, ?command_id: Integer?, ?position: Integer?, ?suspend_workflow: bool, ?worker_id: String?) -> String
     def wait_snapshots_for: (String workflow_id) -> Array[wait_snapshot]
     def workflow_history_for: (String workflow_id) -> Array[workflow_row]
     def workflow_history_count_for: (String workflow_id) -> Integer
@@ -307,9 +327,9 @@ module Durababble
     def complete_object_command: (command_id: String, result: serialized_payload, ?object_type: String?, ?object_id: String?, ?state: serialized_payload, ?wakeup_changes: Array[ObjectWakeupChange], ?worker_id: String?) -> Object?
     def fail_object_command: (command_id: String, error: String, ?worker_id: String?, ?terminal: bool) -> Object?
     def retry_object_command: (command_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
-    def retry_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time) -> Object?
-    def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String) -> Object?
-    def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String) -> Object?
+    def retry_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, ready_at: Time, event_index: Integer) -> Object?
+    def complete_workflow_command: (message_id: String, workflow_id: String, result: serialized_payload, worker_id: String, event_index: Integer) -> Object?
+    def fail_workflow_command: (message_id: String, workflow_id: String, error: String, worker_id: String, event_index: Integer) -> Object?
     def start_child_workflow: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: serialized_payload, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> workflow_row
     def observe_child_workflow: (String child_workflow_id) -> workflow_row
     def child_workflow_rows_for_parent: (parent_workflow_id: String) -> Array[workflow_row]
@@ -325,17 +345,18 @@ module Durababble
     def self.step: (?Symbol method_name, ?retry: retry_config | false | nil) -> Symbol?
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
+    def self.expose_stream: (?Symbol method_name) -> Symbol?
 
     def __durababble_execution__: () -> WorkflowExecution
     def __durababble_execution__=: (WorkflowExecution? execution) -> WorkflowExecution?
     def execute: (Input input) -> Output
     def step_context: () -> StepContext
     def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
-    def sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
     def sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def start_child: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
     def start_workflow: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
+    def stream_cancelled?: () -> bool
   end
 
   class ChildWorkflowHandle[Input, Output]
@@ -385,6 +406,7 @@ module Durababble
     def self.tell: (Id durable_id, Symbol method_name, *serialized_payload args, ?store: Store, ?engine: Engine, ?worker_pool: String?, ?idempotency_key: String?, **serialized_payload kwargs) -> String
     def self.expose: (?Symbol method_name) -> Symbol?
     def self.expose_command: (?Symbol method_name, ?retry: retry_config | false | nil, ?retry_policy: retry_config | false | nil) -> Symbol?
+    def self.expose_stream: (?Symbol method_name) -> Symbol?
 
     attr_reader durable_id: Id
     attr_reader command_context: CommandContext?
@@ -399,6 +421,7 @@ module Durababble
     def start_workflow: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
     def state_dirty?: () -> bool
     def wakeup_changes: () -> Array[ObjectWakeupChange]
+    def stream_cancelled?: () -> bool
   end
 
   class DurableObjectRef[Id, State]
@@ -409,9 +432,84 @@ module Durababble
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
   end
 
+  class DurableObjectTransientHandler
+    def self.assert_read_gate_open!: (Store store, object_type: String, object_id: String, ?worker_pool: String) -> void
+    def initialize: (store: Store, objects: object_registry, node_id: String | _WorkerIdProvider) -> void
+    def call: (request: Object, args: serialized_payload) -> serialized_payload
+  end
+
   class DurableObjectExecutor
     def initialize: (store: Store, objects: object_registry, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def drain_object_inbox: (String object_type, object_id: String, ?limit: Integer) -> Integer
+  end
+
+  # Enumerable consumer for a streaming-result RPC, built on the async reactor
+  # with no background threads: the producer runs as a transient child task and
+  # bridges to the consumer through a bounded `Async::LimitedQueue`. `each`
+  # self-wraps in `Sync {}` off a reactor; `read` requires an ambient reactor
+  # (raises `NotOnReactor` otherwise). `each` re-raises a producer error after any
+  # values already delivered; `read` returns the next value or nil at graceful
+  # end; `close` is idempotent.
+  class ResultStream
+    include Enumerable[serialized_payload]
+
+    # Raised when `read` is called without an ambient reactor task.
+    class NotOnReactor < Durababble::Error
+    end
+
+    # Producer-facing handle wrapping the bounded bridge queue (an
+    # `Async::LimitedQueue`, which RBS has no signature for, hence `Object`).
+    class Writer
+      def initialize: (Object queue) -> void
+      def emit: (serialized_payload value) -> void
+      def cancelled?: () -> bool
+    end
+
+    def initialize: () { (Writer writer) -> void } -> void
+    def each: () { (serialized_payload value) -> void } -> ResultStream
+            | () -> Enumerator[serialized_payload, ResultStream]
+    def read: () -> serialized_payload
+    def close: () -> void
+  end
+
+  # Fiber-local pointer to the active streaming-result writer, read by
+  # `Durababble.stream_cancelled?` from inside an `expose_stream` method body.
+  module StreamExecutionContext
+    def self.current: () -> Object?
+    def self.with_current: (Object writer) { () -> serialized_payload } -> serialized_payload
+  end
+
+  # Server-side dispatcher for `call_transient_stream` RPCs: resolves the target
+  # workflow/object class, verifies lease ownership, and runs its `expose_stream`
+  # method, forwarding yielded values to the RPC writer.
+  class StreamDispatcher
+    def initialize: (store: Store, workflows: workflow_registry, objects: object_registry, node_id: String, ?object_stream_host: ObjectStreamHost?, ?lease_seconds: Integer) -> void
+    def call: (request: Rpc::Messages::TransientRequest, args: Hash[String, serialized_payload]?, writer: Rpc::StreamWriter) -> void
+  end
+
+  # Per-process refcounted holder for the unified `durable_objects` lease used
+  # by exposed-stream RPCs. Claims the row on the first open per object, shares
+  # it for concurrent openers, renews from the worker's Async supervisor, and
+  # releases on the last close or on eviction.
+  class ObjectStreamHost
+    class Entry
+      attr_accessor refcount: Integer
+      attr_accessor lost: bool
+      def initialize: (refcount: Integer, lost: bool) -> void
+    end
+
+    attr_reader worker_id: String
+    attr_reader node_id: String
+    attr_reader worker_pool: String
+    attr_reader renew_interval: Float
+
+    def initialize: (store: Store, worker_id: String, node_id: String, ?worker_pool: String, ?lease_seconds: Integer, ?renew_interval: Float?) -> void
+    def start_async: (?parent: Object?) -> self
+    def with_lease: [T] (worker_pool: String, object_type: String, object_id: String, ?lease_seconds: Integer?) { (Entry) -> T } -> T
+    def evict!: (worker_pool: String, object_type: String, object_id: String) -> bool
+    def evict_all!: () -> Integer
+    def stop!: () -> void
+    def holds?: (worker_pool: String, object_type: String, object_id: String) -> bool
   end
 
   class WaitRequest
@@ -500,6 +598,7 @@ module Durababble
     def waiting_timer: (Integer command_id) -> wait_metadata?
     def waiting_timer_or_child_workflow: (Integer command_id) -> wait_metadata?
     def earliest_unresolved_timer_wake_at: () -> durable_timestamp?
+    def allocate_event_index!: () -> Integer
   end
 
   class RetryPolicy
@@ -592,6 +691,15 @@ module Durababble
       def rpc_address_for: (String node_id) -> String?
     end
 
+    # Server-side producer handle: `emit` writes one value frame to the gRPC
+    # response stream; `cancelled?` reports whether the consumer reset the stream.
+    class StreamWriter
+      def initialize: (Object output) -> void
+      def emit: (serialized_payload value) -> void
+      def cancelled?: () -> bool
+      def close: () -> void
+    end
+
     module Messages
       class AwakenBatchRequest
         attr_reader worker_pool: String
@@ -648,6 +756,15 @@ module Durababble
         def initialize: (?klass: String, ?message: String, ?backtrace: Array[String]) -> void
       end
 
+      class StreamFrame
+        attr_reader kind: Symbol
+        attr_reader value: serialized_payload
+        attr_reader error: RemoteError?
+        def initialize: (?kind: Symbol, ?value: serialized_payload, ?error: RemoteError?) -> void
+        def value?: () -> bool
+        def error?: () -> bool
+      end
+
       class TransientResponse
         attr_reader ok: String?
         attr_reader err: RemoteError?
@@ -667,6 +784,7 @@ module Durababble
       def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
       def call_transient_response: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> Messages::TransientResponse
       def call_transient: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> serialized_payload
+      def call_transient_stream: (worker_pool: String, method: String, args: serialized_payload, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer) -> ResultStream
     end
 
     class WorkflowClient
@@ -679,7 +797,7 @@ module Durababble
       attr_reader host: String
       attr_reader port: Integer?
 
-      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?stream_handler: _StreamHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
       def start: () -> self
       def start_async: (?parent: Object) -> self
       def stop: () -> void
@@ -689,6 +807,7 @@ module Durababble
 
   attr_accessor self.default_store: Store?
   attr_accessor self.default_engine: Engine?
+  attr_accessor self.local_stream_host: ObjectStreamHost?
 
   def self.default_database_url: () -> String
   def self.default_schema: () -> String
@@ -701,7 +820,7 @@ module Durababble
   def self.step: (String | Symbol name, ?retry: RetryPolicy | retry_config | nil, ?retry_policy: RetryPolicy | retry_config | nil) { (*serialized_payload args, **serialized_payload kwargs) -> serialized_payload } -> Step
   def self.step_context: () -> StepContext
   def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
-  def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
   def self.wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
+  def self.stream_cancelled?: () -> bool
 end

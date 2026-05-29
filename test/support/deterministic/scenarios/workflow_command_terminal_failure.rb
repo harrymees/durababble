@@ -56,10 +56,10 @@ module Durababble
               messages.each do |message|
                 id = message.fetch("id")
                 if id == doomed
-                  h.store.fail_workflow_command(message_id: id, workflow_id:, error: "terminal command failure", worker_id: "command-worker")
+                  h.store.fail_workflow_command(message_id: id, workflow_id:, error: "terminal command failure", worker_id: "command-worker", event_index: h.next_event_index(workflow_id))
                   dead_lettered << id
                 else
-                  h.store.complete_workflow_command(message_id: id, workflow_id:, result: { "ok" => id }, worker_id: "command-worker")
+                  h.store.complete_workflow_command(message_id: id, workflow_id:, result: { "ok" => id }, worker_id: "command-worker", event_index: h.next_event_index(workflow_id))
                   completed << id
                 end
               end

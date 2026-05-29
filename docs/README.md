@@ -5,6 +5,8 @@ weight: 1
 
 This folder contains the Zeitung documentation source for Durababble. Run Zeitung commands from the repository root so `docs/content/` resolves correctly.
 
+> **Note:** Zeitung is a thin wrapper around [Hugo](https://gohugo.io). That is why the build invokes the `hugo` binary directly (in the `docs:build` Rake task and in CI) and the site configuration lives in `hugo.toml`. Everywhere else, "Zeitung" is the name we use for the docs toolchain.
+
 ## Local Preview
 
 ```shell

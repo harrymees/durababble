@@ -122,7 +122,7 @@ class DurababbleChildWorkflowTest < DurababbleTestCase
         id: input.fetch("child_id"),
         cancellation: :abandon,
       )
-      timer_task = Async { sleep_until(input.fetch("timer_at"), { "timer" => true }) }
+      timer_task = Async { wait_until(input.fetch("timer_at"), { "timer" => true }) }
       child_result = handle.await(poll_interval: 0)
       { "child" => child_result, "timer" => timer_task.wait }
     end

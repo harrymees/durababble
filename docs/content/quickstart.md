@@ -62,7 +62,7 @@ Workflows can park themselves without holding a worker thread. `wait_until` is a
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    delayed = sleep_until(reminder.fetch("send_at"), reminder)
+    delayed = wait_until(reminder.fetch("send_at"), reminder)
     send_reminder(delayed)
   end
 
@@ -132,6 +132,7 @@ handle.note(message: "approved by legal")
 
 - [Workflows](workflows.md) for cancellation, replay, and the full step model.
 - [Durable Objects](durable-objects.md) for object commands, mailboxes, and RPC.
+- [Cluster RPC](cluster-rpc.md) for how [simple RPCs and command RPCs differ](cluster-rpc.md#simple-rpcs-vs-command-rpcs), and how the worker mesh routes them.
 - [Storage](storage.md) for what gets persisted and why.
 - [Observability](observability.md) for OpenTelemetry spans and metrics.
 - [Testing](testing.md) for durable object and workflow tests in application code.

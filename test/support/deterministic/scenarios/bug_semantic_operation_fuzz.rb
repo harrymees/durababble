@@ -99,14 +99,15 @@ module Durababble
 
           backoff_id = h.store.enqueue_workflow(name: "semantic-counter", input: { "count" => seed }, id: "semantic-backoff")
           h.store.claim_workflow(workflow_id: backoff_id, worker_id: "backoff-owner", lease_seconds: 30)
-          h.store.record_step_scheduled(workflow_id: backoff_id, command_id: 0, name: "increment", worker_id: "backoff-owner")
-          h.store.record_step_started(workflow_id: backoff_id, command_id: 0, name: "increment", worker_id: "backoff-owner")
+          h.store.record_step_scheduled(workflow_id: backoff_id, command_id: 0, name: "increment", worker_id: "backoff-owner", event_index: h.next_event_index(backoff_id))
+          h.store.record_step_started(workflow_id: backoff_id, command_id: 0, name: "increment", worker_id: "backoff-owner", event_index: h.next_event_index(backoff_id))
           h.store.record_step_failed_and_schedule_retry(
             workflow_id: backoff_id,
             command_id: 0,
             error: "transient backoff",
             worker_id: "backoff-owner",
             run_at: h.store.current_time + 100,
+            event_index: h.next_event_index(backoff_id),
           )
 
           outbox_workflow_id = h.store.enqueue_workflow(name: "semantic-counter", input: { "count" => seed }, id: "semantic-outbox")
@@ -208,6 +209,7 @@ module Durababble
               name: "poke",
               attempt_id: "monitor-command-message",
               payload: { "message_id" => "monitor-command-message", "result" => { "ok" => true } },
+              event_index: h.next_event_index(command_monitor_id),
             )
           end
 
@@ -276,6 +278,7 @@ module Durababble
                 workflow_id: command_workflow_id,
                 result: { "unexpected" => true },
                 worker_id: "no-lease-command",
+                event_index: h.next_event_index(command_workflow_id),
               )
             end
           end
@@ -303,6 +306,7 @@ module Durababble
                   workflow_id: command_workflow_id,
                   result: { "ok" => true },
                   worker_id: "command-recovery",
+                  event_index: h.next_event_index(command_workflow_id),
                 )
                 h.store.complete_target_activation(
                   target_kind: "workflow",
@@ -334,7 +338,7 @@ module Durababble
                 when "stale_activation_complete"
                   h.store.complete_target_activation(target_kind: "object", target_type: "semantic-object", target_id: "activation", worker_id: "stale-activation")
                 when "workflow_command_without_workflow_lease"
-                  h.store.complete_workflow_command(message_id: command_message_id, workflow_id: command_workflow_id, result: { "random" => i }, worker_id: "no-lease-command")
+                  h.store.complete_workflow_command(message_id: command_message_id, workflow_id: command_workflow_id, result: { "random" => i }, worker_id: "no-lease-command", event_index: h.next_event_index(command_workflow_id))
                 end
               end
             end

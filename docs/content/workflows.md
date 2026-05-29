@@ -184,7 +184,7 @@ Workflow ids are permanent uniqueness keys. A completed, failed, canceled, or te
 
 ## Sleeping
 
-A workflow can park itself without keeping a worker thread busy. `sleep_until(time, context)` and `wait_until(time, context)` are timer waits: the workflow resumes at or after the given time. Under the hood, Durababble stores wait history, releases the worker lease, and makes the workflow claimable through its `next_run_at` when the timer is due.
+A workflow can park itself without keeping a worker thread busy. `wait_until(time, context)` is a timer wait: the workflow resumes at or after the given time. Under the hood, Durababble stores wait history, releases the worker lease, and makes the workflow claimable through its `next_run_at` when the timer is due.
 
 Timer waits are useful for reminders, delayed retries that are part of business logic, cooling-off periods, scheduled followups, or "do not continue before this time" gates:
 
@@ -201,7 +201,7 @@ Durababble.default_store = store
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    after_delay = sleep_until(reminder.fetch("send_at"), reminder)
+    after_delay = wait_until(reminder.fetch("send_at"), reminder)
     send_reminder(after_delay)
   end
 
@@ -254,7 +254,7 @@ resume_waiting_workflow(store, SendReminderAfterDelay, reminder.workflow_id)
 
 <!-- DOCS:workflow-sleep-example:end -->
 
-The `context` you pass to `sleep_until` or `wait_until` is the value Durababble resumes the workflow with when the timer fires. For workflows that need to resume on an external signal rather than a clock — webhook delivery, human approval, a batch finishing elsewhere — use a workflow command (`expose_command`) from the signaling process instead.
+The `context` you pass to `wait_until` is the value Durababble resumes the workflow with when the timer fires. For workflows that need to resume on an external signal rather than a clock — webhook delivery, human approval, a batch finishing elsewhere — use a workflow command (`expose_command`) from the signaling process instead.
 
 Do not use `Thread.sleep` in workflow code, because that actually blocks the worker thread instead of durably parking the workflow. Direct host wall-clock time, randomness, blocking sleeps, process calls, and blocking file/IO calls from workflow orchestration raise `Durababble::DeterminismError`; put those effects in durable steps or outside workflow execution, where ordinary Ruby host semantics still apply.
 
@@ -403,7 +403,7 @@ Workflows can expose an RPC surface for other members of the Durababble cluster 
 
 RPCs are done by getting a workflow handle for your workflow, and then calling Ruby methods on the handle itself. A caller does not need a Ruby object in the same process as the worker; it needs the workflow id, the workflow class, and a store.
 
-There are two kinds of RPCs you can expose: simple RPCs, and command RPCs.
+There are two kinds of RPCs you can expose: simple RPCs, and command RPCs. See [Simple RPCs vs Command RPCs](cluster-rpc.md#simple-rpcs-vs-command-rpcs) for how the two compare on cost, durability, transactionality, and ordering.
 
 Simple RPCs are transient queries. They route to the workflow's current active lease owner through `CallTransient`, run against the live workflow instance, and fail with the same not-running, stale-lease, or unavailable-owner errors as transient gRPC routing when no active owner can serve the query. They are not recorded durably, cannot use `idempotency_key:`, cannot call workflow steps or waits, and do not warm or start an inactive workflow.
 
