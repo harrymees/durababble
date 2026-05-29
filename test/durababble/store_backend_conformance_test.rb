@@ -2057,7 +2057,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         # runs a command on the intermediate object mid.
         assert_hash_includes(
           store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "mid", worker_id: "obj-a", lease_seconds: 30),
-          "object_id" => "mid", "worker_id" => "obj-a",
+          "object_id" => "mid",
+          "worker_id" => "obj-a",
         )
         mid_cmd = store.enqueue_object_command(object_type: "counter", object_id: "mid", method_name: "start_leaves", args: [], kwargs: {})
         store.claim_object_command(command_id: mid_cmd, worker_id: "obj-a", lease_seconds: 30)
@@ -2196,7 +2197,8 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         # Any worker can lease the ungated child object.
         assert_hash_includes(
           store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "free-leaf", worker_id: "obj-b", lease_seconds: 30),
-          "object_id" => "free-leaf", "worker_id" => "obj-b",
+          "object_id" => "free-leaf",
+          "worker_id" => "obj-b",
         )
       end
     end
