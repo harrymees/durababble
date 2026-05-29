@@ -5,7 +5,7 @@ weight: 10
 
 # Query Perf
 
-The docs publishing path regenerates these MySQL hot-path reports before Hugo builds the site. Each report captures the SQL timeline, transaction context, callsites, EXPLAIN output, and touched table DDL for one registered query reporter scenario.
+The docs publishing path regenerates these MySQL hot-path reports before Zeitung builds the site. Each report captures the SQL timeline, transaction context, callsites, EXPLAIN output, and touched table DDL for one registered query reporter scenario.
 
 ## Reports
 
