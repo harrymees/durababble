@@ -2172,6 +2172,72 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "rolls back a colocated claim that wins the owner lease but loses the child row with #{backend.name}" do
+      # MySQL-only: this is the one claim path that takes the owner lease in Ruby
+      # *before* the child lease (Postgres folds both into a single SQL CTE, so it
+      # can never half-commit). The queue probe admits a re-homing candidate on
+      # `locked_until <= NOW(6)` while the child claim UPDATE rejects it on strict
+      # `locked_until < NOW(6)`; at exact microsecond equality the owner acquire
+      # wins but the child UPDATE matches nothing. We force that split with a stub
+      # and assert the owner acquire is rolled back, not orphaned until TTL.
+      skip("only the MySQL claim path takes the owner lease before the child lease") unless backend.mysql?
+
+      with_durababble_store(backend, "colocation_claim_rollback") do |store|
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-a", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "abc", method_name: "start_child", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "obj-a", lease_seconds: 30)
+        store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: "counter",
+          parent_object_id: "abc",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "obj-a",
+          child_workflow_name: "child",
+          child_workflow_id: "obj-colo-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+          colocate: true,
+        )
+
+        # Free the owner so a fresh poller (obj-b) is allowed to acquire it; the
+        # child stays pending (backdating locked_until bypasses the release guard).
+        expire_object_lease!(store, backend, "counter", "abc")
+
+        # Stub the child lease UPDATE to report "nothing claimed" while letting the
+        # real owner-lease acquire run — reproducing the microsecond-boundary split
+        # where obj-b grabs the owner but the child UPDATE matches no row.
+        zero_affected = Struct.new(:affected_rows).new(0)
+        original = store.method(:execute_store_query)
+        fail_child_claim = true
+        store.define_singleton_method(:execute_store_query) do |id, params = [], **locals|
+          next zero_affected if id == :claim_selected_workflow && fail_child_claim
+
+          original.call(id, params, **locals)
+        end
+
+        # obj-b wins the owner acquire, then the (stubbed) child claim lands nothing.
+        assert_nil store.claim_runnable_workflow(worker_id: "obj-b", lease_seconds: 30, workflow_names: ["child"])
+
+        # The owner acquire must have been rolled back: obj-b does not hold the row.
+        # Without the rollback, obj-b would be committed as the owner of a child it
+        # never claimed — a lease orphaned until TTL, split from the pending child.
+        owner_row = store.send(
+          :execute_params,
+          "SELECT locked_by FROM #{store.send(:table, "durable_objects")} WHERE object_type = ? AND object_id = ?",
+          ["counter", "abc"],
+        ).first
+        assert_equal "obj-a", owner_row.fetch("locked_by")
+
+        # And the system is left claimable: with the child UPDATE working again, the
+        # next poll claims the child and re-homes the owner onto the same worker.
+        fail_child_claim = false
+        claimed = store.claim_runnable_workflow(worker_id: "obj-b", lease_seconds: 30, workflow_names: ["child"])
+        assert_hash_includes claimed, "id" => "obj-colo-child", "locked_by" => "obj-b"
+        assert_hash_includes store.current_object_lease("counter", "abc"), "worker_id" => "obj-b"
+      end
+    end
+
     test "a non-colocated child object leaves the owner columns null and any worker can claim it with #{backend.name}" do
       with_durababble_store(backend, "colocation_object_optout") do |store|
         store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "root", worker_id: "obj-a", lease_seconds: 300)
