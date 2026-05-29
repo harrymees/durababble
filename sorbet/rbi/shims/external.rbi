@@ -199,6 +199,7 @@ module ActiveRecord
   class Deadlocked < ActiveRecordError; end
   class PreparedStatementInvalid < ActiveRecordError; end
   class RecordNotUnique < ActiveRecordError; end
+  class Rollback < ActiveRecordError; end
   class SerializationFailure < ActiveRecordError; end
 
   class Base

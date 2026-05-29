@@ -61,7 +61,14 @@ module Durababble
         next unless acquire_owner_object_lease_for_claim(candidate, worker_id:, lease_microseconds:)
 
         updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_microseconds, candidate.fetch("id"), worker_pool])
-        next unless updated.affected_rows == 1
+        # The owner lease was just acquired but no child landed: the queue probe
+        # admits a re-homing lease on `locked_until <= NOW(6)` while the claim
+        # UPDATE rejects it on strict `locked_until < NOW(6)`, so at exact
+        # microsecond equality we acquire the owner for a child we cannot claim.
+        # Roll back so the owner acquire is undone atomically rather than
+        # committed as a lease orphaned until TTL (and left without us holding it
+        # if we did not already). Rollback returns nil: claimed nothing.
+        raise ActiveRecord::Rollback unless updated.affected_rows == 1
 
         # This worker now holds the lease, so the post-update row is fully known
         # in Ruby: we reconstruct it from the locked candidate snapshot instead of
