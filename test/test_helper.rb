@@ -146,6 +146,20 @@ class DurababbleTestCase < Minitest::Test
   include DurababbleTestWorkflowHelper
   include DurababbleMinitestHelper
 
+  # `Durababble.local_stream_host` is a process global set when a WorkerRuntime
+  # starts its RPC server. In the full suite every test file shares one process,
+  # so a runtime that doesn't cleanly clear it (or last-writer-wins across HA
+  # runtimes) leaks a stale host into later tests — making no-host stream
+  # assertions route to a dead address and raise NodeUnavailable instead of
+  # NoActiveLease. Reset before each test so every test starts from a clean
+  # global, independent of run order. Runs before user `setup`, so a runtime a
+  # test starts in its own setup is unaffected.
+  #: () -> void
+  def before_setup
+    super
+    Durababble.local_stream_host = nil
+  end
+
   class << self
     #: (String) { -> untyped } -> void
     def test(name, &block)
