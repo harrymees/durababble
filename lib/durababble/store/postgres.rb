@@ -75,9 +75,6 @@ module Durababble
         inbox = execute_store_query(:release_inbox_leases, [worker_id]).affected_rows
         target_activations = execute_store_query(:release_target_activation_leases, [worker_id]).affected_rows
         objects = execute_store_query(:release_worker_object_leases, [worker_id]).affected_rows
-        # Drop the worker's colocation group holds so colocated members can be
-        # re-homed immediately rather than waiting out the group lease.
-        execute_store_query(:release_worker_colocation_groups, [worker_id])
         released = { "workflows" => workflows, "outbox" => outbox, "inbox" => inbox, "target_activations" => target_activations, "durable_objects" => objects }
         Observability.count("durababble.leases.expired_recovery", { "durababble.worker.id" => worker_id }, by: released.values.sum)
         released
@@ -179,7 +176,7 @@ module Durababble
         next nil unless step
 
         execute_store_query(:heartbeat_latest_attempt, [workflow_id, command_id, serialized_cursor])
-        keepalive_colocation_group(workflow, worker_id:, lease_microseconds:)
+        keepalive_owner_object_lease(workflow, worker_id:, lease_microseconds:)
         workflow
       end
       renewed = renewed #: as untyped
@@ -249,18 +246,9 @@ module Durababble
     def steal_expired_leases!(now: Time.now)
       workflow_result = execute_store_query(:steal_expired_leases, [timestamp(now)])
       object_result = execute_store_query(:steal_expired_object_leases, [timestamp(now)])
-      # Clear group leases past their deadline on the same timer so a crashed
-      # holder's colocated members become claimable by a fresh worker.
-      execute_store_query(:steal_expired_colocation_groups, [timestamp(now)])
       stolen = workflow_result.affected_rows.to_i + object_result.affected_rows.to_i
       Observability.count("durababble.leases.expired_recovery", by: stolen)
       stolen
-    end
-
-    # PG binds the group with a single conditional upsert.
-    #: (group_id: String, worker_pool: String, worker_id: String, lease_microseconds: Integer) -> Object?
-    def bind_colocation_group_without_transaction(group_id:, worker_pool:, worker_id:, lease_microseconds:)
-      execute_store_query(:bind_colocation_group, [group_id, worker_pool, worker_id, lease_microseconds])
     end
 
     #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
@@ -494,13 +482,14 @@ module Durababble
 
     # Re-entry path for a workflow we still own: the folded claim UPDATE returns
     # nothing when the row is already running under our live lease, so we re-read
-    # it. A colocated member must still hold its group to keep running, so the
-    # gate runs here too — a peer holding the group means we must not resume.
+    # it. A colocated child must still hold its owner object's lease to keep
+    # running, so the gate runs here too — failing to (re)acquire the owner lease
+    # means a peer has taken the object and we must not resume.
     #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, worker_pool: String) -> Object?
     def claim_already_owned_workflow(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
       already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
       return unless already_owned
-      return unless acquire_colocation_group_for_claim(already_owned, worker_pool:, worker_id:, lease_microseconds:)
+      return unless acquire_owner_object_lease_for_claim(already_owned, worker_id:, lease_microseconds:)
 
       decode_row(already_owned)
     end
@@ -611,8 +600,9 @@ module Durababble
       execute_store_query(:lock_workflow_for_update, [workflow_id]).first
     end
 
-    # Returns the locked row (`colocation_group_id`, `locked_until`) or nil when the
-    # caller no longer owns a live lease. Truthy/nil result still gates fencing.
+    # Returns the locked row (`locked_until`) or nil when the caller no longer
+    # owns a live lease. Truthy/nil result gates the workflow-origin child-start
+    # fence; workflow parents never own colocation, so no owner columns are read.
     #: (workflow_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first

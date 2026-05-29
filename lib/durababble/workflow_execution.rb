@@ -219,8 +219,8 @@ module Durababble
       result #: as Result
     end
 
-    #: (Class, Object?, cancellation_policy: Symbol | String, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?colocate: bool) -> ChildWorkflowHandle
-    def call_child_workflow_start(workflow_class, input, cancellation_policy:, id: nil, worker_pool: nil, idempotency_key: nil, colocate: false)
+    #: (Class, Object?, cancellation_policy: Symbol | String, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?) -> ChildWorkflowHandle
+    def call_child_workflow_start(workflow_class, input, cancellation_policy:, id: nil, worker_pool: nil, idempotency_key: nil)
       workflow_class = workflow_class #: as untyped
       assert_workflow_task!("child workflow start #{workflow_class.workflow_name}")
       child_workflow_name = workflow_class.workflow_name
@@ -235,7 +235,6 @@ module Durababble
         worker_pool: child_worker_pool,
         idempotency_key:,
         cancellation_policy: normalized_policy,
-        colocate:,
       )
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
       command_id, future, scheduled_from_history = allocate_command(name:, shape:)
@@ -259,8 +258,6 @@ module Durababble
             input:,
             worker_pool: child_worker_pool,
             cancellation_policy: normalized_policy,
-            colocate:,
-            lease_seconds: colocate ? @lease_seconds.to_i : nil,
           )
           ChildWorkflowReuse.validate!(
             link,
@@ -272,7 +269,6 @@ module Durababble
             input:,
             worker_pool: child_worker_pool,
             cancellation_policy: normalized_policy,
-            colocate:,
           )
           link.slice(
             "child_workflow_id",
@@ -606,8 +602,8 @@ module Durababble
       }
     end
 
-    #: (name: String, child_workflow_name: String, child_workflow_id: String?, input: Object?, worker_pool: String, idempotency_key: String?, cancellation_policy: String, colocate: bool) -> Hash[String, Object?]
-    def child_workflow_start_shape(name:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:, colocate:)
+    #: (name: String, child_workflow_name: String, child_workflow_id: String?, input: Object?, worker_pool: String, idempotency_key: String?, cancellation_policy: String) -> Hash[String, Object?]
+    def child_workflow_start_shape(name:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, idempotency_key:, cancellation_policy:)
       {
         "name" => name,
         "args" => [input],
@@ -616,7 +612,6 @@ module Durababble
           "worker_pool" => worker_pool,
           "idempotency_key" => idempotency_key,
           "cancellation_policy" => cancellation_policy,
-          "colocate" => colocate,
         },
         "child_workflow" => {
           "operation" => "start",
@@ -625,7 +620,6 @@ module Durababble
           "worker_pool" => worker_pool,
           "cancellation_policy" => cancellation_policy,
           "idempotency_key" => idempotency_key,
-          "colocate" => colocate,
         },
       }
     end

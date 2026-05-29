@@ -1,23 +1,11 @@
 -- pg_ack_outbox
 UPDATE "durababble_pg_snapshot"."outbox" SET status = 'processed', processed_at = now() WHERE id = $1 AND locked_by = $2 AND locked_until >= now()
 
--- pg_acquire_colocation_group
-UPDATE "durababble_pg_snapshot"."colocation_groups"
-SET worker_pool = $1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
-WHERE id = $4
+-- pg_acquire_owner_object_lease
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_by = $1, locked_until = now() + ($2::bigint * interval '1 microsecond'), updated_at = now()
+WHERE object_type = $3 AND object_id = $4
   AND (locked_by IS NULL OR locked_until < now() OR locked_by = $5)
-
--- pg_bind_colocation_group
-INSERT INTO "durababble_pg_snapshot"."colocation_groups" (id, worker_pool, locked_by, locked_until, created_at, updated_at)
-VALUES ($1, $2, $3, now() + ($4::bigint * interval '1 microsecond'), now(), now())
-ON CONFLICT (id) DO UPDATE
-SET worker_pool = EXCLUDED.worker_pool,
-    locked_by = EXCLUDED.locked_by,
-    locked_until = EXCLUDED.locked_until,
-    updated_at = now()
-WHERE "durababble_pg_snapshot"."colocation_groups".locked_by IS NULL
-   OR "durababble_pg_snapshot"."colocation_groups".locked_until < now()
-   OR "durababble_pg_snapshot"."colocation_groups".locked_by = EXCLUDED.locked_by
 
 -- pg_cancel_live_step_attempts_for_workflow
 UPDATE "durababble_pg_snapshot"."step_attempts"
@@ -64,17 +52,18 @@ WHERE workflow_id = $3 AND key = $4 AND status = 'running' AND locked_until < no
 
 -- pg_claim_object_lease
 WITH existing AS (
-  SELECT colocation_group_id FROM "durababble_pg_snapshot"."durable_objects"
+  SELECT colocated_owner_object_type, colocated_owner_object_id FROM "durababble_pg_snapshot"."durable_objects"
   WHERE object_type = $2 AND object_id = $3
   FOR UPDATE
 ),
-grp AS (
-  UPDATE "durababble_pg_snapshot"."colocation_groups" g
-  SET worker_pool = $1, locked_by = $4, locked_until = now() + ($5::bigint * interval '1 microsecond'), updated_at = now()
+own AS (
+  UPDATE "durababble_pg_snapshot"."durable_objects" o
+  SET locked_by = $4, locked_until = now() + ($5::bigint * interval '1 microsecond'), updated_at = now()
   FROM existing
-  WHERE g.id = existing.colocation_group_id
-    AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $4)
-  RETURNING g.id
+  WHERE o.object_type = existing.colocated_owner_object_type
+    AND o.object_id = existing.colocated_owner_object_id
+    AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $4)
+  RETURNING o.object_type
 )
 INSERT INTO "durababble_pg_snapshot"."durable_objects"
   (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
@@ -86,8 +75,8 @@ SET locked_by = EXCLUDED.locked_by,
 WHERE ("durababble_pg_snapshot"."durable_objects".locked_by IS NULL
     OR "durababble_pg_snapshot"."durable_objects".locked_until < now()
     OR "durababble_pg_snapshot"."durable_objects".locked_by = EXCLUDED.locked_by)
-  AND ((SELECT colocation_group_id FROM existing) IS NULL OR EXISTS (SELECT 1 FROM grp))
-RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until, colocation_group_id
+  AND ((SELECT colocated_owner_object_type FROM existing) IS NULL OR EXISTS (SELECT 1 FROM own))
+RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until, colocated_owner_object_type, colocated_owner_object_id
 
 -- pg_claim_outbox
 WITH candidate AS (
@@ -113,7 +102,8 @@ RETURNING outbox.*
 
 -- pg_claim_runnable_workflow
 WITH candidate AS (
-  SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at, colocation_group_id FROM "durababble_pg_snapshot"."workflows"
+  SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at,
+         colocated_owner_object_type, colocated_owner_object_id FROM "durababble_pg_snapshot"."workflows"
   WHERE worker_pool = $1
     AND (CASE
   WHEN status IN ('pending', 'canceling') THEN COALESCE(next_run_at, created_at)
@@ -123,11 +113,12 @@ WITH candidate AS (
   ELSE NULL
 END) <= now()
     AND (
-      colocation_group_id IS NULL
+      colocated_owner_object_type IS NULL
       OR NOT EXISTS (
-        SELECT 1 FROM "durababble_pg_snapshot"."colocation_groups" g
-        WHERE g.id = "durababble_pg_snapshot"."workflows".colocation_group_id
-          AND g.locked_by IS NOT NULL AND g.locked_by <> $2 AND g.locked_until >= now()
+        SELECT 1 FROM "durababble_pg_snapshot"."durable_objects" o
+        WHERE o.object_type = "durababble_pg_snapshot"."workflows".colocated_owner_object_type
+          AND o.object_id = "durababble_pg_snapshot"."workflows".colocated_owner_object_id
+          AND o.locked_by IS NOT NULL AND o.locked_by <> $2 AND o.locked_until >= now()
       )
     )
     <name_filter>
@@ -141,19 +132,20 @@ END), created_at
   LIMIT 1
   FOR UPDATE SKIP LOCKED
 ),
-grp AS (
-  UPDATE "durababble_pg_snapshot"."colocation_groups" g
-  SET worker_pool = $1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
+own AS (
+  UPDATE "durababble_pg_snapshot"."durable_objects" o
+  SET locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
   FROM candidate
-  WHERE g.id = candidate.colocation_group_id
-    AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $2)
-  RETURNING g.id
+  WHERE o.object_type = candidate.colocated_owner_object_type
+    AND o.object_id = candidate.colocated_owner_object_id
+    AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $2)
+  RETURNING o.object_type
 )
 UPDATE "durababble_pg_snapshot"."workflows" AS workflows
 SET status = 'running', locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 FROM candidate
 WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
-  AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
+  AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
 RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
 
 -- pg_claim_selected_target_activation
@@ -185,7 +177,7 @@ WHERE id = $1 AND worker_pool = $2 AND status = 'running' AND locked_by = $3 AND
 
 -- pg_claim_workflow_for_activation_update
 WITH candidate AS (
-  SELECT id, colocation_group_id FROM "durababble_pg_snapshot"."workflows"
+  SELECT id, colocated_owner_object_type, colocated_owner_object_id FROM "durababble_pg_snapshot"."workflows"
   WHERE id = $1 AND worker_pool = $2
     AND (
       (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -196,25 +188,26 @@ WITH candidate AS (
     )
   FOR UPDATE
 ),
-grp AS (
-  UPDATE "durababble_pg_snapshot"."colocation_groups" g
-  SET worker_pool = $2, locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+own AS (
+  UPDATE "durababble_pg_snapshot"."durable_objects" o
+  SET locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
   FROM candidate
-  WHERE g.id = candidate.colocation_group_id
-    AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $3)
-  RETURNING g.id
+  WHERE o.object_type = candidate.colocated_owner_object_type
+    AND o.object_id = candidate.colocated_owner_object_id
+    AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $3)
+  RETURNING o.object_type
 )
 UPDATE "durababble_pg_snapshot"."workflows" AS workflows
 SET status = 'running', error = NULL, locked_by = $3,
     locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 FROM candidate
 WHERE workflows.id = candidate.id
-  AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
+  AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
 RETURNING workflows.*
 
 -- pg_claim_workflow_update
 WITH candidate AS (
-  SELECT id, colocation_group_id FROM "durababble_pg_snapshot"."workflows"
+  SELECT id, colocated_owner_object_type, colocated_owner_object_id FROM "durababble_pg_snapshot"."workflows"
   WHERE id = $1 AND worker_pool = $2
     AND (
       (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
@@ -225,20 +218,21 @@ WITH candidate AS (
     )
   FOR UPDATE
 ),
-grp AS (
-  UPDATE "durababble_pg_snapshot"."colocation_groups" g
-  SET worker_pool = $2, locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+own AS (
+  UPDATE "durababble_pg_snapshot"."durable_objects" o
+  SET locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
   FROM candidate
-  WHERE g.id = candidate.colocation_group_id
-    AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $3)
-  RETURNING g.id
+  WHERE o.object_type = candidate.colocated_owner_object_type
+    AND o.object_id = candidate.colocated_owner_object_id
+    AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $3)
+  RETURNING o.object_type
 )
 UPDATE "durababble_pg_snapshot"."workflows" AS workflows
 SET status = 'running', error = NULL, locked_by = $3,
     locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
 FROM candidate
 WHERE workflows.id = candidate.id
-  AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
+  AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
 RETURNING workflows.*
 
 -- pg_complete_fence
@@ -353,7 +347,7 @@ RETURNING heartbeat_cursor
 UPDATE "durababble_pg_snapshot"."workflows"
 SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
 WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
-RETURNING locked_until, colocation_group_id
+RETURNING locked_until, colocated_owner_object_type, colocated_owner_object_id
 
 -- pg_heartbeat_workflow
 UPDATE "durababble_pg_snapshot"."workflows"
@@ -400,17 +394,23 @@ SELECT * FROM "durababble_pg_snapshot"."inbox"
 WHERE worker_pool = $1 AND target_kind = $2 AND target_type = $3 AND target_id = $4
 ORDER BY sequence
 
+-- pg_insert_child_object
+INSERT INTO "durababble_pg_snapshot"."durable_objects"
+  (worker_pool, object_type, object_id, colocated_owner_object_type, colocated_owner_object_id, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, now(), now())
+ON CONFLICT (object_type, object_id) DO NOTHING
+
 -- pg_insert_child_workflow
 INSERT INTO "durababble_pg_snapshot"."workflows" (
   id, name, worker_pool, status, input,
   child_origin_kind, parent_workflow_id, parent_command_id,
   parent_object_type, parent_object_id, parent_object_command_id,
-  child_cancellation_policy, colocation_group_id
+  child_cancellation_policy, colocated_owner_object_type, colocated_owner_object_id
 ) VALUES (
   $1, $2, $3, $4, $5::bytea,
   $6, $7, $8,
   $9, $10, $11,
-  $12, $13
+  $12, $13, $14
 )
 
 -- pg_insert_fence
@@ -467,14 +467,14 @@ WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now(
 FOR UPDATE
 
 -- pg_lock_owned_object_for_update
-SELECT colocation_group_id, locked_until
+SELECT colocated_owner_object_type, colocated_owner_object_id, locked_until
 FROM "durababble_pg_snapshot"."durable_objects"
 WHERE object_type = $1 AND object_id = $2
   AND locked_by = $3 AND locked_until >= now()
 FOR UPDATE
 
 -- pg_lock_owned_workflow_for_update
-SELECT colocation_group_id, locked_until
+SELECT locked_until
 FROM "durababble_pg_snapshot"."workflows"
 WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
 FOR UPDATE
@@ -528,6 +528,11 @@ SET status = 'running', error = NULL, locked_by = $1,
 WHERE id = $3 AND worker_pool = $4
   AND NOT (status IN ('completed', 'canceled', 'terminated') OR (status = 'failed' AND next_run_at IS NULL))
 
+-- pg_object_colocated_owner
+SELECT colocated_owner_object_type, colocated_owner_object_id
+FROM "durababble_pg_snapshot"."durable_objects"
+WHERE object_type = $1 AND object_id = $2
+
 -- pg_object_state
 SELECT state FROM "durababble_pg_snapshot"."durable_objects" WHERE object_type = $1 AND object_id = $2 AND state IS NOT NULL
 
@@ -540,20 +545,25 @@ SELECT * FROM "durababble_pg_snapshot"."outbox" WHERE id = $1
 -- pg_read_fence
 SELECT status, result, error FROM "durababble_pg_snapshot"."fences" WHERE workflow_id = $1 AND key = $2
 
--- pg_refresh_colocation_group
-UPDATE "durababble_pg_snapshot"."colocation_groups"
-SET locked_until = now() + ($1::bigint * interval '1 microsecond'), updated_at = now()
-WHERE id = $2 AND locked_by = $3
-
 -- pg_release_inbox_leases
 UPDATE "durababble_pg_snapshot"."inbox"
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
 WHERE status = 'running' AND locked_by = $1
 
 -- pg_release_object_lease
-UPDATE "durababble_pg_snapshot"."durable_objects"
+UPDATE "durababble_pg_snapshot"."durable_objects" AS d
 SET locked_by = NULL, locked_until = NULL, updated_at = now()
-WHERE object_type = $1 AND object_id = $2 AND locked_by = $3
+WHERE d.object_type = $1 AND d.object_id = $2 AND d.locked_by = $3
+  AND NOT EXISTS (
+    SELECT 1 FROM "durababble_pg_snapshot"."workflows" w
+    WHERE w.colocated_owner_object_type = $1 AND w.colocated_owner_object_id = $2
+      AND w.status = 'running' AND w.locked_until IS NOT NULL AND w.locked_until >= now()
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM "durababble_pg_snapshot"."durable_objects" c
+    WHERE c.colocated_owner_object_type = $1 AND c.colocated_owner_object_id = $2
+      AND c.locked_by IS NOT NULL AND c.locked_until IS NOT NULL AND c.locked_until >= now()
+  )
 
 -- pg_release_outbox_leases
 UPDATE "durababble_pg_snapshot"."outbox"
@@ -564,11 +574,6 @@ WHERE status = 'processing' AND locked_by = $1
 UPDATE "durababble_pg_snapshot"."target_activations"
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
 WHERE status = 'running' AND locked_by = $1
-
--- pg_release_worker_colocation_groups
-UPDATE "durababble_pg_snapshot"."colocation_groups"
-SET locked_by = NULL, locked_until = NULL, updated_at = now()
-WHERE locked_by = $1
 
 -- pg_release_worker_object_leases
 UPDATE "durababble_pg_snapshot"."durable_objects"
@@ -590,6 +595,11 @@ SET locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at =
 WHERE object_type = $1 AND object_id = $2
   AND locked_by = $3 AND locked_until >= now()
 RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+
+-- pg_renew_owner_object_lease
+UPDATE "durababble_pg_snapshot"."durable_objects"
+SET locked_until = now() + ($1::bigint * interval '1 microsecond'), updated_at = now()
+WHERE object_type = $2 AND object_id = $3 AND locked_by = $4
 
 -- pg_request_workflow_cancellation
 UPDATE "durababble_pg_snapshot"."workflows"
@@ -627,21 +637,6 @@ VALUES ($1, $2, $3, $4, 'pending', $5::timestamptz)
 ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
   SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
   WHERE "durababble_pg_snapshot"."target_activations".worker_pool = EXCLUDED.worker_pool
-
--- pg_stamp_object_colocation_group
-UPDATE "durababble_pg_snapshot"."durable_objects"
-SET colocation_group_id = $1, updated_at = now()
-WHERE object_type = $2 AND object_id = $3 AND colocation_group_id IS NULL
-
--- pg_stamp_workflow_colocation_group
-UPDATE "durababble_pg_snapshot"."workflows"
-SET colocation_group_id = $1, updated_at = now()
-WHERE id = $2 AND colocation_group_id IS NULL
-
--- pg_steal_expired_colocation_groups
-UPDATE "durababble_pg_snapshot"."colocation_groups"
-SET locked_by = NULL, locked_until = NULL, updated_at = now()
-WHERE locked_by IS NOT NULL AND locked_until < $1::timestamptz
 
 -- pg_steal_expired_leases
 UPDATE "durababble_pg_snapshot"."workflows"

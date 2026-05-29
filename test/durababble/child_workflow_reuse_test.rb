@@ -19,7 +19,7 @@ class DurababbleChildWorkflowReuseTest < DurababbleTestCase
     end
   end
 
-  def child_row(colocation_group_id: nil)
+  def child_row(colocated_owner_object_type: nil, colocated_owner_object_id: nil)
     {
       "origin_kind" => "workflow",
       "parent_workflow_id" => "parent-1",
@@ -32,7 +32,8 @@ class DurababbleChildWorkflowReuseTest < DurababbleTestCase
       "input" => { "value" => "v" },
       "worker_pool" => "default",
       "cancellation_policy" => "abandon",
-      "colocation_group_id" => colocation_group_id,
+      "colocated_owner_object_type" => colocated_owner_object_type,
+      "colocated_owner_object_id" => colocated_owner_object_id,
     }
   end
 
@@ -40,8 +41,8 @@ class DurababbleChildWorkflowReuseTest < DurababbleTestCase
     reuse_args(child_row, colocate: false)
   end
 
-  test "matching colocated reuse does not raise when the prior child carried a group" do
-    reuse_args(child_row(colocation_group_id: "wf:parent-1"), colocate: true)
+  test "matching colocated reuse does not raise when the prior child carried an owner" do
+    reuse_args(child_row(colocated_owner_object_type: "counter", colocated_owner_object_id: "abc"), colocate: true)
   end
 
   test "requesting colocation against a previously non-colocated child is a conflict" do
@@ -53,7 +54,7 @@ class DurababbleChildWorkflowReuseTest < DurababbleTestCase
 
   test "dropping colocation against a previously colocated child is a conflict" do
     assert_raises(Durababble::IdempotencyKeyConflict) do
-      reuse_args(child_row(colocation_group_id: "wf:parent-1"), colocate: false)
+      reuse_args(child_row(colocated_owner_object_type: "counter", colocated_owner_object_id: "abc"), colocate: false)
     end
   end
 

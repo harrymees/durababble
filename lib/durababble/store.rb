@@ -274,8 +274,13 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?, ?colocate: bool, ?lease_seconds: Integer?) -> Hash[String, Object?]
-    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil, colocate: false, lease_seconds: nil)
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?, ?colocate: bool) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil, colocate: false)
+      raise NotImplementedError
+    end
+
+    #: (parent_object_type: String, parent_object_id: String, parent_object_command_id: String, parent_object_worker_id: String, child_object_type: String, child_object_id: String, worker_pool: String, ?colocate: bool) -> Hash[String, Object?]
+    def start_child_object(parent_object_type:, parent_object_id:, parent_object_command_id:, parent_object_worker_id:, child_object_type:, child_object_id:, worker_pool:, colocate: true)
       raise NotImplementedError
     end
 

@@ -19,9 +19,11 @@ class DurababbleMysqlQueryPlanTest < DurababbleTestCase
       expectations = {
         "workflow claim probe" => {
           sql: query_sql(:claim_runnable_workflow, name_sql: ""),
-          params: ["default"],
+          params: ["default", "worker-1"],
           expected_key_fragment: "workflows_claim",
-          expected_access_types: ["range"],
+          # The owner-fence NOT EXISTS adds a correlated PRIMARY-key lookup on
+          # durable_objects (eq_ref), which is the optimal shape for that probe.
+          expected_access_types: ["range", "eq_ref"],
           max_rows_examined_per_scan: 4_000,
         },
         "expired workflow lease count probe" => {

@@ -17,9 +17,9 @@ module Durababble
           child.fetch("input") != input ||
           child.fetch("worker_pool") != worker_pool ||
           child.fetch("cancellation_policy") != cancellation_policy ||
-          # A colocated child carries a colocation_group_id; reusing the same id
-          # with a different colocation intent is a determinism violation.
-          !child["colocation_group_id"].nil? != colocate
+          # A colocated child records its owner object; reusing the same id with a
+          # different colocation intent is a determinism violation.
+          !child["colocated_owner_object_type"].nil? != colocate
         return unless mismatch
 
         raise IdempotencyKeyConflict, "workflow id #{child_workflow_id} already used for a different child workflow"

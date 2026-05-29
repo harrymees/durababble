@@ -86,6 +86,7 @@ module Durababble
 
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child enqueue cannot specify store: or engine:" if store || engine
+          raise ArgumentError, "colocate: is only supported from durable object commands" if colocate
 
           return execution.call_child_workflow_start(
             self,
@@ -94,7 +95,6 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
-            colocate:,
           )
         end
 
@@ -115,7 +115,7 @@ module Durababble
 
         raise ArgumentError, "idempotency_key: is only supported when enqueue is called from workflow execution or an object command" unless idempotency_key.nil?
         raise ArgumentError, "cancellation: is only supported when enqueue is called from workflow execution or an object command" unless cancellation.nil?
-        raise ArgumentError, "colocate: is only supported when enqueue is called from workflow execution or an object command" if colocate
+        raise ArgumentError, "colocate: is only supported from durable object commands" if colocate
 
         if worker_pool
           workflow_id = id || SecureRandom.uuid
@@ -131,6 +131,7 @@ module Durababble
 
         if (execution = WorkflowExecutionContext.current)
           raise ArgumentError, "workflow child start cannot specify store: or engine:" if store || engine
+          raise ArgumentError, "colocate: is only supported from durable object commands" if colocate
 
           return execution.call_child_workflow_start(
             self,
@@ -139,7 +140,6 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
-            colocate:,
           )
         end
 
@@ -160,7 +160,7 @@ module Durababble
 
         raise ArgumentError, "idempotency_key: is only supported when start is called from workflow execution or an object command" unless idempotency_key.nil?
         raise ArgumentError, "cancellation: is only supported when start is called from workflow execution or an object command" unless cancellation.nil?
-        raise ArgumentError, "colocate: is only supported when start is called from workflow execution or an object command" if colocate
+        raise ArgumentError, "colocate: is only supported from durable object commands" if colocate
 
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
@@ -290,8 +290,8 @@ module Durababble
       Durababble.wait_condition(timeout:, &block)
     end
 
-    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String, ?colocate: bool) -> ChildWorkflowHandle
-    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel, colocate: false)
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
+    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel)
       raise Error, "cannot start child workflows from an exposed query" if WorkflowQueryContext.current
 
       __durababble_execution__.call_child_workflow_start(
@@ -301,7 +301,6 @@ module Durababble
         worker_pool:,
         idempotency_key:,
         cancellation_policy: cancellation,
-        colocate:,
       )
     end
 

@@ -159,7 +159,26 @@ end
 
 The object command records the workflow as object-origin work using the durable mailbox command id, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
 
-Object commands can also pass `colocate: true` (also available on `DurableObject#start_workflow`) to bind the started workflow to the object so they run on the same worker. As with workflow-started children, this is opt-in, only valid inside a command, and crash safe: no other worker can claim the object while a colocated workflow is still running, but if both leases lapse the object and workflow re-home together onto whichever worker picks one of them up. See [Colocating Child Workflows](workflows.md) for the full semantics.
+Object commands can pass `colocate: true` to `start_workflow` to bind the started workflow to the object so they run on the same worker. Colocation is an object-only capability: an object may colocate the child workflows it starts (and the child objects it starts, below), but workflow-to-workflow colocation is not supported. It is opt-in, only valid inside a command, and crash safe: the object's own lease acts as the master lease, so no other worker can claim the object while a colocated child is still running, and the object's lease is released only once no colocated child is live — so if both go idle they re-home together onto whichever worker picks one of them up. See [Colocating Child Workflows](workflows.md) for the full semantics.
+
+### Starting Child Objects
+
+A command can also create another durable object that is colocated with the current object using `start_object(object_class, id:, worker_pool: nil, idempotency_key: nil, colocate: true)`. Like `start_workflow`, this is command-only — it mutates durable state, so calling it from an exposed query or outside a command raises. The child id you supply is the child's durable-object primary key, so a retried command re-stamps the same colocation owner (a no-op); a different object trying to colocate the same id conflicts. The child object is created lazily: `start_object` records only the colocation binding, and the child's `initialize_state` still runs on its first claim. It returns a `DurableObjectRef` for the child.
+
+```ruby
+class Tenant < Durababble::DurableObject
+  object_type "tenant"
+
+  command def provision(region:)
+    # Index runs on the same worker that holds this Tenant's lease.
+    index = start_object(SearchIndex, id: "index-#{durable_id}")
+    update_state(current_state.merge("index_id" => index.durable_id))
+    index.durable_id
+  end
+end
+```
+
+Passing `colocate: false` creates the child object as ordinary, independently-leased work. The default is `colocate: true` because the common reason to start a child object from a command is to keep related state on one worker.
 
 ## Alarms
 
