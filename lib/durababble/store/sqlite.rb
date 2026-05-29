@@ -95,6 +95,15 @@ module Durababble
 
     private
 
+    # current_time is an Integer microsecond epoch here, so the lease window adds as
+    # whole microseconds. This keeps locked_until an Integer that stays sortable and
+    # parseable (workflow_lease_time treats Integers as microsecond epochs), matching
+    # how every other SQLite timestamp is stored.
+    #: (Integer, Integer) -> Integer
+    def lease_until(now, lease_microseconds)
+      now + lease_microseconds
+    end
+
     #: () -> Symbol
     def store_query_prefix
       :sqlite

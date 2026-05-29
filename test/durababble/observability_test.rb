@@ -207,7 +207,7 @@ class DurababbleObservabilityTest < DurababbleTestCase
       append_history(workflow_id, "kind" => "step_failed", "command_id" => position, "payload" => payload, "error" => error)
     end
 
-    def complete_workflow(workflow_id, result:, worker_id: nil)
+    def complete_workflow(workflow_id, result:, worker_id: nil, wake_parent: true)
       workflows.fetch(workflow_id).merge!("status" => "completed", "result" => result, "locked_by" => nil)
     end
 
