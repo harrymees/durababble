@@ -632,10 +632,10 @@ module Durababble
       end
     end
 
-    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?) -> Hash[String, Object?]
-    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil)
+    #: (origin_kind: String, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?parent_workflow_id: String?, ?parent_command_id: Integer?, ?parent_worker_id: String?, ?parent_object_type: String?, ?parent_object_id: String?, ?parent_object_command_id: String?, ?parent_object_worker_id: String?, ?colocate: bool, ?lease_seconds: Integer?) -> Hash[String, Object?]
+    def start_child_workflow(origin_kind:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, parent_workflow_id: nil, parent_command_id: nil, parent_worker_id: nil, parent_object_type: nil, parent_object_id: nil, parent_object_command_id: nil, parent_object_worker_id: nil, colocate: false, lease_seconds: nil)
       result = transaction do
-        fence_child_workflow_origin!(
+        parent = fence_child_workflow_origin!(
           origin_kind:,
           parent_workflow_id:,
           parent_worker_id:,
@@ -643,7 +643,22 @@ module Durababble
           parent_object_id:,
           parent_object_command_id:,
           parent_object_worker_id:,
+          colocate:,
         )
+        colocation_group_id = nil
+        if colocate
+          colocation_group_id = bind_child_colocation_group!(
+            origin_kind:,
+            parent:,
+            parent_workflow_id:,
+            parent_worker_id:,
+            parent_object_type:,
+            parent_object_id:,
+            parent_object_worker_id:,
+            worker_pool:,
+            lease_seconds:,
+          )
+        end
         begin
           transaction do
             insert_child_workflow_without_transaction(
@@ -658,6 +673,7 @@ module Durababble
               input:,
               worker_pool:,
               cancellation_policy:,
+              colocation_group_id:,
             )
           end
         rescue ActiveRecord::RecordNotUnique
@@ -873,14 +889,21 @@ module Durababble
       raise LeaseConflict, "workflow #{workflow_id} lease expired or moved before state update"
     end
 
-    #: (origin_kind: String, parent_workflow_id: String?, parent_worker_id: String?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, parent_object_worker_id: String?) -> void
-    def fence_child_workflow_origin!(origin_kind:, parent_workflow_id:, parent_worker_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, parent_object_worker_id:)
+    # Fences the child start against the parent's live lease and returns the
+    # locked parent row so the caller can read/stamp its colocation group. The
+    # extra object row lock is only taken when `colocate` is set — non-colocated
+    # object-origin starts keep paying for exactly the command-lease fence.
+    #: (origin_kind: String, parent_workflow_id: String?, parent_worker_id: String?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, parent_object_worker_id: String?, ?colocate: bool) -> Hash[String, Object?]?
+    def fence_child_workflow_origin!(origin_kind:, parent_workflow_id:, parent_worker_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, parent_object_worker_id:, colocate: false)
       case origin_kind
       when "workflow"
         raise ArgumentError, "workflow-origin child starts require parent_workflow_id" unless parent_workflow_id
         raise ArgumentError, "workflow-origin child starts require parent_worker_id" unless parent_worker_id
 
-        raise LeaseConflict, "workflow #{parent_workflow_id} lease expired or moved before child workflow start" unless lock_owned_workflow_for_update(workflow_id: parent_workflow_id, worker_id: parent_worker_id)
+        parent = lock_owned_workflow_for_update(workflow_id: parent_workflow_id, worker_id: parent_worker_id)
+        raise LeaseConflict, "workflow #{parent_workflow_id} lease expired or moved before child workflow start" unless parent
+
+        parent
       when "object"
         raise ArgumentError, "object-origin child starts require parent_object_command_id" unless parent_object_command_id
         raise ArgumentError, "object-origin child starts require parent_object_worker_id" unless parent_object_worker_id
@@ -888,9 +911,110 @@ module Durababble
         command = lock_inbox_message_for_completion(message_id: parent_object_command_id, worker_id: parent_object_worker_id)
         matches_target = command && command.fetch("target_kind", nil) == "object" && command.fetch("target_type", nil) == parent_object_type && command.fetch("target_id", nil) == parent_object_id
         raise LeaseConflict, "object command #{parent_object_command_id} lease expired or moved before child workflow start" unless matches_target
+
+        colocate ? lock_owned_object_for_update(object_type: parent_object_type.to_s, object_id: parent_object_id.to_s, worker_id: parent_object_worker_id) : nil
       else
         raise ArgumentError, "unknown child workflow origin kind: #{origin_kind.inspect}"
       end
+    end
+
+    # Resolves the colocation group for a colocated child start and pins it to the
+    # parent's current owner. The group id is inherited from the parent when the
+    # parent is itself a colocated member (transitive membership) and otherwise
+    # derived deterministically from the parent's identity. The parent is stamped
+    # into the group (idempotent, first-writer-wins) and the group lease is taken
+    # for the parent's current worker so no peer can lease the parent while a
+    # colocated child runs. Runs inside the child-start transaction.
+    #: (origin_kind: String, parent: Hash[String, Object?]?, parent_workflow_id: String?, parent_worker_id: String?, parent_object_type: String?, parent_object_id: String?, parent_object_worker_id: String?, worker_pool: String, lease_seconds: Integer?) -> String
+    def bind_child_colocation_group!(origin_kind:, parent:, parent_workflow_id:, parent_worker_id:, parent_object_type:, parent_object_id:, parent_object_worker_id:, worker_pool:, lease_seconds:)
+      lease_microseconds = colocation_lease_microseconds(lease_seconds)
+      existing = parent && parent["colocation_group_id"]
+      group_worker_pool = (parent && parent["worker_pool"]) || worker_pool
+      case origin_kind
+      when "workflow"
+        group_id = (existing || "wf:#{parent_workflow_id}").to_s
+        stamp_workflow_colocation_group(group_id:, workflow_id: parent_workflow_id.to_s) unless existing
+        owner = parent_worker_id.to_s
+      when "object"
+        group_id = (existing || "obj:#{parent_object_type}/#{parent_object_id}").to_s
+        stamp_object_colocation_group(group_id:, object_type: parent_object_type.to_s, object_id: parent_object_id.to_s) unless existing
+        owner = parent_object_worker_id.to_s
+      else
+        raise ArgumentError, "unknown child workflow origin kind: #{origin_kind.inspect}"
+      end
+      bind_colocation_group_without_transaction(group_id:, worker_pool: group_worker_pool.to_s, worker_id: owner, lease_microseconds:)
+      group_id
+    end
+
+    #: (Integer?) -> Integer
+    def colocation_lease_microseconds(lease_seconds)
+      return 60_000_000 unless lease_seconds
+
+      (lease_seconds * 1_000_000).to_i
+    end
+
+    #: (group_id: String, workflow_id: String) -> Object?
+    def stamp_workflow_colocation_group(group_id:, workflow_id:)
+      execute_store_query(:stamp_workflow_colocation_group, [group_id, workflow_id])
+    end
+
+    #: (group_id: String, object_type: String, object_id: String) -> Object?
+    def stamp_object_colocation_group(group_id:, object_type:, object_id:)
+      execute_store_query(:stamp_object_colocation_group, [group_id, object_type, object_id])
+    end
+
+    # Keepalive driven off a live member's heartbeat. Extends the group lease only
+    # while this worker still owns it (no-op once the group has been re-homed), so
+    # a colocated parent keeps the group pinned for as long as it heartbeats.
+    #: (group_id: String, worker_id: String, lease_microseconds: Integer) -> Object?
+    def refresh_colocation_group(group_id:, worker_id:, lease_microseconds:)
+      execute_store_query(:refresh_colocation_group, [lease_microseconds, group_id, worker_id])
+    end
+
+    # Rides the workflow-step heartbeat: when the heartbeating workflow is a
+    # colocation member, push the group lease forward so no peer can poach the
+    # other members while this one stays alive. The group id is read off the row
+    # the heartbeat already returned, so non-colocated heartbeats (group_id NULL)
+    # pay nothing — the early return fires before any extra statement. Runs inside
+    # the heartbeat transaction.
+    #: (Hash[String, Object?]?, worker_id: String, lease_microseconds: Integer) -> void
+    def keepalive_colocation_group(row, worker_id:, lease_microseconds:)
+      group_id = row && row["colocation_group_id"]
+      return unless group_id
+
+      refresh_colocation_group(group_id: group_id.to_s, worker_id:, lease_microseconds:)
+      nil
+    end
+
+    # Conditional group acquire for the non-queue claim paths (targeted workflow
+    # resume, object lease claim). Returns true when this worker holds the group
+    # afterwards. The queue claim folds this into its claim statement instead.
+    #: (group_id: String, worker_pool: String, worker_id: String, lease_microseconds: Integer) -> bool
+    def acquire_colocation_group(group_id:, worker_pool:, worker_id:, lease_microseconds:)
+      result = execute_store_query(:acquire_colocation_group, [worker_pool, worker_id, lease_microseconds, group_id, worker_id])
+      result.affected_rows.to_i == 1
+    end
+
+    # Co-tenancy gate for the claim paths that hold a candidate row in Ruby: the
+    # MySQL queue + targeted claims (which lock the row, then must take the group
+    # before the member lease) and the PG already-owned re-entry. Returns true
+    # when the candidate is non-colocated — nothing to gate, zero extra work — or
+    # when this worker now holds its colocation group. A false return means a peer
+    # holds the group and the member must not be claimed. PG's folded claim
+    # statements gate in-SQL and never reach this.
+    #: (Hash[String, Object?], worker_pool: String, worker_id: String, lease_microseconds: Integer) -> bool
+    def acquire_colocation_group_for_claim(candidate, worker_pool:, worker_id:, lease_microseconds:)
+      group_id = candidate["colocation_group_id"]
+      return true unless group_id
+
+      acquire_colocation_group(group_id: group_id.to_s, worker_pool:, worker_id:, lease_microseconds:)
+    end
+
+    # PG performs the group bind as a single upsert; MySQL splits it into an
+    # ensure-row insert-ignore plus a conditional update. Overridden per backend.
+    #: (group_id: String, worker_pool: String, worker_id: String, lease_microseconds: Integer) -> Object?
+    def bind_colocation_group_without_transaction(group_id:, worker_pool:, worker_id:, lease_microseconds:)
+      raise NotImplementedError
     end
 
     #: (Hash[String, Object?], worker_id: String?) -> void
@@ -1353,8 +1477,8 @@ module Durababble
       )
     end
 
-    #: (origin_kind: String, parent_workflow_id: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String) -> Object?
-    def insert_child_workflow_without_transaction(origin_kind:, parent_workflow_id:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:)
+    #: (origin_kind: String, parent_workflow_id: String?, parent_command_id: Integer?, parent_object_type: String?, parent_object_id: String?, parent_object_command_id: String?, child_workflow_name: String, child_workflow_id: String, input: Object?, worker_pool: String, cancellation_policy: String, ?colocation_group_id: String?) -> Object?
+    def insert_child_workflow_without_transaction(origin_kind:, parent_workflow_id:, parent_command_id:, parent_object_type:, parent_object_id:, parent_object_command_id:, child_workflow_name:, child_workflow_id:, input:, worker_pool:, cancellation_policy:, colocation_group_id: nil)
       params = [
         child_workflow_id,
         child_workflow_name,
@@ -1368,6 +1492,7 @@ module Durababble
         parent_object_id,
         parent_object_command_id,
         cancellation_policy,
+        colocation_group_id,
       ]
       execute_store_query(:insert_child_workflow, params)
     end

@@ -1,6 +1,18 @@
 -- mysql_ack_outbox
 UPDATE `durababble_mysql_snapshot_outbox` SET status = 'processed', processed_at = NOW(6) WHERE id = ? AND locked_by = ? AND locked_until >= NOW(6)
 
+-- mysql_acquire_colocation_group
+UPDATE `durababble_mysql_snapshot_colocation_groups`
+SET worker_pool = ?, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+WHERE id = ?
+  AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+
+-- mysql_bind_colocation_group
+UPDATE `durababble_mysql_snapshot_colocation_groups`
+SET worker_pool = ?, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+WHERE id = ?
+  AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+
 -- mysql_cancel_live_step_attempts_for_workflow
 UPDATE `durababble_mysql_snapshot_step_attempts`
 SET status = 'canceled', error = 'workflow cancellation requested', completed_at = NOW(6)
@@ -58,6 +70,13 @@ SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), upda
 WHERE object_type = ? AND object_id = ?
   AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
 
+-- mysql_claim_object_lease_lock
+SELECT colocation_group_id
+FROM `durababble_mysql_snapshot_durable_objects`
+WHERE object_type = ? AND object_id = ?
+  AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+FOR UPDATE
+
 -- mysql_claim_outbox
 SELECT * FROM `durababble_mysql_snapshot_outbox` FORCE INDEX (durababble_mysql_snapshot_outbox_claim_idx)
 WHERE queue_available_at <= NOW(6)
@@ -68,6 +87,14 @@ FOR UPDATE SKIP LOCKED
 SELECT * FROM `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_claim_idx)
 WHERE worker_pool = ?
   AND queue_available_at <= NOW(6)
+  AND (
+    colocation_group_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM `durababble_mysql_snapshot_colocation_groups` g
+      WHERE g.id = `durababble_mysql_snapshot_workflows`.colocation_group_id
+        AND g.locked_by IS NOT NULL AND g.locked_by <> ? AND g.locked_until >= NOW(6)
+    )
+  )
   <name_sql>
 ORDER BY queue_available_at, created_at
 LIMIT 1
@@ -215,6 +242,11 @@ ORDER BY wake_at, created_at
 LIMIT 100
 FOR UPDATE SKIP LOCKED
 
+-- mysql_ensure_colocation_group_row
+INSERT IGNORE INTO `durababble_mysql_snapshot_colocation_groups`
+  (id, worker_pool, created_at, updated_at)
+VALUES (?, ?, NOW(6), NOW(6))
+
 -- mysql_ensure_object_row
 INSERT IGNORE INTO `durababble_mysql_snapshot_durable_objects`
   (worker_pool, object_type, object_id, created_at, updated_at)
@@ -326,12 +358,12 @@ INSERT INTO `durababble_mysql_snapshot_workflows` (
   id, name, worker_pool, status, input,
   child_origin_kind, parent_workflow_id, parent_command_id,
   parent_object_type, parent_object_id, parent_object_command_id,
-  child_cancellation_policy, created_at, updated_at
+  child_cancellation_policy, colocation_group_id, created_at, updated_at
 ) VALUES (
   ?, ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, NOW(6), NOW(6)
+  ?, ?, NOW(6), NOW(6)
 )
 
 -- mysql_insert_fence
@@ -386,14 +418,14 @@ WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 FOR UPDATE
 
 -- mysql_lock_owned_object_for_update
-SELECT 1
+SELECT colocation_group_id, locked_until
 FROM `durababble_mysql_snapshot_durable_objects`
 WHERE object_type = ? AND object_id = ?
   AND locked_by = ? AND locked_until >= NOW(6)
 FOR UPDATE
 
 -- mysql_lock_owned_workflow_for_update
-SELECT 1
+SELECT colocation_group_id, locked_until
 FROM `durababble_mysql_snapshot_workflows`
 WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
 FOR UPDATE
@@ -456,6 +488,11 @@ SELECT * FROM `durababble_mysql_snapshot_outbox` WHERE id = ?
 -- mysql_read_fence
 SELECT status, result, error FROM `durababble_mysql_snapshot_fences` WHERE workflow_id = ? AND `key` = ?
 
+-- mysql_refresh_colocation_group
+UPDATE `durababble_mysql_snapshot_colocation_groups`
+SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+WHERE id = ? AND locked_by = ?
+
 -- mysql_release_inbox_leases
 UPDATE `durababble_mysql_snapshot_inbox` FORCE INDEX (<index>)
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
@@ -475,6 +512,11 @@ WHERE status = 'processing' AND locked_by = ?
 UPDATE `durababble_mysql_snapshot_target_activations` FORCE INDEX (<index>)
 SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
 WHERE status = 'running' AND locked_by = ?
+
+-- mysql_release_worker_colocation_groups
+UPDATE `durababble_mysql_snapshot_colocation_groups`
+SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE locked_by = ?
 
 -- mysql_release_worker_object_leases
 UPDATE `durababble_mysql_snapshot_durable_objects`
@@ -535,6 +577,21 @@ ON DUPLICATE KEY UPDATE
   locked_by = IF(worker_pool = VALUES(worker_pool), NULL, locked_by),
   locked_until = IF(worker_pool = VALUES(worker_pool), NULL, locked_until),
   updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
+
+-- mysql_stamp_object_colocation_group
+UPDATE `durababble_mysql_snapshot_durable_objects`
+SET colocation_group_id = ?, updated_at = NOW(6)
+WHERE object_type = ? AND object_id = ? AND colocation_group_id IS NULL
+
+-- mysql_stamp_workflow_colocation_group
+UPDATE `durababble_mysql_snapshot_workflows`
+SET colocation_group_id = ?, updated_at = NOW(6)
+WHERE id = ? AND colocation_group_id IS NULL
+
+-- mysql_steal_expired_colocation_groups
+UPDATE `durababble_mysql_snapshot_colocation_groups`
+SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE locked_by IS NOT NULL AND locked_until < ?
 
 -- mysql_steal_expired_leases
 UPDATE `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_expired_lease_idx)
@@ -666,7 +723,7 @@ SELECT COUNT(*) AS count FROM `durababble_mysql_snapshot_workflow_history` WHERE
 SELECT * FROM `durababble_mysql_snapshot_workflow_history` WHERE workflow_id = ? ORDER BY event_index
 
 -- mysql_workflow_locked_until
-SELECT locked_until FROM `durababble_mysql_snapshot_workflows` WHERE id = ?
+SELECT locked_until, colocation_group_id FROM `durababble_mysql_snapshot_workflows` WHERE id = ?
 
 -- mysql_workflow_owned
 SELECT 1

@@ -1830,6 +1830,221 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "colocated workflow-origin child binds parent and child into one group with #{backend.name}" do
+      with_durababble_store(backend, "colocation_workflow_bind") do |store|
+        parent_id = store.enqueue_workflow(name: "parent", input: {})
+        assert_hash_includes(
+          store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30),
+          "locked_by" => "runner-a",
+        )
+        # A bare parent carries no colocation group until it starts a colocated child.
+        assert_nil store.workflow(parent_id).fetch("colocation_group_id")
+
+        child = store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: parent_id,
+          parent_command_id: 0,
+          parent_worker_id: "runner-a",
+          child_workflow_name: "child",
+          child_workflow_id: "colo-child",
+          input: { "value" => "x" },
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+          colocate: true,
+          lease_seconds: 300,
+        )
+
+        group_id = "wf:#{parent_id}"
+        # The deterministic group id binds parent and child together, and the child
+        # is parked `pending` — binding stamps the group but does not pre-lease the
+        # child (it is claimed off the queue later by the group owner).
+        assert_equal group_id, child.fetch("colocation_group_id")
+        assert_equal group_id, store.workflow(parent_id).fetch("colocation_group_id")
+        assert_equal group_id, store.workflow("colo-child").fetch("colocation_group_id")
+        assert_equal "pending", store.workflow("colo-child").fetch("status")
+        # The group row is held by the parent's current worker.
+        assert_hash_includes colocation_group_row(store, backend, group_id), "locked_by" => "runner-a"
+      end
+    end
+
+    test "colocated child is claimable only by the worker holding the group with #{backend.name}" do
+      with_durababble_store(backend, "colocation_child_claim_gate") do |store|
+        parent_id = store.enqueue_workflow(name: "parent", input: {})
+        store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30)
+        store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: parent_id,
+          parent_command_id: 0,
+          parent_worker_id: "runner-a",
+          child_workflow_name: "child",
+          child_workflow_id: "colo-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+          colocate: true,
+          lease_seconds: 300,
+        )
+
+        # A foreign poller cannot pick up the colocated child while runner-a holds
+        # the group. (Scoped to name "child" so the running parent is never a
+        # candidate — the gated child is the only runnable row.)
+        assert_nil store.claim_runnable_workflow(worker_id: "runner-b", lease_seconds: 30, workflow_names: ["child"])
+
+        # The worker that owns the group claims the child off the queue; claiming
+        # folds in a group renew for the same owner.
+        claimed = store.claim_runnable_workflow(worker_id: "runner-a", lease_seconds: 30, workflow_names: ["child"])
+        assert_hash_includes claimed, "id" => "colo-child", "locked_by" => "runner-a"
+      end
+    end
+
+    test "a peer cannot lease a colocated parent while the child holds the group with #{backend.name}" do
+      with_durababble_store(backend, "colocation_parent_fence") do |store|
+        parent_id = store.enqueue_workflow(name: "parent", input: {})
+        store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30)
+        store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: parent_id,
+          parent_command_id: 0,
+          parent_worker_id: "runner-a",
+          child_workflow_name: "child",
+          child_workflow_id: "colo-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+          colocate: true,
+          lease_seconds: 300,
+        )
+
+        # Simulate runner-a's PARENT lease lapsing (the parent crashed mid-flight)
+        # while the colocated child — and so the group — is still held by runner-a.
+        # The group lease is independent of the parent's workflow lease.
+        expire_workflow_lease!(store, backend, parent_id)
+
+        # A peer that finds the expired parent still cannot lease it: the group gate
+        # rejects both the targeted resume and the queue poll because runner-a holds
+        # the group. This is the crash-safety invariant — no split-brain takeover.
+        assert_nil store.claim_workflow(workflow_id: parent_id, worker_id: "runner-b", lease_seconds: 30)
+        assert_nil store.claim_runnable_workflow(worker_id: "runner-b", lease_seconds: 30, workflow_names: ["parent"])
+
+        # The group owner can still resume the parent (crash-safe re-home onto the
+        # worker that legitimately holds the colocation group).
+        assert_hash_includes(
+          store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30),
+          "id" => parent_id,
+          "locked_by" => "runner-a",
+        )
+      end
+    end
+
+    test "an expired colocation group lets a new worker re-home both members with #{backend.name}" do
+      with_durababble_store(backend, "colocation_group_rehome") do |store|
+        parent_id = store.enqueue_workflow(name: "parent", input: {})
+        store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30)
+        store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: parent_id,
+          parent_command_id: 0,
+          parent_worker_id: "runner-a",
+          child_workflow_name: "child",
+          child_workflow_id: "colo-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+          colocate: true,
+          lease_seconds: 300,
+        )
+        group_id = "wf:#{parent_id}"
+
+        # Both runner-a's parent lease and the group lease lapse (runner-a is gone
+        # for good). With the group free, a fresh worker can take the colocated
+        # child off the queue, and the claim re-homes the group onto runner-b.
+        expire_workflow_lease!(store, backend, parent_id)
+        expire_colocation_group!(store, backend, group_id)
+
+        claimed = store.claim_runnable_workflow(worker_id: "runner-b", lease_seconds: 300, workflow_names: ["child"])
+        assert_hash_includes claimed, "id" => "colo-child", "locked_by" => "runner-b"
+        assert_hash_includes colocation_group_row(store, backend, group_id), "locked_by" => "runner-b"
+
+        # The re-homed group now pins the parent to runner-b: a third worker is
+        # locked out of the parent, but runner-b (the new group owner) gets it.
+        # Both members are leased together by the same worker, as required.
+        assert_nil store.claim_workflow(workflow_id: parent_id, worker_id: "runner-c", lease_seconds: 30)
+        assert_hash_includes(
+          store.claim_workflow(workflow_id: parent_id, worker_id: "runner-b", lease_seconds: 30),
+          "locked_by" => "runner-b",
+        )
+      end
+    end
+
+    test "colocated object-origin child binds the object into a group and fences peers with #{backend.name}" do
+      with_durababble_store(backend, "colocation_object_bind") do |store|
+        # The colocate path locks the parent object row, so the worker must hold the
+        # object lease in addition to the command lease.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-a", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "abc", method_name: "start_child", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "obj-a", lease_seconds: 30)
+
+        child = store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: "counter",
+          parent_object_id: "abc",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "obj-a",
+          child_workflow_name: "child",
+          child_workflow_id: "obj-colo-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+          colocate: true,
+          lease_seconds: 300,
+        )
+
+        group_id = "obj:counter/abc"
+        assert_equal group_id, child.fetch("colocation_group_id")
+        assert_hash_includes colocation_group_row(store, backend, group_id), "locked_by" => "obj-a"
+
+        # A peer cannot take the object lease while the colocated child holds the
+        # group, even once the object's own lease lapses (crash-safety for objects).
+        expire_object_lease!(store, backend, "counter", "abc")
+        assert_nil store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-b", lease_seconds: 30)
+
+        # Once the group lease also lapses, a fresh worker re-homes the object.
+        expire_colocation_group!(store, backend, group_id)
+        assert_hash_includes(
+          store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-b", lease_seconds: 30),
+          "worker_id" => "obj-b",
+        )
+      end
+    end
+
+    test "a non-colocated child start leaves both members unbound with #{backend.name}" do
+      with_durababble_store(backend, "colocation_optout") do |store|
+        parent_id = store.enqueue_workflow(name: "parent", input: {})
+        store.claim_workflow(workflow_id: parent_id, worker_id: "runner-a", lease_seconds: 30)
+        child = store.start_child_workflow(
+          origin_kind: "workflow",
+          parent_workflow_id: parent_id,
+          parent_command_id: 0,
+          parent_worker_id: "runner-a",
+          child_workflow_name: "child",
+          child_workflow_id: "plain-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "request_cancel",
+        )
+
+        # Default opt-out: no group id on either row and no group mutex row created.
+        assert_nil child.fetch("colocation_group_id")
+        assert_nil store.workflow(parent_id).fetch("colocation_group_id")
+        assert_nil store.workflow("plain-child").fetch("colocation_group_id")
+        assert_nil colocation_group_row(store, backend, "wf:#{parent_id}")
+
+        # And any worker can claim the ungated child off the queue.
+        claimed = store.claim_runnable_workflow(worker_id: "runner-b", lease_seconds: 30, workflow_names: ["child"])
+        assert_hash_includes claimed, "id" => "plain-child", "locked_by" => "runner-b"
+      end
+    end
+
     test "fences stale durable object command completion writes with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(
@@ -2178,6 +2393,54 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
         # And A's release remains idempotent on the now-empty row.
         assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
       end
+    end
+  end
+
+  # Read a colocation group mutex row by id (or nil when no group has been
+  # stamped). Used to assert which worker currently pins a group.
+  def colocation_group_row(store, backend, group_id)
+    table = store.send(:table, "colocation_groups")
+    sql = backend.postgres? ? "SELECT * FROM #{table} WHERE id = $1" : "SELECT * FROM #{table} WHERE id = ?"
+    store.send(:execute_params, sql, [group_id]).first
+  end
+
+  # Backdate a workflow's locked_until to simulate a crashed owner without
+  # waiting out a real lease. Mirrors expire_object_lease! but keyed on the
+  # workflow id; each backend stores locked_until in its own native form.
+  def expire_workflow_lease!(store, backend, workflow_id)
+    table = store.send(:table, "workflows")
+    if backend.postgres?
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = now() - interval '1 hour' WHERE id = $1",
+        [workflow_id],
+      )
+    elsif backend.sqlite?
+      expired_at = ((Time.now.to_r - 3600) * 1_000_000).to_i
+      store.send(:execute_params, "UPDATE #{table} SET locked_until = ? WHERE id = ?", [expired_at, workflow_id])
+    else
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(:execute_params, "UPDATE #{table} SET locked_until = ? WHERE id = ?", [expired_at, workflow_id])
+    end
+  end
+
+  # Backdate a colocation group's locked_until so the group lease reads as
+  # expired, letting a fresh worker re-home its members. Same per-backend clock
+  # handling as expire_object_lease! (SQLite stores an integer microsecond epoch).
+  def expire_colocation_group!(store, backend, group_id)
+    table = store.send(:table, "colocation_groups")
+    if backend.postgres?
+      store.send(
+        :execute_params,
+        "UPDATE #{table} SET locked_until = now() - interval '1 hour' WHERE id = $1",
+        [group_id],
+      )
+    elsif backend.sqlite?
+      expired_at = ((Time.now.to_r - 3600) * 1_000_000).to_i
+      store.send(:execute_params, "UPDATE #{table} SET locked_until = ? WHERE id = ?", [expired_at, group_id])
+    else
+      expired_at = (Time.now - 3600).strftime("%Y-%m-%d %H:%M:%S.%6N")
+      store.send(:execute_params, "UPDATE #{table} SET locked_until = ? WHERE id = ?", [expired_at, group_id])
     end
   end
 

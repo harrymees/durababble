@@ -40,6 +40,7 @@ module Durababble
           parent_object_id TEXT,
           parent_object_command_id TEXT,
           child_cancellation_policy TEXT,
+          colocation_group_id TEXT,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           queue_available_at INTEGER GENERATED ALWAYS AS (
@@ -51,6 +52,16 @@ module Durababble
               ELSE NULL
             END
           ) STORED
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("colocation_groups")} (
+          id TEXT PRIMARY KEY,
+          worker_pool TEXT NOT NULL DEFAULT 'default',
+          locked_by TEXT,
+          locked_until INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (dura_now()),
+          updated_at INTEGER NOT NULL DEFAULT (dura_now())
         )
       SQL
       execute(<<~SQL)
@@ -148,6 +159,7 @@ module Durababble
           state BLOB,
           locked_by TEXT,
           locked_until INTEGER,
+          colocation_group_id TEXT,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           PRIMARY KEY (object_type, object_id)

@@ -159,6 +159,8 @@ end
 
 The object command records the workflow as object-origin work using the durable mailbox command id, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
 
+Object commands can also pass `colocate: true` (also available on `DurableObject#start_workflow`) to bind the started workflow to the object so they run on the same worker. As with workflow-started children, this is opt-in, only valid inside a command, and crash safe: no other worker can claim the object while a colocated workflow is still running, but if both leases lapse the object and workflow re-home together onto whichever worker picks one of them up. See [Colocating Child Workflows](workflows.md) for the full semantics.
+
 ## Alarms
 
 Object commands can schedule persisted, named wakeups for the object with `schedule_wake(name:, at:, payload: nil)`. Each `name` addresses an independent wake, so one object can hold several outstanding wakes at once — a TTL sweep, a retry, and a daily flush can all be pending against the same id. Calling `schedule_wake` again with the same `name` before it fires replaces that wake's time and payload while leaving the other names untouched. `cancel_wake(name:)` removes a single named wake, and `cancel_all_wakes` removes every pending wake for the object. Scheduling and cancellation are committed with the command, so a failed or retried command does not leave behind an unrelated process-local timer.

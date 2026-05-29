@@ -128,22 +128,50 @@ module Durababble
       },
     }.freeze
 
+    # Colocation folds into the single claim round-trip with no extra statement:
+    #   * the candidate filter skips any workflow whose group is actively held by
+    #     another worker (the OR short-circuits to a no-op for the common
+    #     colocation_group_id IS NULL row, so non-colocated claims pay nothing);
+    #   * the data-modifying grp CTE acquires/renews the group lease for a
+    #     colocated candidate under the same co-tenancy condition as every other
+    #     acquire, serializing concurrent same-group claims on the group row;
+    #   * the final UPDATE only lands when the candidate is unbound or the group
+    #     acquire succeeded, so losing the group race claims nothing and the
+    #     member stays put for whoever owns the group.
     define(:pg_claim_runnable_workflow, backend: :postgres, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_filter:|
       workflows = table(store, "workflows")
+      groups = table(store, "colocation_groups")
       <<~SQL.chomp
         WITH candidate AS (
-          SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at FROM #{workflows}
+          SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at, colocation_group_id FROM #{workflows}
           WHERE worker_pool = $1
             AND (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) <= now()
+            AND (
+              colocation_group_id IS NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM #{groups} g
+                WHERE g.id = #{workflows}.colocation_group_id
+                  AND g.locked_by IS NOT NULL AND g.locked_by <> $2 AND g.locked_until >= now()
+              )
+            )
             #{name_filter}
           ORDER BY (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}), created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
+        ),
+        grp AS (
+          UPDATE #{groups} g
+          SET worker_pool = $1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE g.id = candidate.colocation_group_id
+            AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $2)
+          RETURNING g.id
         )
         UPDATE #{workflows} AS workflows
         SET status = 'running', locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         FROM candidate
         WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
+          AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
         RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
       SQL
     end
@@ -156,19 +184,41 @@ module Durababble
     end
 
     define(:pg_claim_workflow_update, backend: :postgres) do |store|
+      # Targeted resume claim with the colocation co-tenancy gate folded in. The
+      # candidate CTE locks the target row and carries its colocation_group_id;
+      # grp acquires the group lease (free / expired / ours) when colocated; the
+      # member UPDATE only fires when non-colocated or the group is now held. One
+      # atomic statement, so non-colocated claims pay nothing beyond an empty grp.
+      workflows = table(store, "workflows")
+      groups = table(store, "colocation_groups")
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
+        WITH candidate AS (
+          SELECT id, colocation_group_id FROM #{workflows}
+          WHERE id = $1 AND worker_pool = $2
+            AND (
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'waiting' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
+            )
+          FOR UPDATE
+        ),
+        grp AS (
+          UPDATE #{groups} g
+          SET worker_pool = $2, locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE g.id = candidate.colocation_group_id
+            AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $3)
+          RETURNING g.id
+        )
+        UPDATE #{workflows} AS workflows
         SET status = 'running', error = NULL, locked_by = $3,
             locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
-        WHERE id = $1 AND worker_pool = $2
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'waiting' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
-          )
-        RETURNING *
+        FROM candidate
+        WHERE workflows.id = candidate.id
+          AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
+        RETURNING workflows.*
       SQL
     end
 
@@ -225,11 +275,14 @@ module Durababble
     end
 
     define(:pg_heartbeat_step_workflow, backend: :postgres) do |store|
+      # Returns colocation_group_id so the heartbeat keepalive can refresh the
+      # group lease in the same transaction without a second read. NULL for the
+      # non-colocated common case, where the keepalive short-circuits.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
-        RETURNING locked_until
+        RETURNING locked_until, colocation_group_id
       SQL
     end
 
@@ -405,12 +458,12 @@ module Durababble
           id, name, worker_pool, status, input,
           child_origin_kind, parent_workflow_id, parent_command_id,
           parent_object_type, parent_object_id, parent_object_command_id,
-          child_cancellation_policy
+          child_cancellation_policy, colocation_group_id
         ) VALUES (
           $1, $2, $3, $4, $5::bytea,
           $6, $7, $8,
           $9, $10, $11,
-          $12
+          $12, $13
         )
       SQL
     end
@@ -482,11 +535,28 @@ module Durababble
       SQL
     end
 
+    # MySQL claims in two statements (candidate select, then lease UPDATE), so
+    # colocation rides the existing split: the candidate filter skips a workflow
+    # whose group is actively held elsewhere (the subquery carries no FOR UPDATE,
+    # so the outer locking read never locks group rows), and the orchestration
+    # wedges acquire_colocation_group between the two statements as the
+    # authoritative co-tenancy gate. Non-colocated rows short-circuit on the
+    # leading colocation_group_id IS NULL.
     define(:mysql_claim_runnable_workflow, backend: :mysql, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_sql:|
+      groups = table(store, "colocation_groups")
+      workflows = table(store, "workflows")
       <<~SQL.chomp
-        SELECT * FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
+        SELECT * FROM #{workflows} FORCE INDEX (#{index_name(store, "workflows", "claim")})
         WHERE worker_pool = ?
           AND queue_available_at <= NOW(6)
+          AND (
+            colocation_group_id IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM #{groups} g
+              WHERE g.id = #{workflows}.colocation_group_id
+                AND g.locked_by IS NOT NULL AND g.locked_by <> ? AND g.locked_until >= NOW(6)
+            )
+          )
           #{name_sql}
         ORDER BY queue_available_at, created_at
         LIMIT 1
@@ -579,7 +649,9 @@ module Durababble
     end
 
     define(:mysql_workflow_locked_until, backend: :mysql) do |store|
-      "SELECT locked_until FROM #{table(store, "workflows")} WHERE id = ?"
+      # colocation_group_id rides along so the heartbeat keepalive can refresh the
+      # group lease without a second read (NULL for non-colocated workflows).
+      "SELECT locked_until, colocation_group_id FROM #{table(store, "workflows")} WHERE id = ?"
     end
 
     define(:mysql_current_workflow_lease, backend: :mysql) do |store|
@@ -690,12 +762,12 @@ module Durababble
           id, name, worker_pool, status, input,
           child_origin_kind, parent_workflow_id, parent_command_id,
           parent_object_type, parent_object_id, parent_object_command_id,
-          child_cancellation_policy, created_at, updated_at
+          child_cancellation_policy, colocation_group_id, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?,
-          ?, NOW(6), NOW(6)
+          ?, ?, NOW(6), NOW(6)
         )
       SQL
     end
@@ -742,19 +814,39 @@ module Durababble
     end
 
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
+      # Activation-path claim with the same folded colocation gate as
+      # pg_claim_workflow_update; the only difference is the wider waiting clause
+      # (activation resumes a waiting workflow unconditionally).
+      workflows = table(store, "workflows")
+      groups = table(store, "colocation_groups")
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
+        WITH candidate AS (
+          SELECT id, colocation_group_id FROM #{workflows}
+          WHERE id = $1 AND worker_pool = $2
+            AND (
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR status = 'waiting'
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
+            )
+          FOR UPDATE
+        ),
+        grp AS (
+          UPDATE #{groups} g
+          SET worker_pool = $2, locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE g.id = candidate.colocation_group_id
+            AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $3)
+          RETURNING g.id
+        )
+        UPDATE #{workflows} AS workflows
         SET status = 'running', error = NULL, locked_by = $3,
             locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
-        WHERE id = $1 AND worker_pool = $2
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR status = 'waiting'
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
-          )
-        RETURNING *
+        FROM candidate
+        WHERE workflows.id = candidate.id
+          AND (candidate.colocation_group_id IS NULL OR EXISTS (SELECT 1 FROM grp))
+        RETURNING workflows.*
       SQL
     end
 
@@ -869,18 +961,41 @@ module Durababble
     # that to `nil`. Callers compare against nil to detect a lost claim; we
     # deliberately do not surface the competing holder's identity here.
     define(:pg_claim_object_lease, backend: :postgres) do |store|
+      # Object-lease claim with the colocation co-tenancy gate folded in. The
+      # `existing` CTE locks the current row (if any) and carries its
+      # colocation_group_id; `grp` takes the group lease (free / expired / ours)
+      # when the object is colocated. The upsert's INSERT branch (a brand-new,
+      # never-colocated object) is unaffected; only the ON CONFLICT UPDATE is
+      # gated, firing only when non-colocated or the group is now held. One
+      # atomic statement, so non-colocated claims pay only an empty `grp`.
+      objects = table(store, "durable_objects")
+      groups = table(store, "colocation_groups")
       <<~SQL.chomp
-        INSERT INTO #{table(store, "durable_objects")}
+        WITH existing AS (
+          SELECT colocation_group_id FROM #{objects}
+          WHERE object_type = $2 AND object_id = $3
+          FOR UPDATE
+        ),
+        grp AS (
+          UPDATE #{groups} g
+          SET worker_pool = $1, locked_by = $4, locked_until = now() + ($5::bigint * interval '1 microsecond'), updated_at = now()
+          FROM existing
+          WHERE g.id = existing.colocation_group_id
+            AND (g.locked_by IS NULL OR g.locked_until < now() OR g.locked_by = $4)
+          RETURNING g.id
+        )
+        INSERT INTO #{objects}
           (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 microsecond'), now(), now())
         ON CONFLICT (object_type, object_id) DO UPDATE
         SET locked_by = EXCLUDED.locked_by,
             locked_until = EXCLUDED.locked_until,
             updated_at = now()
-        WHERE #{table(store, "durable_objects")}.locked_by IS NULL
-           OR #{table(store, "durable_objects")}.locked_until < now()
-           OR #{table(store, "durable_objects")}.locked_by = EXCLUDED.locked_by
-        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+        WHERE (#{objects}.locked_by IS NULL
+            OR #{objects}.locked_until < now()
+            OR #{objects}.locked_by = EXCLUDED.locked_by)
+          AND ((SELECT colocation_group_id FROM existing) IS NULL OR EXISTS (SELECT 1 FROM grp))
+        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until, colocation_group_id
       SQL
     end
 
@@ -901,7 +1016,7 @@ module Durababble
     # reads and streams route to durable_objects.locked_by as the active owner.
     define(:pg_lock_owned_object_for_update, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocation_group_id, locked_until
         FROM #{table(store, "durable_objects")}
         WHERE object_type = $1 AND object_id = $2
           AND locked_by = $3 AND locked_until >= now()
@@ -935,6 +1050,101 @@ module Durababble
         UPDATE #{table(store, "durable_objects")}
         SET locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE locked_by = $1
+      SQL
+    end
+
+    # --- Colocation -----------------------------------------------------------
+    # A colocation group is a single mutex row in #{table(store, "colocation_groups")}.
+    # Members (a parent workflow/object plus its colocated children) carry the
+    # group id; the group row carries the single live owner. The hot leasing path
+    # short-circuits on `colocation_group_id IS NULL`, so non-colocated work pays
+    # nothing for these.
+
+    # Stamp a parent workflow into a group, but only if it is not already a member.
+    # Idempotent and racing-safe: the first writer wins, later writers see a
+    # non-NULL group and no-op (transitive membership preserved).
+    # Placeholder numbering mirrors the MySQL mirror's textual order (SET params
+    # first, then WHERE) so callers pass one positional array to either backend.
+    define(:pg_stamp_workflow_colocation_group, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "workflows")}
+        SET colocation_group_id = $1, updated_at = now()
+        WHERE id = $2 AND colocation_group_id IS NULL
+      SQL
+    end
+
+    # Stamp a parent durable object into a group (objects are always group roots).
+    define(:pg_stamp_object_colocation_group, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET colocation_group_id = $1, updated_at = now()
+        WHERE object_type = $2 AND object_id = $3 AND colocation_group_id IS NULL
+      SQL
+    end
+
+    # Bind the group to the parent's current owner at child-start. Creates the
+    # group row on first colocation and otherwise takes/refreshes ownership only
+    # when the group is free, expired, or already ours — the same co-tenancy
+    # condition used by every other group acquire. The deadline is now + lease so
+    # the group lease window tracks the parent's lease without round-tripping an
+    # absolute timestamp across dialects.
+    define(:pg_bind_colocation_group, backend: :postgres) do |store|
+      groups = table(store, "colocation_groups")
+      <<~SQL.chomp
+        INSERT INTO #{groups} (id, worker_pool, locked_by, locked_until, created_at, updated_at)
+        VALUES ($1, $2, $3, now() + ($4::bigint * interval '1 microsecond'), now(), now())
+        ON CONFLICT (id) DO UPDATE
+        SET worker_pool = EXCLUDED.worker_pool,
+            locked_by = EXCLUDED.locked_by,
+            locked_until = EXCLUDED.locked_until,
+            updated_at = now()
+        WHERE #{groups}.locked_by IS NULL
+           OR #{groups}.locked_until < now()
+           OR #{groups}.locked_by = EXCLUDED.locked_by
+      SQL
+    end
+
+    # Keepalive: extend the group lease while this worker still holds it. Driven
+    # off a live member's heartbeat (workflow step heartbeat / object lease renew),
+    # so the group stays pinned for as long as any colocated member is alive.
+    define(:pg_refresh_colocation_group, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_until = now() + ($1::bigint * interval '1 microsecond'), updated_at = now()
+        WHERE id = $2 AND locked_by = $3
+      SQL
+    end
+
+    # Conditional group acquire used by the non-queue claim paths (targeted
+    # workflow resume, object lease claim). Mirrors the bind co-tenancy condition
+    # but never inserts — by the time a member is claimable its group row exists.
+    define(:pg_acquire_colocation_group, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET worker_pool = $1, locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
+        WHERE id = $4
+          AND (locked_by IS NULL OR locked_until < now() OR locked_by = $5)
+      SQL
+    end
+
+    # Shutdown sweep: drop every group this worker owns so peers can re-home the
+    # members immediately. Rides release_worker_leases! alongside the other lease
+    # types.
+    define(:pg_release_worker_colocation_groups, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE locked_by = $1
+      SQL
+    end
+
+    # Expiry sweep: clear group leases past their deadline so a crashed holder's
+    # members become claimable. Rides steal_expired_leases! on the same timer.
+    define(:pg_steal_expired_colocation_groups, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE locked_by IS NOT NULL AND locked_until < $1::timestamptz
       SQL
     end
 
@@ -1189,9 +1399,14 @@ module Durababble
       "SELECT * FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
     end
 
+    # Colocation reads `colocation_group_id` off the row so a parent that starts a
+    # colocated child can stamp/bind the child into the parent's group while the
+    # parent lease is held. Returning the row (rather than `SELECT 1`) keeps the
+    # boolean truthiness callers rely on — a present row is a non-nil hash even
+    # when the group is NULL.
     define(:pg_lock_owned_workflow_for_update, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocation_group_id, locked_until
         FROM #{table(store, "workflows")}
         WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
         FOR UPDATE
@@ -1546,6 +1761,26 @@ module Durababble
       SQL
     end
 
+    # Claimability lock. The PG claim folds the colocation-group gate into the
+    # single upsert statement, but MySQL has no RETURNING and cannot learn the
+    # candidate's colocation_group_id without a read — so the claim is a
+    # lock-then-claim: this SELECT ... FOR UPDATE matches the same free / expired
+    # / ours predicate as the claim UPDATE, locks the row for the rest of the
+    # transaction, and surfaces colocation_group_id so the caller can acquire the
+    # group lease before writing the member lease. No matching row means we lost
+    # the claim outright. Non-colocated rows still pay this one extra SELECT, but
+    # object activation is far colder than workflow polling, so the cost is
+    # acceptable to keep the colocation gate atomic with the claim.
+    define(:mysql_claim_object_lease_lock, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT colocation_group_id
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = ? AND object_id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+        FOR UPDATE
+      SQL
+    end
+
     # Conditional claim against the guaranteed-present row. The WHERE only
     # matches when the lease is free, expired, or already ours; on a match the
     # UPDATE writes new values and `affected_rows = 1` (under CLIENT_FOUND_ROWS,
@@ -1573,7 +1808,7 @@ module Durababble
     # MySQL mirror of pg_lock_owned_object_for_update.
     define(:mysql_lock_owned_object_for_update, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocation_group_id, locked_until
         FROM #{table(store, "durable_objects")}
         WHERE object_type = ? AND object_id = ?
           AND locked_by = ? AND locked_until >= NOW(6)
@@ -1605,6 +1840,78 @@ module Durababble
         UPDATE #{table(store, "durable_objects")}
         SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE locked_by = ?
+      SQL
+    end
+
+    # --- Colocation (MySQL mirrors of the pg_*_colocation_group queries) -------
+
+    define(:mysql_stamp_workflow_colocation_group, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "workflows")}
+        SET colocation_group_id = ?, updated_at = NOW(6)
+        WHERE id = ? AND colocation_group_id IS NULL
+      SQL
+    end
+
+    define(:mysql_stamp_object_colocation_group, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET colocation_group_id = ?, updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ? AND colocation_group_id IS NULL
+      SQL
+    end
+
+    # MySQL has no upsert-with-conditional-WHERE that cleanly reports whether the
+    # row was created, so bind is split the same way object-lease claim is: ensure
+    # the group row exists (INSERT IGNORE), then a conditional UPDATE takes/refreshes
+    # ownership when free, expired, or already ours.
+    define(:mysql_ensure_colocation_group_row, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT IGNORE INTO #{table(store, "colocation_groups")}
+          (id, worker_pool, created_at, updated_at)
+        VALUES (?, ?, NOW(6), NOW(6))
+      SQL
+    end
+
+    define(:mysql_bind_colocation_group, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET worker_pool = ?, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+      SQL
+    end
+
+    define(:mysql_refresh_colocation_group, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE id = ? AND locked_by = ?
+      SQL
+    end
+
+    define(:mysql_acquire_colocation_group, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET worker_pool = ?, locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+      SQL
+    end
+
+    define(:mysql_release_worker_colocation_groups, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE locked_by = ?
+      SQL
+    end
+
+    define(:mysql_steal_expired_colocation_groups, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "colocation_groups")}
+        SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE locked_by IS NOT NULL AND locked_until < ?
       SQL
     end
 
@@ -1848,7 +2155,7 @@ module Durababble
 
     define(:mysql_lock_owned_workflow_for_update, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocation_group_id, locked_until
         FROM #{table(store, "workflows")}
         WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
         FOR UPDATE

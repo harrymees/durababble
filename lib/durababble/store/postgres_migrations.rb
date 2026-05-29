@@ -34,6 +34,17 @@ module Durababble
           parent_object_id text,
           parent_object_command_id text,
           child_cancellation_policy text,
+          colocation_group_id text,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      SQL
+      execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{table("colocation_groups")} (
+          id text PRIMARY KEY,
+          worker_pool text NOT NULL DEFAULT 'default',
+          locked_by text,
+          locked_until timestamptz,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now()
         )
@@ -117,6 +128,7 @@ module Durababble
           state bytea,
           locked_by text,
           locked_until timestamptz,
+          colocation_group_id text,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
           PRIMARY KEY (object_type, object_id)
@@ -224,6 +236,8 @@ module Durababble
       create_postgres_index("target_activations_claim_idx", "ON #{table("target_activations")} (worker_pool ASC, target_kind ASC, target_type ASC, (#{StoreQueries::POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("durable_objects_worker_lease_idx", "ON #{table("durable_objects")} (locked_by) WHERE locked_by IS NOT NULL")
       create_postgres_index("durable_objects_expired_lease_idx", "ON #{table("durable_objects")} (locked_until) WHERE locked_by IS NOT NULL")
+      create_postgres_index("colocation_groups_worker_lease_idx", "ON #{table("colocation_groups")} (locked_by) WHERE locked_by IS NOT NULL")
+      create_postgres_index("colocation_groups_expired_lease_idx", "ON #{table("colocation_groups")} (locked_until) WHERE locked_by IS NOT NULL")
     end
 
     #: (untyped, untyped, ?unique: bool) -> untyped

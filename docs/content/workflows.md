@@ -176,6 +176,31 @@ Child workflows inherit the parent worker pool unless `worker_pool:` is supplied
 
 Cancellation is explicit. `cancellation: :request_cancel` asks Durababble to request child cancellation when the parent observes cooperative cancellation. `cancellation: :abandon` leaves the child running or pending if the parent is canceled. Parent hard termination does not request child cancellation or run cleanup; use the child handle if the child should be stopped separately.
 
+### Colocating Child Workflows
+
+Passing `colocate: true` asks Durababble to run the child on the same worker as the parent that starts it. Colocation is opt-in and defaults to `false`; it is only valid when `enqueue`/`start` is called from inside a workflow execution or a durable object command, and raises `ArgumentError` if requested from anywhere else. The flag is part of the child's idempotency identity, so a retried start must keep the same `colocate:` value it first used.
+
+```ruby
+class ReconcileBatch < Durababble::Workflow
+  def execute(batch)
+    # Runs on the same worker that is currently executing ReconcileBatch.
+    handle = ScoreRecords.start(
+      { "batch_id" => batch.fetch("id") },
+      id: "score-#{batch.fetch('id')}",
+      colocate: true,
+    )
+
+    handle.result
+  end
+end
+```
+
+Colocation binds the parent and child into a colocation group at start time. While both are actively leased they are always leased together by the same worker, and no other worker can claim the parent while a colocated child is still running. This is useful when the parent and child share an expensive worker-local resource — a warmed cache, a GPU, a large in-memory dataset, a connection to a single-writer system — and shuffling them across workers would be wasteful or incorrect.
+
+Colocation does not pin work to one worker forever, so it stays crash safe. If the parent's lease expires or its worker disappears, that is fine; the group simply has no live holder for a moment. Once both leases have lapsed, any worker may pick up the parent, the child, or both — but a worker that takes one live member of the group takes the whole group, so the pair re-homes together rather than splitting across machines. Colocation is a placement constraint, not a durability or ordering guarantee: the child still has its own lifecycle, history, and result, and the parent still observes it through the normal `ChildWorkflowHandle`.
+
+Colocation is cheap. It adds no extra queries to the lease, poll, or task-write hot paths — the same claim statement that already leases a workflow also enforces group co-tenancy — so turning it on for a child does not slow ordinary execution.
+
 ### Deduplicating Workflow Starts
 
 Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.

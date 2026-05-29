@@ -11,7 +11,7 @@ require_relative "error_formatting"
 require_relative "worker_identity"
 
 module Durababble
-  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
+  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id, :lease_seconds)
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -262,8 +262,8 @@ module Durababble
       true
     end
 
-    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
-    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon)
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String, ?colocate: bool) -> ChildWorkflowHandle
+    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon, colocate: false)
       raise Error, "cannot start workflows from an exposed query" if @__durababble_query_context
       raise Error, "durable object workflow starts can only be scheduled from object commands" unless command_context
 
@@ -287,6 +287,8 @@ module Durababble
         input:,
         worker_pool: child_worker_pool,
         cancellation_policy: policy,
+        colocate:,
+        lease_seconds: colocate ? context.lease_seconds&.to_i : nil,
       )
       ChildWorkflowReuse.validate!(
         link,
@@ -299,6 +301,7 @@ module Durababble
         input:,
         worker_pool: child_worker_pool,
         cancellation_policy: policy,
+        colocate:,
       )
       ChildWorkflowHandle.new(
         workflow_class,
@@ -1102,6 +1105,7 @@ module Durababble
         attempt_number: message.fetch("attempts").to_i,
         idempotency_key: "durababble:v1:object:#{object_type}:#{object_id}:command:#{message.fetch("id")}",
         worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
       )
 
       # The drain runs inside the host's `with_lease`, so when a resident host

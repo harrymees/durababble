@@ -80,8 +80,8 @@ module Durababble
         workflow_name
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (String | ChildWorkflowHandle)
-      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?, ?colocate: bool) -> (String | ChildWorkflowHandle)
+      def enqueue(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil, colocate: false)
         raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current || WorkflowQueryContext.current
 
         if (execution = WorkflowExecutionContext.current)
@@ -94,6 +94,7 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+            colocate:,
           )
         end
 
@@ -108,11 +109,13 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation: cancellation.nil? ? :abandon : cancellation,
+            colocate:,
           )
         end
 
         raise ArgumentError, "idempotency_key: is only supported when enqueue is called from workflow execution or an object command" unless idempotency_key.nil?
         raise ArgumentError, "cancellation: is only supported when enqueue is called from workflow execution or an object command" unless cancellation.nil?
+        raise ArgumentError, "colocate: is only supported when enqueue is called from workflow execution or an object command" if colocate
 
         if worker_pool
           workflow_id = id || SecureRandom.uuid
@@ -122,8 +125,8 @@ module Durababble
         end
       end
 
-      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?) -> (WorkflowRef | ChildWorkflowHandle)
-      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil)
+      #: (Object?, ?id: String?, ?store: Store?, ?engine: Engine?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String?, ?colocate: bool) -> (WorkflowRef | ChildWorkflowHandle)
+      def start(input, id: nil, store: nil, engine: nil, worker_pool: nil, idempotency_key: nil, cancellation: nil, colocate: false)
         raise Error, "cannot start workflows from an exposed query" if ObjectQueryExecutionContext.current || WorkflowQueryContext.current
 
         if (execution = WorkflowExecutionContext.current)
@@ -136,6 +139,7 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation_policy: cancellation.nil? ? :request_cancel : cancellation,
+            colocate:,
           )
         end
 
@@ -150,11 +154,13 @@ module Durababble
             worker_pool:,
             idempotency_key:,
             cancellation: cancellation.nil? ? :abandon : cancellation,
+            colocate:,
           )
         end
 
         raise ArgumentError, "idempotency_key: is only supported when start is called from workflow execution or an object command" unless idempotency_key.nil?
         raise ArgumentError, "cancellation: is only supported when start is called from workflow execution or an object command" unless cancellation.nil?
+        raise ArgumentError, "colocate: is only supported when start is called from workflow execution or an object command" if colocate
 
         if worker_pool
           resolved_store = Durababble.store_for(store:, engine:)
@@ -284,8 +290,8 @@ module Durababble
       Durababble.wait_condition(timeout:, &block)
     end
 
-    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
-    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel)
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String, ?colocate: bool) -> ChildWorkflowHandle
+    def start_child(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :request_cancel, colocate: false)
       raise Error, "cannot start child workflows from an exposed query" if WorkflowQueryContext.current
 
       __durababble_execution__.call_child_workflow_start(
@@ -295,6 +301,7 @@ module Durababble
         worker_pool:,
         idempotency_key:,
         cancellation_policy: cancellation,
+        colocate:,
       )
     end
 
