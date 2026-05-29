@@ -318,8 +318,8 @@ module Durababble
       raise NotImplementedError
     end
 
-    #: (String, result: Object?, ?worker_id: String?) -> Object
-    def complete_workflow(workflow_id, result:, worker_id: nil)
+    #: (String, result: Object?, ?worker_id: String?, ?wake_parent: bool) -> Object
+    def complete_workflow(workflow_id, result:, worker_id: nil, wake_parent: true)
       raise NotImplementedError
     end
 

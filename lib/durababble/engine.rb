@@ -61,7 +61,13 @@ module Durababble
           raise LeaseConflict, "workflow #{workflow_id} is leased by another worker"
         end
 
-        execute(workflow_class, workflow_id:, initial_input: owned_claim.fetch("input"), claimed_next_run_at: claimed_next_run_at(current, owned_claim))
+        execute(
+          workflow_class,
+          workflow_id:,
+          initial_input: owned_claim.fetch("input"),
+          claimed_next_run_at: claimed_next_run_at(current, owned_claim),
+          wake_parent: !owned_claim["parent_workflow_id"].nil?,
+        )
       end
     end
 
@@ -72,9 +78,8 @@ module Durababble
       WorkflowStatus.terminal?(row)
     end
 
-    #: (untyped, ?history_count: untyped) -> bool
-    def check_workflow_history_limit!(workflow_id, history_count: nil)
-      history_count ||= @store.workflow_history_count_for(workflow_id)
+    #: (untyped, history_count: Integer) -> bool
+    def check_workflow_history_limit!(workflow_id, history_count:)
       max_history_events = Durababble.max_workflow_history_events
       warned = Durababble.warn_workflow_history_events(
         workflow_id:,
@@ -106,8 +111,8 @@ module Durababble
     # rescue maps one boundary outcome (suspended, retry scheduled, lease lost,
     # canceled, failed) onto the right persisted state. `attributes` is computed
     # before the trace block so it is always available to the rescue handlers.
-    #: (untyped, workflow_id: untyped, ?initial_input: untyped, ?claimed_next_run_at: untyped) -> untyped
-    def execute(workflow_class, workflow_id:, initial_input: nil, claimed_next_run_at: nil)
+    #: (untyped, workflow_id: untyped, ?initial_input: untyped, ?claimed_next_run_at: untyped, ?wake_parent: bool) -> untyped
+    def execute(workflow_class, workflow_id:, initial_input: nil, claimed_next_run_at: nil, wake_parent: true)
       # Deferred boot check: at workflow execution time the host's initializers have run
       # and ActiveSupport::IsolatedExecutionState.isolation_level should be :fiber. Running
       # the Async reactor below with :thread isolation would share one AR connection across
@@ -115,7 +120,7 @@ module Durababble
       Durababble.assert_fiber_isolation!
       attributes = execute_attributes(workflow_class, workflow_id)
       Observability.trace("durababble.workflow.execute", attributes) do
-        terminal_run = drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at:)
+        terminal_run = drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at:, wake_parent:)
         terminal_run || snapshot(workflow_id)
       end
     rescue WorkflowSuspended => e
@@ -134,8 +139,8 @@ module Durababble
     # owned here so the ensure can always break its reference back to the
     # execution, and errors raised inside the reactor are surfaced to the
     # boundary rescues via root_error rather than escaping the Async task.
-    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped, ?claimed_next_run_at: untyped) -> untyped
-    def drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at: nil)
+    #: (untyped, workflow_id: untyped, initial_input: untyped, attributes: untyped, ?claimed_next_run_at: untyped, ?wake_parent: bool) -> untyped
+    def drive_workflow_to_completion(workflow_class, workflow_id:, initial_input:, attributes:, claimed_next_run_at: nil, wake_parent: true)
       workflow = nil #: untyped
       root_error = nil #: StandardError?
       terminal_run = nil #: untyped
@@ -158,7 +163,7 @@ module Durababble
         )
         workflow.__durababble_execution__ = execution
         result = run_workflow_body(workflow, execution, workflow_class, workflow_id:, initial_input:)
-        terminal_run = persist_terminal_state(execution, workflow_id:, result:, attributes:)
+        terminal_run = persist_terminal_state(execution, workflow_id:, result:, attributes:, wake_parent:)
         crash!(:workflow_completed)
       rescue StandardError => e
         root_error = e
@@ -173,8 +178,8 @@ module Durababble
 
     #: (untyped, untyped) -> [untyped, bool]
     def load_workflow_history(workflow_id, attributes)
-      history_warning_logged = check_workflow_history_limit!(workflow_id)
       history = @store.workflow_history_for(workflow_id)
+      history_warning_logged = check_workflow_history_limit!(workflow_id, history_count: history.length)
       Observability.record(
         "durababble.workflow.history.steps",
         history.count { |event| event.fetch("kind") == "step_completed" },
@@ -199,8 +204,8 @@ module Durababble
     # raises unless it set status='completed', result=<result>, error=NULL, and the
     # serializer round-trips result faithfully. The CANCEL path returns nil because
     # its persisted error/reason isn't reconstructable here; the caller re-reads.
-    #: (untyped, workflow_id: untyped, result: untyped, attributes: untyped) -> untyped
-    def persist_terminal_state(execution, workflow_id:, result:, attributes:)
+    #: (untyped, workflow_id: untyped, result: untyped, attributes: untyped, ?wake_parent: bool) -> untyped
+    def persist_terminal_state(execution, workflow_id:, result:, attributes:, wake_parent: true)
       WorkflowExecutionContext.with_current(execution) do
         execution.validate_replay_complete!
         WorkflowDeterminism.allow_host_operations do
@@ -209,7 +214,7 @@ module Durababble
             Observability.count("durababble.workflow.cancellations", attributes.merge("durababble.workflow.status" => "canceled"))
             nil
           else
-            @store.complete_workflow(workflow_id, result:, worker_id: @worker_id)
+            @store.complete_workflow(workflow_id, result:, worker_id: @worker_id, wake_parent:)
             Observability.count("durababble.workflow.completions", attributes.merge("durababble.workflow.status" => "completed"))
             Run.new(id: workflow_id, status: "completed", result:, error: nil)
           end

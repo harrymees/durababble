@@ -261,8 +261,10 @@ module Durababble
       end
     end
 
-    #: (String, result: Object?, ?worker_id: String?) -> Object
-    def complete_workflow(workflow_id, result:, worker_id: nil)
+    # See MysqlStore#complete_workflow: `wake_parent: false` drops the no-op
+    # parent-wake round trip when the claimed row had a NULL parent_workflow_id.
+    #: (String, result: Object?, ?worker_id: String?, ?wake_parent: bool) -> Object
+    def complete_workflow(workflow_id, result:, worker_id: nil, wake_parent: true)
       serialized_result = dump_workflow_result(workflow_id:, result:)
       transaction do
         update = if worker_id
@@ -272,7 +274,7 @@ module Durababble
         end
         require_workflow_completion_update!(update, workflow_id:, worker_id:)
         cancel_live_workflow_dependents(workflow_id)
-        wake_parent_workflow_if_child_terminal(workflow_id)
+        wake_parent_workflow_if_child_terminal(workflow_id) if wake_parent
         update
       end
     end

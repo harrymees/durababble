@@ -323,8 +323,12 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_completed", command_id:, payload: result, event_index:)
     end
 
-    #: (String, result: Object?, ?worker_id: String?) -> Object
-    def complete_workflow(workflow_id, result:, worker_id: nil)
+    # `wake_parent: false` skips the parent-wake JOIN when the caller already
+    # knows this workflow has no parent (the claimed row carried a NULL
+    # parent_workflow_id). The wake is a no-op for parentless workflows — the
+    # self-join matches zero rows — so skipping it only drops a round trip.
+    #: (String, result: Object?, ?worker_id: String?, ?wake_parent: bool) -> Object
+    def complete_workflow(workflow_id, result:, worker_id: nil, wake_parent: true)
       serialized_result = dump_workflow_result(workflow_id:, result:)
       transaction do
         update = if worker_id
@@ -334,7 +338,7 @@ module Durababble
         end
         require_workflow_completion_update!(update, workflow_id:, worker_id:)
         cancel_live_workflow_dependents(workflow_id)
-        wake_parent_workflow_if_child_terminal(workflow_id)
+        wake_parent_workflow_if_child_terminal(workflow_id) if wake_parent
         update
       end
     end
