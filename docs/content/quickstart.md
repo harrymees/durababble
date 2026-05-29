@@ -62,7 +62,7 @@ Workflows can park themselves without holding a worker thread. `wait_until` is a
 ```ruby
 class SendReminderAfterDelay < Durababble::Workflow
   def execute(reminder)
-    delayed = sleep_until(reminder.fetch("send_at"), reminder)
+    delayed = wait_until(reminder.fetch("send_at"), reminder)
     send_reminder(delayed)
   end
 

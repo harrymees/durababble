@@ -352,7 +352,6 @@ module Durababble
     def execute: (Input input) -> Output
     def step_context: () -> StepContext
     def wait_until: (Time time, ?serialized_payload context) -> serialized_payload
-    def sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
     def sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
     def wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
     def start_child: [ChildInput, ChildOutput] (singleton(Workflow) workflow_class, ChildInput input, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle[ChildInput, ChildOutput]
@@ -823,7 +822,6 @@ module Durababble
   def self.step: (String | Symbol name, ?retry: RetryPolicy | retry_config | nil, ?retry_policy: RetryPolicy | retry_config | nil) { (*serialized_payload args, **serialized_payload kwargs) -> serialized_payload } -> Step
   def self.step_context: () -> StepContext
   def self.wait_until: (Time time, ?serialized_payload context) -> serialized_payload
-  def self.sleep_until: (Time time, ?serialized_payload context) -> serialized_payload
   def self.sleep: (Numeric duration, ?serialized_payload context) -> serialized_payload
   def self.wait_condition: (?timeout: Numeric?) { () -> bool } -> bool
   def self.stream_cancelled?: () -> bool

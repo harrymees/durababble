@@ -797,7 +797,7 @@ class DurababbleEngineTest < DurababbleTestCase
             workflow_name "history-limit-wait"
 
             define_method(:execute) do |input|
-              sleep_until(wake_at, input.merge("slept" => true))
+              wait_until(wake_at, input.merge("slept" => true))
             end
           end
           workflow_id = store.enqueue_workflow(name: workflow.workflow_name, input: { "id" => "wait" })
