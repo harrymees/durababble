@@ -343,8 +343,6 @@ module Durababble
       wait_request
     end
 
-    alias_method :sleep_until, :wait_until
-
     #: (Numeric, ?Object?) -> Object?
     def sleep(duration, context = {})
       execution = WorkflowExecutionContext.current

@@ -108,9 +108,9 @@ Child workflows run independently in the target worker pool. If `worker_pool:` i
 
 Parent cancellation is cooperative and policy driven. The default workflow-origin policy is `:request_cancel`: when the parent observes a cancellation request, Durababble durably requests cancellation of each non-terminal child workflow row whose child cancellation policy is `request_cancel`, then raises `Durababble::CancellationError` into parent workflow code. `cancellation: :abandon` leaves the child running/pending when the parent cancels. Parent hard termination does not deliver cancellation, does not run parent cleanup, and does not request child cancellation; operators can cancel or terminate the child separately through its handle. Child retry policy remains whatever the child workflow declares; parent step/replay retries never duplicate child start and do not reset child retry attempts.
 
-Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `sleep_until(time, context)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, `Durababble.sleep_until(time, context)`, and `Durababble.wait_until(time, context)`.
+Workflow code may use durable timer waits directly from orchestration code through workflow helper methods or the module-level helpers: `sleep(duration)`, `wait_until(time, context)`, `Durababble.sleep(duration)`, and `Durababble.wait_until(time, context)`.
 
-Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `sleep_until(time)` are timer waits with workflow-friendly API shape.
+Durable sleep helpers such as `Durababble::Workflow.sleep(duration)` and `wait_until(time)` are timer waits with workflow-friendly API shape.
 
 `wait_condition(timeout: nil) { ... }` and `Durababble.wait_condition(timeout: nil) { ... }` block a workflow fiber until the predicate is true or a durable timeout fires. Direct waits append replayable workflow command history, park the workflow with the earliest unresolved timer in `workflows.next_run_at`, and resume under the normal workflow claim path when the timer is due. Durable sleeps are implemented as timer waits and must survive process exit.
 

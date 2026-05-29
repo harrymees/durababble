@@ -270,13 +270,6 @@ module Durababble
       Durababble.wait_until(time, context)
     end
 
-    #: (Time, ?Object?) -> Object?
-    def sleep_until(time, context = {})
-      raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current
-
-      Durababble.sleep_until(time, context)
-    end
-
     #: (Numeric, ?Object?) -> Object?
     def sleep(duration, context = {})
       raise Error, "cannot schedule workflow waits from an exposed query" if WorkflowQueryContext.current

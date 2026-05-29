@@ -48,7 +48,7 @@ class CounterWorkflow < Durababble::Workflow
 end
 ```
 
-When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`; when it calls a reusable step constant, the step object delegates to `WorkflowExecution#call_step_object`. Direct orchestration waits (`sleep`, `sleep_until`, `wait_until`, and `wait_condition`) and in-workflow handle RPCs (`Workflow.handle(...).approve(...)`, `DurableObject.at(...).credit(...)`, and `DurableObject.tell(...)`) delegate to the same workflow command scheduler without wrapping the operation in a user step. The execution object:
+When `#execute` calls a step method, the wrapper delegates to `WorkflowExecution#call_step`; when it calls a reusable step constant, the step object delegates to `WorkflowExecution#call_step_object`. Direct orchestration waits (`sleep`, `wait_until`, and `wait_condition`) and in-workflow handle RPCs (`Workflow.handle(...).approve(...)`, `DurableObject.at(...).credit(...)`, and `DurableObject.tell(...)`) delegate to the same workflow command scheduler without wrapping the operation in a user step. The execution object:
 
 1. assigns the next step position;
 2. returns a persisted result immediately if that position already completed and the recorded step name matches the current method;
