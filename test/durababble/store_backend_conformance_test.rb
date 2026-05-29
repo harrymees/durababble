@@ -2033,6 +2033,174 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
       end
     end
 
+    test "a colocated child of a colocated object flattens onto the root owner with #{backend.name}" do
+      with_durababble_store(backend, "colocation_flatten") do |store|
+        # root is the colocation root; obj-a holds its lease.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "root", worker_id: "obj-a", lease_seconds: 300)
+        root_cmd = store.enqueue_object_command(object_type: "counter", object_id: "root", method_name: "start_mid", args: [], kwargs: {})
+        store.claim_object_command(command_id: root_cmd, worker_id: "obj-a", lease_seconds: 30)
+
+        # root starts a colocated child object "mid": mid's owner is root itself.
+        store.start_child_object(
+          parent_object_type: "counter",
+          parent_object_id: "root",
+          parent_object_command_id: root_cmd,
+          parent_object_worker_id: "obj-a",
+          child_object_type: "counter",
+          child_object_id: "mid",
+          worker_pool: "default",
+          colocate: true,
+        )
+        assert_equal ["counter", "root"], store.object_colocated_owner(object_type: "counter", object_id: "mid")
+
+        # obj-a already holds root, so the gate lets it claim mid's lease; then it
+        # runs a command on the intermediate object mid.
+        assert_hash_includes(
+          store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "mid", worker_id: "obj-a", lease_seconds: 30),
+          "object_id" => "mid", "worker_id" => "obj-a",
+        )
+        mid_cmd = store.enqueue_object_command(object_type: "counter", object_id: "mid", method_name: "start_leaves", args: [], kwargs: {})
+        store.claim_object_command(command_id: mid_cmd, worker_id: "obj-a", lease_seconds: 30)
+
+        # A colocated child workflow started from the *intermediate* mid flattens to
+        # the ROOT owner, not to mid — the claim gate never resolves a chain.
+        child_wf = store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: "counter",
+          parent_object_id: "mid",
+          parent_object_command_id: mid_cmd,
+          parent_object_worker_id: "obj-a",
+          child_workflow_name: "child",
+          child_workflow_id: "flat-wf",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+          colocate: true,
+        )
+        assert_equal "counter", child_wf.fetch("colocated_owner_object_type")
+        assert_equal "root", child_wf.fetch("colocated_owner_object_id")
+
+        # A colocated child object started from mid flattens to root just the same.
+        child_obj = store.start_child_object(
+          parent_object_type: "counter",
+          parent_object_id: "mid",
+          parent_object_command_id: mid_cmd,
+          parent_object_worker_id: "obj-a",
+          child_object_type: "counter",
+          child_object_id: "leaf",
+          worker_pool: "default",
+          colocate: true,
+        )
+        assert_equal "root", child_obj.fetch("colocated_owner_object_id")
+        assert_equal ["counter", "root"], store.object_colocated_owner(object_type: "counter", object_id: "leaf")
+      end
+    end
+
+    test "re-running a colocated child-object create is idempotent but rejects a different owner with #{backend.name}" do
+      with_durababble_store(backend, "colocation_object_idempotent") do |store|
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "root", worker_id: "obj-a", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "root", method_name: "start_child_object", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "obj-a", lease_seconds: 30)
+
+        child_args = {
+          parent_object_type: "counter",
+          parent_object_id: "root",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "obj-a",
+          child_object_type: "counter",
+          child_object_id: "leaf",
+          worker_pool: "default",
+          colocate: true,
+        }
+        first = store.start_child_object(**child_args)
+        # A retried command re-stamps the same owner: the PK conflict is ignored and
+        # the persisted owner is read back and confirmed, so the call is a no-op.
+        second = store.start_child_object(**child_args)
+        assert_equal first.fetch("colocated_owner_object_id"), second.fetch("colocated_owner_object_id")
+        assert_equal ["counter", "root"], store.object_colocated_owner(object_type: "counter", object_id: "leaf")
+
+        # A *different* owner colocating the same child id is a conflict — the child
+        # is already bound to root.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "other-root", worker_id: "obj-c", lease_seconds: 300)
+        other_cmd = store.enqueue_object_command(object_type: "counter", object_id: "other-root", method_name: "start_child_object", args: [], kwargs: {})
+        store.claim_object_command(command_id: other_cmd, worker_id: "obj-c", lease_seconds: 30)
+        assert_raises(Durababble::IdempotencyKeyConflict) do
+          store.start_child_object(
+            parent_object_type: "counter",
+            parent_object_id: "other-root",
+            parent_object_command_id: other_cmd,
+            parent_object_worker_id: "obj-c",
+            child_object_type: "counter",
+            child_object_id: "leaf",
+            worker_pool: "default",
+            colocate: true,
+          )
+        end
+      end
+    end
+
+    test "a colocated child workflow's step heartbeat keeps the owner object lease alive with #{backend.name}" do
+      with_durababble_store(backend, "colocation_keepalive") do |store|
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-a", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "abc", method_name: "start_child", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "obj-a", lease_seconds: 30)
+        store.start_child_workflow(
+          origin_kind: "object",
+          parent_object_type: "counter",
+          parent_object_id: "abc",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "obj-a",
+          child_workflow_name: "child",
+          child_workflow_id: "beat-child",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+          colocate: true,
+        )
+        store.claim_runnable_workflow(worker_id: "obj-a", lease_seconds: 300, workflow_names: ["child"])
+        store.record_step_started(workflow_id: "beat-child", position: 0, name: "beat", event_index: next_event_index("beat-child"))
+
+        # The owner object's TTL lapses while the child runs, but obj-a still owns
+        # the row. The child's step heartbeat renews the owner lease (keepalive rides
+        # the heartbeat), so a peer still cannot poach the owner out from under it.
+        expire_object_lease!(store, backend, "counter", "abc")
+        refute_nil store.heartbeat_step(workflow_id: "beat-child", position: 0, worker_id: "obj-a", lease_seconds: 300, cursor: { "offset" => 1 })
+
+        assert_nil store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "abc", worker_id: "obj-b", lease_seconds: 30)
+        assert_hash_includes store.current_object_lease("counter", "abc"), "worker_id" => "obj-a"
+      end
+    end
+
+    test "a non-colocated child object leaves the owner columns null and any worker can claim it with #{backend.name}" do
+      with_durababble_store(backend, "colocation_object_optout") do |store|
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "root", worker_id: "obj-a", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "root", method_name: "start_child_object", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "obj-a", lease_seconds: 30)
+
+        child = store.start_child_object(
+          parent_object_type: "counter",
+          parent_object_id: "root",
+          parent_object_command_id: command_id,
+          parent_object_worker_id: "obj-a",
+          child_object_type: "counter",
+          child_object_id: "free-leaf",
+          worker_pool: "default",
+          colocate: false,
+        )
+
+        # Opt-out: no owner recorded, so there is no fence.
+        assert_nil child.fetch("colocated_owner_object_type")
+        assert_nil child.fetch("colocated_owner_object_id")
+        assert_equal [nil, nil], store.object_colocated_owner(object_type: "counter", object_id: "free-leaf")
+
+        # Any worker can lease the ungated child object.
+        assert_hash_includes(
+          store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "free-leaf", worker_id: "obj-b", lease_seconds: 30),
+          "object_id" => "free-leaf", "worker_id" => "obj-b",
+        )
+      end
+    end
+
     test "fences stale durable object command completion writes with #{backend.name}" do
       with_durababble_store(backend, "conformance") do |store|
         command_id = store.enqueue_object_command(
@@ -2380,6 +2548,148 @@ class DurababbleStoreBackendConformanceTest < DurababbleTestCase
 
         # And A's release remains idempotent on the now-empty row.
         assert_equal false, store.release_object_lease(**key, worker_id: "owner-a")
+      end
+    end
+
+    test "re-enqueueing a workflow command with the same idempotency key reuses the existing message with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_idempotent_reuse") do |store|
+        workflow_id = store.enqueue_workflow(name: "approval", input: {})
+        command_args = {
+          workflow_id:,
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method_name" => "approve", "args" => [], "kwargs" => {} },
+          idempotency_key: "approve-once",
+        }
+
+        first = store.enqueue_workflow_command(**command_args)
+        # An identical re-enqueue (same idempotency key + shape) must return the
+        # already-persisted message id rather than inserting a duplicate command.
+        second = store.enqueue_workflow_command(**command_args)
+        assert_equal first, second
+        assert_equal 1, store.inbox_messages_for(target_kind: "workflow", target_type: "approval", target_id: workflow_id).size
+      end
+    end
+
+    test "failing or retrying an unknown object command is a silent no-op with #{backend.name}" do
+      with_durababble_store(backend, "object_command_unknown_noop") do |store|
+        # A live, claimed command that must remain untouched by the no-op calls.
+        store.claim_object_lease(worker_pool: "default", object_type: "counter", object_id: "obj", worker_id: "owner", lease_seconds: 300)
+        command_id = store.enqueue_object_command(object_type: "counter", object_id: "obj", method_name: "incr", args: [], kwargs: {})
+        store.claim_object_command(command_id:, worker_id: "owner", lease_seconds: 30)
+
+        # An unknown command id never locks a row, so both writes fall through the
+        # `next nil unless command` guard and return nil without side effects.
+        assert_nil store.fail_object_command(command_id: "missing-command", error: "boom", worker_id: "owner")
+        assert_nil store.retry_object_command(command_id: "missing-command", error: "boom", worker_id: "owner", ready_at: Time.now)
+
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "owner"
+      end
+    end
+
+    test "retrying a workflow command for an unknown or mismatched workflow is a silent no-op with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_retry_target_identity") do |store|
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-a")
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-b")
+        command_id = store.enqueue_workflow_command(
+          workflow_id: "wf-a",
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method_name" => "approve", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-a-1",
+        )
+        store.claim_target_activation(worker_id: "command-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-a", worker_id: "command-worker", lease_seconds: 30, limit: 1)
+        assert_equal [command_id], claimed.map { |message| message.fetch("id") }
+
+        # Unknown message id: never locks a row, returns nil at `next nil unless command`.
+        assert_nil store.retry_workflow_command(message_id: "missing-command", workflow_id: "wf-a", error: "boom", worker_id: "command-worker", ready_at: Time.now, event_index: next_event_index("wf-a"))
+        # Real command, wrong workflow: rejected at the target-identity guard before
+        # the lease check, so the command stays running and no history is written.
+        assert_nil store.retry_workflow_command(message_id: command_id, workflow_id: "wf-b", error: "boom", worker_id: "command-worker", ready_at: Time.now, event_index: next_event_index("wf-b"))
+
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "command-worker"
+        assert_empty store.workflow_history_for("wf-a")
+        assert_empty store.workflow_history_for("wf-b")
+      end
+    end
+
+    test "completing a workflow command for an unknown or mismatched workflow is a silent no-op with #{backend.name}" do
+      with_durababble_store(backend, "workflow_command_complete_target_identity") do |store|
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-c")
+        store.enqueue_workflow(name: "approval", input: {}, id: "wf-d")
+        command_id = store.enqueue_workflow_command(
+          workflow_id: "wf-c",
+          workflow_name: "approval",
+          method_name: "approve",
+          payload: { "method_name" => "approve", "args" => [], "kwargs" => {} },
+          idempotency_key: "cmd-c-1",
+        )
+        store.claim_target_activation(worker_id: "command-worker", lease_seconds: 30, target_kinds: ["workflow"], target_types: ["approval"])
+        claimed = store.claim_inbox_messages(target_kind: "workflow", target_type: "approval", target_id: "wf-c", worker_id: "command-worker", lease_seconds: 30, limit: 1)
+        assert_equal [command_id], claimed.map { |message| message.fetch("id") }
+
+        # Unknown message id: never locks a row, returns nil at `next nil unless command`.
+        assert_nil store.complete_workflow_command(message_id: "missing-command", workflow_id: "wf-c", result: nil, worker_id: "command-worker", event_index: next_event_index("wf-c"))
+        # Real command, wrong workflow: rejected at the target-identity guard before
+        # the lease check, so the command stays running and no history is written.
+        assert_nil store.complete_workflow_command(message_id: command_id, workflow_id: "wf-d", result: nil, worker_id: "command-worker", event_index: next_event_index("wf-d"))
+
+        assert_hash_includes store.inbox_message(command_id), "status" => "running", "locked_by" => "command-worker"
+        assert_empty store.workflow_history_for("wf-c")
+        assert_empty store.workflow_history_for("wf-d")
+      end
+    end
+
+    test "wake_due_timers rejects a non-positive batch size with #{backend.name}" do
+      with_durababble_store(backend, "wake_due_timers_batch_validation") do |store|
+        error = assert_raises(ArgumentError) { store.wake_due_timers(batch_size: 0) }
+        assert_match(/batch_size must be positive/, error.message)
+      end
+    end
+
+    test "looking up a missing outbox message returns nil with #{backend.name}" do
+      with_durababble_store(backend, "outbox_message_missing") do |store|
+        assert_nil store.outbox_message("does-not-exist")
+      end
+    end
+
+    test "child workflow start validates its origin fence arguments with #{backend.name}" do
+      with_durababble_store(backend, "child_workflow_origin_fence_validation") do |store|
+        base = {
+          child_workflow_name: "child",
+          child_workflow_id: "child-wf",
+          input: {},
+          worker_pool: "default",
+          cancellation_policy: "abandon",
+        }
+
+        # Workflow origin requires both the parent workflow id and its worker id;
+        # each is checked independently before the fence touches any rows.
+        missing_parent_id = assert_raises(ArgumentError) do
+          store.start_child_workflow(origin_kind: "workflow", parent_worker_id: "w", **base)
+        end
+        assert_match(/parent_workflow_id/, missing_parent_id.message)
+        missing_worker_id = assert_raises(ArgumentError) do
+          store.start_child_workflow(origin_kind: "workflow", parent_workflow_id: "parent", **base)
+        end
+        assert_match(/parent_worker_id/, missing_worker_id.message)
+
+        # Object origin requires the parent object command id and worker id.
+        missing_command_id = assert_raises(ArgumentError) do
+          store.start_child_workflow(origin_kind: "object", parent_object_type: "counter", parent_object_id: "root", parent_object_worker_id: "obj-a", **base)
+        end
+        assert_match(/parent_object_command_id/, missing_command_id.message)
+        missing_object_worker = assert_raises(ArgumentError) do
+          store.start_child_workflow(origin_kind: "object", parent_object_type: "counter", parent_object_id: "root", parent_object_command_id: "cmd-1", **base)
+        end
+        assert_match(/parent_object_worker_id/, missing_object_worker.message)
+
+        # An unrecognized origin kind is rejected outright.
+        unknown_origin = assert_raises(ArgumentError) do
+          store.start_child_workflow(origin_kind: "nonsense", **base)
+        end
+        assert_match(/origin kind/, unknown_origin.message)
       end
     end
   end
