@@ -247,15 +247,6 @@ module Durababble
       stolen
     end
 
-    #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
-    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_microseconds: 60_000_000, worker_pool: "default")
-      if worker_id
-        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_microseconds, workflow_id, worker_pool])
-      else
-        execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
-      end
-    end
-
     #: (String, result: Object?, ?worker_id: String?) -> Object
     def complete_workflow(workflow_id, result:, worker_id: nil)
       serialized_result = dump_workflow_result(workflow_id:, result:)
@@ -682,11 +673,6 @@ module Durababble
       append_workflow_history_without_transaction(workflow_id:, kind: "step_failed", command_id:, payload:, error:)
     end
 
-    #: (workflow_id: String, command_id: Integer, status: String, result: Object?, error: String?) -> Object?
-    def update_latest_attempt(workflow_id:, command_id:, status:, result:, error:)
-      update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result: dump_serialized(result), error:)
-    end
-
     #: (workflow_id: String, command_id: Integer, status: String, serialized_result: Object?, error: String?) -> Object?
     def update_latest_attempt_serialized(workflow_id:, command_id:, status:, serialized_result:, error:)
       execute_store_query(:update_latest_attempt, [workflow_id, command_id, status, serialized_result, error])
@@ -762,11 +748,6 @@ module Durababble
     #: (Integer, Integer) -> Object?
     def postgres_placeholders(offset, count)
       count.times.map { |index| "$#{offset + index}" }.join(", ")
-    end
-
-    #: (Integer) -> Object?
-    def placeholder(index)
-      "$#{index}"
     end
 
     #: (String) -> Object?

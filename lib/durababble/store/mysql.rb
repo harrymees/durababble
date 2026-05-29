@@ -33,15 +33,6 @@ module Durababble
       @migrated = false
     end
 
-    #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
-    def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_microseconds: 60_000_000, worker_pool: "default")
-      if worker_id
-        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_microseconds, workflow_id, worker_pool])
-      else
-        execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
-      end
-    end
-
     #: (worker_id: String, lease_microseconds: Integer, ?workflow_names: Array[String]?, ?worker_pool: String, ?excluding_workflow_ids: Array[String]?) -> Object?
     def claim_runnable_workflow_unchecked(worker_id:, lease_microseconds:, workflow_names: nil, worker_pool: "default", excluding_workflow_ids: nil)
       return if workflow_names&.empty?
@@ -782,11 +773,6 @@ module Durababble
     #: (Integer) -> Object?
     def mysql_placeholders(count)
       Array.new(count, "?").join(", ")
-    end
-
-    #: (Integer) -> Object?
-    def placeholder(_index)
-      "?"
     end
 
     #: (Time?) -> Time?

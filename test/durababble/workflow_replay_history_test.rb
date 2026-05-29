@@ -244,6 +244,11 @@ class DurababbleWorkflowReplayHistoryTest < DurababbleTestCase
     assert_equal Time.utc(2026, 1, 1, 1), start + 3600
   end
 
+  test "durable timestamp helpers pass through already-normalized non-string values" do
+    assert_equal 1_700_000_000_000_000, Durababble::DurableTime.durable_comparable(1_700_000_000_000_000)
+    assert_equal 1_700_000_000_000_000, Durababble::DurableTime.comparable(1_700_000_000_000_000)
+  end
+
   test "waiting_timer falls back to scheduled wait metadata for legacy waiting payloads" do
     wake_at = Time.utc(2026, 1, 1)
     history = Durababble::WorkflowReplayHistory.new([

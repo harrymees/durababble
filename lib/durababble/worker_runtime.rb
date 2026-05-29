@@ -31,7 +31,7 @@ module Durababble
       end
     end
 
-    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Object, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?, ?rpc_credentials: Object?, ?rpc_pool_size: Integer) -> void
+    #: (workflows: Object, worker_pool: String, ?objects: Object, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Object, ?migrate: bool, ?rpc_host: String?, ?rpc_port: Integer?) -> void
     def initialize(
       workflows:,
       worker_pool:,
@@ -45,9 +45,7 @@ module Durababble
       concurrency: 1,
       migrate: true,
       rpc_host: "127.0.0.1",
-      rpc_port: 0,
-      rpc_credentials: :this_port_is_insecure,
-      rpc_pool_size: 4
+      rpc_port: 0
     )
       schema ||= Durababble.default_schema unless store
       raise ArgumentError, "provide either store: or database_url:" unless store || database_url
@@ -77,8 +75,6 @@ module Durababble
       @poll_interval = poll_interval
       @concurrency = parsed_concurrency
       @migrate = migrate
-      @rpc_credentials = rpc_credentials
-      @rpc_pool_size = rpc_pool_size
       # @mutex guards lifecycle state touched by callers and the runtime task.
       # @wakeups is only a hint channel; durable work still lives in the store.
       @mutex = Mutex.new
@@ -217,8 +213,6 @@ module Durababble
         workflow_handlers: @workflow_rpc_handlers,
         host: @rpc_host,
         port: @rpc_port,
-        credentials: @rpc_credentials,
-        pool_size: @rpc_pool_size,
         verify_deliver_message_owner: false,
         identity_id: @worker_identity_id,
         deliver_message: method(:enqueue_delivery),
@@ -262,7 +256,7 @@ module Durababble
     #: () -> Hash[String, Object]
     def workflow_rpc_handlers
       handlers = {}
-      normalize_workflows(@workflows).each_value do |workflow_class|
+      Durababble.normalize_workflows(@workflows).each_value do |workflow_class|
         workflow_class = workflow_class #: as untyped
         workflow_class.exposed_queries.each_key do |method_name|
           handlers[method_name.to_s] = lambda do |payload|
@@ -276,16 +270,6 @@ module Durababble
         end
       end
       handlers
-    end
-
-    #: (untyped) -> Hash[String, Object]
-    def normalize_workflows(workflows)
-      case workflows
-      when Hash
-        workflows.transform_keys(&:to_s)
-      else
-        Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
-      end
     end
 
     #: (untyped) -> void

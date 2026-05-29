@@ -650,7 +650,10 @@ module Durababble
 
     #: (Hash[String, Object?]?) -> bool
     def object_command_message?(row)
-      !!(row && (!row.key?("target_kind") || (row.fetch("target_kind") == "object" && ["ask", "tell"].include?(row.fetch("message_kind")))))
+      return false unless row
+      return true unless row.key?("target_kind")
+
+      row.fetch("target_kind") == "object" && ["ask", "tell"].include?(row.fetch("message_kind"))
     end
 
     #: (Hash[String, Object?]) -> Hash[String, Object?]

@@ -467,9 +467,9 @@ module Durababble
     attr_reader last_error: StandardError?
     attr_reader rpc_address: String?
 
-    def self.start: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> WorkerRuntime
+    def self.start: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer) -> WorkerRuntime
 
-    def initialize: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer, ?rpc_credentials: Rpc::credentials, ?rpc_pool_size: Integer) -> void
+    def initialize: (workflows: workflow_registry, worker_pool: String, ?objects: object_registry, ?store: Store?, ?database_url: String?, ?schema: String?, ?worker_id: String?, ?lease_seconds: Numeric, ?poll_interval: Numeric, ?concurrency: Integer, ?migrate: bool, ?rpc_host: String, ?rpc_port: Integer) -> void
     def start: () -> self
     def start_async: (?parent: Object?) -> Object
     def shutdown: (?timeout: Numeric) -> (:stopped | :timeout)
@@ -568,8 +568,6 @@ module Durababble
   end
 
   module Rpc
-    type credentials = Object
-
     def self.dump: (serialized_payload value, ?surface: Symbol?, ?context: String?) -> String
     def self.load: (String? bytes) -> serialized_payload
     def self.grpc_client_for: (String address) -> Async::GRPC::Client
@@ -663,7 +661,7 @@ module Durababble
     class Client
       attr_reader address: String
 
-      def initialize: (address: String, ?credentials: credentials?, ?timeout: Numeric, ?grpc_client: Object?) -> void
+      def initialize: (address: String, ?timeout: Numeric, ?grpc_client: Object?) -> void
       def awaken_batch: (worker_pool: String, workflow_ids: Array[String]) -> true
       def evict_lease: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
       def deliver_message: (worker_pool: String, target_kind: String, ?target_class: String, target_id: String, ?expected_worker_id: String) -> true
@@ -672,7 +670,7 @@ module Durababble
     end
 
     class WorkflowClient
-      def initialize: (address: String, ?worker_pool: String, ?credentials: credentials, ?timeout: Numeric) -> void
+      def initialize: (address: String, ?worker_pool: String, ?timeout: Numeric) -> void
       def request: (String command, Hash[String, serialized_payload] payload) -> serialized_payload
     end
 
@@ -681,7 +679,7 @@ module Durababble
       attr_reader host: String
       attr_reader port: Integer?
 
-      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: credentials?, ?pool_size: Integer?, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      def initialize: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, _WorkflowRpcHandler], ?transient_handler: _TransientHandler?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?authorize: _RpcAuthorize?, ?awaken_batch: _AwakenBatchHandler?, ?evict_lease: _TargetMessageHandler?, ?deliver_message: _TargetMessageHandler?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
       def start: () -> self
       def start_async: (?parent: Object) -> self
       def stop: () -> void

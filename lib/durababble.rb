@@ -161,6 +161,29 @@ module Durababble
       ENV.fetch("DURABABBLE_DATABASE_URL")
     end
 
+    # A workflow/object registry may be supplied as a Hash (name => class) or as
+    # an Array/single class to be keyed by the class's canonical name. Both forms
+    # normalize to a String-keyed Hash.
+    #: (untyped) -> Hash[String, untyped]
+    def normalize_workflows(workflows)
+      case workflows
+      when Hash
+        workflows.transform_keys(&:to_s)
+      else
+        Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
+      end
+    end
+
+    #: (untyped) -> Hash[String, untyped]
+    def normalize_objects(objects)
+      case objects
+      when Hash
+        objects.transform_keys(&:to_s)
+      else
+        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
+      end
+    end
+
     #: () -> String
     def default_schema
       ENV.fetch("DURABABBLE_SCHEMA") { workspace_schema }

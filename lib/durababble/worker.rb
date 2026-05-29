@@ -14,8 +14,8 @@ module Durababble
     #: (store: Store, workflows: Object, worker_id: String, ?objects: Object, ?lease_seconds: Numeric, ?migrate: bool, ?worker_pool: String, ?workflow_query_registry: Object?) -> void
     def initialize(store:, workflows:, worker_id:, objects: [], lease_seconds: Engine::DEFAULT_LEASE_SECONDS, migrate: true, worker_pool: "default", workflow_query_registry: nil)
       @store = store
-      @workflows = normalize_workflows(workflows)
-      @objects = normalize_objects(objects)
+      @workflows = Durababble.normalize_workflows(workflows)
+      @objects = Durababble.normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @worker_pool = worker_pool
@@ -262,26 +262,6 @@ module Durababble
       Time.now
     rescue ArgumentError, TypeError
       Time.now + Backoff.jittered(ACTIVATION_FORWARD_RETRY_SECONDS)
-    end
-
-    #: (untyped) -> untyped
-    def normalize_workflows(workflows)
-      case workflows
-      when Hash
-        workflows.transform_keys(&:to_s)
-      else
-        Array(workflows).to_h { |workflow_class| [workflow_class.workflow_name, workflow_class] }
-      end
-    end
-
-    #: (untyped) -> untyped
-    def normalize_objects(objects)
-      case objects
-      when Hash
-        objects.transform_keys(&:to_s)
-      else
-        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
-      end
     end
 
     #: () -> untyped

@@ -256,6 +256,45 @@ class DurababblePublicApiBranchCoverageTest < DurababbleTestCase
     end
   end
 
+  test "rejects store: or engine: when enqueuing or starting a child workflow" do
+    input = { "plain" => "plain", "keyword" => "keyword" }
+
+    Durababble::WorkflowExecutionContext.with_current(Object.new) do
+      assert_raises_matching(ArgumentError, /child enqueue cannot specify store: or engine:/) do
+        BranchTestWorkflow.enqueue(input, store: :unused)
+      end
+      assert_raises_matching(ArgumentError, /child start cannot specify store: or engine:/) do
+        BranchTestWorkflow.start(input, engine: :unused)
+      end
+    end
+  end
+
+  test "rejects store: or engine: when starting a workflow from an object command" do
+    input = { "plain" => "plain", "keyword" => "keyword" }
+
+    Durababble::ObjectCommandExecutionContext.with_current(Object.new) do
+      assert_raises_matching(ArgumentError, /object-command workflow enqueue cannot specify store: or engine:/) do
+        BranchTestWorkflow.enqueue(input, engine: :unused)
+      end
+      assert_raises_matching(ArgumentError, /object-command workflow start cannot specify store: or engine:/) do
+        BranchTestWorkflow.start(input, store: :unused)
+      end
+    end
+  end
+
+  test "rejects starting workflows from an exposed query" do
+    input = { "plain" => "plain", "keyword" => "keyword" }
+
+    Durababble::ObjectQueryExecutionContext.with_current(Object.new) do
+      assert_raises_matching(Durababble::Error, /cannot start workflows from an exposed query/) do
+        BranchTestWorkflow.enqueue(input)
+      end
+      assert_raises_matching(Durababble::Error, /cannot start workflows from an exposed query/) do
+        BranchTestWorkflow.start(input)
+      end
+    end
+  end
+
   durababble_store_backends.each do |backend|
     test "covers durable object query, command, retry, and missing methods with #{backend.name}" do
       with_durababble_store(backend, "public_api_branch_object") do |store|

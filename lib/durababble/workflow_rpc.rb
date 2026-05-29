@@ -44,6 +44,18 @@ module Durababble
 
         NoActiveLease.new("workflow #{workflow_id} has no active lease")
       end
+
+      # Real stores hand out a dedicated connection for the duration of the block
+      # (see Store#with_dedicated_connection); test doubles that do not implement
+      # it simply receive the store itself.
+      #: (Store) { (Store) -> Object? } -> Object?
+      def with_store(store, &block)
+        if store.respond_to?(:with_dedicated_connection)
+          store.with_dedicated_connection(&block)
+        else
+          block.call(store)
+        end
+      end
     end
 
     class LeaseStarter
@@ -196,19 +208,8 @@ module Durababble
       def request(command, payload)
         raise UnknownCommand, command unless command == "workflow_rpc"
 
-        with_store do |store|
+        WorkflowRpc.with_store(@store) do |store|
           Handler.new(store:, node_id: @node_id, handlers: @handlers).call(payload)
-        end
-      end
-
-      private
-
-      #: () { (Store) -> Object? } -> Object?
-      def with_store(&block)
-        if @store.respond_to?(:with_dedicated_connection)
-          @store.with_dedicated_connection(&block)
-        else
-          block.call(@store)
         end
       end
     end

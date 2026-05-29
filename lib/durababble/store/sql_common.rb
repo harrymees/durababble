@@ -946,7 +946,11 @@ module Durababble
 
     #: (String, ?worker_id: String?, ?lease_microseconds: Integer, ?worker_pool: String) -> Object?
     def mark_workflow_running_unchecked(workflow_id, worker_id: nil, lease_microseconds: 60_000_000, worker_pool: "default")
-      raise NotImplementedError
+      if worker_id
+        execute_store_query(:mark_workflow_running_with_worker, [worker_id, lease_microseconds, workflow_id, worker_pool])
+      else
+        execute_store_query(:mark_workflow_running, [workflow_id, worker_pool])
+      end
     end
 
     #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, cursor: Object?, ?command_id: Integer?, ?position: Integer?) -> Object?
@@ -1009,11 +1013,6 @@ module Durababble
 
     #: (String) -> String
     def table(name)
-      raise NotImplementedError
-    end
-
-    #: (Integer) -> String
-    def placeholder(index)
       raise NotImplementedError
     end
 
