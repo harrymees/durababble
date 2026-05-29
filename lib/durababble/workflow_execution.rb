@@ -170,14 +170,7 @@ module Durababble
         idempotency_key: caller_idempotency_key,
       )
       raise_if_cancel_requested! if deliver_cancellation_before_command?(shape)
-      command_id, future, scheduled_from_history = synchronize_store do
-        command_id = @next_command_id
-        @next_command_id += 1
-        future = CommandFuture.new(command_id)
-        @futures[command_id] = future
-        scheduled_from_history = schedule_command!(command_id, name:, shape:, event_budget: 3)
-        [command_id, future, scheduled_from_history]
-      end
+      command_id, future, scheduled_from_history = allocate_command(name:, shape:)
       synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(retry_policy))
       attributes = handle_rpc_attributes(
         target_kind:,
@@ -187,14 +180,10 @@ module Durababble
         rpc_kind:,
         command_id:,
       )
-      observability_attributes = attributes #: as untyped
-      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+      count_replay_step(command_id, attributes)
 
       unless @replay_history.terminal_recorded?(command_id)
-        if scheduled_from_history
-          ensure_history_limit_allows!(additional_events: 2)
-          @replay_history.reserve_events!(2)
-        end
+        reserve_scheduled_followup_events!(scheduled_from_history)
         # The handle-RPC block runs OUTSIDE synchronize_store on purpose: it calls
         # wait_for_inbox_message, which polls with a yielding sleep between SELECTs. Holding
         # the store mutex across that poll would serialize the whole workflow. Concurrent
@@ -240,8 +229,7 @@ module Durababble
       command_id, future, scheduled_from_history = allocate_command(name:, shape:)
       synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(nil))
       attributes = child_workflow_attributes(child_workflow_name:, child_workflow_id: id, command_id:, operation: "start")
-      observability_attributes = attributes #: as untyped
-      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+      count_replay_step(command_id, attributes)
 
       unless @replay_history.terminal_recorded?(command_id)
         reserve_scheduled_followup_events!(scheduled_from_history)
@@ -301,8 +289,7 @@ module Durababble
       command_id, future, scheduled_from_history = allocate_command(name:, shape:)
       synthetic_step = Step.new(name:, retry_policy: RetryPolicy.from(nil))
       attributes = child_workflow_attributes(child_workflow_name: "workflow", child_workflow_id: handle.workflow_id, command_id:, operation: "observe")
-      observability_attributes = attributes #: as untyped
-      Observability.count("durababble.workflow.replay.steps", observability_attributes) if @replay_history.terminal_recorded?(command_id)
+      count_replay_step(command_id, attributes)
 
       unless @replay_history.terminal_recorded?(command_id)
         reserve_scheduled_followup_events!(scheduled_from_history)
@@ -704,6 +691,14 @@ module Durababble
         "durababble.child_workflow.id" => child_workflow_id,
         "durababble.child_workflow.operation" => operation,
       }
+    end
+
+    #: (Integer, Hash[String, Object?]) -> void
+    def count_replay_step(command_id, attributes)
+      return unless @replay_history.terminal_recorded?(command_id)
+
+      observability_attributes = attributes #: as untyped
+      Observability.count("durababble.workflow.replay.steps", observability_attributes)
     end
 
     #: (Integer) -> String

@@ -972,7 +972,7 @@ module Durababble
     #: (store: Store, objects: Object, worker_id: String, lease_seconds: Numeric, ?worker_pool: String) -> void
     def initialize(store:, objects:, worker_id:, lease_seconds:, worker_pool: "default")
       @store = store
-      @objects = normalize_objects(objects)
+      @objects = Durababble.normalize_objects(objects)
       @worker_id = worker_id
       @lease_seconds = lease_seconds
       @worker_pool = worker_pool
@@ -1025,16 +1025,6 @@ module Durababble
     end
 
     private
-
-    #: (untyped) -> untyped
-    def normalize_objects(objects)
-      case objects
-      when Hash
-        objects.transform_keys(&:to_s)
-      else
-        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
-      end
-    end
 
     #: (untyped, object_id: untyped, message: untyped) -> untyped
     def dispatch_message(object_class, object_id:, message:)

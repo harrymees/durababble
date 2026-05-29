@@ -404,6 +404,21 @@ class DurababbleObservabilityTest < DurababbleTestCase
     assert_equal "mysql", Durababble::Observability.store_backend(Durababble::MysqlStore.allocate)
   end
 
+  test "merges keyword attributes into positional attributes when both are present" do
+    assert_equal(
+      { "service" => "checkout", "shop_id" => 42 },
+      Durababble::Observability.normalize_attribute_args({ "service" => "checkout" }, { shop_id: 42 }),
+    )
+    assert_equal(
+      { "service" => "checkout" },
+      Durababble::Observability.normalize_attribute_args({ "service" => "checkout" }, {}),
+    )
+  end
+
+  test "returns no instrument for an unknown instrument kind" do
+    assert_nil Durababble.observability.instrument(:gauge, "durababble.unknown.kind")
+  end
+
   test "emits spans and metrics for runtime, object, worker, and store paths" do
     runtime_store = RuntimeStore.new
     engine = Durababble::Engine.new(store: runtime_store)

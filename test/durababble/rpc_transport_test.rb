@@ -460,7 +460,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
 
   test "keeps server lifecycle and workflow client command validation idempotent" do
     store = self.store
-    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0, pool_size: 2)
+    server = Durababble::Rpc::Server.new(node_id: "node-a", store:, port: 0)
 
     assert_raises_matching(Durababble::ConfigurationError, /inside a running Async reactor/) do
       server.start
@@ -1049,7 +1049,7 @@ class DurababbleRpcTransportTest < DurababbleTestCase
   def with_rpc_server(**kwargs)
     server = nil
     runner = lambda do |task|
-      server = Durababble::Rpc::Server.new(**kwargs, port: 0, pool_size: 2)
+      server = Durababble::Rpc::Server.new(**kwargs, port: 0)
       server.start_async(parent: task)
       yield server
     ensure

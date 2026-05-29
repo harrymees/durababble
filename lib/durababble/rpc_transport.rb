@@ -90,6 +90,12 @@ module Durababble
         cache.clear
       end
 
+      #: (Object) -> bool
+      def deadline_exceeded?(call)
+        call = call #: as untyped
+        call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
+      end
+
       #: (String, String) -> Exception
       def build_remote_error(klass, message)
         WorkflowRpc.remote_error_from_fields(klass, message) ||
@@ -198,10 +204,8 @@ module Durababble
       # `grpc_client:` is an injection seam for tests; production callers leave
       # it nil and a cached `Async::GRPC::Client` is built inside the request
       # `Sync` block.
-      # `credentials:` is accepted for call-site compatibility but unused now
-      # that the transport is cleartext h2c.
-      #: (address: String, ?credentials: Object?, ?timeout: Numeric, ?grpc_client: Object?) -> void
-      def initialize(address:, credentials: nil, timeout: DEFAULT_TIMEOUT, grpc_client: nil)
+      #: (address: String, ?timeout: Numeric, ?grpc_client: Object?) -> void
+      def initialize(address:, timeout: DEFAULT_TIMEOUT, grpc_client: nil)
         @address = address
         @timeout = timeout
         @injected_client = grpc_client
@@ -250,16 +254,8 @@ module Durababble
         end
       end
 
-      #: (**Object?) -> Object?
-      def call_transient(**kwargs)
-        worker_pool = kwargs.fetch(:worker_pool) #: as String
-        method = kwargs.fetch(:method) #: as String
-        args = kwargs.fetch(:args)
-        class_name = kwargs.fetch(:class_name, "") #: as String
-        durable_object_id = kwargs.fetch(:durable_object_id, "") #: as String
-        workflow_id = kwargs.fetch(:workflow_id, "") #: as String
-        deadline_ms = kwargs.fetch(:deadline_ms, 0) #: as Integer
-        expected_worker_id = kwargs.fetch(:expected_worker_id, "") #: as String
+      #: (worker_pool: String, method: String, args: Object?, ?class_name: String, ?durable_object_id: String, ?workflow_id: String, ?deadline_ms: Integer, ?expected_worker_id: String) -> Object?
+      def call_transient(worker_pool:, method:, args:, class_name: "", durable_object_id: "", workflow_id: "", deadline_ms: 0, expected_worker_id: "")
         self.class.decode_transient_response(
           call_transient_response(worker_pool:, method:, args:, class_name:, durable_object_id:, workflow_id:, deadline_ms:, expected_worker_id:),
         )
@@ -479,9 +475,9 @@ module Durababble
     end
 
     class WorkflowClient
-      #: (address: String, ?worker_pool: String, ?credentials: Object?, ?timeout: Numeric) -> void
-      def initialize(address:, worker_pool: "default", credentials: nil, timeout: DEFAULT_TIMEOUT)
-        @client = Client.new(address:, credentials:, timeout:)
+      #: (address: String, ?worker_pool: String, ?timeout: Numeric) -> void
+      def initialize(address:, worker_pool: "default", timeout: DEFAULT_TIMEOUT)
+        @client = Client.new(address:, timeout:)
         @worker_pool = worker_pool
       end
 
@@ -507,12 +503,9 @@ module Durababble
       #: Integer?
       attr_reader :port
 
-      # `credentials:`/`pool_size:` are accepted for call-site compatibility but
-      # unused: the transport is currently cleartext gRPC over h2c and the
-      # reactor multiplexes connections on one fiber scheduler (no thread pool).
       # `identity_id:` seeds the generated `node_id` (`<id>@<address>`) so a worker
       # keeps a stable identity across address reuse (see #68/#69).
-      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method | DurableObjectTransientHandler)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?credentials: Object?, ?pool_size: Integer?, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
+      #: (node_id: String?, store: Store, ?worker_pool: String, ?workflow_handlers: Hash[String, Object], ?transient_handler: (Proc | Method | DurableObjectTransientHandler)?, ?stream_handler: (Proc | Method)?, ?node_directory: NodeDirectory, ?host: String, ?port: Integer, ?authorize: (Proc | Method)?, ?awaken_batch: (Proc | Method)?, ?evict_lease: (Proc | Method)?, ?deliver_message: (Proc | Method)?, ?verify_deliver_message_owner: bool, ?identity_id: String?) -> void
       def initialize(
         node_id:,
         store:,
@@ -523,8 +516,6 @@ module Durababble
         node_directory: NodeDirectory.new,
         host: "127.0.0.1",
         port: 50_051,
-        credentials: nil,
-        pool_size: nil,
         authorize: nil,
         awaken_batch: nil,
         evict_lease: nil,
@@ -685,54 +676,22 @@ module Durababble
 
       #: (Object, Object, Object) -> void
       def awaken_batch(input, output, call)
-        rpc_input = input #: as untyped
-        rpc_output = output #: as untyped
-        rpc_output.write(@service.awaken_batch(rpc_input.read, call))
-      rescue Unauthenticated => e
-        raise Protocol::GRPC::Unauthenticated, e.message
-      rescue Async::TimeoutError => e
-        raise_deadline_timeout_or_internal!(e, call)
-      rescue StandardError => e
-        raise Protocol::GRPC::Internal, e.message
+        dispatch(:awaken_batch, input, output, call)
       end
 
       #: (Object, Object, Object) -> void
       def evict_lease(input, output, call)
-        rpc_input = input #: as untyped
-        rpc_output = output #: as untyped
-        rpc_output.write(@service.evict_lease(rpc_input.read, call))
-      rescue Unauthenticated => e
-        raise Protocol::GRPC::Unauthenticated, e.message
-      rescue Async::TimeoutError => e
-        raise_deadline_timeout_or_internal!(e, call)
-      rescue StandardError => e
-        raise Protocol::GRPC::Internal, e.message
+        dispatch(:evict_lease, input, output, call)
       end
 
       #: (Object, Object, Object) -> void
       def deliver_message(input, output, call)
-        rpc_input = input #: as untyped
-        rpc_output = output #: as untyped
-        rpc_output.write(@service.deliver_message(rpc_input.read, call))
-      rescue Unauthenticated => e
-        raise Protocol::GRPC::Unauthenticated, e.message
-      rescue Async::TimeoutError => e
-        raise_deadline_timeout_or_internal!(e, call)
-      rescue StandardError => e
-        raise Protocol::GRPC::Internal, e.message
+        dispatch(:deliver_message, input, output, call)
       end
 
       #: (Object, Object, Object) -> void
       def call_transient(input, output, call)
-        rpc_input = input #: as untyped
-        rpc_output = output #: as untyped
-        rpc_output.write(@service.call_transient(rpc_input.read, call))
-      rescue Unauthenticated => e
-        raise Protocol::GRPC::Unauthenticated, e.message
-      rescue Async::TimeoutError => e
-        raise_deadline_timeout_or_internal!(e, call)
-      rescue StandardError => e
-        raise Protocol::GRPC::Internal, e.message
+        dispatch(:call_transient, input, output, call)
       end
 
       #: (Object, Object, Object) -> void
@@ -747,17 +706,24 @@ module Durababble
 
       private
 
-      #: (Async::TimeoutError, Object) -> bot
-      def raise_deadline_timeout_or_internal!(error, call)
-        raise error if grpc_deadline_exceeded?(call)
-
-        raise Protocol::GRPC::Internal, error.message
+      #: (Symbol, Object, Object, Object) -> void
+      def dispatch(method, input, output, call)
+        rpc_input = input #: as untyped
+        rpc_output = output #: as untyped
+        rpc_output.write(@service.public_send(method, rpc_input.read, call))
+      rescue Unauthenticated => e
+        raise Protocol::GRPC::Unauthenticated, e.message
+      rescue Async::TimeoutError => e
+        raise_deadline_timeout_or_internal!(e, call)
+      rescue StandardError => e
+        raise Protocol::GRPC::Internal, e.message
       end
 
-      #: (Object) -> bool
-      def grpc_deadline_exceeded?(call)
-        call = call #: as untyped
-        call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
+      #: (Async::TimeoutError, Object) -> bot
+      def raise_deadline_timeout_or_internal!(error, call)
+        raise error if Rpc.deadline_exceeded?(call)
+
+        raise Protocol::GRPC::Internal, error.message
       end
 
       #: (Object, Integer, StandardError) -> void
@@ -860,7 +826,7 @@ module Durababble
         # that `RpcService` translates `Unauthenticated` into gRPC unauthenticated.
         raise
       rescue Async::TimeoutError => e
-        raise if grpc_deadline_exceeded?(call)
+        raise if Rpc.deadline_exceeded?(call)
 
         observe_transient_error(request, e)
         remote_error_response(e)
@@ -920,12 +886,6 @@ module Durababble
         raise Unauthenticated, "durababble RPC peer is not authorized"
       end
 
-      #: (Object) -> bool
-      def grpc_deadline_exceeded?(call)
-        call = call #: as untyped
-        call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
-      end
-
       #: (Messages::TransientRequest) -> Object?
       def call_workflow_transient(request)
         expected_worker_id = request.expected_worker_id.to_s.empty? ? @node_id : request.expected_worker_id
@@ -935,21 +895,12 @@ module Durababble
           "command" => request["method"],
           "payload" => load_request_args(request, context: "CallTransient #{request["method"]} args") || {},
         }
-        with_store do |store|
+        WorkflowRpc.with_store(@store) do |store|
           WorkflowRpc::Handler.new(
             store:,
             node_id: @node_id,
             handlers: @workflow_handlers,
           ).call(payload)
-        end
-      end
-
-      #: () { (Store) -> Object? } -> Object?
-      def with_store(&block)
-        if @store.respond_to?(:with_dedicated_connection)
-          @store.with_dedicated_connection(&block)
-        else
-          block.call(@store)
         end
       end
 
