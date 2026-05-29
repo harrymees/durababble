@@ -128,22 +128,55 @@ module Durababble
       },
     }.freeze
 
+    # Colocation folds into the single claim round-trip with no extra statement:
+    #   * the candidate filter skips any colocated child whose owner object is
+    #     actively held by another worker (the OR short-circuits to a no-op for
+    #     the common colocated_owner_object_type IS NULL row, so non-colocated
+    #     claims pay nothing);
+    #   * the data-modifying own CTE acquires/renews the owner object's own lease
+    #     for a colocated candidate under the same co-tenancy condition as every
+    #     other lease acquire, serializing concurrent same-owner claims on the
+    #     owner row;
+    #   * the final UPDATE only lands when the candidate is non-colocated or the
+    #     owner acquire succeeded, so losing the owner race claims nothing and the
+    #     child stays put for whoever holds the owner.
     define(:pg_claim_runnable_workflow, backend: :postgres, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_filter:|
       workflows = table(store, "workflows")
+      objects = table(store, "durable_objects")
       <<~SQL.chomp
         WITH candidate AS (
-          SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at FROM #{workflows}
+          SELECT id, status AS claimed_status, next_run_at AS claimed_next_run_at,
+                 colocated_owner_object_type, colocated_owner_object_id FROM #{workflows}
           WHERE worker_pool = $1
             AND (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}) <= now()
+            AND (
+              colocated_owner_object_type IS NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM #{objects} o
+                WHERE o.object_type = #{workflows}.colocated_owner_object_type
+                  AND o.object_id = #{workflows}.colocated_owner_object_id
+                  AND o.locked_by IS NOT NULL AND o.locked_by <> $2 AND o.locked_until >= now()
+              )
+            )
             #{name_filter}
           ORDER BY (#{POSTGRES_WORKFLOW_CLAIM_EXPRESSION}), created_at
           LIMIT 1
           FOR UPDATE SKIP LOCKED
+        ),
+        own AS (
+          UPDATE #{objects} o
+          SET locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE o.object_type = candidate.colocated_owner_object_type
+            AND o.object_id = candidate.colocated_owner_object_id
+            AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $2)
+          RETURNING o.object_type
         )
         UPDATE #{workflows} AS workflows
         SET status = 'running', locked_by = $2, locked_until = now() + ($3::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
         FROM candidate
         WHERE workflows.id = candidate.id AND workflows.worker_pool = $1
+          AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
         RETURNING workflows.*, candidate.claimed_status, candidate.claimed_next_run_at
       SQL
     end
@@ -156,19 +189,43 @@ module Durababble
     end
 
     define(:pg_claim_workflow_update, backend: :postgres) do |store|
+      # Targeted resume claim with the colocation co-tenancy gate folded in. The
+      # candidate CTE locks the target row and carries its owner object columns;
+      # own acquires/renews the owner object's lease (free / expired / ours) when
+      # colocated; the member UPDATE only fires when non-colocated or the owner is
+      # now held. One atomic statement, so non-colocated claims pay nothing beyond
+      # an empty own.
+      workflows = table(store, "workflows")
+      objects = table(store, "durable_objects")
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
+        WITH candidate AS (
+          SELECT id, colocated_owner_object_type, colocated_owner_object_id FROM #{workflows}
+          WHERE id = $1 AND worker_pool = $2
+            AND (
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'waiting' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
+            )
+          FOR UPDATE
+        ),
+        own AS (
+          UPDATE #{objects} o
+          SET locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE o.object_type = candidate.colocated_owner_object_type
+            AND o.object_id = candidate.colocated_owner_object_id
+            AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $3)
+          RETURNING o.object_type
+        )
+        UPDATE #{workflows} AS workflows
         SET status = 'running', error = NULL, locked_by = $3,
             locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
-        WHERE id = $1 AND worker_pool = $2
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'waiting' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
-          )
-        RETURNING *
+        FROM candidate
+        WHERE workflows.id = candidate.id
+          AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
+        RETURNING workflows.*
       SQL
     end
 
@@ -225,11 +282,14 @@ module Durababble
     end
 
     define(:pg_heartbeat_step_workflow, backend: :postgres) do |store|
+      # Returns the owner object columns so the heartbeat keepalive can renew the
+      # owner lease in the same round-trip without a second read. NULL for the
+      # non-colocated common case, where the keepalive short-circuits.
       <<~SQL.chomp
         UPDATE #{table(store, "workflows")}
         SET locked_until = now() + ($3::bigint * interval '1 microsecond'), updated_at = now()
         WHERE id = $1 AND locked_by = $2 AND status = 'running' AND locked_until >= now()
-        RETURNING locked_until
+        RETURNING locked_until, colocated_owner_object_type, colocated_owner_object_id
       SQL
     end
 
@@ -405,12 +465,12 @@ module Durababble
           id, name, worker_pool, status, input,
           child_origin_kind, parent_workflow_id, parent_command_id,
           parent_object_type, parent_object_id, parent_object_command_id,
-          child_cancellation_policy
+          child_cancellation_policy, colocated_owner_object_type, colocated_owner_object_id
         ) VALUES (
           $1, $2, $3, $4, $5::bytea,
           $6, $7, $8,
           $9, $10, $11,
-          $12
+          $12, $13, $14
         )
       SQL
     end
@@ -482,11 +542,31 @@ module Durababble
       SQL
     end
 
+    # MySQL claims in two statements (candidate select, then lease UPDATE), so
+    # colocation rides the existing split: the candidate filter skips a workflow
+    # whose owner object is actively held by another worker (the subquery carries
+    # no FOR UPDATE, so the outer locking read never locks the owner row), keeping
+    # an owner-busy colocated child from stalling the queue head. The orchestration
+    # then wedges acquire_owner_object_lease_for_claim between the two statements as
+    # the authoritative co-tenancy gate. Non-colocated rows short-circuit on the
+    # leading colocated_owner_object_type IS NULL; the candidate is SELECT * so its
+    # owner columns ride back for that gate.
     define(:mysql_claim_runnable_workflow, backend: :mysql, description: "Probe the unified workflow queue for one runnable candidate in this worker pool.") do |store, name_sql:|
+      objects = table(store, "durable_objects")
+      workflows = table(store, "workflows")
       <<~SQL.chomp
-        SELECT * FROM #{table(store, "workflows")} FORCE INDEX (#{index_name(store, "workflows", "claim")})
+        SELECT * FROM #{workflows} FORCE INDEX (#{index_name(store, "workflows", "claim")})
         WHERE worker_pool = ?
           AND queue_available_at <= NOW(6)
+          AND (
+            colocated_owner_object_type IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM #{objects} o
+              WHERE o.object_type = #{workflows}.colocated_owner_object_type
+                AND o.object_id = #{workflows}.colocated_owner_object_id
+                AND o.locked_by IS NOT NULL AND o.locked_by <> ? AND o.locked_until >= NOW(6)
+            )
+          )
           #{name_sql}
         ORDER BY queue_available_at, created_at
         LIMIT 1
@@ -579,7 +659,9 @@ module Durababble
     end
 
     define(:mysql_workflow_locked_until, backend: :mysql) do |store|
-      "SELECT locked_until FROM #{table(store, "workflows")} WHERE id = ?"
+      # The owner object columns ride along so the heartbeat keepalive can renew the
+      # owner object's lease without a second read (NULL for non-colocated workflows).
+      "SELECT locked_until, colocated_owner_object_type, colocated_owner_object_id FROM #{table(store, "workflows")} WHERE id = ?"
     end
 
     define(:mysql_current_workflow_lease, backend: :mysql) do |store|
@@ -690,12 +772,12 @@ module Durababble
           id, name, worker_pool, status, input,
           child_origin_kind, parent_workflow_id, parent_command_id,
           parent_object_type, parent_object_id, parent_object_command_id,
-          child_cancellation_policy, created_at, updated_at
+          child_cancellation_policy, colocated_owner_object_type, colocated_owner_object_id, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?,
-          ?, NOW(6), NOW(6)
+          ?, ?, ?, NOW(6), NOW(6)
         )
       SQL
     end
@@ -742,19 +824,40 @@ module Durababble
     end
 
     define(:pg_claim_workflow_for_activation_update, backend: :postgres) do |store|
+      # Activation-path claim with the same folded colocation gate as
+      # pg_claim_workflow_update; the only difference is the wider waiting clause
+      # (activation resumes a waiting workflow unconditionally).
+      workflows = table(store, "workflows")
+      objects = table(store, "durable_objects")
       <<~SQL.chomp
-        UPDATE #{table(store, "workflows")}
+        WITH candidate AS (
+          SELECT id, colocated_owner_object_type, colocated_owner_object_id FROM #{workflows}
+          WHERE id = $1 AND worker_pool = $2
+            AND (
+              (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR status = 'waiting'
+              OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
+              OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
+              OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
+            )
+          FOR UPDATE
+        ),
+        own AS (
+          UPDATE #{objects} o
+          SET locked_by = $3, locked_until = now() + ($4::bigint * interval '1 microsecond'), updated_at = now()
+          FROM candidate
+          WHERE o.object_type = candidate.colocated_owner_object_type
+            AND o.object_id = candidate.colocated_owner_object_id
+            AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $3)
+          RETURNING o.object_type
+        )
+        UPDATE #{workflows} AS workflows
         SET status = 'running', error = NULL, locked_by = $3,
             locked_until = now() + ($4::bigint * interval '1 microsecond'), next_run_at = NULL, updated_at = now()
-        WHERE id = $1 AND worker_pool = $2
-          AND (
-            (status = 'pending' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR status = 'waiting'
-            OR (status = 'canceling' AND (next_run_at IS NULL OR next_run_at <= now()))
-            OR (status = 'failed' AND next_run_at IS NOT NULL AND next_run_at <= now())
-            OR (status = 'running' AND (locked_by = $3 OR locked_until < now()))
-          )
-        RETURNING *
+        FROM candidate
+        WHERE workflows.id = candidate.id
+          AND (candidate.colocated_owner_object_type IS NULL OR EXISTS (SELECT 1 FROM own))
+        RETURNING workflows.*
       SQL
     end
 
@@ -869,18 +972,41 @@ module Durababble
     # that to `nil`. Callers compare against nil to detect a lost claim; we
     # deliberately do not surface the competing holder's identity here.
     define(:pg_claim_object_lease, backend: :postgres) do |store|
+      # Object-lease claim with the colocation co-tenancy gate folded in. The
+      # `existing` CTE locks the current row (if any) and carries its owner object
+      # columns; `own` takes the owner object's lease (free / expired / ours) when
+      # this object is itself a colocated child. The upsert's INSERT branch (a
+      # brand-new, never-colocated object) is unaffected; only the ON CONFLICT
+      # UPDATE is gated, firing only when non-colocated or the owner is now held.
+      # One atomic statement, so non-colocated claims pay only an empty `own`.
+      objects = table(store, "durable_objects")
       <<~SQL.chomp
-        INSERT INTO #{table(store, "durable_objects")}
+        WITH existing AS (
+          SELECT colocated_owner_object_type, colocated_owner_object_id FROM #{objects}
+          WHERE object_type = $2 AND object_id = $3
+          FOR UPDATE
+        ),
+        own AS (
+          UPDATE #{objects} o
+          SET locked_by = $4, locked_until = now() + ($5::bigint * interval '1 microsecond'), updated_at = now()
+          FROM existing
+          WHERE o.object_type = existing.colocated_owner_object_type
+            AND o.object_id = existing.colocated_owner_object_id
+            AND (o.locked_by IS NULL OR o.locked_until < now() OR o.locked_by = $4)
+          RETURNING o.object_type
+        )
+        INSERT INTO #{objects}
           (worker_pool, object_type, object_id, locked_by, locked_until, created_at, updated_at)
         VALUES ($1, $2, $3, $4, now() + ($5::bigint * interval '1 microsecond'), now(), now())
         ON CONFLICT (object_type, object_id) DO UPDATE
         SET locked_by = EXCLUDED.locked_by,
             locked_until = EXCLUDED.locked_until,
             updated_at = now()
-        WHERE #{table(store, "durable_objects")}.locked_by IS NULL
-           OR #{table(store, "durable_objects")}.locked_until < now()
-           OR #{table(store, "durable_objects")}.locked_by = EXCLUDED.locked_by
-        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until
+        WHERE (#{objects}.locked_by IS NULL
+            OR #{objects}.locked_until < now()
+            OR #{objects}.locked_by = EXCLUDED.locked_by)
+          AND ((SELECT colocated_owner_object_type FROM existing) IS NULL OR EXISTS (SELECT 1 FROM own))
+        RETURNING worker_pool, object_type, object_id, locked_by AS worker_id, locked_until, colocated_owner_object_type, colocated_owner_object_id
       SQL
     end
 
@@ -901,7 +1027,7 @@ module Durababble
     # reads and streams route to durable_objects.locked_by as the active owner.
     define(:pg_lock_owned_object_for_update, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocated_owner_object_type, colocated_owner_object_id, locked_until
         FROM #{table(store, "durable_objects")}
         WHERE object_type = $1 AND object_id = $2
           AND locked_by = $3 AND locked_until >= now()
@@ -910,11 +1036,28 @@ module Durababble
     end
 
     # Idempotent release; non-owner workers cannot release someone else's lease.
+    # When this object owns colocated children the release is also held back while
+    # any child is still live, so holder(child) always implies holder(owner): the
+    # owner cannot be released out from under a running colocated child workflow or
+    # a leased colocated child object. When every child has gone idle the dual
+    # NOT EXISTS passes and the owner re-homes together with them.
     define(:pg_release_object_lease, backend: :postgres) do |store|
+      objects = table(store, "durable_objects")
+      workflows = table(store, "workflows")
       <<~SQL.chomp
-        UPDATE #{table(store, "durable_objects")}
+        UPDATE #{objects} AS d
         SET locked_by = NULL, locked_until = NULL, updated_at = now()
-        WHERE object_type = $1 AND object_id = $2 AND locked_by = $3
+        WHERE d.object_type = $1 AND d.object_id = $2 AND d.locked_by = $3
+          AND NOT EXISTS (
+            SELECT 1 FROM #{workflows} w
+            WHERE w.colocated_owner_object_type = $1 AND w.colocated_owner_object_id = $2
+              AND w.status = 'running' AND w.locked_until IS NOT NULL AND w.locked_until >= now()
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM #{objects} c
+            WHERE c.colocated_owner_object_type = $1 AND c.colocated_owner_object_id = $2
+              AND c.locked_by IS NOT NULL AND c.locked_until IS NOT NULL AND c.locked_until >= now()
+          )
       SQL
     end
 
@@ -935,6 +1078,64 @@ module Durababble
         UPDATE #{table(store, "durable_objects")}
         SET locked_by = NULL, locked_until = NULL, updated_at = now()
         WHERE locked_by = $1
+      SQL
+    end
+
+    # --- Colocation -----------------------------------------------------------
+    # Colocation is object-parent-only and rides the parent object's own lease
+    # (durable_objects.locked_by/locked_until) — there is no separate group row.
+    # A colocated child (workflow or object) records the flattened root owner in
+    # colocated_owner_object_type/id; NULL means not colocated and every path
+    # short-circuits, so non-colocated work pays nothing. The claim queries above
+    # fold the owner acquire into a single statement; these are the helpers used
+    # by the claim paths that hold the candidate in Ruby (MySQL queue/targeted
+    # claims, PG already-owned re-entry) and by the colocated child-object create.
+
+    # Conditional acquire of the owner object's lease. Co-tenancy condition: free,
+    # expired, or already ours. Placeholder numbering mirrors the MySQL mirror's
+    # textual order (SET params first, then WHERE) so callers pass one positional
+    # array to either backend; $1 and $5 are both the worker id.
+    define(:pg_acquire_owner_object_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = $1, locked_until = now() + ($2::bigint * interval '1 microsecond'), updated_at = now()
+        WHERE object_type = $3 AND object_id = $4
+          AND (locked_by IS NULL OR locked_until < now() OR locked_by = $5)
+      SQL
+    end
+
+    # Keepalive: extend the owner object's lease while this worker still holds it.
+    # Driven off a live colocated child workflow's step heartbeat so the owner (and
+    # its siblings) stays pinned for as long as the child is alive.
+    define(:pg_renew_owner_object_lease, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_until = now() + ($1::bigint * interval '1 microsecond'), updated_at = now()
+        WHERE object_type = $2 AND object_id = $3 AND locked_by = $4
+      SQL
+    end
+
+    # Idempotent create of a lease-only child object row carrying its colocation
+    # owner. The deterministic child id is the PK; a retried command re-runs this
+    # and the existing row wins (DO NOTHING), after which start_child_object reads
+    # the owner back to confirm it matches. NULL state leaves the child reporting
+    # uninitialized so initialize_state still runs on its first claim.
+    define(:pg_insert_child_object, backend: :postgres) do |store|
+      <<~SQL.chomp
+        INSERT INTO #{table(store, "durable_objects")}
+          (worker_pool, object_type, object_id, colocated_owner_object_type, colocated_owner_object_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, now(), now())
+        ON CONFLICT (object_type, object_id) DO NOTHING
+      SQL
+    end
+
+    # Read back a child object's recorded colocation owner for the idempotency
+    # check in start_child_object.
+    define(:pg_object_colocated_owner, backend: :postgres) do |store|
+      <<~SQL.chomp
+        SELECT colocated_owner_object_type, colocated_owner_object_id
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = $1 AND object_id = $2
       SQL
     end
 
@@ -1189,9 +1390,13 @@ module Durababble
       "SELECT * FROM #{table(store, "workflows")} WHERE id = $1 FOR UPDATE"
     end
 
+    # Fences a workflow-origin child start against the parent workflow's live
+    # lease. Returning a column (rather than `SELECT 1`) keeps the boolean
+    # truthiness callers rely on — a present row is a non-nil hash. Workflow
+    # parents never own colocation, so no owner columns are read here.
     define(:pg_lock_owned_workflow_for_update, backend: :postgres) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT locked_until
         FROM #{table(store, "workflows")}
         WHERE id = $1 AND status = 'running' AND locked_by = $2 AND locked_until >= now()
         FOR UPDATE
@@ -1527,22 +1732,59 @@ module Durababble
       SQL
     end
 
-    # MySQL mirror of pg_claim_object_lease, split in two so we can read win/loss
-    # off the UPDATE's affected_rows alone. A single-statement
-    # `INSERT ... ON DUPLICATE KEY UPDATE` would not work here: the trilogy
-    # adapter forces `CLIENT_FOUND_ROWS` on every connection, which makes a
-    # no-op "row matched but unchanged" UPDATE report `affected_rows = 1`
-    # — indistinguishable from a fresh insert and so unable to tell a winning
-    # claim from a rejected one without a follow-up SELECT. Splitting it lets
-    # the conditional WHERE on the UPDATE step do the gating: a matching row
-    # means we won (insert or takeover or refresh-self); no match means we
-    # lost. `mysql_ensure_object_row` just guarantees the PK exists so the
-    # UPDATE has something to match.
+    # MySQL object-lease claim. MySQL has no RETURNING, so win/loss is read off the
+    # UPDATE's affected_rows. The trilogy adapter forces `CLIENT_FOUND_ROWS`, so a
+    # no-op "row matched but unchanged" UPDATE reports affected_rows >= 1 — but every
+    # branch of these conditional WHEREs only matches a row we legitimately won, so
+    # the count stays unambiguous (insert-then-claim, takeover, or refresh-self).
+    #
+    # The claim is three statements. `mysql_ensure_object_row` guarantees the PK
+    # exists so an UPDATE has something to match. `mysql_claim_uncolocated_object_lease`
+    # is the fast path: the overwhelming majority of objects are not colocated, and
+    # they claim in that single conditional UPDATE with no owner read — the same
+    # two-statement cost as before colocation existed. Only a colocated child (the
+    # rare case) misses that UPDATE and falls to the lock-then-claim cold path
+    # (`mysql_claim_object_lease_lock` → owner-lease acquire → `mysql_claim_object_lease`),
+    # which reads the child's owner and takes the owner lease before the child lease.
     define(:mysql_ensure_object_row, backend: :mysql) do |store|
       <<~SQL.chomp
         INSERT IGNORE INTO #{table(store, "durable_objects")}
           (worker_pool, object_type, object_id, created_at, updated_at)
         VALUES (?, ?, ?, NOW(6), NOW(6))
+      SQL
+    end
+
+    # Fast path for non-colocated objects: one conditional UPDATE that claims the
+    # lease when it is free, expired, or already ours. The
+    # `colocated_owner_object_type IS NULL` clause keeps colocated children out of
+    # this path so they always take their owner's lease first via the cold path.
+    # affected_rows >= 1 means we won; 0 means either a genuine loss or a colocated
+    # child, and the caller resolves both on the cold path.
+    define(:mysql_claim_uncolocated_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+          AND colocated_owner_object_type IS NULL
+      SQL
+    end
+
+    # Cold-path claimability lock, reached only for a colocated child (or a rare
+    # late-freeing non-colocated row). The PG claim folds the owner-lease gate into
+    # one upsert, but MySQL has no RETURNING and cannot learn the candidate's owner
+    # object without a read — so the cold path is lock-then-claim: this
+    # SELECT ... FOR UPDATE matches the same free / expired / ours predicate as the
+    # claim UPDATE, locks the row for the rest of the transaction, and surfaces the
+    # owner object columns so the caller can acquire the owner lease before writing
+    # the child lease. No matching row means we lost the claim outright.
+    define(:mysql_claim_object_lease_lock, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT colocated_owner_object_type, colocated_owner_object_id
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = ? AND object_id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+        FOR UPDATE
       SQL
     end
 
@@ -1573,7 +1815,7 @@ module Durababble
     # MySQL mirror of pg_lock_owned_object_for_update.
     define(:mysql_lock_owned_object_for_update, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT colocated_owner_object_type, colocated_owner_object_id, locked_until
         FROM #{table(store, "durable_objects")}
         WHERE object_type = ? AND object_id = ?
           AND locked_by = ? AND locked_until >= NOW(6)
@@ -1581,12 +1823,35 @@ module Durababble
       SQL
     end
 
-    # MySQL mirror of pg_release_object_lease.
+    # MySQL mirror of pg_release_object_lease. Same dual NOT EXISTS guard: an owner
+    # cannot be released while it still has a live colocated child (a running child
+    # workflow, or a leased child object), so holder(child) always implies
+    # holder(owner) and the owner re-homes with its children only once they all go
+    # idle. MySQL forbids referencing the UPDATE target table directly in a
+    # subquery, so the child-object probe wraps durable_objects in a derived table
+    # to force materialization (the child-workflow probe hits a different table and
+    # needs no wrap). Params: object_type, object_id, worker_id, then object_type +
+    # object_id once per NOT EXISTS branch.
     define(:mysql_release_object_lease, backend: :mysql) do |store|
+      objects = table(store, "durable_objects")
+      workflows = table(store, "workflows")
       <<~SQL.chomp
-        UPDATE #{table(store, "durable_objects")}
+        UPDATE #{objects}
         SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE object_type = ? AND object_id = ? AND locked_by = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM #{workflows} w
+            WHERE w.colocated_owner_object_type = ? AND w.colocated_owner_object_id = ?
+              AND w.status = 'running' AND w.locked_until IS NOT NULL AND w.locked_until >= NOW(6)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM (
+              SELECT colocated_owner_object_type, colocated_owner_object_id, locked_by, locked_until
+              FROM #{objects}
+            ) c
+            WHERE c.colocated_owner_object_type = ? AND c.colocated_owner_object_id = ?
+              AND c.locked_by IS NOT NULL AND c.locked_until IS NOT NULL AND c.locked_until >= NOW(6)
+          )
       SQL
     end
 
@@ -1605,6 +1870,59 @@ module Durababble
         UPDATE #{table(store, "durable_objects")}
         SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE locked_by = ?
+      SQL
+    end
+
+    # --- Colocation (MySQL mirrors of the pg owner-lease helpers) --------------
+    # Object-parent-only colocation rides the parent object's own lease; there is
+    # no separate group row. These mirror pg_acquire_owner_object_lease,
+    # pg_renew_owner_object_lease, pg_insert_child_object, and
+    # pg_object_colocated_owner. Placeholder order matches the PG variants so one
+    # positional param array drives either backend.
+
+    # Conditional acquire of the owner object's lease: free, expired, or ours.
+    # Params: worker_id, lease_microseconds, owner_object_type, owner_object_id,
+    # worker_id.
+    define(:mysql_acquire_owner_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_by = ?, locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ?
+          AND (locked_by IS NULL OR locked_until < NOW(6) OR locked_by = ?)
+      SQL
+    end
+
+    # Keepalive: extend the owner object's lease while this worker still holds it.
+    # Params: lease_microseconds, owner_object_type, owner_object_id, worker_id.
+    define(:mysql_renew_owner_object_lease, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "durable_objects")}
+        SET locked_until = DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), updated_at = NOW(6)
+        WHERE object_type = ? AND object_id = ? AND locked_by = ?
+      SQL
+    end
+
+    # Idempotent create of a lease-only child object row carrying its colocation
+    # owner. INSERT IGNORE swallows the PK conflict on retry (durable_objects has no
+    # foreign keys, so the only conflict the ignore can mask is the PK); NULL state
+    # leaves the child uninitialized so initialize_state runs on its first claim.
+    # Params: worker_pool, object_type, object_id, colocated_owner_object_type,
+    # colocated_owner_object_id.
+    define(:mysql_insert_child_object, backend: :mysql) do |store|
+      <<~SQL.chomp
+        INSERT IGNORE INTO #{table(store, "durable_objects")}
+          (worker_pool, object_type, object_id, colocated_owner_object_type, colocated_owner_object_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, NOW(6), NOW(6))
+      SQL
+    end
+
+    # Read back a child object's recorded colocation owner for the idempotency
+    # check in start_child_object. Params: object_type, object_id.
+    define(:mysql_object_colocated_owner, backend: :mysql) do |store|
+      <<~SQL.chomp
+        SELECT colocated_owner_object_type, colocated_owner_object_id
+        FROM #{table(store, "durable_objects")}
+        WHERE object_type = ? AND object_id = ?
       SQL
     end
 
@@ -1848,7 +2166,7 @@ module Durababble
 
     define(:mysql_lock_owned_workflow_for_update, backend: :mysql) do |store|
       <<~SQL.chomp
-        SELECT 1
+        SELECT locked_until
         FROM #{table(store, "workflows")}
         WHERE id = ? AND status = 'running' AND locked_by = ? AND locked_until >= NOW(6)
         FOR UPDATE
@@ -2231,12 +2549,14 @@ module Durababble
       SQL
     end
 
-    # No :sqlite_claim_object_lease override: the two-step
-    # :mysql_ensure_object_row + :mysql_claim_object_lease pair translates
-    # cleanly through #translate_to_sqlite (INSERT IGNORE → INSERT OR IGNORE,
-    # DATE_ADD(NOW(6), INTERVAL n SECOND) → dura_now() + n * seconds_scale).
-    # SQLite needs no CLIENT_FOUND_ROWS workaround — `db.changes` reports the
-    # actual matched-and-updated count, so the same UPDATE-WHERE win/loss
-    # signal applies.
+    # No :sqlite_claim_object_lease override: the object-claim statements
+    # (:mysql_ensure_object_row, the :mysql_claim_uncolocated_object_lease fast
+    # path, and the cold-path :mysql_claim_object_lease_lock +
+    # :mysql_claim_object_lease) translate cleanly through #translate_to_sqlite
+    # (INSERT IGNORE → INSERT OR IGNORE, DATE_ADD(NOW(6), INTERVAL n MICROSECOND)
+    # → dura_now()-based arithmetic, `colocated_owner_object_type IS NULL` is
+    # plain SQL). SQLite needs no CLIENT_FOUND_ROWS workaround — `db.changes`
+    # reports the actual matched-and-updated count, so the same UPDATE-WHERE
+    # win/loss signal applies on both the fast and cold paths.
   end
 end

@@ -159,6 +159,27 @@ end
 
 The object command records the workflow as object-origin work using the durable mailbox command id, so retrying the same object command reattaches to the same workflow instead of starting a duplicate. Object commands should not synchronously wait for children; store the child id in object state, schedule a wake, receive a later command/signal, or read the child handle after the command commits.
 
+Object commands can pass `colocate: true` to `start_workflow` to bind the started workflow to the object so they run on the same worker. Colocation is an object-only capability: an object may colocate the child workflows it starts (and the child objects it starts, below), but workflow-to-workflow colocation is not supported. It is opt-in, only valid inside a command, and crash safe: the object's own lease acts as the master lease, so no other worker can claim the object while a colocated child is still running, and the object's lease is released only once no colocated child is live — so if both go idle they re-home together onto whichever worker picks one of them up. See [Colocating Child Workflows](workflows.md) for the full semantics.
+
+### Starting Child Objects
+
+A command can also create another durable object that is colocated with the current object using `start_object(object_class, id:, worker_pool: nil, idempotency_key: nil, colocate: true)`. Like `start_workflow`, this is command-only — it mutates durable state, so calling it from an exposed query or outside a command raises. The child id you supply is the child's durable-object primary key, so a retried command re-stamps the same colocation owner (a no-op); a different object trying to colocate the same id conflicts. The child object is created lazily: `start_object` records only the colocation binding, and the child's `initialize_state` still runs on its first claim. It returns a `DurableObjectRef` for the child.
+
+```ruby
+class Tenant < Durababble::DurableObject
+  object_type "tenant"
+
+  command def provision(region:)
+    # Index runs on the same worker that holds this Tenant's lease.
+    index = start_object(SearchIndex, id: "index-#{durable_id}")
+    update_state(current_state.merge("index_id" => index.durable_id))
+    index.durable_id
+  end
+end
+```
+
+Passing `colocate: false` creates the child object as ordinary, independently-leased work. The default is `colocate: true` because the common reason to start a child object from a command is to keep related state on one worker.
+
 ## Alarms
 
 Object commands can schedule persisted, named wakeups for the object with `schedule_wake(name:, at:, payload: nil)`. Each `name` addresses an independent wake, so one object can hold several outstanding wakes at once — a TTL sweep, a retry, and a daily flush can all be pending against the same id. Calling `schedule_wake` again with the same `name` before it fires replaces that wake's time and payload while leaving the other names untouched. `cancel_wake(name:)` removes a single named wake, and `cancel_all_wakes` removes every pending wake for the object. Scheduling and cancellation are committed with the command, so a failed or retried command does not leave behind an unrelated process-local timer.

@@ -34,6 +34,8 @@ module Durababble
           parent_object_id text,
           parent_object_command_id text,
           child_cancellation_policy text,
+          colocated_owner_object_type text,
+          colocated_owner_object_id text,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now()
         )
@@ -117,6 +119,8 @@ module Durababble
           state bytea,
           locked_by text,
           locked_until timestamptz,
+          colocated_owner_object_type text,
+          colocated_owner_object_id text,
           created_at timestamptz NOT NULL DEFAULT now(),
           updated_at timestamptz NOT NULL DEFAULT now(),
           PRIMARY KEY (object_type, object_id)
@@ -224,6 +228,8 @@ module Durababble
       create_postgres_index("target_activations_claim_idx", "ON #{table("target_activations")} (worker_pool ASC, target_kind ASC, target_type ASC, (#{StoreQueries::POSTGRES_TARGET_ACTIVATION_CLAIM_EXPRESSION}) ASC, created_at ASC)")
       create_postgres_index("durable_objects_worker_lease_idx", "ON #{table("durable_objects")} (locked_by) WHERE locked_by IS NOT NULL")
       create_postgres_index("durable_objects_expired_lease_idx", "ON #{table("durable_objects")} (locked_until) WHERE locked_by IS NOT NULL")
+      create_postgres_index("workflows_colocated_owner_idx", "ON #{table("workflows")} (colocated_owner_object_type, colocated_owner_object_id) WHERE colocated_owner_object_type IS NOT NULL")
+      create_postgres_index("durable_objects_colocated_owner_idx", "ON #{table("durable_objects")} (colocated_owner_object_type, colocated_owner_object_id) WHERE colocated_owner_object_type IS NOT NULL")
     end
 
     #: (untyped, untyped, ?unique: bool) -> untyped

@@ -40,6 +40,8 @@ module Durababble
           parent_object_id TEXT,
           parent_object_command_id TEXT,
           child_cancellation_policy TEXT,
+          colocated_owner_object_type TEXT,
+          colocated_owner_object_id TEXT,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           queue_available_at INTEGER GENERATED ALWAYS AS (
@@ -148,6 +150,8 @@ module Durababble
           state BLOB,
           locked_by TEXT,
           locked_until INTEGER,
+          colocated_owner_object_type TEXT,
+          colocated_owner_object_id TEXT,
           created_at INTEGER NOT NULL DEFAULT (dura_now()),
           updated_at INTEGER NOT NULL DEFAULT (dura_now()),
           PRIMARY KEY (object_type, object_id)

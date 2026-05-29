@@ -42,11 +42,24 @@ module Durababble
         exclusion_sql, exclusion_params = workflow_exclusion_filter(excluding_workflow_ids)
         workflow_sql = "#{name_sql} #{exclusion_sql}"
         workflow_params = name_params + exclusion_params
-        candidate = execute_store_query(:claim_runnable_workflow, [worker_pool] + workflow_params, name_sql: workflow_sql).first
+        candidate = execute_store_query(:claim_runnable_workflow, [worker_pool, worker_id] + workflow_params, name_sql: workflow_sql).first
         next unless candidate
 
+        # Colocated candidates must hold the owner object's lease before the child
+        # lease; the candidate scan only skips heads whose owner is held elsewhere,
+        # so this acquire is the authoritative co-tenancy gate that serializes a
+        # free owner against concurrent same-owner claims. Losing it claims nothing.
+        next unless acquire_owner_object_lease_for_claim(candidate, worker_id:, lease_microseconds:)
+
         updated = execute_store_query(:claim_selected_workflow, [worker_id, lease_microseconds, candidate.fetch("id"), worker_pool])
-        next unless updated.affected_rows == 1
+        # The owner lease was just acquired but no child landed: the queue probe
+        # admits a re-homing lease on `locked_until <= NOW(6)` while the claim
+        # UPDATE rejects it on strict `locked_until < NOW(6)`, so at exact
+        # microsecond equality we acquire the owner for a child we cannot claim.
+        # Roll back so the owner acquire is undone atomically rather than
+        # committed as a lease orphaned until TTL (and left without us holding it
+        # if we did not already). Rollback returns nil: claimed nothing.
+        raise ActiveRecord::Rollback unless updated.affected_rows == 1
 
         # This worker now holds the lease, so the post-update row is fully known
         # in Ruby: we reconstruct it from the locked candidate snapshot instead of
@@ -74,6 +87,10 @@ module Durababble
       transaction do
         candidate = execute_store_query(:claim_workflow_lock, [workflow_id, worker_pool, worker_id]).first
         next unless candidate
+        # Take the owner object's lease before the child lease so a colocated child
+        # can never be stranded on a different worker than its owner. Lost owner =
+        # nothing claimed; non-colocated candidates skip this for free.
+        next unless acquire_owner_object_lease_for_claim(candidate, worker_id:, lease_microseconds:)
 
         execute_store_query(:claim_workflow_update, [worker_id, lease_microseconds, workflow_id, worker_pool])
         reconstruct_claimed_workflow(candidate, worker_id:, lease_microseconds:)
@@ -85,6 +102,7 @@ module Durababble
       transaction do
         candidate = execute_store_query(:claim_workflow_for_activation_lock, [workflow_id, worker_pool, worker_id]).first
         next unless candidate
+        next unless acquire_owner_object_lease_for_claim(candidate, worker_id:, lease_microseconds:)
 
         execute_store_query(:claim_workflow_for_activation_update, [worker_id, lease_microseconds, workflow_id, worker_pool])
         reconstruct_claimed_workflow(candidate, worker_id:, lease_microseconds:)
@@ -221,7 +239,9 @@ module Durababble
         execute_store_query(:heartbeat_step_row, [serialized_cursor, workflow_id, command_id])
 
         execute_store_query(:heartbeat_latest_attempt, [serialized_cursor, workflow_id, command_id])
-        execute_store_query(:workflow_locked_until, [workflow_id]).first
+        locked = execute_store_query(:workflow_locked_until, [workflow_id]).first
+        keepalive_owner_object_lease(locked, worker_id:, lease_microseconds:)
+        locked
       end
       renewed = renewed #: as untyped
       renewed&.fetch("locked_until")
@@ -251,21 +271,56 @@ module Durababble
       execute_store_query(:current_object_lease, [object_type, object_id]).first
     end
 
-    # MySQL has no RETURNING, so claim is split in two: ensure the
-    # `durable_objects` row exists (idempotent INSERT IGNORE), then run a
-    # conditional UPDATE whose WHERE gates on (free OR expired OR same
-    # worker). The UPDATE's affected_rows is the unambiguous win/loss signal
-    # — no follow-up SELECT. A single-statement upsert won't do here because
-    # the trilogy adapter forces CLIENT_FOUND_ROWS, which makes a rejected
-    # "matched but unchanged" branch indistinguishable from a winning fresh
-    # insert (both report affected_rows = 1).
+    # MySQL has no RETURNING and cannot fold the owner-lease gate into the claim
+    # the way Postgres does. The common case — a non-colocated object — claims in
+    # one conditional UPDATE (`claim_uncolocated_object_lease`) after ensuring the
+    # row exists, so non-colocated claims cost the same two statements they did
+    # before colocation existed. That UPDATE filters on `colocated_owner_object_type
+    # IS NULL`, so a colocated child never matches it; affected_rows == 0 means
+    # either a genuine loss or a colocated child, and we fall to the cold path.
+    #
+    # The cold path is lock-then-claim: lock the row with a SELECT ... FOR UPDATE
+    # that matches the same free/expired/ours predicate (no row → we lost) and
+    # surfaces the owner columns, acquire the owner object's lease (a colocated
+    # child can never be claimed without first holding its owner's lease), then run
+    # the conditional UPDATE. The lock already gated claimability and holds the row
+    # for the rest of the transaction, so the UPDATE is guaranteed to match; under
+    # CLIENT_FOUND_ROWS a matched-but-unchanged UPDATE is indistinguishable from a
+    # winning one, which is why the lock SELECT — not affected_rows — is the signal.
     #: (worker_pool: String, object_type: String, object_id: String, worker_id: String, ?lease_microseconds: Integer) -> Hash[String, Object?]?
     def claim_object_lease_unchecked(worker_pool:, object_type:, object_id:, worker_id:, lease_microseconds: 60_000_000)
-      execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
-      result = execute_store_query(:claim_object_lease, [worker_id, lease_microseconds.to_i, object_type, object_id, worker_id])
-      return unless result.affected_rows.to_i.positive?
+      result = transaction do
+        execute_store_query(:ensure_object_row, [worker_pool, object_type, object_id])
+        fast = execute_store_query(:claim_uncolocated_object_lease, [worker_id, lease_microseconds.to_i, object_type, object_id, worker_id])
+        if fast.affected_rows.to_i.positive?
+          next {
+            "worker_pool" => worker_pool,
+            "object_type" => object_type,
+            "object_id" => object_id,
+            "worker_id" => worker_id,
+            "colocated_owner_object_type" => nil,
+            "colocated_owner_object_id" => nil,
+          }
+        end
 
-      { "worker_pool" => worker_pool, "object_type" => object_type, "object_id" => object_id, "worker_id" => worker_id }
+        locked = execute_store_query(:claim_object_lease_lock, [object_type, object_id, worker_id]).first
+        next unless locked
+        # A colocated child object must hold its owner object's lease before the
+        # child lease so it can never be stranded on a different worker than its
+        # owner. Lost owner = nothing claimed; non-colocated rows skip this for free.
+        next unless acquire_owner_object_lease_for_claim(locked, worker_id:, lease_microseconds:)
+
+        execute_store_query(:claim_object_lease, [worker_id, lease_microseconds.to_i, object_type, object_id, worker_id])
+        {
+          "worker_pool" => worker_pool,
+          "object_type" => object_type,
+          "object_id" => object_id,
+          "worker_id" => worker_id,
+          "colocated_owner_object_type" => locked["colocated_owner_object_type"],
+          "colocated_owner_object_id" => locked["colocated_owner_object_id"],
+        }
+      end
+      result #: as Hash[String, Object?]?
     end
 
     # Conditional renew. MySQL reports affected_rows from the UPDATE; 0 means the lease
@@ -285,7 +340,11 @@ module Durababble
 
     #: (object_type: String, object_id: String, worker_id: String) -> bool
     def release_object_lease(object_type:, object_id:, worker_id:)
-      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id])
+      # Positional ? placeholders can't be reused like PG's $1/$2, so the owner
+      # identity (this object itself) is repeated once per NOT EXISTS branch: the
+      # WHERE clause (3) plus the child-workflow probe (2) plus the child-object
+      # probe (2).
+      result = execute_store_query(:release_object_lease, [object_type, object_id, worker_id, object_type, object_id, object_type, object_id])
       result.affected_rows.to_i.positive?
     end
 
@@ -562,12 +621,15 @@ module Durababble
       raise WorkflowAlreadyExists, "workflow #{workflow_id} already exists"
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
+    # Returns the locked row (`locked_until`) or nil when the caller no longer
+    # owns a live lease. Truthy/nil result gates the workflow-origin child-start
+    # fence; workflow parents never own colocation, so no owner columns are read.
+    #: (workflow_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
     end
 
-    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    #: (object_type: String, object_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_object_for_update(object_type:, object_id:, worker_id:)
       execute_store_query(:lock_owned_object_for_update, [object_type, object_id, worker_id]).first
     end

@@ -176,6 +176,32 @@ Child workflows inherit the parent worker pool unless `worker_pool:` is supplied
 
 Cancellation is explicit. `cancellation: :request_cancel` asks Durababble to request child cancellation when the parent observes cooperative cancellation. `cancellation: :abandon` leaves the child running or pending if the parent is canceled. Parent hard termination does not request child cancellation or run cleanup; use the child handle if the child should be stopped separately.
 
+### Colocating Child Workflows
+
+Passing `colocate: true` asks Durababble to run the child on the same worker as the durable object that starts it. Colocation is opt-in, defaults to `false`, and is supported only from inside a durable object command — an object may colocate the child workflows and child objects it creates, but workflow-to-workflow colocation is not supported and requesting `colocate: true` from a workflow execution raises `ArgumentError`. The flag is part of the child's idempotency identity, so a retried start must keep the same `colocate:` value it first used.
+
+```ruby
+class Ledger < Durababble::DurableObject
+  command def reconcile(batch)
+    # Runs on the same worker that currently holds this Ledger object's lease.
+    handle = start_workflow(
+      ScoreRecords,
+      { "batch_id" => batch.fetch("id") },
+      id: "score-#{batch.fetch('id')}",
+      colocate: true,
+    )
+
+    handle.workflow_id
+  end
+end
+```
+
+Colocation binds the child workflow to the starting object's lease. The object's own `durable_objects` lease is the master lease: while the object is leased, no other worker can claim a colocated child, and a colocated child's heartbeat renews the object lease so the object cannot be stolen out from under a running child. This is useful when the object and its child share an expensive worker-local resource — a warmed cache, a GPU, a large in-memory dataset, a connection to a single-writer system — and shuffling them across workers would be wasteful or incorrect.
+
+Colocation does not pin work to one worker forever, so it stays crash safe. If the object's lease expires or its worker disappears, that is fine; the object simply has no live holder for a moment. The object's lease is released only once no colocated child is still live, so the pair never splits across machines: once both go idle, any worker may pick up the object and its children, re-homing them together. Colocation is a placement constraint, not a durability or ordering guarantee: the child still has its own lifecycle, history, and result, and the object still observes it through the normal `ChildWorkflowHandle`.
+
+Colocation is cheap. A non-colocated child records a `NULL` owner and short-circuits every colocation check, so it adds nothing to the lease, poll, heartbeat, or task-write hot paths. A colocated child folds the owner-object lease acquisition into the same claim statement that already leases the workflow, so turning it on does not add a round trip to ordinary execution.
+
 ### Deduplicating Workflow Starts
 
 Use deterministic workflow ids when the caller has a natural idempotency key, such as an order id, import id, or external request id. `FulfillOrder.enqueue(order, id: "fulfillment-order-123")` and `FulfillOrder.start(order, id: "fulfillment-order-123")` insert the workflow row with that exact id. If any workflow row already has that id, Durababble raises `Durababble::WorkflowAlreadyExists` before creating workflow history, waits, inbox messages, or activations.

@@ -9,6 +9,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
   # Registered production queries not directly asserted by the large-fixture EXPLAIN suite.
   # Adding a new registered query without plan coverage must create an intentional diff here.
   POSTGRES_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
+    :pg_acquire_owner_object_lease,
     :pg_cancel_step,
     :pg_cancel_workflow,
     :pg_cancel_workflow_with_worker,
@@ -39,6 +40,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_inbox_message,
     :pg_inbox_messages_for,
     :pg_inbox_messages_for_worker_pool,
+    :pg_insert_child_object,
     :pg_insert_child_workflow,
     :pg_insert_inbox_message,
     :pg_insert_mailbox_sequence,
@@ -56,6 +58,8 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :pg_mark_workflow_canceling_for_request,
     :pg_mark_workflow_cancellation_delivered,
     :pg_mark_workflow_running,
+    :pg_object_colocated_owner,
+    :pg_renew_owner_object_lease,
     :pg_retry_inbox_message,
     :pg_schedule_workflow_retry,
     :pg_set_target_activation_pending,
@@ -72,6 +76,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
 
   MYSQL_QUERIES_WITHOUT_PLAN_ASSERTIONS = [
     :mysql_ack_outbox,
+    :mysql_acquire_owner_object_lease,
     :mysql_cancel_step,
     :mysql_cancel_waiting_step_attempts_for_workflow,
     :mysql_cancel_waiting_steps_for_workflow,
@@ -80,6 +85,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_child_workflow_by_child_id_for_update,
     :mysql_child_workflow_rows_for_object,
     :mysql_child_workflow_rows_for_parent,
+    :mysql_claim_object_lease_lock,
     :mysql_claim_outbox,
     :mysql_claim_runnable_workflow,
     :mysql_claim_selected_outbox,
@@ -118,6 +124,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_inbox_message,
     :mysql_inbox_messages_for,
     :mysql_inbox_messages_for_worker_pool,
+    :mysql_insert_child_object,
     :mysql_insert_child_workflow,
     :mysql_insert_fence,
     :mysql_insert_inbox_message,
@@ -141,6 +148,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_mark_workflow_cancellation_delivered,
     :mysql_mark_workflow_running,
     :mysql_mark_workflow_running_with_worker,
+    :mysql_object_colocated_owner,
     :mysql_object_state,
     :mysql_outbox_by_key,
     :mysql_outbox_message,
@@ -149,6 +157,7 @@ class DurababbleQueryPlanTest < DurababbleTestCase
     :mysql_release_outbox_leases,
     :mysql_release_target_activation_leases,
     :mysql_release_workflow_leases,
+    :mysql_renew_owner_object_lease,
     :mysql_request_workflow_cancellation,
     :mysql_retry_inbox_message,
     :mysql_running_step_exists,

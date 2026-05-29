@@ -42,8 +42,7 @@ module Durababble
       row = execute_store_query(:claim_workflow_update, [workflow_id, worker_pool, worker_id, lease_microseconds]).first
       return decode_row(row) if row
 
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      decode_row(already_owned) if already_owned
+      claim_already_owned_workflow(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, ?worker_pool: String) -> Object?
@@ -51,8 +50,7 @@ module Durababble
       row = execute_store_query(:claim_workflow_for_activation_update, [workflow_id, worker_pool, worker_id, lease_microseconds]).first
       return decode_row(row) if row
 
-      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
-      decode_row(already_owned) if already_owned
+      claim_already_owned_workflow(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
     end
 
     #: (workflow_id: String, worker_id: String, lease_microseconds: Integer) -> ActiveRecord::Result
@@ -178,6 +176,7 @@ module Durababble
         next nil unless step
 
         execute_store_query(:heartbeat_latest_attempt, [workflow_id, command_id, serialized_cursor])
+        keepalive_owner_object_lease(workflow, worker_id:, lease_microseconds:)
         workflow
       end
       renewed = renewed #: as untyped
@@ -472,6 +471,20 @@ module Durababble
 
     private
 
+    # Re-entry path for a workflow we still own: the folded claim UPDATE returns
+    # nothing when the row is already running under our live lease, so we re-read
+    # it. A colocated child must still hold its owner object's lease to keep
+    # running, so the gate runs here too — failing to (re)acquire the owner lease
+    # means a peer has taken the object and we must not resume.
+    #: (workflow_id: String, worker_id: String, lease_microseconds: Integer, worker_pool: String) -> Object?
+    def claim_already_owned_workflow(workflow_id:, worker_id:, lease_microseconds:, worker_pool:)
+      already_owned = execute_store_query(:claim_workflow_already_owned, [workflow_id, worker_pool, worker_id]).first
+      return unless already_owned
+      return unless acquire_owner_object_lease_for_claim(already_owned, worker_id:, lease_microseconds:)
+
+      decode_row(already_owned)
+    end
+
     #: (name: String, input: Object?, status: String, id: String, ?worker_id: String?, ?lease_microseconds: Numeric?, ?worker_pool: String) -> String
     def insert_workflow(name:, input:, status:, id:, worker_id: nil, lease_microseconds: nil, worker_pool: "default")
       workflow_id = id
@@ -578,12 +591,15 @@ module Durababble
       execute_store_query(:lock_workflow_for_update, [workflow_id]).first
     end
 
-    #: (workflow_id: String, worker_id: String) -> bool
+    # Returns the locked row (`locked_until`) or nil when the caller no longer
+    # owns a live lease. Truthy/nil result gates the workflow-origin child-start
+    # fence; workflow parents never own colocation, so no owner columns are read.
+    #: (workflow_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_workflow_for_update(workflow_id:, worker_id:)
       execute_store_query(:lock_owned_workflow_for_update, [workflow_id, worker_id]).first
     end
 
-    #: (object_type: String, object_id: String, worker_id: String) -> bool
+    #: (object_type: String, object_id: String, worker_id: String) -> Hash[String, Object?]?
     def lock_owned_object_for_update(object_type:, object_id:, worker_id:)
       execute_store_query(:lock_owned_object_for_update, [object_type, object_id, worker_id]).first
     end

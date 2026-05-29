@@ -11,7 +11,7 @@ require_relative "error_formatting"
 require_relative "worker_identity"
 
 module Durababble
-  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id)
+  CommandContext = Data.define(:object_type, :durable_id, :command_id, :attempt_number, :idempotency_key, :worker_id, :lease_seconds)
   ObjectWakeupChange = Data.define(:action, :name, :wake_at, :payload)
 
   class DurableObject
@@ -262,8 +262,8 @@ module Durababble
       true
     end
 
-    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String) -> ChildWorkflowHandle
-    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon)
+    #: (Class, Object?, ?id: String?, ?worker_pool: String?, ?idempotency_key: String?, ?cancellation: Symbol | String, ?colocate: bool) -> ChildWorkflowHandle
+    def start_workflow(workflow_class, input, id: nil, worker_pool: nil, idempotency_key: nil, cancellation: :abandon, colocate: false)
       raise Error, "cannot start workflows from an exposed query" if @__durababble_query_context
       raise Error, "durable object workflow starts can only be scheduled from object commands" unless command_context
 
@@ -287,6 +287,7 @@ module Durababble
         input:,
         worker_pool: child_worker_pool,
         cancellation_policy: policy,
+        colocate:,
       )
       ChildWorkflowReuse.validate!(
         link,
@@ -299,6 +300,7 @@ module Durababble
         input:,
         worker_pool: child_worker_pool,
         cancellation_policy: policy,
+        colocate:,
       )
       ChildWorkflowHandle.new(
         workflow_class,
@@ -307,6 +309,40 @@ module Durababble
         worker_pool: link.fetch("worker_pool").to_s,
         cancellation_policy: link.fetch("cancellation_policy").to_s,
       )
+    end
+
+    # Create a child durable object colocated with this object so the two run on
+    # the same worker. Command-only (a colocated start mutates durable state):
+    # raises from an exposed query or outside a command. The child id is supplied
+    # by the caller and is the durable_objects PK, so a retried command re-stamps
+    # the same owner (a no-op); a different owner colocating the same id conflicts.
+    # The child object is created lazily — this only records a lease-only binding
+    # row and `initialize_state` still runs on the child's first claim. Returns a
+    # `DurableObjectRef` for the child.
+    #: (Class, id: String, ?worker_pool: String?, ?idempotency_key: String?, ?colocate: bool) -> DurableObjectRef
+    def start_object(object_class, id:, worker_pool: nil, idempotency_key: nil, colocate: true)
+      raise Error, "cannot start durable objects from an exposed query" if @__durababble_query_context
+      raise Error, "durable object starts can only be scheduled from object commands" unless command_context
+
+      object_class = object_class #: as untyped
+      context = command_context #: as CommandContext
+      child_object_type = object_class.object_type
+      child_worker_pool = worker_pool || @worker_pool
+      child_object_id = String(id)
+      # A live command always runs against a materialized object, so durable_id is set.
+      owner_object_id = durable_id #: as String
+      store = @store #: as Store
+      store.start_child_object(
+        parent_object_type: self.class.object_type,
+        parent_object_id: owner_object_id,
+        parent_object_command_id: context.command_id,
+        parent_object_worker_id: context.worker_id,
+        child_object_type:,
+        child_object_id:,
+        worker_pool: child_worker_pool,
+        colocate:,
+      )
+      object_class.handle(child_object_id, store:, worker_pool: child_worker_pool, idempotency_key:)
     end
 
     #: () -> bool
@@ -1092,6 +1128,7 @@ module Durababble
         attempt_number: message.fetch("attempts").to_i,
         idempotency_key: "durababble:v1:object:#{object_type}:#{object_id}:command:#{message.fetch("id")}",
         worker_id: @worker_id,
+        lease_seconds: @lease_seconds,
       )
 
       # The drain runs inside the host's `with_lease`, so when a resident host

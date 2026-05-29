@@ -31,6 +31,8 @@ module Durababble
           parent_object_id VARCHAR(191),
           parent_object_command_id VARCHAR(191),
           child_cancellation_policy VARCHAR(32),
+          colocated_owner_object_type VARCHAR(191),
+          colocated_owner_object_id VARCHAR(191),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           queue_available_at DATETIME(6) GENERATED ALWAYS AS (
@@ -44,7 +46,8 @@ module Durababble
           ) STORED,
           INDEX #{quote_column_name(index_name("workflows", "claim"))} (worker_pool, queue_available_at, created_at),
           INDEX #{quote_column_name(index_name("workflows", "expired_lease"))} (status, locked_until, created_at),
-          INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by)
+          INDEX #{quote_column_name(index_name("workflows", "worker_lease"))} (status, locked_by),
+          INDEX #{quote_column_name(index_name("workflows", "colocated_owner"))} (colocated_owner_object_type, colocated_owner_object_id)
         )
       SQL
       execute(<<~SQL)
@@ -143,11 +146,14 @@ module Durababble
           state LONGBLOB,
           locked_by VARCHAR(191),
           locked_until DATETIME(6),
+          colocated_owner_object_type VARCHAR(191),
+          colocated_owner_object_id VARCHAR(191),
           created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           updated_at DATETIME(6) NOT NULL DEFAULT NOW(6),
           PRIMARY KEY (object_type, object_id),
           INDEX #{quote_column_name(index_name("durable_objects", "worker_lease"))} (locked_by),
-          INDEX #{quote_column_name(index_name("durable_objects", "expired_lease"))} (locked_until)
+          INDEX #{quote_column_name(index_name("durable_objects", "expired_lease"))} (locked_until),
+          INDEX #{quote_column_name(index_name("durable_objects", "colocated_owner"))} (colocated_owner_object_type, colocated_owner_object_id)
         )
       SQL
       execute(<<~SQL)
