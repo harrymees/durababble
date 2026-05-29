@@ -201,7 +201,24 @@ module Durababble
       drained = 0
       if holder
         executor = DurableObjectExecutor.new(store: @store, objects: @objects, worker_id: @worker_id, lease_seconds: @lease_seconds, worker_pool:)
-        drained = executor.drain_object_inbox(object_type, object_id:)
+        # When a local `ObjectStreamHost` is wired (a worker running on this
+        # process), route the lease lifecycle through its refcount so a
+        # stream RPC arriving while the activation runs can keep the lease
+        # alive past `drain_object_inbox`'s ensure release. The host's
+        # `acquire` calls `claim_object_lease` idempotently for the same
+        # `worker_id`, so this is a no-op write on the row the eager
+        # activation claim above already took; the new effect is a non-zero
+        # host refcount the drain's ensure can defer to. Without a host (DST
+        # scenarios, tests using raw `Worker.new`) we run the drain inline and
+        # the ensure release behaves exactly as the activation-only path.
+        host = Durababble.local_stream_host #: as ObjectStreamHost?
+        if host && host.worker_id == @worker_id
+          host.with_lease(worker_pool:, object_type:, object_id:, lease_seconds: @lease_seconds.to_i) do
+            drained = executor.drain_object_inbox(object_type, object_id:)
+          end
+        else
+          drained = executor.drain_object_inbox(object_type, object_id:)
+        end
         # `drain_object_inbox` releases the lease in its ensure block; the
         # in-claim re-claim inside `claim_inbox_messages` is idempotent for
         # the same worker_id and stays as a safety net for direct callers.

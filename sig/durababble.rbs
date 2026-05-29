@@ -89,6 +89,10 @@ module Durababble
     def call: (request: Object, args: serialized_payload, writer: Rpc::StreamWriter) -> void
   end
 
+  interface _WorkerIdProvider
+    def call: () -> String
+  end
+
   interface _RpcRequester
     def request: (String command, payload_map payload) -> serialized_payload
   end
@@ -136,6 +140,9 @@ module Durababble
   end
 
   class CommandTimeout < Error
+  end
+
+  class ObjectReadBlocked < Error
   end
 
   class IdempotencyKeyConflict < Error
@@ -243,6 +250,8 @@ module Durababble
     attr_accessor workflow_rpc_client_factory: _WorkflowRpcClientFactory
     attr_accessor local_workflow_rpc_node_id: String?
     attr_accessor local_workflow_rpc_handlers: Hash[String, _WorkflowRpcHandler]?
+    attr_accessor local_worker_id: String?
+    attr_accessor local_transient_handler: _TransientHandler?
 
     def self.connect: (database_url: String, ?schema: String) -> Store
     def self.from_active_record: (connection_pool: _ActiveRecordConnectionPool, ?schema: String, ?owner: _ActiveRecordOwner?) -> Store
@@ -422,6 +431,12 @@ module Durababble
     def initialize: (singleton(DurableObject) object_class, Id durable_id, store: Store, ?worker_pool: String?, ?idempotency_key: String?) -> void
     def method_missing: (Symbol method_name, *serialized_payload args, **serialized_payload kwargs) -> serialized_payload
     def respond_to_missing?: (Symbol method_name, ?bool include_private) -> bool
+  end
+
+  class DurableObjectTransientHandler
+    def self.assert_read_gate_open!: (Store store, object_type: String, object_id: String, ?worker_pool: String) -> void
+    def initialize: (store: Store, objects: object_registry, node_id: String | _WorkerIdProvider) -> void
+    def call: (request: Object, args: serialized_payload) -> serialized_payload
   end
 
   class DurableObjectExecutor

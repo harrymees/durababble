@@ -12,13 +12,20 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
   class FakeLeaseStore
     attr_reader :claims, :renews, :releases
 
-    def initialize(holder: "host-worker", renew_returns: true)
+    def initialize(holder: "host-worker", renew_returns: true, object_state: Durababble::Store::NO_OBJECT_STATE)
       @claims = []
       @renews = []
       @releases = []
       @holder = holder
       @renew_returns = renew_returns
+      @object_state = object_state
       @mutex = Mutex.new
+    end
+
+    # Residency materialization reads durable state through `state_from_store`,
+    # which calls this. Defaults to `NO_OBJECT_STATE` so the host runs `on_create`.
+    def object_state_entry(object_type:, object_id:)
+      @object_state
     end
 
     def claim_object_lease(worker_pool:, object_type:, object_id:, worker_id:, lease_seconds: 60)
@@ -38,7 +45,51 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
     end
   end
 
-  test "claims on the first opener and releases on the last refcount" do
+  # A durable-object fixture whose lifecycle hooks stand up / tear down a warm
+  # resource and record every call on a class-level log, so residency tests can
+  # assert the instance is materialized once (`on_create`/`on_load`), reused
+  # across operations, and torn down (`on_destroy`) at the right moment.
+  class ResidencyFixture < Durababble::DurableObject
+    object_type "residency_fixture"
+
+    class << self
+      attr_accessor :events
+    end
+
+    def on_create
+      warm_up
+      record(:on_create)
+    end
+
+    def on_load
+      warm_up
+      record(:on_load)
+    end
+
+    def on_destroy
+      record(:on_destroy)
+    end
+
+    # Mutates a non-durable ivar so tests can prove one warm instance is reused:
+    # the count only accumulates if the same resident object serves every read.
+    def mark_used
+      @uses += 1
+    end
+
+    attr_reader :uses
+
+    private
+
+    def warm_up
+      @uses = 0
+    end
+
+    def record(event)
+      (self.class.events ||= []) << [event, durable_id]
+    end
+  end
+
+  test "claims on the first opener and retains the lease at refcount 0 (sticky residency)" do
     store = FakeLeaseStore.new(holder: "host-worker")
     host = build_host(store:)
 
@@ -48,13 +99,19 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
     end
 
     assert_equal(1, store.claims.size)
+    # Residency token: the lease is held past refcount 0, not dropped on block exit.
+    assert_empty(store.releases)
+    assert(host.holds?(worker_pool: "default", object_type: "counter", object_id: "c1"))
+
+    # The lease is released by eviction, never by a refcount drop.
+    assert(host.evict!(worker_pool: "default", object_type: "counter", object_id: "c1"))
     assert_equal(1, store.releases.size)
     refute(host.holds?(worker_pool: "default", object_type: "counter", object_id: "c1"))
   ensure
     host&.stop!
   end
 
-  test "shares the lease across concurrent openers and releases once" do
+  test "shares the lease across concurrent openers and retains it after both finish" do
     store = FakeLeaseStore.new(holder: "host-worker")
     host = build_host(store:)
     Async do |task|
@@ -82,13 +139,16 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
       assert_same(first_entry, second_entry)
       outer.wait
 
-      # Inner is still inside its block; refcount went 0->1->2->1 (outer released).
+      # Inner is still inside its block; refcount went 0->1->2->1. One claim,
+      # and nothing released — outer dropping to a still-positive refcount holds.
       assert_equal(1, store.claims.size)
       assert_empty(store.releases)
 
       block_release.enqueue(:go)
       inner.wait
-      assert_equal(1, store.releases.size)
+      # Both openers done (refcount 0), but residency keeps the lease resident.
+      assert_empty(store.releases)
+      assert(host.holds?(worker_pool: "default", object_type: "counter", object_id: "c1"))
     end.wait
   ensure
     host&.stop!
@@ -126,7 +186,9 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
       first.wait
     end
 
-    assert_equal(1, store.releases.size)
+    # Sticky residency: the single shared lease is retained after both pools finish.
+    assert_empty(store.releases)
+    assert(host.holds?(worker_pool: "pool-b", object_type: "counter", object_id: "c1"))
   ensure
     host&.stop!
   end
@@ -392,6 +454,8 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
     fake_logger.define_singleton_method(:warn) { |msg| captured << msg }
     Durababble.stub(:logger, fake_logger) do
       host.with_lease(worker_pool: "default", object_type: "t", object_id: "x") {}
+      # Residency holds the lease past refcount 0; release runs on eviction.
+      host.evict!(worker_pool: "default", object_type: "t", object_id: "x")
     end
 
     refute_empty(store.releases)
@@ -514,6 +578,138 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
     host&.stop!
   end
 
+  test "with_resident materializes once, keeps the instance warm, and becomes the resident owner" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:)
+
+    first = nil
+    second = nil
+    host.with_resident(object_type: "residency_fixture", object_id: "r1", worker_pool: "default") do |instance|
+      instance.mark_used
+      first = instance
+    end
+    host.with_resident(object_type: "residency_fixture", object_id: "r1", worker_pool: "default") do |instance|
+      instance.mark_used
+      second = instance
+    end
+
+    assert_same(first, second, "both reads observe one warm resident instance")
+    assert_equal(2, second.uses, "the resident instance accumulates state across reads")
+    assert_equal(1, store.claims.size, "the lease is claimed once and held as a residency token")
+    assert_empty(store.releases, "residency retains the lease at refcount 0 (become-and-stay owner)")
+    assert(host.holds?(worker_pool: "default", object_type: "residency_fixture", object_id: "r1"))
+    assert_equal([[:on_create, "r1"]], ResidencyFixture.events, "fresh state materializes via on_create, exactly once")
+  ensure
+    host&.stop!
+  end
+
+  test "materialization runs on_load when durable state already exists" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker", object_state: { "value" => "persisted" })
+    host = build_resident_host(store:)
+
+    observed = nil
+    host.with_resident(object_type: "residency_fixture", object_id: "r1", worker_pool: "default") do |instance|
+      observed = instance.current_state
+    end
+
+    assert_equal({ "value" => "persisted" }, observed)
+    assert_equal([[:on_load, "r1"]], ResidencyFixture.events, "existing state materializes via on_load")
+  ensure
+    host&.stop!
+  end
+
+  test "resident_instance get-or-materializes within a held lease and raises when not held" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:)
+
+    assert_raises(Durababble::WorkflowRpc::NoActiveLease) do
+      host.resident_instance(object_type: "residency_fixture", object_id: "r1", worker_pool: "default")
+    end
+
+    one = nil
+    two = nil
+    host.with_lease(worker_pool: "default", object_type: "residency_fixture", object_id: "r1") do
+      one = host.resident_instance(object_type: "residency_fixture", object_id: "r1", worker_pool: "default")
+      two = host.resident_instance(object_type: "residency_fixture", object_id: "r1", worker_pool: "default")
+    end
+
+    assert_same(one, two)
+    assert_equal(1, ResidencyFixture.events.size, "the stream path reuses one materialized instance")
+  ensure
+    host&.stop!
+  end
+
+  test "materializing an unknown object type raises UnknownCommand" do
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:)
+
+    assert_raises(Durababble::WorkflowRpc::UnknownCommand) do
+      host.with_resident(object_type: "nope", object_id: "x", worker_pool: "default") {}
+    end
+  ensure
+    host&.stop!
+  end
+
+  test "idle past idle_ttl evicts the resident instance: on_destroy fires and the lease is released" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:, renew_interval: 0.02, idle_ttl: 0.01)
+
+    Async do |task|
+      host.start_async(parent: task)
+      host.with_resident(object_type: "residency_fixture", object_id: "r1", worker_pool: "default", &:mark_used)
+      # Refcount is now 0 with last_used_at stamped; the renewal loop crosses the
+      # idle window on its next tick and evicts.
+      task.with_timeout(2) { sleep(0.01) until store.releases.any? }
+    end.wait
+
+    refute(host.holds?(worker_pool: "default", object_type: "residency_fixture", object_id: "r1"))
+    assert_equal(1, store.releases.size, "idle eviction releases the lease so ownership can rebalance")
+    assert_includes(ResidencyFixture.events, [:on_destroy, "r1"], "idle eviction runs on_destroy")
+  ensure
+    host&.stop!
+  end
+
+  test "evict! tears the resident instance down: on_destroy fires and the lease is released" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:)
+
+    host.with_resident(object_type: "residency_fixture", object_id: "r1", worker_pool: "default", &:mark_used)
+    assert(host.holds?(worker_pool: "default", object_type: "residency_fixture", object_id: "r1"))
+
+    assert(host.evict!(worker_pool: "default", object_type: "residency_fixture", object_id: "r1"))
+    refute(host.holds?(worker_pool: "default", object_type: "residency_fixture", object_id: "r1"))
+    assert_equal(1, store.releases.size)
+    assert_includes(ResidencyFixture.events, [:on_destroy, "r1"], "lease-loss eviction runs on_destroy")
+  ensure
+    host&.stop!
+  end
+
+  test "evict! swallows and logs when on_destroy raises" do
+    ResidencyFixture.events = []
+    store = FakeLeaseStore.new(holder: "host-worker")
+    host = build_resident_host(store:)
+    host.with_resident(object_type: "residency_fixture", object_id: "boom", worker_pool: "default") do |instance|
+      instance.define_singleton_method(:on_destroy) { raise StandardError, "destroy blew up" }
+    end
+
+    captured = Queue.new
+    fake_logger = Object.new
+    fake_logger.define_singleton_method(:warn) { |msg| captured << msg }
+    Durababble.stub(:logger, fake_logger) do
+      assert(host.evict!(worker_pool: "default", object_type: "residency_fixture", object_id: "boom"))
+    end
+
+    assert_match(/on_destroy failed/, captured.pop)
+    assert_equal(1, store.releases.size, "release still happens after on_destroy blows up")
+  ensure
+    host&.stop!
+  end
+
   private
 
   def refute_raises
@@ -530,6 +726,18 @@ class DurababbleObjectStreamHostTest < DurababbleTestCase
       node_id: "host-worker",
       lease_seconds: 30,
       renew_interval:,
+    )
+  end
+
+  def build_resident_host(store:, renew_interval: 1.0, idle_ttl: nil)
+    Durababble::ObjectStreamHost.new(
+      store:,
+      worker_id: "host-worker",
+      node_id: "host-worker",
+      lease_seconds: 30,
+      renew_interval:,
+      objects: [ResidencyFixture],
+      idle_ttl:,
     )
   end
 end
