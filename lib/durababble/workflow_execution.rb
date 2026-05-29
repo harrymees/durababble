@@ -21,6 +21,8 @@ module Durababble
 
     #: Store
     attr_reader :store
+    #: String
+    attr_reader :workflow_id
 
     #: (store: Store, workflow_id: String, worker_id: String, lease_seconds: Numeric, history: Array[Hash[String, Object?]], root_task: Object, workflow_class: Class, workflow: Object, worker_pool: String, ?crash_after: Symbol?, ?history_warning_logged: bool, ?claimed_next_run_at: Object?) -> void
     def initialize(store:, workflow_id:, worker_id:, lease_seconds:, history:, root_task:, workflow_class:, workflow:, worker_pool:, crash_after: nil, history_warning_logged: false, claimed_next_run_at: nil)
@@ -74,6 +76,18 @@ module Durababble
     #: () -> bool
     def cancellation_delivered?
       @cancellation_delivered
+    end
+
+    # True while the body is re-running over recorded history: the next command
+    # to be allocated already has a terminal event, so it will short-circuit
+    # instead of doing live work. Reflection uses this to gate publishing —
+    # mutations are always *applied* to keep the Document authoritative, but only
+    # *published* once execution has run past the replay frontier. Once
+    # `@next_command_id` points at a command with no recorded terminal, the body
+    # is executing live and this flips to false for the rest of the activation.
+    #: () -> bool
+    def replaying?
+      @replay_history.terminal_recorded?(@next_command_id)
     end
 
     #: () -> StepContext
