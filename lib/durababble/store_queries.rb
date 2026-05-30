@@ -928,6 +928,19 @@ module Durababble
       SQL
     end
 
+    # Reset stale running inbox rows whose lease expired without being completed
+    # or released. A worker crashing mid-claim_inbox_messages leaves the row in
+    # status='running' with a locked_until in the past; without this sweep it
+    # stays stuck forever because steal_expired_leases! is the only broad expiry
+    # path and it previously only covered workflows and durable objects.
+    define(:pg_steal_expired_inbox_leases, backend: :postgres) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "inbox")}
+        SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+        WHERE status = 'running' AND locked_until < $1::timestamptz
+      SQL
+    end
+
     # Graceful release of every object lease this worker still owns. Called from
     # release_worker_leases! on shutdown.
     define(:pg_release_worker_object_leases, backend: :postgres) do |store|
@@ -1596,6 +1609,15 @@ module Durababble
         UPDATE #{table(store, "durable_objects")}
         SET locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
         WHERE locked_by IS NOT NULL AND locked_until < ?
+      SQL
+    end
+
+    # MySQL mirror of pg_steal_expired_inbox_leases.
+    define(:mysql_steal_expired_inbox_leases, backend: :mysql) do |store|
+      <<~SQL.chomp
+        UPDATE #{table(store, "inbox")}
+        SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+        WHERE status = 'running' AND locked_until < ?
       SQL
     end
 
