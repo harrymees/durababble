@@ -294,7 +294,8 @@ module Durababble
       expired = execute_store_query(:count_expired_workflow_leases, [now]).first.fetch("count").to_i
       execute_store_query(:steal_expired_leases, [now])
       object_result = execute_store_query(:steal_expired_object_leases, [now])
-      stolen = expired + object_result.affected_rows.to_i
+      inbox_result = execute_store_query(:steal_expired_inbox_leases, [now])
+      stolen = expired + object_result.affected_rows.to_i + inbox_result.affected_rows.to_i
       Observability.count("durababble.leases.expired_recovery", by: stolen)
       stolen
     end

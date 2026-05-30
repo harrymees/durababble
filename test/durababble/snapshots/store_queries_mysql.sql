@@ -536,6 +536,11 @@ ON DUPLICATE KEY UPDATE
   locked_until = IF(worker_pool = VALUES(worker_pool), NULL, locked_until),
   updated_at = IF(worker_pool = VALUES(worker_pool), NOW(6), updated_at)
 
+-- mysql_steal_expired_inbox_leases
+UPDATE `durababble_mysql_snapshot_inbox`
+SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = NOW(6)
+WHERE status = 'running' AND locked_until < ?
+
 -- mysql_steal_expired_leases
 UPDATE `durababble_mysql_snapshot_workflows` FORCE INDEX (durababble_mysql_snapshot_workflows_expired_lease_idx)
 SET status = CASE

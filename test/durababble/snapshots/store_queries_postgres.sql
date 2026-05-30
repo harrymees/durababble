@@ -539,6 +539,11 @@ ON CONFLICT (target_kind, target_type, target_id) DO UPDATE
   SET status = 'pending', ready_at = EXCLUDED.ready_at, locked_by = NULL, locked_until = NULL, updated_at = now()
   WHERE "durababble_pg_snapshot"."target_activations".worker_pool = EXCLUDED.worker_pool
 
+-- pg_steal_expired_inbox_leases
+UPDATE "durababble_pg_snapshot"."inbox"
+SET status = 'pending', locked_by = NULL, locked_until = NULL, updated_at = now()
+WHERE status = 'running' AND locked_until < $1::timestamptz
+
 -- pg_steal_expired_leases
 UPDATE "durababble_pg_snapshot"."workflows"
 SET status = CASE

@@ -245,9 +245,11 @@ module Durababble
 
     #: (?now: Time) -> Integer
     def steal_expired_leases!(now: Time.now)
-      workflow_result = execute_store_query(:steal_expired_leases, [timestamp(now)])
-      object_result = execute_store_query(:steal_expired_object_leases, [timestamp(now)])
-      stolen = workflow_result.affected_rows.to_i + object_result.affected_rows.to_i
+      ts = timestamp(now)
+      workflow_result = execute_store_query(:steal_expired_leases, [ts])
+      object_result = execute_store_query(:steal_expired_object_leases, [ts])
+      inbox_result = execute_store_query(:steal_expired_inbox_leases, [ts])
+      stolen = workflow_result.affected_rows.to_i + object_result.affected_rows.to_i + inbox_result.affected_rows.to_i
       Observability.count("durababble.leases.expired_recovery", by: stolen)
       stolen
     end
