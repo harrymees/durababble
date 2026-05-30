@@ -45,6 +45,7 @@ Current scenarios:
 - `waits_fences_and_outbox` — timer waits, idempotency fences, and outbox processing.
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
+- `worker_tick_dispatch_fuzz` — the real `Durababble::Worker#tick` dispatcher claims workflow rows, drains object target activations, and idles under seed-varying interleavings.
 - `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
@@ -72,6 +73,18 @@ mise exec -- ruby -Ilib -Itest -e 'require "support/deterministic"; p Durababble
 ```
 
 An empty array means no invariant violation was found for that seed range.
+
+## DST coverage
+
+Use `mise exec -- bundle exec rake dst:coverage` to run the seed-varying fuzz scenario set under SimpleCov. The task runs the scenarios classified in `Durababble::Deterministic::ScenarioSets::FUZZ_SCENARIOS` across seeds `1..100` and writes a DST-only HTML report plus `.resultset.json` and `dst-summary.json` under `coverage/dst/`.
+
+For a faster local probe, call the script directly with a smaller seed range or a focused scenario list:
+
+```sh
+mise exec -- ruby scripts/dst-coverage.rb --seeds 1..3 --scenarios chaos,worker_tick_dispatch_fuzz --coverage-dir coverage/dst-probe
+```
+
+The report is advisory rather than a CI gate. It excludes non-DST unit tests and fixed regression/contract scenarios so it answers a narrower question: which library paths are exercised by seed-varying deterministic fuzzing. The ordinary coverage gate remains `mise exec -- bundle exec rake test:coverage`.
 
 ## Bugs found during harness work
 

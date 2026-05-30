@@ -77,6 +77,13 @@ Rake::TestTask.new(:dst) do |task|
   task.test_files = FileList[*DST_TEST_FILES]
 end
 
+namespace :dst do
+  desc "Run seed-varying DST scenarios with SimpleCov coverage measurement"
+  task :coverage do
+    ruby("scripts/dst-coverage.rb")
+  end
+end
+
 namespace :test do
   desc "Run the (non-DST) test suite with SimpleCov line and branch coverage gates"
   task :coverage do

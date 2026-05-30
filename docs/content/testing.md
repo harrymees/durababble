@@ -111,3 +111,13 @@ raise "unexpected result" unless handle.result == { "payment_id" => "pay_card_12
 For fuller examples, see `test/durababble/workflow_test.rb`, `test/durababble/workflow_wait_test.rb`, `test/durababble/workflow_cancellation_test.rb`, and the end-to-end tests under `test/examples/`.
 
 Durababble's public testing helpers are still minimal: the reliable integration path is a real store plus a local worker. Helpers for isolated test stores, running workers to a condition, advancing timers, and asserting workflow/object history would be valuable. Contributions are welcome.
+
+## Deterministic Simulation Coverage
+
+The DST suite has an advisory SimpleCov runner for the seed-varying fuzz scenarios:
+
+```sh
+mise exec -- bundle exec rake dst:coverage
+```
+
+This writes a DST-only report under `coverage/dst/` and a machine-readable `dst-summary.json` with the scenario/seed matrix and invariant violations. Use `scripts/dst-coverage.rb --seeds 1..3 --scenarios chaos --coverage-dir coverage/dst-probe` for a faster local probe. This is separate from the ordinary non-DST coverage gate, `mise exec -- bundle exec rake test:coverage`.
