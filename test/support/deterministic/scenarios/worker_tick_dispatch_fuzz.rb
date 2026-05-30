@@ -9,7 +9,9 @@ module Durababble
         run(seed, "worker_tick_dispatch_fuzz") do |h|
           h.expect_settled!
           h.workflows["worker-counter"] = workflow_class("worker-counter") do
+            expose_command(:approve)
             test_step("increment") { |ctx| ctx.merge("count" => ctx.fetch("count") + 1) }
+            define_method(:approve) { |reason:| { "approved_by" => reason } }
           end
 
           object_type = "worker-counter-object"
@@ -47,6 +49,20 @@ module Durababble
               max_attempts: 20,
             )
           end
+          activated_workflow_id = h.store.enqueue_workflow(
+            name: "worker-counter",
+            input: { "id" => "worker-activated-#{seed}", "count" => 100 },
+            id: "worker-activated-#{seed}",
+          )
+          h.store.claim_workflow(workflow_id: activated_workflow_id, worker_id: "external-owner-#{seed}@127.0.0.1:#{40_000 + seed}", lease_seconds: 30)
+          activated_command_id = h.store.enqueue_workflow_command(
+            workflow_id: activated_workflow_id,
+            workflow_name: "worker-counter",
+            method_name: "approve",
+            payload: { "method" => "approve", "args" => [], "kwargs" => { reason: "operator-#{seed}" } },
+            idempotency_key: "worker-activated-#{seed}-approve",
+            max_attempts: 20,
+          )
 
           workers = Array.new(3) do |index|
             Durababble::Worker.new(
@@ -69,6 +85,16 @@ module Durababble
               h.scheduler.trace.event(h.scheduler.time, "real-worker", "real_worker_tick_yield", error: e.class.name, tick:)
             end
           end
+          h.scheduler.schedule(actor: "real-worker-delivery", delay: 8 + h.scheduler.rng.int(20), name: "deliver_workflow_activation") do
+            result = workers[h.scheduler.rng.int(workers.length)].deliver_target(
+              target_kind: "workflow",
+              target_type: "worker-counter",
+              target_id: activated_workflow_id,
+            )
+            h.scheduler.trace.event(h.scheduler.time, "real-worker-delivery", "deliver_workflow_activation", result:)
+          rescue WorkflowSuspended, StepRetryScheduled, LeaseConflict => e
+            h.scheduler.trace.event(h.scheduler.time, "real-worker-delivery", "deliver_workflow_activation_yield", error: e.class.name)
+          end
 
           4.times do |index|
             h.scheduler.schedule(actor: "real-worker-reaper-#{index}", delay: 20 + index * 20, name: "steal_expired") do
@@ -80,7 +106,15 @@ module Durababble
           end
 
           h.check("real worker tick completed every workflow") do
-            workflow_ids.all? { |workflow_id| h.store.workflow(workflow_id).fetch("status") == "completed" }
+            workflow_ids.all? { |workflow_id| h.store.workflow(workflow_id).fetch("status") == "completed" } &&
+              h.store.workflow(activated_workflow_id).fetch("status") == "completed"
+          end
+          h.check("real worker advisory delivery completed the workflow command once") do
+            message = h.store.inbox_message(activated_command_id)
+            message &&
+              message.fetch("status") == "completed" &&
+              message.fetch("result") == { "approved_by" => "operator-#{seed}" } &&
+              h.store.workflow_history_for(activated_workflow_id).one? { |event| event.fetch("kind") == "workflow_command_completed" }
           end
           h.check("real worker tick drained every object command exactly once") do
             messages = h.store.inbox_messages_for(target_kind: "object", target_type: object_type, target_id: "worker-object-#{seed}")
@@ -96,6 +130,7 @@ module Durababble
           h.check("real worker tick path exercised workflow and object dispatch") do
             trace = h.scheduler.trace.to_s
             trace.include?("real_worker_tick") &&
+              trace.include?("deliver_workflow_activation") &&
               trace.include?("result=:worked") &&
               trace.include?("workflow_claimed") &&
               h.store.object_state(object_type:, object_id: "worker-object-#{seed}")

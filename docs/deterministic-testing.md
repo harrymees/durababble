@@ -46,7 +46,7 @@ Current scenarios:
 - `outbox_lease_expiry` — an outbox sender crashes after claim and another sender reclaims after expiry.
 - `timer_and_partition` — timer waits plus virtual network partition/drop/heal behavior.
 - `worker_tick_dispatch_fuzz` — the real `Durababble::Worker#tick` dispatcher claims workflow rows, drains object target activations, and idles under seed-varying interleavings.
-- `chaos` — randomized enqueues, waits, drops, worker crashes, and lease reaping.
+- `chaos` — randomized enqueues, waits, drops, simulated worker crashes, production `Worker#tick` dispatch, object activations, and lease reaping.
 - `rpc_fault_injection` — process-boundary timeout, connection error, EOF, remote error, idle reconnect, and success paths.
 - `workflow_rpc_owner_state_matrix` — workflow RPC ownership races are covered together: lease moves to a new owner, no active owner is internally restarted, and terminal workflow shutdown rejects the stale call without running the unowned handler.
 - `cooperative_cancellation_cleanup` — a waiting workflow receives a durable cancellation request, cancels waiting step/attempt state, delivers `CancellationError`, runs cleanup once, ignores a late timer claim, and finishes as canceled.
