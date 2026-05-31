@@ -221,12 +221,13 @@ module Durababble
       @terminal.keys.filter_map { |command_id| waiting_timer_or_child_workflow(command_id)&.fetch("wake_at", nil) }.min_by { |wake_at| comparable_time(wake_at) }
     end
 
-    #: (Integer, name: String, wait_request: WaitRequest) -> void
-    def remember_step_waiting(command_id, name:, wait_request:)
+    #: (Integer, name: String, wait_request: WaitRequest, ?event_index: Integer?) -> void
+    def remember_step_waiting(command_id, name:, wait_request:, event_index: nil)
       @terminal[command_id] = {
         "kind" => "step_waiting",
         "command_id" => command_id,
         "name" => name,
+        "event_index" => event_index,
         "payload" => step_waiting_payload(wait_request),
       }
     end

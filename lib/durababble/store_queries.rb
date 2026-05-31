@@ -98,7 +98,7 @@ module Durababble
       },
       "workflow lease lifecycle" => {
         methods: ["Store.claim_workflow", "Store.heartbeat", "Store.release_worker_leases!", "Store.steal_expired_leases!"],
-        indexes: ["workflows_pkey", "workflows_expired_lease_idx", "workflows_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
+        indexes: ["workflows_pkey", "workflows_expired_lease_idx", "workflows_worker_lease_idx", "durable_objects_expired_lease_idx", "durable_objects_worker_lease_idx", "inbox_worker_lease_idx", "target_activations_worker_lease_idx"],
         assertions: ["primary-key lease updates", "expired lease index", "worker release index"],
         benchmarks: ["lease_heartbeat", "lease_conflict_check", "expired_workflow_lease_recovery"],
       },

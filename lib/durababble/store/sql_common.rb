@@ -312,31 +312,19 @@ module Durababble
 
     #: (target_kind: String, target_type: String, target_id: String, message_kind: String, ?method_name: String?, ?payload: Object?, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?, ?worker_pool: String) -> String
     def enqueue_inbox_message(target_kind:, target_type:, target_id:, message_kind:, method_name: nil, payload: {}, idempotency_key: nil, ready_at: nil, max_attempts: nil, worker_pool: "default")
-      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
       result = transaction do
-        reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
-        next reused if reused
-
-        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
-        id = SecureRandom.uuid
-        insert_inbox_message_without_transaction(
-          id:,
-          worker_pool: mailbox_worker_pool,
+        enqueue_inbox_message_without_transaction(
+          worker_pool:,
           target_kind:,
           target_type:,
           target_id:,
-          sequence:,
           message_kind:,
           method_name:,
-          operation_id: id,
-          idempotency_key:,
-          shape_hash:,
           payload:,
+          idempotency_key:,
           ready_at:,
           max_attempts:,
         )
-        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:, ready_at:)
-        id
       end
       result #: as String
     end
@@ -354,31 +342,19 @@ module Durababble
         worker_pool = row_worker_pool(decoded_workflow)
         target_kind = "workflow"
         message_kind = "workflow_command"
-        shape_hash = inbox_shape_hash(target_kind:, target_type: workflow_name, target_id: workflow_id, message_kind:, method_name:, payload:)
-        reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type: workflow_name, target_id: workflow_id, shape_hash:)
-        next reused if reused
-
         raise Error, "workflow #{workflow_id} is terminal" if terminal_for_cancellation?(decoded_workflow)
 
-        sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type: workflow_name, target_id: workflow_id)
-        id = SecureRandom.uuid
-        insert_inbox_message_without_transaction(
-          id:,
-          worker_pool: mailbox_worker_pool,
+        enqueue_inbox_message_without_transaction(
+          worker_pool:,
           target_kind:,
           target_type: workflow_name,
           target_id: workflow_id,
-          sequence:,
           message_kind:,
           method_name:,
-          operation_id: id,
-          idempotency_key:,
-          shape_hash:,
           payload:,
+          idempotency_key:,
           max_attempts:,
         )
-        upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type: workflow_name, target_id: workflow_id)
-        id
       end
       result #: as String
     end
@@ -571,22 +547,14 @@ module Durababble
         next nil unless command
         next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
-        workflow = lock_workflow_for_update(workflow_id)
-        terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
-        assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+        terminal_update = prepare_workflow_command_commit(command, workflow_id:, message_id:, worker_id:)
+        next terminal_update if terminal_update
 
-        if terminal
-          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
-          reconcile_command_target_activation(command)
-          next updated
-        end
-
-        append_workflow_history_without_transaction(
+        append_workflow_command_history_without_transaction(
+          command,
+          message_id:,
           workflow_id:,
           kind: "workflow_command_failed",
-          name: command["method_name"],
-          attempt_id: message_id,
-          payload: workflow_command_history_payload(command, message_id:),
           error:,
           event_index:,
         )
@@ -606,24 +574,16 @@ module Durababble
         # LeaseConflict against an unrelated (not-running) workflow row.
         next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
-        workflow = lock_workflow_for_update(workflow_id)
-        terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
-        # [DURABABBLE-LEASE-4] Workflow command history commits need the workflow and inbox leases.
-        # Terminal workflows skip the lease assert so a late completion can dead-letter the inbox row.
-        assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+        terminal_update = prepare_workflow_command_commit(command, workflow_id:, message_id:, worker_id:)
+        next terminal_update if terminal_update
 
-        if terminal
-          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
-          reconcile_command_target_activation(command)
-          next updated
-        end
-
-        append_workflow_history_without_transaction(
+        append_workflow_command_history_without_transaction(
+          command,
+          message_id:,
           workflow_id:,
           kind: "workflow_command_completed",
-          name: command["method_name"],
-          attempt_id: message_id,
-          payload: workflow_command_history_payload(command, message_id:, result:, include_result: true),
+          result:,
+          include_result: true,
           event_index:,
         )
         updated = complete_inbox_message_without_transaction(message_id:, result:)
@@ -706,24 +666,14 @@ module Durababble
         # complete_workflow_command above.
         next nil unless workflow_command_targets_workflow?(command, workflow_id)
 
-        workflow = lock_workflow_for_update(workflow_id)
-        terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
-        # [DURABABBLE-LEASE-4] Workflow command failure history is also a workflow commit.
-        # Terminal workflows skip the lease assert so a late failure can dead-letter the inbox row.
-        assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+        terminal_update = prepare_workflow_command_commit(command, workflow_id:, message_id:, worker_id:)
+        next terminal_update if terminal_update
 
-        if terminal
-          updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
-          reconcile_command_target_activation(command)
-          next updated
-        end
-
-        append_workflow_history_without_transaction(
+        append_workflow_command_history_without_transaction(
+          command,
+          message_id:,
           workflow_id:,
           kind: "workflow_command_failed",
-          name: command["method_name"],
-          attempt_id: message_id,
-          payload: workflow_command_history_payload(command, message_id:),
           error:,
           event_index:,
         )
@@ -765,6 +715,65 @@ module Durababble
         )
       end
       existing.fetch("id") #: as String
+    end
+
+    # Shared durable enqueue path for object commands, workflow commands, and
+    # generic inbox messages. Callers are responsible for target-specific
+    # preconditions before entering this helper.
+    #: (worker_pool: String, target_kind: String, target_type: String, target_id: String, message_kind: String, payload: Object?, ?method_name: String?, ?idempotency_key: String?, ?ready_at: Time?, ?max_attempts: Integer?) -> String
+    def enqueue_inbox_message_without_transaction(worker_pool:, target_kind:, target_type:, target_id:, message_kind:, payload:, method_name: nil, idempotency_key: nil, ready_at: nil, max_attempts: nil)
+      shape_hash = inbox_shape_hash(target_kind:, target_type:, target_id:, message_kind:, method_name:, payload:)
+      reused = reuse_existing_inbox_message(idempotency_key, target_kind:, target_type:, target_id:, shape_hash:)
+      return reused if reused
+
+      sequence, mailbox_worker_pool = allocate_mailbox_sequence(worker_pool:, target_kind:, target_type:, target_id:)
+      id = SecureRandom.uuid
+      insert_inbox_message_without_transaction(
+        id:,
+        worker_pool: mailbox_worker_pool,
+        target_kind:,
+        target_type:,
+        target_id:,
+        sequence:,
+        message_kind:,
+        method_name:,
+        operation_id: id,
+        idempotency_key:,
+        shape_hash:,
+        payload:,
+        ready_at:,
+        max_attempts:,
+      )
+      upsert_target_activation_without_transaction(worker_pool: mailbox_worker_pool, target_kind:, target_type:, target_id:, ready_at:)
+      id
+    end
+
+    # [DURABABBLE-LEASE-4] Workflow command history commits need the workflow
+    # and inbox leases. Terminal workflows skip the workflow lease assert so a
+    # late completion/failure can dead-letter the inbox row instead.
+    #: (Hash[String, Object?], workflow_id: String, message_id: String, worker_id: String) -> Object?
+    def prepare_workflow_command_commit(command, workflow_id:, message_id:, worker_id:)
+      workflow = lock_workflow_for_update(workflow_id)
+      terminal = workflow && WorkflowStatus.terminal?(decode_row(workflow))
+      assert_workflow_lease_for_update!(workflow_id:, worker_id:) unless terminal
+      return unless terminal
+
+      updated = dead_letter_inbox_message_without_transaction(message_id:, error: "workflow #{workflow_id} is #{workflow.fetch("status")}")
+      reconcile_command_target_activation(command)
+      updated
+    end
+
+    #: (Hash[String, Object?], message_id: String, workflow_id: String, kind: String, event_index: Integer, ?result: Object?, ?include_result: bool, ?error: String?) -> Object?
+    def append_workflow_command_history_without_transaction(command, message_id:, workflow_id:, kind:, event_index:, result: nil, include_result: false, error: nil)
+      append_workflow_history_without_transaction(
+        workflow_id:,
+        kind:,
+        name: command["method_name"],
+        attempt_id: message_id,
+        payload: workflow_command_history_payload(command, message_id:, result:, include_result:),
+        error:,
+        event_index:,
+      )
     end
 
     #: (Object?, workflow_id: String, worker_id: String?, operation: String) -> Object?
