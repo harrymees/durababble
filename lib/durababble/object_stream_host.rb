@@ -59,7 +59,7 @@ module Durababble
       @worker_pool = worker_pool
       @lease_seconds = lease_seconds
       @renew_interval = (renew_interval || [1.0, lease_seconds / 3.0].max).to_f
-      @objects = normalize_objects(objects)
+      @objects = Durababble.normalize_objects(objects)
       @idle_ttl = (idle_ttl || lease_seconds).to_f
       @entries = {} #: Hash[[String, String], Entry]
       @claims_in_progress = {} #: Hash[[String, String], bool]
@@ -468,16 +468,6 @@ module Durababble
     #: () -> Float
     def monotonic_now
       Process.clock_gettime(Process::CLOCK_MONOTONIC).to_f
-    end
-
-    #: (untyped) -> Hash[String, untyped]
-    def normalize_objects(objects)
-      case objects
-      when Hash
-        objects.transform_keys(&:to_s)
-      else
-        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
-      end
     end
   end
 end

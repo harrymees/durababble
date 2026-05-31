@@ -785,6 +785,7 @@ module Durababble
       due_timer = wait_request.kind == "timer" && wait_request.wake_at && timer_due?(wait_request.wake_at)
       next_run_at = next_run_at_for_wait(wait_request)
       synchronize_store do
+        event_index = @replay_history.allocate_event_index!
         @store.record_wait(
           workflow_id: @workflow_id,
           command_id:,
@@ -793,9 +794,9 @@ module Durababble
           suspend_workflow: suspend_workflow && !due_timer,
           worker_id: @worker_id,
           next_run_at:,
-          event_index: @replay_history.allocate_event_index!,
+          event_index:,
         )
-        @replay_history.remember_step_waiting(command_id, name:, wait_request:)
+        @replay_history.remember_step_waiting(command_id, name:, wait_request:, event_index:)
       end
       crash!(:wait_recorded)
       if due_timer
@@ -1066,8 +1067,9 @@ module Durababble
         return
       end
 
-      result = invoke_workflow_command(method_name, args:, kwargs:)
       reserve_workflow_command_history_event!
+      event_index = synchronize_store { @replay_history.allocate_event_index! }
+      result = invoke_workflow_command(method_name, args:, kwargs:)
       message_id = message.fetch("id").to_s
       synchronize_store do
         @store.complete_workflow_command(
@@ -1075,11 +1077,11 @@ module Durababble
           workflow_id: @workflow_id,
           result:,
           worker_id: @worker_id,
-          event_index: @replay_history.allocate_event_index!,
+          event_index:,
         )
       end
     rescue StandardError => e
-      handle_workflow_command_error(message, retry_policy:, error: e)
+      handle_workflow_command_error(message, retry_policy:, error: e, event_index: event_index)
     end
 
     #: (Hash[String, Object?]) -> void
@@ -1131,9 +1133,9 @@ module Durababble
       kwargs.empty? ? @workflow.public_send(method_name, *args) : @workflow.public_send(method_name, *args, **kwargs)
     end
 
-    #: (Hash[String, Object?], String) -> void
-    def fail_workflow_command_message(message, error)
-      reserve_workflow_command_history_event!
+    #: (Hash[String, Object?], String, ?event_index: Integer?) -> void
+    def fail_workflow_command_message(message, error, event_index: nil)
+      reserve_workflow_command_history_event! unless event_index
       message_id = message.fetch("id").to_s
       synchronize_store do
         @store.fail_workflow_command(
@@ -1141,26 +1143,26 @@ module Durababble
           workflow_id: @workflow_id,
           error:,
           worker_id: @worker_id,
-          event_index: @replay_history.allocate_event_index!,
+          event_index: event_index || @replay_history.allocate_event_index!,
         )
       end
     end
 
-    #: (Hash[String, Object?], retry_policy: RetryPolicy?, error: StandardError) -> void
-    def handle_workflow_command_error(message, retry_policy:, error:)
+    #: (Hash[String, Object?], retry_policy: RetryPolicy?, error: StandardError, ?event_index: Integer?) -> void
+    def handle_workflow_command_error(message, retry_policy:, error:, event_index: nil)
       serialized_error = "#{error.class}: #{error.message}"
       attempt_value = message.fetch("attempts") #: as untyped
       attempt_number = attempt_value.to_i
       if retry_policy&.retryable?(error, attempt_number:)
-        retry_workflow_command_message(message, serialized_error, retry_policy.delay_for_attempt(attempt_number))
+        retry_workflow_command_message(message, serialized_error, retry_policy.delay_for_attempt(attempt_number), event_index:)
       else
-        fail_workflow_command_message(message, serialized_error)
+        fail_workflow_command_message(message, serialized_error, event_index:)
       end
     end
 
-    #: (Hash[String, Object?], String, Numeric) -> void
-    def retry_workflow_command_message(message, error, delay)
-      reserve_workflow_command_history_event!
+    #: (Hash[String, Object?], String, Numeric, ?event_index: Integer?) -> void
+    def retry_workflow_command_message(message, error, delay, event_index: nil)
+      reserve_workflow_command_history_event! unless event_index
       message_id = message.fetch("id").to_s
       synchronize_store do
         @store.retry_workflow_command(
@@ -1169,7 +1171,7 @@ module Durababble
           error:,
           worker_id: @worker_id,
           ready_at: retry_run_at(delay),
-          event_index: @replay_history.allocate_event_index!,
+          event_index: event_index || @replay_history.allocate_event_index!,
         )
       end
     end

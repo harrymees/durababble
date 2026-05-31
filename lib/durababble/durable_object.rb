@@ -871,7 +871,7 @@ module Durababble
     #: (store: untyped, objects: untyped, node_id: untyped) -> void
     def initialize(store:, objects:, node_id:)
       @store = store
-      @objects = normalize_objects(objects)
+      @objects = Durababble.normalize_objects(objects)
       @node_id = node_id
     end
 
@@ -895,16 +895,6 @@ module Durababble
     end
 
     private
-
-    #: (untyped) -> untyped
-    def normalize_objects(objects)
-      case objects
-      when Hash
-        objects.transform_keys(&:to_s)
-      else
-        Array(objects).to_h { |object_class| [object_class.object_type, object_class] }
-      end
-    end
 
     #: (object_type: untyped, object_id: untyped) -> void
     def assert_current_lease!(object_type:, object_id:)

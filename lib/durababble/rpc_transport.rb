@@ -96,6 +96,17 @@ module Durababble
         call.respond_to?(:deadline_exceeded?) && call.deadline_exceeded?
       end
 
+      #: (Exception) -> Async::TimeoutError?
+      def timeout_error_cause(error)
+        current = error #: Exception?
+        while current
+          return current if current.is_a?(Async::TimeoutError)
+
+          current = current.cause
+        end
+        nil
+      end
+
       #: (String, String) -> Exception
       def build_remote_error(klass, message)
         WorkflowRpc.remote_error_from_fields(klass, message) ||
@@ -831,6 +842,9 @@ module Durababble
         observe_transient_error(request, e)
         remote_error_response(e)
       rescue StandardError => e
+        timeout_error = Rpc.timeout_error_cause(e)
+        raise timeout_error if timeout_error && Rpc.deadline_exceeded?(call)
+
         observe_transient_error(request, e)
         remote_error_response(e)
       end
